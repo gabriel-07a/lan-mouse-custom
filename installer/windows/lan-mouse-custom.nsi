@@ -2,10 +2,16 @@
 ;
 ; Built by .github/workflows/release.yml on the Windows runner after
 ; `lan-mouse-windows\` was populated with lan-mouse.exe and the GTK dlls.
+; The version is passed with /DAPPVERSION=<version>.
+
+!include "MUI2.nsh"
+
+!ifndef APPVERSION
+  !define APPVERSION "0.11.0"
+!endif
 
 !define APPNAME "Lan Mouse"
 !define APPID "de.feschber.LanMouse.Custom"
-!define APPVERSION "0.11.0"
 !define PUBLISHER "Gabriel Arcanjo"
 !define EXENAME "lan-mouse.exe"
 
@@ -18,19 +24,36 @@ RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 Unicode true
 
-Page directory
-Page instfiles
-UninstPage uninstConfirm
-UninstPage instfiles
+; --- Modern UI -----------------------------------------------------------
+!define MUI_ICON "..\..\assets\icon.ico"
+!define MUI_UNICON "..\..\assets\icon.ico"
+!define MUI_ABORTWARNING
+!define MUI_FINISHPAGE_RUN_TEXT "Launch Lan Mouse"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${EXENAME}"
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+!insertmacro MUI_LANGUAGE "PortugueseBR"
+
+Function .onInit
+  ; Upgrade in place: close a running instance so the files can be replaced.
+  nsExec::ExecToLog 'taskkill /F /IM ${EXENAME}'
+FunctionEnd
 
 Section "Install"
   SetOutPath "$INSTDIR"
   File /r "..\..\lan-mouse-windows\*.*"
+  File "..\..\assets\icon.ico"
 
-  ; Shortcuts: desktop + start menu.
-  CreateShortCut "$DESKTOP\Lan Mouse.lnk" "$INSTDIR\${EXENAME}"
+  ; Shortcuts carry the icon explicitly so they look right even if the shell
+  ; has not refreshed its icon cache yet.
+  CreateShortCut "$DESKTOP\Lan Mouse.lnk" "$INSTDIR\${EXENAME}" "" "$INSTDIR\icon.ico" 0
   CreateDirectory "$SMPROGRAMS\Lan Mouse"
-  CreateShortCut "$SMPROGRAMS\Lan Mouse\Lan Mouse.lnk" "$INSTDIR\${EXENAME}"
+  CreateShortCut "$SMPROGRAMS\Lan Mouse\Lan Mouse.lnk" "$INSTDIR\${EXENAME}" "" "$INSTDIR\icon.ico" 0
   CreateShortCut "$SMPROGRAMS\Lan Mouse\Uninstall.lnk" "$INSTDIR\uninstall.exe"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -47,7 +70,14 @@ Section "Install"
   nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Lan Mouse" dir=in action=allow program="$INSTDIR\${EXENAME}" enable=yes profile=private,domain'
 SectionEnd
 
+Function .onInstSuccess
+  ; Refresh the shell so the new shortcuts get their icon immediately.
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
+FunctionEnd
+
 Section "Uninstall"
+  nsExec::ExecToLog 'taskkill /F /IM ${EXENAME}'
+
   Delete "$DESKTOP\Lan Mouse.lnk"
   Delete "$SMPROGRAMS\Lan Mouse\Lan Mouse.lnk"
   Delete "$SMPROGRAMS\Lan Mouse\Uninstall.lnk"

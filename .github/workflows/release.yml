@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev \
-            libwayland-dev libxkbcommon-dev
+            libwayland-dev libxkbcommon-dev librsvg2-bin imagemagick
       - name: Release build
         run: cargo build --release
       - name: Collect binary
@@ -98,7 +98,8 @@ jobs:
         shell: pwsh
         run: |
           choco install nsis -y --no-progress
-          & "C:\Program Files (x86)\NSIS\makensis.exe" installer\windows\lan-mouse-custom.nsi
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DAPPVERSION=$version installer\windows\lan-mouse-custom.nsi
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

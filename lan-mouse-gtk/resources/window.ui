@@ -7,6 +7,10 @@
       <attribute name="label" translatable="yes">_Close window</attribute>
       <attribute name="action">window.close</attribute>
     </item>
+    <item>
+      <attribute name="label" translatable="yes">_Quit Lan Mouse</attribute>
+      <attribute name="action">app.quit-app</attribute>
+    </item>
   </menu>
   <template class="LanMouseWindow" parent="AdwApplicationWindow">
     <property name="width-request">600</property>

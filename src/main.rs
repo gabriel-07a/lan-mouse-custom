@@ -1,3 +1,10 @@
+// Hide the console window when the executable is started from Explorer or a
+// shortcut. Debug builds keep it so `println!`/backtraces stay visible.
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
@@ -43,6 +50,11 @@ enum LanMouseError {
 }
 
 fn main() {
+    // A GUI executable has no console; when the binary is invoked from a
+    // terminal, reattach to the parent's console so `--help`/`cli` output is
+    // still visible.
+    attach_parent_console();
+
     // init logging
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
@@ -130,11 +142,32 @@ where
 }
 
 fn start_service() -> Result<Child, io::Error> {
-    let child = process::Command::new(std::env::current_exe()?)
-        .args(std::env::args().skip(1))
-        .arg("daemon")
-        .spawn()?;
-    Ok(child)
+    let mut command = process::Command::new(std::env::current_exe()?);
+    command.args(std::env::args().skip(1)).arg("daemon");
+    // The daemon must never flash a console window on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command.spawn()
+}
+
+/// Reattach to the parent console when started from a shell.
+///
+/// The release build is linked as a GUI subsystem executable, which has no
+/// console of its own; without this, running `lan-mouse cli` from a terminal
+/// would print nothing.
+fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        if std::env::args_os().len() > 1 {
+            use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+            unsafe {
+                let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        }
+    }
 }
 
 async fn run_service(config: Config) -> Result<(), ServiceError> {

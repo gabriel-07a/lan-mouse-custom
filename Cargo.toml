@@ -27,6 +27,9 @@ panic = "abort"
 [build-dependencies]
 shadow-rs = "1.2.0"
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 input-clipboard = { path = "input-clipboard", version = "0.1.0" }
 input-event = { path = "input-event", version = "0.4.0" }
@@ -74,6 +77,12 @@ hostname = "0.4.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
 
 [features]
 default = [

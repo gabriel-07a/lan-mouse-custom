@@ -4,11 +4,15 @@ mod client_row;
 mod fingerprint_window;
 mod key_object;
 mod key_row;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod linux_tray;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
 mod window;
+#[cfg(windows)]
+mod windows_tray;
 
 use std::{env, process, str, sync::OnceLock};
 
@@ -210,13 +214,16 @@ fn build_ui(app: &Application) {
         Ok(conn) => conn,
         Err(e) => {
             log::warn!("could not connect to daemon ({e}), spawning a new one");
-            if let Err(spawn_err) = process::Command::new(
+            let mut daemon = process::Command::new(
                 env::current_exe().expect("could not determine executable path"),
-            )
-            .args(env::args().skip(1))
-            .arg("daemon")
-            .spawn()
+            );
+            daemon.args(env::args().skip(1)).arg("daemon");
+            #[cfg(windows)]
             {
+                use std::os::windows::process::CommandExt;
+                daemon.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            if let Err(spawn_err) = daemon.spawn() {
                 log::error!("failed to spawn daemon: {spawn_err}");
                 process::exit(1);
             }
@@ -246,6 +253,35 @@ fn build_ui(app: &Application) {
     });
 
     let window = Window::new(app, frontend_tx);
+
+    // Closing the window keeps the app (and the sharing service) running:
+    // the tray icon is the way back. "Quit Lan Mouse" in the menu exits for
+    // real. macOS uses the status bar item instead.
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Hiding the window keeps it alive (GTK only quits when the last
+        // window is destroyed), so no `hold()` is needed: the tray icon brings
+        // it back and "Quit Lan Mouse" destroys nothing but calls quit().
+        let quit = gio::SimpleAction::new("quit-app", None);
+        quit.connect_activate(clone!(
+            #[weak]
+            app,
+            move |_, _| {
+                app.quit();
+            }
+        ));
+        app.add_action(&quit);
+
+        window.connect_close_request(|window| {
+            window.set_visible(false);
+            glib::Propagation::Stop
+        });
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux_tray::setup(&window);
+    #[cfg(windows)]
+    windows_tray::setup(&window);
     #[cfg(target_os = "macos")]
     {
         window.connect_close_request(|window| {

@@ -7,6 +7,9 @@
     <file compressed="true" preprocess="xml-stripblanks">client_row.ui</file>
     <file compressed="true" preprocess="xml-stripblanks">key_row.ui</file>
     <file compressed="true">style.css</file>
+    <!-- Application icon, used by the system tray (the icon theme is not
+         guaranteed to have it when running from a build tree). -->
+    <file compressed="true">icons/icon-256.png</file>
   </gresource>
   <gresource prefix="/de/feschber/LanMouse/icons">
     <file compressed="true" preprocess="xml-stripblanks">de.feschber.LanMouse.svg</file>

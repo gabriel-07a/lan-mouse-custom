@@ -1,6 +1,8 @@
 use shadow_rs::ShadowBuilder;
 
 fn main() {
+    embed_windows_icon();
+
     ShadowBuilder::builder()
         .deny_const(Default::default())
         .build()
@@ -57,5 +59,22 @@ fn main() {
     }
     if x11_emulation {
         println!("cargo::rustc-cfg=x11_emulation");
+    }
+}
+
+/// Embed `assets/icon.ico` into the executable so Explorer, the taskbar, the
+/// tray and the shortcuts created by the installer all show the app icon.
+fn embed_windows_icon() {
+    // Build scripts run on the host, so check the *target* instead of cfg!.
+    #[cfg(windows)]
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo::rerun-if-changed=assets/icon.ico");
+        let mut resource = winresource::WindowsResource::new();
+        resource.set_icon("assets/icon.ico");
+        resource.set("ProductName", "Lan Mouse");
+        resource.set("FileDescription", "Lan Mouse - mouse and keyboard sharing");
+        if let Err(e) = resource.compile() {
+            println!("cargo::warning=could not embed the Windows icon: {e}");
+        }
     }
 }
