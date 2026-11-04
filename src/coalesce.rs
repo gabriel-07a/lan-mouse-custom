@@ -85,7 +85,7 @@ impl MotionCoalescer {
         }
 
         match self.batch {
-            Some(batch) => now.duration_since(self.last_flush) >= batch,
+            Some(batch) => now.saturating_duration_since(self.last_flush) >= batch,
             None => false,
         }
     }
@@ -103,6 +103,9 @@ impl MotionCoalescer {
 
     /// Drain every pending motion (used by the flush timer and on release).
     pub(crate) fn take_all(&mut self) -> Vec<(CaptureHandle, Motion)> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
         self.last_flush = Instant::now();
         let pending = self.pending.drain().collect::<Vec<_>>();
         self.batches_out += pending.len() as u64;
@@ -182,6 +185,8 @@ mod tests {
         let t0 = Instant::now();
         c.push(1, 0, 1.0, 0.0, t0);
         assert!(c.take(1).is_some(), "flush before the pause");
+        // Empty timer ticks during the idle period must not reset `last_flush`.
+        assert!(c.take_all().is_empty());
         assert!(
             c.push(1, 1, 1.0, 0.0, t0 + Duration::from_millis(50)),
             "idle for longer than the window must flush at once"

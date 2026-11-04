@@ -765,6 +765,7 @@ impl CaptureTask {
         // connection grace. Failure is expected here and must not recurse
         // into another release.
         self.flush_motion_now().await;
+        self.disconnected_since = None;
         self.state = State::WaitingForAck;
         self.enter.reset();
 
