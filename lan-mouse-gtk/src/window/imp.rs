@@ -4,7 +4,7 @@ use adw::subclass::prelude::*;
 use adw::{ActionRow, PreferencesGroup, ToastOverlay, prelude::*};
 use glib::subclass::InitializingObject;
 use gtk::glib::clone;
-use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, gdk, gio, glib};
+use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, Switch, gdk, gio, glib};
 
 use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
 
@@ -36,6 +36,8 @@ pub struct Window {
     #[template_child]
     pub capture_emulation_group: TemplateChild<PreferencesGroup>,
     #[template_child]
+    pub clipboard_group: TemplateChild<PreferencesGroup>,
+    #[template_child]
     pub capture_status_row: TemplateChild<ActionRow>,
     #[template_child]
     pub emulation_status_row: TemplateChild<ActionRow>,
@@ -51,6 +53,8 @@ pub struct Window {
     pub port: Cell<u16>,
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,
+    pub clipboard_row: RefCell<Option<(ActionRow, Switch)>>,
+    pub updating_clipboard: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
 }
 

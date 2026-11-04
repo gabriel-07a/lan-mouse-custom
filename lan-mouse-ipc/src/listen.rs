@@ -42,24 +42,14 @@ pub struct AsyncFrontendListener {
 impl AsyncFrontendListener {
     pub async fn new() -> Result<Self, IpcListenerCreationError> {
         #[cfg(unix)]
-        let (socket_path, listener) = {
+        {
             let socket_path = crate::default_socket_path()?;
+            Self::new_at(socket_path).await
+        }
 
-            log::debug!("remove socket: {socket_path:?}");
-            if socket_path.exists() {
-                // try to connect to see if some other instance
-                // of lan-mouse is already running
-                match UnixStream::connect(&socket_path).await {
-                    // connected -> lan-mouse is already running
-                    Ok(_) => return Err(IpcListenerCreationError::AlreadyRunning),
-                    // lan-mouse is not running but a socket was left behind
-                    Err(e) => {
-                        log::debug!("{socket_path:?}: {e} - removing left behind socket");
-                        let _ = std::fs::remove_file(&socket_path);
-                    }
-                }
-            }
-            let listener = match UnixListener::bind(&socket_path) {
+        #[cfg(windows)]
+        {
+            let listener = match TcpListener::bind("127.0.0.1:5252").await {
                 Ok(ls) => ls,
                 // some other lan-mouse instance has bound the socket in the meantime
                 Err(e) if e.kind() == ErrorKind::AddrInUse => {
@@ -67,11 +57,34 @@ impl AsyncFrontendListener {
                 }
                 Err(e) => return Err(IpcListenerCreationError::Bind(e)),
             };
-            (socket_path, listener)
-        };
 
-        #[cfg(windows)]
-        let listener = match TcpListener::bind("127.0.0.1:5252").await {
+            Ok(Self {
+                listener,
+                line_streams: SelectAll::new(),
+                tx_streams: vec![],
+            })
+        }
+    }
+
+    /// Bind the frontend socket at an explicit path (Unix only). Used by
+    /// tests and by callers that need an isolated service instance.
+    #[cfg(unix)]
+    pub async fn new_at(socket_path: PathBuf) -> Result<Self, IpcListenerCreationError> {
+        log::debug!("remove socket: {socket_path:?}");
+        if socket_path.exists() {
+            // try to connect to see if some other instance
+            // of lan-mouse is already running
+            match UnixStream::connect(&socket_path).await {
+                // connected -> lan-mouse is already running
+                Ok(_) => return Err(IpcListenerCreationError::AlreadyRunning),
+                // lan-mouse is not running but a socket was left behind
+                Err(e) => {
+                    log::debug!("{socket_path:?}: {e} - removing left behind socket");
+                    let _ = std::fs::remove_file(&socket_path);
+                }
+            }
+        }
+        let listener = match UnixListener::bind(&socket_path) {
             Ok(ls) => ls,
             // some other lan-mouse instance has bound the socket in the meantime
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
@@ -80,15 +93,12 @@ impl AsyncFrontendListener {
             Err(e) => return Err(IpcListenerCreationError::Bind(e)),
         };
 
-        let adapter = Self {
+        Ok(Self {
             listener,
-            #[cfg(unix)]
             socket_path,
             line_streams: SelectAll::new(),
             tx_streams: vec![],
-        };
-
-        Ok(adapter)
+        })
     }
 
     pub async fn broadcast(&mut self, notify: FrontendEvent) {

@@ -104,6 +104,11 @@
                       </object>
                     </child>
                     <child>
+                      <object class="AdwPreferencesGroup" id="clipboard_group">
+                        <property name="title" translatable="yes">Clipboard</property>
+                      </object>
+                    </child>
+                    <child>
                       <object class="AdwPreferencesGroup">
                         <property name="title" translatable="yes">General</property>
                         <!--

@@ -425,6 +425,81 @@ port = 4242
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
 
+## Two-way (mutual) operation
+
+Lan Mouse has **no fixed server/client role**: every instance listens for
+incoming connections *and* dials the clients configured in its own config.
+Either machine can therefore drive the other one — as long as both sides are
+configured.
+
+To let both machines control each other:
+
+1. Run lan-mouse on **both** machines.
+2. On each machine add the *other* one as a `[[clients]]` entry with the
+   mirrored position:
+   - on PC A: `position = "right"` for PC B,
+   - on PC B: `position = "left"` for PC A.
+3. Authorize each peer's certificate fingerprint on the receiving side
+   (`authorized_fingerprints`, or approve the prompt in the frontend).
+4. Allow the same UDP port (default `4242`) through the firewall on both
+   machines.
+
+Only one side holds the input capture at a time: the machine whose cursor
+crossed the edge last takes control, and the other side releases its capture
+so events can never loop back. If only one side has a client entry, control
+works in one direction only.
+
+`lan-mouse doctor` prints the configured clients, the selected capture and
+emulation backends, the local fingerprint and warnings for common
+misconfigurations. Add `--probe` to also initialize the input backends, and
+`--json` for scripted use.
+
+### Network tuning
+
+- `motion_batch_ms` (default `4`, `0` disables): coalesces pointer motion into
+  small batches. On Wi-Fi this cuts the motion packet rate by roughly 4x with
+  less than 5 ms of added latency. Values above ~8 ms start to be noticeable.
+- `connect_grace_ms` (default `400`, `0` disables): how long an input event may
+  wait for a (re)connection before the capture is released. Keeps the mouse
+  grabbed during a short Wi-Fi hiccup instead of bouncing back to the local
+  screen immediately.
+
+Both options also exist as command line flags (`--motion-batch-ms`,
+`--connect-grace-ms`).
+
+## Clipboard
+
+Lan Mouse can synchronize the clipboard (plain text, HTML and PNG images)
+between authorized, connected peers.
+
+- Enabled by default. Toggle it in the frontend or with
+  `lan-mouse-cli clipboard enable|disable`; `--no-clipboard` disables it at
+  startup.
+- Size limits are configurable under `[clipboard]` (defaults: 256 KiB text,
+  1 MiB HTML, 8 MiB image, 10 MiB per snapshot).
+- **Linux / Wayland (GNOME 50+)** uses the XDG desktop portal. The first run
+  asks for **"Allow Clipboard Access"**; the consent is stored in
+  `~/.cache/lan-mouse/clipboard.token` (delete it to be asked again).
+- **Windows** and **macOS** use the native clipboard. On Windows, images are
+  converted between the canonical PNG and `CF_DIB`/`CF_DIBV5`.
+- Content marked as secret by the source application (macOS
+  `org.nspasteboard.ConcealedType`, KDE password-manager hint, Windows
+  clipboard-history/cloud opt-outs) is never synchronized.
+- Clipboard sync only runs between authorized peers and stops immediately when
+  the toggle is off.
+
+```toml
+[clipboard]
+enabled = true
+max_text_bytes = 262144
+max_html_bytes = 1048576
+max_image_bytes = 8388608
+max_snapshot_bytes = 10485760
+```
+
+Clipboard backends for wlroots compositors and native X11 are not implemented
+yet.
+
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
 - [x] respect xdg-config-home for config file location.
@@ -437,9 +512,9 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 - [x] Windows Input Capture
 - [x] Encryption
 - [ ] X11 Input Capture
-- [ ] Latency measurement and visualization
+- [x] Latency measurement and visualization (RTT per client)
 - [ ] Bandwidth usage measurement and visualization
-- [ ] Clipboard support
+- [x] Clipboard support (text, HTML, PNG; portal + Windows/macOS)
 
 
 ## Detailed OS Support

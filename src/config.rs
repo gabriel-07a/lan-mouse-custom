@@ -1,4 +1,5 @@
 use crate::capture_test::TestCaptureArgs;
+use crate::doctor::DoctorArgs;
 use crate::emulation_test::TestEmulationArgs;
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::event::ModifyKind;
@@ -66,9 +67,40 @@ struct ConfigToml {
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
+    /// batch window for pointer motion events in milliseconds (0 disables)
+    motion_batch_ms: Option<u64>,
+    /// how long a send may wait for a (re)connection before giving up, in ms
+    connect_grace_ms: Option<u64>,
+    /// clipboard synchronization settings
+    clipboard: Option<ClipboardConfig>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, Eq, PartialEq)]
+struct ClipboardConfig {
+    enabled: Option<bool>,
+    max_text_bytes: Option<usize>,
+    max_html_bytes: Option<usize>,
+    max_image_bytes: Option<usize>,
+    max_snapshot_bytes: Option<usize>,
+}
+
+impl ClipboardConfig {
+    fn limits(&self) -> input_clipboard::Limits {
+        let default = input_clipboard::Limits::default();
+        input_clipboard::Limits {
+            max_text: self.max_text_bytes.unwrap_or(default.max_text),
+            max_html: self.max_html_bytes.unwrap_or(default.max_html),
+            max_image: self.max_image_bytes.unwrap_or(default.max_image),
+            max_snapshot: self.max_snapshot_bytes.unwrap_or(default.max_snapshot),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -101,6 +133,19 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
+    /// batch window for pointer motion events in milliseconds (0 disables)
+    #[arg(long)]
+    motion_batch_ms: Option<u64>,
+
+    /// how long an input event may wait for a (re)connection before the
+    /// capture is released, in milliseconds (0 disables the grace period)
+    #[arg(long)]
+    connect_grace_ms: Option<u64>,
+
+    /// disable clipboard synchronization
+    #[arg(long)]
+    no_clipboard: bool,
+
     /// capture backend override
     #[arg(long)]
     capture_backend: Option<CaptureBackend>,
@@ -126,6 +171,8 @@ pub enum Command {
     TestCapture(TestCaptureArgs),
     /// Lan Mouse commandline interface
     Cli(CliArgs),
+    /// diagnose input backends, config and connectivity
+    Doctor(DoctorArgs),
     /// run in daemon mode
     Daemon,
 }
@@ -344,6 +391,16 @@ pub enum ConfigError {
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
     [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt];
 
+/// Default batching window for pointer motion events. 4 ms caps the
+/// motion packet rate at ~250/s while staying below the latency of a
+/// typical wireless mouse. `0` disables coalescing.
+const DEFAULT_MOTION_BATCH_MS: u64 = 4;
+
+/// How long a single input event may block on a broken connection before
+/// the capture is released. Keeps the grab during short Wi-Fi hiccups
+/// instead of bouncing the cursor back to the local screen immediately.
+const DEFAULT_CONNECT_GRACE_MS: u64 = 400;
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -421,7 +478,13 @@ impl Config {
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
             let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
+            let event = match event {
+                Ok(event) => event,
+                Err(e) => {
+                    log::warn!("config watcher error: {e}");
+                    continue;
+                }
+            };
             if event.paths.contains(&self.config_path)
                 && matches!(
                     event.kind,
@@ -500,11 +563,54 @@ impl Config {
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
     }
 
+    /// batching window for pointer motion events (0 disables coalescing)
+    pub fn motion_batch_ms(&self) -> u64 {
+        self.args
+            .motion_batch_ms
+            .or(self.config_toml.as_ref().and_then(|c| c.motion_batch_ms))
+            .unwrap_or(DEFAULT_MOTION_BATCH_MS)
+    }
+
+    /// how long a send may wait for a (re)connection before giving up
+    pub fn connect_grace_ms(&self) -> u64 {
+        self.args
+            .connect_grace_ms
+            .or(self.config_toml.as_ref().and_then(|c| c.connect_grace_ms))
+            .unwrap_or(DEFAULT_CONNECT_GRACE_MS)
+    }
+
+    /// whether clipboard synchronization is enabled at startup
+    pub fn clipboard_enabled(&self) -> bool {
+        if self.args.no_clipboard {
+            return false;
+        }
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard.as_ref())
+            .is_none_or(ClipboardConfig::enabled)
+    }
+
+    /// persist the clipboard toggle in the config file
+    pub fn set_clipboard_enabled(&mut self, enabled: bool) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        let config = self.config_toml.as_mut().expect("config");
+        let clipboard = config.clipboard.get_or_insert_with(Default::default);
+        clipboard.enabled = Some(enabled);
+    }
+
+    /// clipboard size limits
+    pub fn clipboard_limits(&self) -> input_clipboard::Limits {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard.as_ref())
+            .map(ClipboardConfig::limits)
+            .unwrap_or_default()
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
@@ -582,5 +688,134 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml: &str) -> ConfigToml {
+        toml::from_str(toml).expect("parse config")
+    }
+
+    fn toml_client() -> TomlClient {
+        TomlClient {
+            hostname: Some("peer".into()),
+            host_name: None,
+            ips: Some(vec![IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2))]),
+            port: None,
+            position: None,
+            activate_on_startup: None,
+            enter_hook: None,
+            leave_hook: None,
+        }
+    }
+
+    #[test]
+    fn shipped_example_config_parses() {
+        let config: ConfigToml =
+            toml::from_str(include_str!("../config.toml")).expect("example config must parse");
+        assert_eq!(config.port, Some(4242));
+        assert!(config.release_bind.is_some());
+        assert_eq!(config.clients.as_ref().map(Vec::len), Some(2));
+        assert_eq!(
+            config.authorized_fingerprints.as_ref().map(HashMap::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn empty_config_has_no_overrides() {
+        let config = parse("");
+        assert!(config.port.is_none());
+        assert!(config.motion_batch_ms.is_none());
+        assert!(config.connect_grace_ms.is_none());
+        assert!(config.clients.is_none());
+        assert!(config.authorized_fingerprints.is_none());
+    }
+
+    #[test]
+    fn new_tuning_options_parse() {
+        let config = parse("motion_batch_ms = 8\nconnect_grace_ms = 250\n");
+        assert_eq!(config.motion_batch_ms, Some(8));
+        assert_eq!(config.connect_grace_ms, Some(250));
+    }
+
+    #[test]
+    fn unknown_config_keys_are_tolerated() {
+        let config = parse("some_future_option = true\nmotion_batch_ms = 2\n");
+        assert_eq!(config.motion_batch_ms, Some(2));
+    }
+
+    #[test]
+    fn client_defaults_are_applied() {
+        let client: ConfigClient = toml_client().into();
+        assert_eq!(client.port, DEFAULT_PORT);
+        assert_eq!(client.pos, Position::Left);
+        assert!(!client.active);
+        assert_eq!(client.ips.len(), 1);
+        assert_eq!(client.hostname.as_deref(), Some("peer"));
+    }
+
+    #[test]
+    fn activate_on_startup_maps_to_active() {
+        let mut toml = toml_client();
+        toml.activate_on_startup = Some(true);
+        toml.port = Some(5000);
+        toml.position = Some(Position::Right);
+        let client: ConfigClient = toml.into();
+        assert!(client.active);
+        assert_eq!(client.port, 5000);
+        assert_eq!(client.pos, Position::Right);
+    }
+
+    #[test]
+    fn default_config_roundtrips_through_toml() {
+        let serialized = toml::to_string_pretty(&ConfigToml::default()).expect("serialize");
+        let parsed: ConfigToml = toml::from_str(&serialized).expect("reparse");
+        assert!(parsed.port.is_none());
+        assert!(parsed.clients.is_none());
+    }
+
+    #[test]
+    fn default_network_constants_are_documented_values() {
+        assert_eq!(DEFAULT_MOTION_BATCH_MS, 4);
+        assert_eq!(DEFAULT_CONNECT_GRACE_MS, 400);
+        assert_eq!(DEFAULT_RELEASE_KEYS.len(), 4);
+    }
+
+    #[test]
+    fn clipboard_config_parses_and_applies_custom_limits() {
+        let config = parse(
+            "[clipboard]\nenabled = false\nmax_text_bytes = 10\nmax_html_bytes = 20\n             max_image_bytes = 30\nmax_snapshot_bytes = 40\n",
+        );
+        let clipboard = config.clipboard.as_ref().expect("clipboard table");
+        assert!(!clipboard.enabled());
+        let limits = clipboard.limits();
+        assert_eq!(limits.max_text, 10);
+        assert_eq!(limits.max_html, 20);
+        assert_eq!(limits.max_image, 30);
+        assert_eq!(limits.max_snapshot, 40);
+    }
+
+    #[test]
+    fn clipboard_is_enabled_by_default() {
+        assert!(ClipboardConfig::default().enabled());
+        let config = parse("[clipboard]\nmax_text_bytes = 10\n");
+        let clipboard = config.clipboard.as_ref().expect("clipboard table");
+        assert!(clipboard.enabled());
+        assert_eq!(clipboard.limits().max_text, 10);
+        assert_eq!(
+            clipboard.limits().max_image,
+            input_clipboard::Limits::default().max_image,
+            "unset fields fall back to the defaults"
+        );
+    }
+
+    #[test]
+    fn local_commit_is_eight_bytes() {
+        let commit = local_commit();
+        assert_eq!(commit.len(), 8);
     }
 }

@@ -27,6 +27,7 @@ impl ClientObject {
             )
             .property("resolving", state.resolving)
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
+            .property("rtt-ms", state.rtt_ms.unwrap_or(0))
             .build()
     }
 
@@ -53,4 +54,32 @@ pub struct ClientData {
     pub resolving: bool,
     pub ips: Vec<String>,
     pub peer_commit: Option<String>,
+    /// 0 means unknown
+    pub rtt_ms: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_an_ascii_commit() {
+        assert_eq!(
+            peer_commit_to_string(Some(*b"abcd1234")),
+            Some("abcd1234".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_commit_stays_none() {
+        assert_eq!(peer_commit_to_string(None), None);
+    }
+
+    #[test]
+    fn invalid_utf8_commit_is_dropped() {
+        assert_eq!(
+            peer_commit_to_string(Some([0xff, 0xfe, 0, 0, 0, 0, 0, 0])),
+            None
+        );
+    }
 }

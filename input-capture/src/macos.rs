@@ -134,7 +134,9 @@ impl InputCaptureState {
 
     /// resets the cursor to the position, where the capture started
     fn reset_cursor(&mut self) -> Result<(), CaptureError> {
-        let pos = self.enter_position.expect("capture active");
+        let Some(pos) = self.enter_position else {
+            return Ok(());
+        };
         log::trace!("Resetting cursor position to: {}, {}", pos.x, pos.y);
         CGDisplay::warp_mouse_cursor_position(pos).map_err(CaptureError::WarpCursor)
     }

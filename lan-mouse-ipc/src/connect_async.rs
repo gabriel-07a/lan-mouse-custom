@@ -58,33 +58,72 @@ impl AsyncFrontendRequestWriter {
 pub async fn connect_async(
     timeout: Option<Duration>,
 ) -> Result<(AsyncFrontendEventReader, AsyncFrontendRequestWriter), ConnectionError> {
+    #[cfg(unix)]
+    {
+        let socket_path = crate::default_socket_path()?;
+        connect_async_at(&socket_path, timeout).await
+    }
+
+    #[cfg(windows)]
+    {
+        let stream = if let Some(duration) = timeout {
+            tokio::select! {
+                s = wait_for_service() => s?,
+                _ = tokio::time::sleep(duration) => return Err(ConnectionError::Timeout),
+            }
+        } else {
+            wait_for_service().await?
+        };
+        Ok(split_stream(stream))
+    }
+}
+
+/// Connect to the frontend socket at an explicit path (Unix only). Used by
+/// tests and by callers that need an isolated service instance.
+#[cfg(unix)]
+pub async fn connect_async_at(
+    socket_path: &std::path::Path,
+    timeout: Option<Duration>,
+) -> Result<(AsyncFrontendEventReader, AsyncFrontendRequestWriter), ConnectionError> {
     let stream = if let Some(duration) = timeout {
         tokio::select! {
-            s = wait_for_service() => s?,
+            s = wait_for_service_at(socket_path) => s?,
             _ = tokio::time::sleep(duration) => return Err(ConnectionError::Timeout),
         }
     } else {
-        wait_for_service().await?
+        wait_for_service_at(socket_path).await?
     };
-    #[cfg(unix)]
+    Ok(split_stream(stream))
+}
+
+#[cfg(unix)]
+fn split_stream(stream: UnixStream) -> (AsyncFrontendEventReader, AsyncFrontendRequestWriter) {
     let (rx, tx): (ReadHalf<UnixStream>, WriteHalf<UnixStream>) = tokio::io::split(stream);
-    #[cfg(windows)]
+    let buf_reader = BufReader::new(rx);
+    let lines = buf_reader.lines();
+    let lines_stream = LinesStream::new(lines);
+    let reader = AsyncFrontendEventReader { lines_stream };
+    let writer = AsyncFrontendRequestWriter { tx };
+    (reader, writer)
+}
+
+#[cfg(windows)]
+fn split_stream(stream: TcpStream) -> (AsyncFrontendEventReader, AsyncFrontendRequestWriter) {
     let (rx, tx): (ReadHalf<TcpStream>, WriteHalf<TcpStream>) = tokio::io::split(stream);
     let buf_reader = BufReader::new(rx);
     let lines = buf_reader.lines();
     let lines_stream = LinesStream::new(lines);
     let reader = AsyncFrontendEventReader { lines_stream };
     let writer = AsyncFrontendRequestWriter { tx };
-    Ok((reader, writer))
+    (reader, writer)
 }
 
 /// wait for the lan-mouse socket to come online
 #[cfg(unix)]
-async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
-    let socket_path = crate::default_socket_path()?;
+async fn wait_for_service_at(socket_path: &std::path::Path) -> Result<UnixStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = UnixStream::connect(&socket_path).await {
+        if let Ok(stream) = UnixStream::connect(socket_path).await {
             break Ok(stream);
         }
         // a signaling mechanism or inotify could be used to

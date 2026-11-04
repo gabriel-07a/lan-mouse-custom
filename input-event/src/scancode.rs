@@ -849,3 +849,41 @@ impl TryFrom<Windows> for Linux {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_scancodes_decode_from_the_wire_value() {
+        assert_eq!(Linux::try_from(0u32).unwrap(), Linux::KeyReserved);
+        assert_eq!(Linux::try_from(1u32).unwrap(), Linux::KeyEsc);
+        assert_eq!(Linux::try_from(30u32).unwrap(), Linux::KeyA);
+        assert_eq!(Linux::try_from(42u32).unwrap(), Linux::KeyLeftShift);
+        assert_eq!(Linux::try_from(29u32).unwrap(), Linux::KeyLeftCtrl);
+        assert!(Linux::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn linux_to_windows_roundtrips_for_common_keys() {
+        for key in [
+            Linux::KeyEsc,
+            Linux::Key1,
+            Linux::KeyA,
+            Linux::KeyZ,
+            Linux::KeySpace,
+            Linux::KeyEnter,
+            Linux::KeyLeftShift,
+            Linux::KeyLeftCtrl,
+        ] {
+            let windows = Windows::try_from(key).expect("windows mapping");
+            let back = Linux::try_from(windows).expect("linux mapping");
+            assert_eq!(back, key, "roundtrip failed for {key:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_key_has_no_windows_mapping() {
+        assert!(Windows::try_from(Linux::KeyReserved).is_err());
+    }
+}

@@ -1,10 +1,13 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{
+    MAX_EVENT_SIZE, ProtoEvent,
+    clipboard::{ClipboardFrame, MAX_CLIPBOARD_FRAME, is_clipboard_frame},
+};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -34,9 +37,19 @@ pub enum ListenerCreationError {
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 
+/// Commands sent from other tasks to the listener task.
+pub(crate) enum ListenerCommand {
+    /// Send an already encoded frame to a connected peer.
+    Reply(SocketAddr, Vec<u8>),
+}
+
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
+        addr: SocketAddr,
+    },
+    Clipboard {
+        frame: ClipboardFrame,
         addr: SocketAddr,
     },
     Accept {
@@ -109,8 +122,7 @@ impl LanMouseListener {
             ..Default::default()
         };
 
-        let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-        let mut listener = listen(listen_addr, cfg.clone()).await?;
+        let mut listener = bind_listener(port, cfg.clone()).await?;
 
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
@@ -127,6 +139,7 @@ impl LanMouseListener {
                         _ = sleep => continue,
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
+                                let addr = normalize_addr(addr);
                                 log::info!("dtls client connected, ip: {addr}");
                                 let mut conns = conns_clone.lock().await;
                                 conns.push((addr, conn.clone()));
@@ -158,8 +171,7 @@ impl LanMouseListener {
                         },
                         port = request_port_change_rx.recv() => {
                             let port = port.expect("channel closed");
-                            let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-                            match listen(listen_addr, cfg.clone()).await {
+                            match bind_listener(port, cfg.clone()).await {
                                 Ok(new_listener) => {
                                     let _ = listener.close().await;
                                     listener = new_listener;
@@ -206,10 +218,15 @@ impl LanMouseListener {
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        self.reply_raw(addr, &buf[..len]).await;
+    }
+
+    /// Send an already encoded frame (clipboard acks and chunks).
+    pub(crate) async fn reply_raw(&self, addr: SocketAddr, bytes: &[u8]) {
         let conns = self.conns.lock().await;
         for (a, conn) in conns.iter() {
             if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
+                let _ = conn.send(bytes).await;
             }
         }
     }
@@ -245,19 +262,76 @@ impl Stream for LanMouseListener {
     }
 }
 
+/// Listen on a dual-stack socket on Linux (IPv4-mapped addresses are
+/// normalized when accepted), and on IPv4 elsewhere.
+async fn bind_listener(port: u16, cfg: Config) -> Result<impl Listener, webrtc_dtls::Error> {
+    #[cfg(target_os = "linux")]
+    let primary = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+    #[cfg(not(target_os = "linux"))]
+    let primary = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+
+    match listen(primary, cfg.clone()).await {
+        Ok(listener) => Ok(listener),
+        Err(e) => {
+            #[cfg(target_os = "linux")]
+            {
+                log::warn!("could not listen on [::]:{port} ({e}); falling back to 0.0.0.0");
+                let fallback = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+                listen(fallback, cfg).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Map IPv4-mapped IPv6 addresses (dual-stack sockets) back to IPv4, so
+/// configured client addresses keep matching.
+fn normalize_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::V4(SocketAddrV4::new(v4, v6.port())),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
 async fn read_loop(
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     addr: SocketAddr,
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
 ) -> Result<(), Error> {
-    let mut b = [0u8; MAX_EVENT_SIZE];
+    let mut b = [0u8; MAX_CLIPBOARD_FRAME];
 
-    while conn.recv(&mut b).await.is_ok() {
-        match b.try_into() {
-            Ok(event) => dtls_tx
-                .send(ListenEvent::Msg { event, addr })
-                .expect("channel closed"),
+    loop {
+        let n = match conn.recv(&mut b).await {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n > 0 && is_clipboard_frame(b[0]) {
+            match ClipboardFrame::decode(&b[..n]) {
+                Ok(frame) => {
+                    if dtls_tx
+                        .send(ListenEvent::Clipboard { frame, addr })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => log::debug!("ignoring undecodable clipboard frame from {addr}: {e}"),
+            }
+            continue;
+        }
+        match ProtoEvent::try_from(&b[..n]) {
+            Ok(event) => {
+                if dtls_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+                    break;
+                }
+            }
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep
                 // listening. Each DTLS recv returns one full
@@ -274,10 +348,8 @@ async fn read_loop(
     }
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
-    let index = conns
-        .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
-    conns.remove(index);
+    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
+        conns.remove(index);
+    }
     Ok(())
 }

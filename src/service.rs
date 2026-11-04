@@ -10,14 +10,18 @@ use crate::{
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, ClientHandle, ClipboardStatus, Diagnostics, FrontendEvent,
+    FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
 };
+use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION};
+use local_channel::mpsc::Receiver;
 use log;
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
@@ -42,6 +46,20 @@ pub struct Service {
     capture: Capture,
     /// input emulation
     emulation: Emulation,
+    /// clipboard synchronization
+    clipboard: crate::clipboard::ClipboardTask,
+    /// user-controlled clipboard toggle (shared with the clipboard task)
+    clipboard_enabled: Rc<Cell<bool>>,
+    /// clipboard size limits (shared with the clipboard task)
+    clipboard_limits: Rc<Cell<input_clipboard::Limits>>,
+    /// latest clipboard status reported by the task
+    clipboard_status: ClipboardStatus,
+    /// clipboard status updates from the task
+    clipboard_status_rx: Receiver<ClipboardStatus>,
+    /// clipboard peer disconnects from the emulation task
+    clipboard_peer_events: local_channel::mpsc::Sender<std::net::SocketAddr>,
+    /// whether the clipboard status channel is still open
+    clipboard_status_open: bool,
     /// dns resolver
     resolver: DnsResolver,
     /// frontend listener
@@ -94,13 +112,42 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let mut conn = LanMouseConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            config.connect_grace_ms(),
+        );
+        let clipboard_sender = conn.sender();
+        let clipboard_from_connection = conn.take_clipboard_rx();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(capture_backend, conn, config.release_bind());
+        let capture = Capture::new(
+            capture_backend,
+            conn,
+            config.release_bind(),
+            config.motion_batch_ms(),
+        );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let (clipboard_from_listener_tx, clipboard_from_listener_rx) =
+            local_channel::mpsc::channel();
+        let emulation = Emulation::new(emulation_backend, listener, clipboard_from_listener_tx);
+        let clipboard_enabled_initial = config.clipboard_enabled();
+        let clipboard_enabled = Rc::new(Cell::new(clipboard_enabled_initial));
+        let clipboard_limits = Rc::new(Cell::new(config.clipboard_limits()));
+        let (clipboard_status_tx, clipboard_status_rx) = local_channel::mpsc::channel();
+        let (clipboard_peer_tx, clipboard_peer_rx) = local_channel::mpsc::channel();
+        let clipboard = crate::clipboard::ClipboardTask::new(
+            client_manager.clone(),
+            clipboard_sender,
+            emulation.reply_handle(),
+            clipboard_from_listener_rx,
+            clipboard_from_connection.expect("clipboard receiver"),
+            clipboard_peer_rx,
+            clipboard_limits.clone(),
+            clipboard_enabled.clone(),
+            clipboard_status_tx,
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -109,6 +156,16 @@ impl Service {
         let service = Self {
             config,
             capture,
+            clipboard,
+            clipboard_enabled,
+            clipboard_limits,
+            clipboard_status: ClipboardStatus {
+                enabled: clipboard_enabled_initial,
+                ..Default::default()
+            },
+            clipboard_status_rx,
+            clipboard_peer_events: clipboard_peer_tx,
+            clipboard_status_open: true,
             emulation,
             frontend_listener,
             resolver,
@@ -147,6 +204,12 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                status = self.clipboard_status_rx.recv(), if self.clipboard_status_open => {
+                    match status {
+                        Some(status) => self.handle_clipboard_status(status),
+                        None => self.clipboard_status_open = false,
+                    }
+                },
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -155,6 +218,8 @@ impl Service {
         log::info!("terminating service ...");
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
+        log::debug!("terminating clipboard ...");
+        self.clipboard.terminate().await;
         log::debug!("terminating emulation ...");
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
@@ -218,6 +283,7 @@ impl Service {
                 self.update_leave_hook(handle, leave_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
         }
     }
 
@@ -264,6 +330,11 @@ impl Service {
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
+
+        // Size limits can change at runtime. The enabled toggle is owned by
+        // the frontend/CLI, so an external config edit only takes effect on
+        // the next start.
+        self.clipboard_limits.set(self.config.clipboard_limits());
         self.sync_frontend();
     }
 
@@ -296,6 +367,7 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
+                let _ = self.clipboard_peer_events.send(addr);
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -320,14 +392,24 @@ impl Service {
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
-            EmulationEvent::PeerHello { addr, commit } => {
+            EmulationEvent::PeerHello {
+                addr,
+                commit,
+                proto_version,
+                capabilities,
+            } => {
                 // Map the peer's source addr back to its client handle
-                // and stamp the commit. Skip if we don't have an
+                // and stamp the version. Skip if we don't have an
                 // outgoing client configured for this peer (incoming-
                 // only setup) — there's nowhere to display the version
                 // in that case anyway.
                 if let Some(handle) = self.client_manager.get_client(addr) {
-                    self.client_manager.set_peer_commit(handle, Some(commit));
+                    self.client_manager.set_peer_hello(
+                        handle,
+                        Some(commit),
+                        proto_version,
+                        capabilities,
+                    );
                     self.broadcast_client(handle);
                 }
             }
@@ -397,6 +479,52 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_frontend(FrontendEvent::ClipboardStatus(
+            self.clipboard_status.clone(),
+        ));
+        let diagnostics = self.diagnostics();
+        self.notify_frontend(FrontendEvent::Diagnostics(diagnostics));
+    }
+
+    fn handle_clipboard_status(&mut self, status: ClipboardStatus) {
+        // The service owns the toggle: a status produced before the task saw
+        // a recent toggle must not flip it back.
+        self.clipboard_status.backend = status.backend;
+        self.clipboard_status.available = status.available;
+        self.clipboard_status.applied = status.applied;
+        self.clipboard_status.last_error = status.last_error;
+        self.clipboard_status.enabled = self.clipboard_enabled.get();
+        self.notify_frontend(FrontendEvent::ClipboardStatus(
+            self.clipboard_status.clone(),
+        ));
+    }
+
+    fn set_clipboard_enabled(&mut self, enabled: bool) {
+        self.clipboard_enabled.set(enabled);
+        self.clipboard_status.enabled = enabled;
+        if !enabled {
+            self.clipboard_status.last_error = None;
+        }
+        self.config.set_clipboard_enabled(enabled);
+        self.notify_frontend(FrontendEvent::ClipboardStatus(
+            self.clipboard_status.clone(),
+        ));
+        self.save_config();
+    }
+
+    /// Runtime information used by the frontend and `lan-mouse doctor`.
+    pub(crate) fn diagnostics(&self) -> Diagnostics {
+        Diagnostics {
+            capture_backend: self.capture.backend().map(|b| b.to_string()),
+            emulation_backend: self.emulation.backend().map(|b| b.to_string()),
+            session_type: std::env::var("XDG_SESSION_TYPE").ok(),
+            desktop: std::env::var("XDG_CURRENT_DESKTOP").ok(),
+            port: self.port,
+            proto_version: PROTO_VERSION,
+            capabilities: CAPABILITIES,
+            clipboard_backend: self.clipboard_status.backend.clone(),
+            clipboard_enabled: self.clipboard_status.enabled,
+        }
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -524,6 +652,8 @@ impl Service {
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
             self.capture.create(handle, pos, CaptureType::Default);
+            /* pre-establish the connection so the first crossing is instant */
+            self.capture.connect(handle);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }

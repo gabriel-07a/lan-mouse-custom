@@ -1,10 +1,13 @@
 mod capture;
 pub mod capture_test;
 pub mod client;
+mod clipboard;
+mod coalesce;
 pub mod config;
 mod connect;
 mod crypto;
 mod dns;
+pub mod doctor;
 mod emulation;
 pub mod emulation_test;
 mod listen;

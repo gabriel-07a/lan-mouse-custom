@@ -75,3 +75,27 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+## Clipboard
+The clipboard is a separate subsystem (crate `input-clipboard`). A snapshot is
+a set of canonical formats (`text/plain;charset=utf-8`, `text/html`,
+`image/png`) and is transferred over the existing DTLS association as its own
+frame type (12–15) with chunking, acknowledgements and retransmission. The sync
+layer suppresses echoes by content hash.
+
+OS integration:
+- GNOME 50+ / Wayland: `org.freedesktop.portal.Clipboard` (requires a one-time
+  consent, persisted with a restore token).
+- Windows: `CF_UNICODETEXT`, `CF_HTML`, `PNG`/`CF_DIB`.
+- macOS: `NSPasteboard` (`public.utf8-plain-text`, `public.html`, `public.png`).
+- wlroots/X11: not implemented yet.
+
+## Symmetric roles
+Every instance runs both a listener and an outgoing connection, so *server* and
+*client* above only describe who initiates a given DTLS session — not a fixed
+role. With a client entry on each side, either device can control the other.
+
+The handoff is coordinated with a serial number: the side that captures sends
+`Enter` with a monotonically increasing serial and retransmits it until the
+peer answers with `Ack(serial)`. The receiver deduplicates retransmissions and
+releases its own capture exactly once. `Leave` returns control.
+

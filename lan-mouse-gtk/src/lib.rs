@@ -324,6 +324,34 @@ fn build_ui(app: &Application) {
                     FrontendEvent::IncomingDisconnected(addr) => {
                         window.show_toast(format!("{addr} disconnected").as_str());
                     }
+                    FrontendEvent::ClipboardStatus(status) => {
+                        window.set_clipboard_status(status);
+                    }
+                    FrontendEvent::Diagnostics(diagnostics) => {
+                        let capture = diagnostics
+                            .capture_backend
+                            .as_deref()
+                            .unwrap_or("initializing");
+                        let emulation = diagnostics
+                            .emulation_backend
+                            .as_deref()
+                            .unwrap_or("initializing");
+                        log::info!(
+                            "diagnostics: capture={capture} emulation={emulation} \
+                             session={:?} desktop={:?} proto={} caps={:#x}",
+                            diagnostics.session_type,
+                            diagnostics.desktop,
+                            diagnostics.proto_version,
+                            diagnostics.capabilities,
+                        );
+                        window.show_toast(
+                            format!(
+                                "capture: {capture} · emulation: {emulation} · clipboard: {}",
+                                diagnostics.clipboard_backend.as_deref().unwrap_or("off")
+                            )
+                            .as_str(),
+                        );
+                    }
                 }
             }
         }

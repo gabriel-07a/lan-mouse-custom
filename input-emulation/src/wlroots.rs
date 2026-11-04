@@ -104,10 +104,11 @@ impl State {
             None => {
                 let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
                 // TODO: use server side keymap
-                let Some((format, fd, size)) = self.keymap.as_ref() else {
-                    panic!("no keymap");
-                };
-                keyboard.keymap(*format, fd.as_fd(), *size);
+                if let Some((format, fd, size)) = self.keymap.as_ref() {
+                    keyboard.keymap(*format, fd.as_fd(), *size);
+                } else {
+                    log::warn!("compositor did not send a keymap; keyboard emulation may not work");
+                }
                 self.keyboard = Some(keyboard.clone());
                 keyboard
             }

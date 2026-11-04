@@ -119,6 +119,8 @@ impl Display for Backend {
 pub struct InputCapture {
     /// capture backend
     capture: Box<dyn Capture>,
+    /// backend that was actually selected
+    backend: Backend,
     /// keys pressed by active capture
     pressed_keys: HashSet<scancode::Linux>,
     /// map from position to ids
@@ -191,9 +193,10 @@ impl InputCapture {
 
     /// creates a new [`InputCapture`]
     pub async fn new(backend: Option<Backend>) -> Result<Self, CaptureCreationError> {
-        let capture = create(backend).await?;
+        let (backend, capture) = create(backend).await?;
         Ok(Self {
             capture,
+            backend,
             id_map: Default::default(),
             pending: Default::default(),
             position_map: Default::default(),
@@ -201,9 +204,15 @@ impl InputCapture {
         })
     }
 
-    /// check whether the given keys are pressed
+    /// the backend that was actually selected
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// check whether the given keys are pressed.
+    /// An empty release bind must never release the capture.
     pub fn keys_pressed(&self, keys: &[scancode::Linux]) -> bool {
-        keys.iter().all(|k| self.pressed_keys.contains(k))
+        keys_pressed_in(&self.pressed_keys, keys)
     }
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
@@ -217,6 +226,10 @@ impl InputCapture {
     }
 }
 
+fn keys_pressed_in(pressed: &HashSet<scancode::Linux>, keys: &[scancode::Linux]) -> bool {
+    !keys.is_empty() && keys.iter().all(|key| pressed.contains(key))
+}
+
 impl Stream for InputCapture {
     type Item = Result<(CaptureHandle, CaptureEvent), CaptureError>;
 
@@ -224,53 +237,64 @@ impl Stream for InputCapture {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        if let Some(e) = self.pending.pop_front() {
-            return Poll::Ready(Some(Ok(e)));
-        }
+        loop {
+            if let Some(e) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(e)));
+            }
 
-        // ready
-        let event = ready!(self.capture.poll_next_unpin(cx));
+            // ready
+            let event = ready!(self.capture.poll_next_unpin(cx));
 
-        // stream closed
-        let event = match event {
-            Some(e) => e,
-            None => return Poll::Ready(None),
-        };
+            // stream closed
+            let event = match event {
+                Some(e) => e,
+                None => return Poll::Ready(None),
+            };
 
-        // error occurred
-        let (pos, event) = match event {
-            Ok(e) => e,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        };
+            // error occurred
+            let (pos, event) = match event {
+                Ok(e) => e,
+                Err(e) => return Poll::Ready(Some(Err(e))),
+            };
 
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
-        }
+            // handle key presses
+            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
+                event
+            {
+                self.update_pressed_keys(key, state);
+            }
 
-        let len = self
-            .position_map
-            .get(&pos)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
+            let len = self
+                .position_map
+                .get(&pos)
+                .map(|ids| ids.len())
+                .unwrap_or(0);
 
-        match len {
-            0 => Poll::Pending,
-            1 => Poll::Ready(Some(Ok((
-                self.position_map.get(&pos).expect("no id")[0],
-                event,
-            )))),
-            _ => {
-                let mut position_map = HashMap::new();
-                swap(&mut self.position_map, &mut position_map);
-                {
-                    for &id in position_map.get(&pos).expect("position") {
-                        self.pending.push_back((id, event));
-                    }
+            match len {
+                // No capture registered for this position (for example an
+                // event that raced a `destroy`). Drop it and keep polling
+                // instead of returning `Pending` without registering a
+                // waker, which would stall the stream until an unrelated
+                // wakeup.
+                0 => continue,
+                1 => {
+                    return Poll::Ready(Some(Ok((
+                        self.position_map.get(&pos).expect("no id")[0],
+                        event,
+                    ))));
                 }
-                swap(&mut self.position_map, &mut position_map);
+                _ => {
+                    let mut position_map = HashMap::new();
+                    swap(&mut self.position_map, &mut position_map);
+                    {
+                        for &id in position_map.get(&pos).expect("position") {
+                            self.pending.push_back((id, event));
+                        }
+                    }
+                    swap(&mut self.position_map, &mut position_map);
 
-                Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
+                    return Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))));
+                }
             }
         }
     }
@@ -315,7 +339,10 @@ async fn create_backend(
 async fn create(
     backend: Option<Backend>,
 ) -> Result<
-    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+    (
+        Backend,
+        Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+    ),
     CaptureCreationError,
 > {
     if let Some(backend) = backend {
@@ -323,7 +350,7 @@ async fn create(
         if b.is_ok() {
             log::info!("using capture backend: {backend}");
         }
-        return b;
+        return b.map(|b| (backend, b));
     }
 
     for backend in [
@@ -341,11 +368,47 @@ async fn create(
         match create_backend(backend).await {
             Ok(b) => {
                 log::info!("using capture backend: {backend}");
-                return Ok(b);
+                return Ok((backend, b));
             }
             Err(e) if e.cancelled_by_user() => return Err(e),
             Err(e) => log::warn!("{backend} input capture backend unavailable: {e}"),
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_opposite_is_involutive() {
+        for pos in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            assert_eq!(pos.opposite().opposite(), pos);
+            assert_ne!(pos.opposite(), pos);
+        }
+    }
+
+    #[test]
+    fn empty_release_bind_never_matches() {
+        let pressed = HashSet::from([scancode::Linux::KeyA]);
+        assert!(!keys_pressed_in(&pressed, &[]));
+        assert!(keys_pressed_in(&pressed, &[scancode::Linux::KeyA]));
+        assert!(!keys_pressed_in(
+            &pressed,
+            &[scancode::Linux::KeyA, scancode::Linux::KeyB]
+        ));
+        assert!(!keys_pressed_in(&HashSet::new(), &[scancode::Linux::KeyA]));
+    }
+
+    #[test]
+    fn position_display_is_lowercase() {
+        assert_eq!(Position::Left.to_string(), "left");
+        assert_eq!(Position::Bottom.to_string(), "bottom");
+    }
 }

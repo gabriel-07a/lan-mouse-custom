@@ -1,9 +1,10 @@
 use crate::config::local_commit;
-use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
+use crate::listen::{LanMouseListener, ListenEvent, ListenerCommand, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{Position, ProtoEvent};
+use lan_mouse_proto::clipboard::ClipboardFrame;
+use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -17,11 +18,18 @@ use tokio::{
     task::{JoinHandle, spawn_local},
 };
 
+/// How long the listening side tolerates silence (no ping, no input) before
+/// it releases held keys and tears the emulation handle down. Wide enough
+/// to survive Wi-Fi jitter and a couple of lost pings.
+const EMULATION_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
     task: JoinHandle<()>,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
+    selected_backend: Rc<Cell<Option<input_emulation::Backend>>>,
+    reply_tx: Sender<ListenerCommand>,
 }
 
 pub(crate) enum EmulationEvent {
@@ -63,6 +71,8 @@ pub(crate) enum EmulationEvent {
     PeerHello {
         addr: SocketAddr,
         commit: [u8; 8],
+        proto_version: u8,
+        capabilities: u32,
     },
 }
 
@@ -77,40 +87,60 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        clipboard_tx: Sender<(std::net::SocketAddr, ClipboardFrame)>,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend);
+        let selected_backend: Rc<Cell<Option<input_emulation::Backend>>> = Default::default();
+        let emulation_proxy = EmulationProxy::new(backend, selected_backend.clone());
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let (reply_tx, reply_rx) = channel();
         let emulation_task = ListenTask {
             listener,
             emulation_proxy,
             request_rx,
             event_tx,
+            clipboard_tx,
+            reply_rx,
         };
         let task = spawn_local(emulation_task.run());
         Self {
             task,
             request_tx,
             event_rx,
+            selected_backend,
+            reply_tx,
         }
+    }
+
+    /// Handle used by the clipboard task to reply on incoming connections.
+    pub(crate) fn reply_handle(&self) -> Sender<ListenerCommand> {
+        self.reply_tx.clone()
+    }
+
+    /// The emulation backend that was actually selected, once initialized.
+    pub(crate) fn backend(&self) -> Option<input_emulation::Backend> {
+        self.selected_backend.get()
     }
 
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
         self.request_tx
             .send(EmulationRequest::Release(addr))
-            .expect("channel closed");
+            .ok()
+            .unwrap_or_default();
     }
 
     pub(crate) fn reenable(&self) {
         self.request_tx
             .send(EmulationRequest::Reenable)
-            .expect("channel closed");
+            .ok()
+            .unwrap_or_default();
     }
 
     pub(crate) fn request_port_change(&self, port: u16) {
         self.request_tx
             .send(EmulationRequest::ChangePort(port))
-            .expect("channel closed")
+            .ok()
+            .unwrap_or_default()
     }
 
     pub(crate) async fn event(&mut self) -> EmulationEvent {
@@ -122,10 +152,36 @@ impl Emulation {
         log::debug!("terminating emulation");
         self.request_tx
             .send(EmulationRequest::Terminate)
-            .expect("channel closed");
+            .ok()
+            .unwrap_or_default();
         if let Err(e) = (&mut self.task).await {
             log::warn!("{e}");
         }
+    }
+}
+
+/// Deduplicates `Enter` retransmissions per connection.
+///
+/// Serial `0` means a peer predating the serial field; those events are
+/// never deduplicated because legacy peers always send `0`.
+#[derive(Debug, Default)]
+struct EnterDeduper {
+    last: HashMap<SocketAddr, u32>,
+}
+
+impl EnterDeduper {
+    /// Whether this `Enter` is a retransmission of the last handled one.
+    fn is_duplicate(&self, addr: SocketAddr, serial: u32) -> bool {
+        serial != 0 && self.last.get(&addr) == Some(&serial)
+    }
+
+    /// Remember a successfully handled `Enter`.
+    fn record(&mut self, addr: SocketAddr, serial: u32) {
+        self.last.insert(addr, serial);
+    }
+
+    fn clear(&mut self, addr: SocketAddr) {
+        self.last.remove(&addr);
     }
 }
 
@@ -134,12 +190,17 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    clipboard_tx: Sender<(std::net::SocketAddr, ClipboardFrame)>,
+    reply_rx: Receiver<ListenerCommand>,
 }
 
 impl ListenTask {
     async fn run(mut self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut last_response = HashMap::new();
+        // Last `Enter` serial seen per connection, used to swallow
+        // retransmissions without re-triggering `ReleaseNotify`.
+        let mut last_enter = EnterDeduper::default();
         let mut rejected_connections = HashMap::new();
         loop {
             select! {
@@ -148,12 +209,17 @@ impl ListenTask {
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         match event {
-                            ProtoEvent::Enter(pos) => {
-                                if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                            ProtoEvent::Enter { pos, serial } => {
+                                let duplicate = last_enter.is_duplicate(addr, serial);
+                                if duplicate {
+                                    log::debug!("duplicate Enter({serial}) from {addr}, re-acking");
+                                    self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
+                                } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                    last_enter.record(addr, serial);
                                     log::info!("releasing capture: {addr} entered this device");
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
-                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                    self.event_tx.send(EmulationEvent::ReleaseNotify).ok().unwrap_or_default();
+                                    self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
+                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).ok().unwrap_or_default();
                                 }
                             }
                             ProtoEvent::Leave(_) => {
@@ -173,27 +239,49 @@ impl ListenTask {
                             // listener down) the version display would
                             // otherwise silently say "unknown" while
                             // the peer is in fact happily talking to us.
-                            ProtoEvent::Hello { commit } => {
-                                self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                            ProtoEvent::Hello { commit, proto_version, capabilities } => {
+                                self.listener.reply(addr, ProtoEvent::Hello {
+                                    commit: local_commit(),
+                                    proto_version: PROTO_VERSION,
+                                    capabilities: CAPABILITIES,
+                                }).await;
+                                self.event_tx.send(EmulationEvent::PeerHello {
+                                    addr,
+                                    commit,
+                                    proto_version,
+                                    capabilities,
+                                }).ok().unwrap_or_default();
                             }
                             _ => {}
                         }
                     }
+                    Some(ListenEvent::Clipboard { frame, addr }) => {
+                        if self.clipboard_tx.send((addr, frame)).is_err() {
+                            log::debug!(
+                                "clipboard task is not running, dropping a frame from {addr}"
+                            );
+                        }
+                    }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
-                        self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
+                        // A fresh connection from this address starts a new
+                        // serial space; never dedupe against the old one.
+                        last_enter.clear(addr);
+                        self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).ok().unwrap_or_default();
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
                             .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).ok().unwrap_or_default();
                             }
                     }
                     None => break
                 }}
                 event = self.emulation_proxy.event() => {
-                    self.event_tx.send(event).expect("channel closed");
+                    self.event_tx.send(event).ok().unwrap_or_default();
                 }
+                command = self.reply_rx.recv() => match command.expect("channel closed") {
+                    ListenerCommand::Reply(addr, bytes) => self.listener.reply_raw(addr, &bytes).await,
+                },
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
@@ -202,16 +290,17 @@ impl ListenTask {
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
-                        self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
+                        self.event_tx.send(EmulationEvent::PortChanged(result)).ok().unwrap_or_default();
                     }
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
                     last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
+                        if instant.elapsed() > EMULATION_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                            self.event_tx.send(EmulationEvent::Disconnected { addr }).ok().unwrap_or_default();
+                            last_enter.clear(addr);
                             false
                         } else {
                             true
@@ -243,7 +332,10 @@ enum ProxyRequest {
 }
 
 impl EmulationProxy {
-    fn new(backend: Option<input_emulation::Backend>) -> Self {
+    fn new(
+        backend: Option<input_emulation::Backend>,
+        selected_backend: Rc<Cell<Option<input_emulation::Backend>>>,
+    ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
@@ -255,6 +347,7 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            selected_backend,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -282,27 +375,31 @@ impl EmulationProxy {
         if self.emulation_active.get() {
             self.request_tx
                 .send(ProxyRequest::Input(event, addr))
-                .expect("channel closed");
+                .ok()
+                .unwrap_or_default();
         }
     }
 
     fn remove(&self, addr: SocketAddr) {
         self.request_tx
             .send(ProxyRequest::Remove(addr))
-            .expect("channel closed");
+            .ok()
+            .unwrap_or_default();
     }
 
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
-            .expect("channel closed");
+            .ok()
+            .unwrap_or_default();
     }
 
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
             .send(ProxyRequest::Terminate)
-            .expect("channel closed");
+            .ok()
+            .unwrap_or_default();
         let _ = (&mut self.task).await;
     }
 }
@@ -314,6 +411,7 @@ struct EmulationTask {
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    selected_backend: Rc<Cell<Option<input_emulation::Backend>>>,
 }
 
 impl EmulationTask {
@@ -344,6 +442,7 @@ impl EmulationTask {
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
+        self.selected_backend.set(Some(emulation.backend()));
 
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(
@@ -437,7 +536,7 @@ struct DropGuard<T> {
 
 impl<T> DropGuard<T> {
     fn new(tx: Sender<T>, on_new: T, on_drop: T) -> Self {
-        tx.send(on_new).expect("channel closed");
+        tx.send(on_new).ok().unwrap_or_default();
         let on_drop = Some(on_drop);
         Self { tx, on_drop }
     }
@@ -447,6 +546,62 @@ impl<T> Drop for DropGuard<T> {
     fn drop(&mut self) {
         self.tx
             .send(self.on_drop.take().expect("item"))
-            .expect("channel closed");
+            .ok()
+            .unwrap_or_default();
+    }
+}
+
+#[cfg(test)]
+mod enter_deduper_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)), 4242)
+    }
+
+    #[test]
+    fn repeated_serial_is_a_duplicate() {
+        let mut deduper = EnterDeduper::default();
+        assert!(!deduper.is_duplicate(addr(1), 5));
+        deduper.record(addr(1), 5);
+        assert!(deduper.is_duplicate(addr(1), 5));
+    }
+
+    #[test]
+    fn new_serial_is_not_a_duplicate() {
+        let mut deduper = EnterDeduper::default();
+        assert!(!deduper.is_duplicate(addr(1), 5));
+        deduper.record(addr(1), 5);
+        assert!(!deduper.is_duplicate(addr(1), 6));
+        deduper.record(addr(1), 6);
+        assert!(
+            !deduper.is_duplicate(addr(1), 5),
+            "an older serial is not a retry"
+        );
+    }
+
+    #[test]
+    fn legacy_serial_zero_is_never_deduplicated() {
+        let mut deduper = EnterDeduper::default();
+        assert!(!deduper.is_duplicate(addr(1), 0));
+        deduper.record(addr(1), 0);
+        assert!(!deduper.is_duplicate(addr(1), 0));
+    }
+
+    #[test]
+    fn connections_are_isolated() {
+        let mut deduper = EnterDeduper::default();
+        deduper.record(addr(1), 5);
+        assert!(!deduper.is_duplicate(addr(2), 5), "different peer");
+    }
+
+    #[test]
+    fn clear_forgets_the_serial_space() {
+        let mut deduper = EnterDeduper::default();
+        deduper.record(addr(1), 5);
+        assert!(deduper.is_duplicate(addr(1), 5));
+        deduper.clear(addr(1));
+        assert!(!deduper.is_duplicate(addr(1), 5));
     }
 }

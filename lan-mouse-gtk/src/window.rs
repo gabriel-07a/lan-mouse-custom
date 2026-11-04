@@ -11,8 +11,8 @@ use gtk::{
 };
 
 use lan_mouse_ipc::{
-    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, FrontendRequestWriter,
-    Position,
+    ClientConfig, ClientHandle, ClientState, ClipboardStatus, DEFAULT_PORT, FrontendRequest,
+    FrontendRequestWriter, Position,
 };
 
 use crate::{
@@ -48,7 +48,41 @@ impl Window {
             .frontend_request_writer
             .borrow_mut()
             .replace(conn);
+
+        let clipboard_row = adw::ActionRow::new();
+        clipboard_row.set_title("Clipboard");
+        clipboard_row.set_subtitle("Clipboard sync is disabled");
+        let clipboard_switch = gtk::Switch::new();
+        clipboard_switch.set_valign(gtk::Align::Center);
+        clipboard_switch.set_active(false);
+        clipboard_row.add_suffix(&clipboard_switch);
+        clipboard_row.set_activatable_widget(Some(&clipboard_switch));
+        clipboard_switch.connect_active_notify(clone!(
+            #[weak(rename_to = window)]
+            window,
+            move |switch| {
+                if window.imp().updating_clipboard.get() {
+                    return;
+                }
+                window.request(FrontendRequest::SetClipboardEnabled(switch.is_active()));
+            }
+        ));
+        window.imp().capture_emulation_group.add(&clipboard_row);
         window
+            .imp()
+            .clipboard_row
+            .replace(Some((clipboard_row, clipboard_switch)));
+        window
+    }
+
+    pub(super) fn set_clipboard_status(&self, status: ClipboardStatus) {
+        let Some((row, switch)) = self.imp().clipboard_row.borrow().as_ref().cloned() else {
+            return;
+        };
+        self.imp().updating_clipboard.set(true);
+        switch.set_active(status.enabled);
+        self.imp().updating_clipboard.set(false);
+        row.set_subtitle(&status.summary());
     }
 
     fn clients(&self) -> gio::ListStore {
@@ -371,6 +405,7 @@ impl Window {
             "peer-commit",
             crate::client_object::peer_commit_to_string(state.peer_commit),
         );
+        client_object.set_property("rtt-ms", state.rtt_ms.unwrap_or(0));
         row.refresh_version_status();
     }
 

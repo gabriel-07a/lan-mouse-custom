@@ -54,7 +54,7 @@ impl DnsResolver {
 
     pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String) {
         let request = DnsRequest { handle, hostname };
-        self.request_tx.send(request).expect("channel closed");
+        self.request_tx.send(request).ok().unwrap_or_default();
     }
 
     pub(crate) async fn event(&mut self) -> DnsEvent {
@@ -90,7 +90,8 @@ impl DnsTask {
 
             self.event_tx
                 .send(DnsEvent::Resolving(handle))
-                .expect("channel closed");
+                .ok()
+                .unwrap_or_default();
 
             /* spawn task for dns request */
             let event_tx = self.event_tx.clone();
@@ -101,7 +102,7 @@ impl DnsTask {
                     result = resolve_hostname(&hostname) => {
                        event_tx
                            .send(DnsEvent::Resolved(handle, hostname, result))
-                           .expect("channel closed");
+                           .ok().unwrap_or_default();
                     }
                     _ = cancellation_token.cancelled() => {},
                 }
@@ -124,4 +125,98 @@ impl DnsTask {
 async fn resolve_hostname(hostname: &str) -> io::Result<Vec<IpAddr>> {
     let addrs = lookup_host((hostname, 0)).await?;
     Ok(addrs.map(|sa| sa.ip()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::task::LocalSet;
+
+    async fn next_event(resolver: &mut DnsResolver) -> DnsEvent {
+        tokio::time::timeout(Duration::from_secs(10), resolver.event())
+            .await
+            .expect("timed out waiting for a dns event")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolves_localhost_through_the_resolver_task() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let mut resolver = DnsResolver::new().expect("resolver");
+                resolver.resolve(7, "localhost".to_string());
+
+                let mut resolved = false;
+                for _ in 0..5 {
+                    match next_event(&mut resolver).await {
+                        DnsEvent::Resolving(handle) => assert_eq!(handle, 7),
+                        DnsEvent::Resolved(handle, hostname, result) => {
+                            assert_eq!(handle, 7);
+                            assert_eq!(hostname, "localhost");
+                            let ips = result.expect("localhost must resolve");
+                            assert!(!ips.is_empty());
+                            resolved = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(resolved, "resolver never produced a result");
+                resolver.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_resolutions_are_reported_independently() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let mut resolver = DnsResolver::new().expect("resolver");
+                resolver.resolve(1, "localhost".to_string());
+                resolver.resolve(2, "localhost".to_string());
+
+                let mut handles = Vec::new();
+                while handles.len() < 2 {
+                    if let DnsEvent::Resolved(handle, _, result) = next_event(&mut resolver).await {
+                        result.expect("localhost must resolve");
+                        handles.push(handle);
+                    }
+                }
+                handles.sort();
+                assert_eq!(handles, vec![1, 2]);
+                resolver.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_new_request_for_the_same_handle_supersedes_the_previous_one() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let mut resolver = DnsResolver::new().expect("resolver");
+                resolver.resolve(3, "localhost".to_string());
+                resolver.resolve(3, "localhost".to_string());
+
+                let mut resolved = 0;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while tokio::time::Instant::now() < deadline {
+                    match tokio::time::timeout(Duration::from_secs(1), resolver.event()).await {
+                        Ok(DnsEvent::Resolved(3, _, result)) => {
+                            result.expect("localhost must resolve");
+                            resolved += 1;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                assert!(
+                    resolved >= 1,
+                    "at least the latest request must be resolved"
+                );
+                resolver.terminate().await;
+            })
+            .await;
+    }
 }

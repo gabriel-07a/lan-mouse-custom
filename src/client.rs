@@ -298,9 +298,43 @@ impl ClientManager {
         }
     }
 
-    pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
+    /// smoothed round-trip time measured by the connection layer
+    pub(crate) fn set_rtt_ms(&self, handle: ClientHandle, rtt_ms: Option<u32>) {
+        let mut clients = self.clients.borrow_mut();
+        let Some((_, state)) = clients.get_mut(handle as usize) else {
+            return;
+        };
+        let smoothed = match (state.rtt_ms, rtt_ms) {
+            // Exponential moving average: 3/4 old, 1/4 new. Keeps the UI
+            // from flickering on a single outlier while still tracking
+            // real changes within a few ping rounds.
+            (Some(old), Some(new)) => Some(((old as u64 * 3 + new as u64) / 4) as u32),
+            (None, new) => new,
+            (old, None) => old,
+        };
+        state.rtt_ms = smoothed;
+    }
+
+    /// whether the client is currently marked active (receiving our input)
+    pub(crate) fn is_active(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(_, s)| s.active)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn set_peer_hello(
+        &self,
+        handle: ClientHandle,
+        commit: Option<[u8; 8]>,
+        proto_version: u8,
+        capabilities: u32,
+    ) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.peer_commit = commit;
+            s.peer_proto_version = proto_version;
+            s.peer_capabilities = capabilities;
         }
     }
 
@@ -331,5 +365,182 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(_, s)| s.ips.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lan_mouse_ipc::Position;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, last))
+    }
+
+    fn config_client(pos: Position, active: bool) -> ConfigClient {
+        ConfigClient {
+            ips: HashSet::from([ip(10)]),
+            hostname: Some("peer".to_string()),
+            port: 4242,
+            pos,
+            active,
+            enter_hook: None,
+            leave_hook: None,
+        }
+    }
+
+    #[test]
+    fn add_with_config_initializes_state() {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config_client(Position::Right, true));
+        let (config, state) = manager.get_state(handle).expect("client");
+        assert_eq!(config.hostname.as_deref(), Some("peer"));
+        assert_eq!(config.pos, Position::Right);
+        assert!(state.active);
+        assert_eq!(state.ips, HashSet::from([ip(10)]));
+    }
+
+    #[test]
+    fn activate_and_deactivate_report_state_changes() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        assert!(manager.activate_client(handle));
+        assert!(!manager.activate_client(handle), "already active");
+        assert!(manager.is_active(handle));
+        assert!(manager.deactivate_client(handle));
+        assert!(!manager.deactivate_client(handle), "already inactive");
+        assert!(!manager.is_active(handle));
+    }
+
+    #[test]
+    fn client_at_only_matches_active_clients() {
+        let manager = ClientManager::default();
+        let inactive = manager.add_with_config(config_client(Position::Left, false));
+        let active = manager.add_with_config(config_client(Position::Right, true));
+        assert_eq!(manager.client_at(Position::Left), None);
+        assert_eq!(manager.client_at(Position::Right), Some(active));
+        assert_ne!(inactive, active);
+    }
+
+    #[test]
+    fn get_client_matches_active_ip_addresses() {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config_client(Position::Left, true));
+        let addr = SocketAddr::new(ip(10), 4242);
+        assert_eq!(manager.get_client(addr), Some(handle));
+        assert_eq!(manager.get_client(SocketAddr::new(ip(11), 4242)), None);
+
+        manager.deactivate_client(handle);
+        assert_eq!(
+            manager.get_client(addr),
+            None,
+            "inactive clients never match"
+        );
+    }
+
+    #[test]
+    fn set_port_keeps_active_addr_in_sync() {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config_client(Position::Left, true));
+        manager.set_active_addr(handle, Some(SocketAddr::new(ip(10), 4242)));
+        manager.set_port(handle, 5000);
+        assert_eq!(
+            manager.active_addr(handle),
+            Some(SocketAddr::new(ip(10), 5000))
+        );
+        assert_eq!(manager.get_port(handle), Some(5000));
+    }
+
+    #[test]
+    fn set_hostname_clears_resolution_state() {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config_client(Position::Left, true));
+        manager.set_dns_ips(handle, vec![ip(11)]);
+        manager.set_active_addr(handle, Some(SocketAddr::new(ip(11), 4242)));
+        assert!(manager.get_ips(handle).expect("ips").contains(&ip(11)));
+
+        assert!(manager.set_hostname(handle, Some("renamed".to_string())));
+        let (config, state) = manager.get_state(handle).expect("client");
+        assert_eq!(config.hostname.as_deref(), Some("renamed"));
+        assert!(state.dns_ips.is_empty());
+        assert_eq!(state.active_addr, None);
+        assert_eq!(state.ips, HashSet::from([ip(10)]), "only fixed ips remain");
+    }
+
+    #[test]
+    fn setting_the_same_hostname_is_a_no_op() {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config_client(Position::Left, true));
+        assert!(!manager.set_hostname(handle, Some("peer".to_string())));
+    }
+
+    #[test]
+    fn set_pos_reports_capture_change_only_for_active_clients() {
+        let manager = ClientManager::default();
+        let active = manager.add_with_config(config_client(Position::Left, true));
+        let inactive = manager.add_with_config(config_client(Position::Top, false));
+        assert!(manager.set_pos(active, Position::Bottom));
+        assert!(!manager.set_pos(active, Position::Bottom), "unchanged");
+        assert!(!manager.set_pos(inactive, Position::Right));
+        assert_eq!(manager.get_pos(active), Some(Position::Bottom));
+    }
+
+    #[test]
+    fn rtt_uses_an_exponential_moving_average() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        manager.set_rtt_ms(handle, Some(100));
+        assert_eq!(manager.get_state(handle).unwrap().1.rtt_ms, Some(100));
+        manager.set_rtt_ms(handle, Some(200));
+        assert_eq!(manager.get_state(handle).unwrap().1.rtt_ms, Some(125));
+        manager.set_rtt_ms(handle, Some(200));
+        assert_eq!(manager.get_state(handle).unwrap().1.rtt_ms, Some(143));
+        manager.set_rtt_ms(handle, None);
+        assert_eq!(
+            manager.get_state(handle).unwrap().1.rtt_ms,
+            Some(143),
+            "no sample keeps the previous value"
+        );
+    }
+
+    #[test]
+    fn peer_hello_and_reset_are_stored() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        manager.set_peer_hello(handle, Some(*b"abcd1234"), 1, 0b101);
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert_eq!(state.peer_commit, Some(*b"abcd1234"));
+        assert_eq!(state.peer_proto_version, 1);
+        assert_eq!(state.peer_capabilities, 0b101);
+
+        manager.set_peer_hello(handle, None, 0, 0);
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert_eq!(state.peer_commit, None);
+        assert_eq!(state.peer_proto_version, 0);
+    }
+
+    #[test]
+    fn registered_and_active_lists_track_state() {
+        let manager = ClientManager::default();
+        let a = manager.add_with_config(config_client(Position::Left, true));
+        let b = manager.add_with_config(config_client(Position::Right, false));
+        assert_eq!(manager.registered_clients().len(), 2);
+        assert_eq!(manager.active_clients(), vec![a]);
+        manager.activate_client(b);
+        let mut active = manager.active_clients();
+        active.sort();
+        assert_eq!(active, vec![a, b]);
+    }
+
+    #[test]
+    fn remove_client_returns_its_state() {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config_client(Position::Left, true));
+        let (config, state) = manager.remove_client(handle).expect("removed");
+        assert_eq!(config.pos, Position::Left);
+        assert!(state.active);
+        assert!(manager.get_state(handle).is_none());
+        assert!(manager.remove_client(handle).is_none());
     }
 }

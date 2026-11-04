@@ -1,7 +1,10 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{
+    MAX_EVENT_SIZE, ProtoEvent,
+    clipboard::{ClipboardFrame, MAX_CLIPBOARD_FRAME, is_clipboard_frame},
+};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -10,12 +13,12 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
-    sync::Mutex,
+    sync::watch,
     task::{JoinSet, spawn_local},
 };
 use webrtc_dtls::{
@@ -41,15 +44,348 @@ pub(crate) enum LanMouseConnectionError {
     Timeout,
 }
 
-const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-address DTLS handshake budget. Addresses are dialed in parallel, so
+/// the total time to establish a connection stays close to this value even
+/// when a client has several (possibly stale) IPs configured.
+const ADDRESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Backoff for the background reconnect loop while a client stays active.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+type ArcConn = Arc<dyn Conn + Send + Sync>;
+type ConnMap = Rc<RefCell<HashMap<SocketAddr, ArcConn>>>;
+type FastConnMap = Rc<RefCell<HashMap<ClientHandle, ArcConn>>>;
+
+/// Shared state of the outgoing connection layer.
+///
+/// Everything in this module runs on the single-threaded [`tokio::task::LocalSet`],
+/// so interior mutability via `Rc<RefCell<_>>` is enough and keeps the hot
+/// send path free of async locks.
+#[derive(Clone)]
+struct ConnCtx {
+    cert: Certificate,
+    client_manager: ClientManager,
+    /// connections keyed by peer address (source of truth)
+    conns: ConnMap,
+    /// connections keyed by client handle (hot-path cache)
+    fast_conns: FastConnMap,
+    /// handles with a connect attempt in flight
+    connecting: Rc<RefCell<HashSet<ClientHandle>>>,
+    /// handles with a background reconnect loop running
+    reconnecting: Rc<RefCell<HashSet<ClientHandle>>>,
+    /// broadcasts connection state changes to `send` callers
+    waiters: Rc<RefCell<HashMap<ClientHandle, watch::Sender<bool>>>>,
+    /// receiver for the upper layer (Ack/Leave)
+    tx: Sender<(ClientHandle, ProtoEvent)>,
+    /// receiver for clipboard frames arriving on outgoing connections
+    clipboard_tx: Sender<(ClientHandle, ClipboardFrame)>,
+    /// addresses that answered the current ping round
+    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    /// timestamp of the last ping sent, used to derive RTT from `Pong`
+    ping_sent: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
+    /// how long a single `send` blocks waiting for a connection
+    grace: Duration,
+}
+
+impl ConnCtx {
+    fn notify_connected(&self, handle: ClientHandle, connected: bool) {
+        if let Some(tx) = self.waiters.borrow().get(&handle) {
+            tx.send_replace(connected);
+        }
+    }
+
+    fn waiter(&self, handle: ClientHandle) -> watch::Receiver<bool> {
+        let mut waiters = self.waiters.borrow_mut();
+        if let Some(tx) = waiters.get(&handle) {
+            return tx.subscribe();
+        }
+        let connected = self.client_manager.active_addr(handle).is_some();
+        let (tx, rx) = watch::channel(connected);
+        waiters.insert(handle, tx);
+        rx
+    }
+
+    /// Start a background connect attempt, unless one is already running or
+    /// the client is already connected.
+    fn start_connecting(&self, handle: ClientHandle) {
+        if self.client_manager.active_addr(handle).is_some() {
+            return;
+        }
+        if !self.connecting.borrow_mut().insert(handle) {
+            return;
+        }
+        let ctx = self.clone();
+        spawn_local(async move {
+            if let Err(e) = connect_to_handle(&ctx, handle).await {
+                log::debug!("client {handle} connect attempt failed: {e}");
+            }
+        });
+    }
+
+    /// Keep trying to restore a connection for an active client.
+    fn schedule_reconnect(&self, handle: ClientHandle) {
+        if !self.client_manager.is_active(handle) {
+            return;
+        }
+        if !self.reconnecting.borrow_mut().insert(handle) {
+            return;
+        }
+        let ctx = self.clone();
+        spawn_local(async move {
+            let mut delay = RECONNECT_BACKOFF_MIN;
+            loop {
+                tokio::time::sleep(delay).await;
+                if !ctx.client_manager.is_active(handle) {
+                    break;
+                }
+                if ctx.client_manager.active_addr(handle).is_some() {
+                    break;
+                }
+                ctx.start_connecting(handle);
+                delay = (delay * 2).min(RECONNECT_BACKOFF_MAX);
+            }
+            ctx.reconnecting.borrow_mut().remove(&handle);
+        });
+    }
+
+    fn fast_conn(&self, handle: ClientHandle, addr: SocketAddr) -> Option<ArcConn> {
+        if let Some(conn) = self.fast_conns.borrow().get(&handle).cloned() {
+            return Some(conn);
+        }
+        let conn = self.conns.borrow().get(&addr).cloned()?;
+        self.fast_conns.borrow_mut().insert(handle, conn.clone());
+        Some(conn)
+    }
+
+    fn disconnect(&self, handle: ClientHandle, addr: SocketAddr) {
+        log::warn!("client ({handle}) @ {addr} connection closed");
+        self.conns.borrow_mut().remove(&addr);
+        self.fast_conns.borrow_mut().remove(&handle);
+        self.client_manager.set_active_addr(handle, None);
+        self.client_manager.set_alive(handle, false);
+        self.client_manager.set_peer_hello(handle, None, 0, 0);
+        self.client_manager.set_rtt_ms(handle, None);
+        self.ping_sent.borrow_mut().remove(&addr);
+        self.ping_response.borrow_mut().remove(&addr);
+        self.notify_connected(handle, false);
+        self.schedule_reconnect(handle);
+    }
+
+    /// Resolve a usable connection for `handle`, waiting up to `remaining`
+    /// for a connection attempt that is already (or will be) in flight.
+    async fn conn_for(
+        &self,
+        handle: ClientHandle,
+        remaining: Duration,
+    ) -> Result<(SocketAddr, ArcConn), LanMouseConnectionError> {
+        if let Some(addr) = self.client_manager.active_addr(handle) {
+            if let Some(conn) = self.fast_conn(handle, addr) {
+                return Ok((addr, conn));
+            }
+        }
+
+        self.start_connecting(handle);
+
+        if !remaining.is_zero() && !*self.waiter(handle).borrow() {
+            let mut rx = self.waiter(handle);
+            let _ = tokio::time::timeout(remaining, async {
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+
+        let addr = self
+            .client_manager
+            .active_addr(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let conn = self
+            .fast_conn(handle, addr)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        Ok((addr, conn))
+    }
+}
+
+/// Cloneable send half of the connection layer.
+///
+/// The input capture task owns the receive half; the clipboard task uses this
+/// handle to push frames to the same peers.
+#[derive(Clone)]
+pub(crate) struct ConnectionSender {
+    ctx: ConnCtx,
+}
+
+pub(crate) struct LanMouseConnection {
+    sender: ConnectionSender,
+    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
+    clipboard_rx: Option<Receiver<(ClientHandle, ClipboardFrame)>>,
+}
+
+impl LanMouseConnection {
+    pub(crate) fn new(
+        cert: Certificate,
+        client_manager: ClientManager,
+        connect_grace_ms: u64,
+    ) -> Self {
+        let (recv_tx, recv_rx) = channel();
+        let (clipboard_tx, clipboard_rx) = channel();
+        let ctx = ConnCtx {
+            cert,
+            client_manager,
+            conns: Default::default(),
+            fast_conns: Default::default(),
+            connecting: Default::default(),
+            reconnecting: Default::default(),
+            waiters: Default::default(),
+            tx: recv_tx,
+            clipboard_tx,
+            ping_response: Default::default(),
+            ping_sent: Default::default(),
+            grace: Duration::from_millis(connect_grace_ms),
+        };
+        Self {
+            sender: ConnectionSender { ctx },
+            recv_rx,
+            clipboard_rx: Some(clipboard_rx),
+        }
+    }
+
+    /// Cloneable send half, used by the clipboard sync task.
+    pub(crate) fn sender(&self) -> ConnectionSender {
+        self.sender.clone()
+    }
+
+    /// Hand the clipboard frame receiver to the clipboard task. The input
+    /// capture task keeps the input event receiver.
+    pub(crate) fn take_clipboard_rx(&mut self) -> Option<Receiver<(ClientHandle, ClipboardFrame)>> {
+        self.clipboard_rx.take()
+    }
+
+    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+        self.recv_rx.recv().await.expect("channel closed")
+    }
+
+    /// Pre-establish the connection for an active client so that the first
+    /// time the user crosses the screen edge the input can flow immediately.
+    pub(crate) fn ensure_connected(&self, handle: ClientHandle) {
+        self.sender.ctx.start_connecting(handle);
+    }
+
+    pub(crate) async fn send(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        self.sender.send(event, handle).await
+    }
+
+    /// Best-effort send that never waits for a connection. Used by teardown
+    /// paths (key-up synthesis, modifier reset, `Leave`) so releasing a
+    /// connection to a dead peer does not keep the input grabbed.
+    pub(crate) async fn send_now(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        self.sender.send_now(event, handle).await
+    }
+}
+
+impl ConnectionSender {
+    /// Pre-establish the connection for a peer (used when a clipboard peer
+    /// is registered before its first frame).
+    pub(crate) fn ensure_connected(&self, handle: ClientHandle) {
+        self.ctx.start_connecting(handle);
+    }
+
+    pub(crate) async fn send(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        self.send_bytes(&buf[..len], handle, self.ctx.grace, true)
+            .await
+    }
+
+    pub(crate) async fn send_now(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        self.send_bytes(&buf[..len], handle, Duration::ZERO, true)
+            .await
+    }
+
+    /// Send an already encoded clipboard frame. Clipboard traffic does not
+    /// depend on the peer's input-emulation state, so it skips the `alive`
+    /// requirement, and it never blocks on a reconnect (the transfer layer
+    /// retransmits instead).
+    pub(crate) async fn send_raw(
+        &self,
+        handle: ClientHandle,
+        bytes: &[u8],
+    ) -> Result<(), LanMouseConnectionError> {
+        self.send_bytes(bytes, handle, Duration::ZERO, false).await
+    }
+
+    async fn send_bytes(
+        &self,
+        buf: &[u8],
+        handle: ClientHandle,
+        grace: Duration,
+        require_alive: bool,
+    ) -> Result<(), LanMouseConnectionError> {
+        let deadline = Instant::now() + grace;
+        let mut retried = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (addr, conn) = self.ctx.conn_for(handle, remaining).await?;
+
+            if require_alive && !self.ctx.client_manager.alive(handle) {
+                return Err(LanMouseConnectionError::TargetEmulationDisabled);
+            }
+
+            match conn.send(buf).await {
+                Ok(_) => {
+                    log::trace!("{} bytes >->->->->- {addr}", buf.len());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("client {handle} failed to send: {e}");
+                    self.ctx.disconnect(handle, addr);
+                    // One transparent retry lets a transient send error be
+                    // absorbed without releasing the capture. The retry path
+                    // still has to complete before the caller's grace expires.
+                    if retried || Instant::now() >= deadline {
+                        return Err(e.into());
+                    }
+                    retried = true;
+                }
+            }
+        }
+    }
+}
 
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
-) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
+    timeout: Duration,
+) -> Result<(ArcConn, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
+    let bind_addr = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let conn = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
+        UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| (addr, e.into()))?,
     );
@@ -61,7 +397,7 @@ async fn connect(
         extended_master_secret: ExtendedMasterSecretType::Require,
         ..Default::default()
     };
-    let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
+    let timeout = tokio::time::sleep(timeout);
     tokio::select! {
         _ = timeout => Err((addr, LanMouseConnectionError::Timeout)),
         result = DTLSConn::new(conn, config, true, None) => match result {
@@ -74,214 +410,178 @@ async fn connect(
 async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
-) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
+    timeout: Duration,
+) -> Result<(ArcConn, SocketAddr), LanMouseConnectionError> {
+    if addrs.is_empty() {
+        return Err(LanMouseConnectionError::NotConnected);
+    }
     let mut joinset = JoinSet::new();
     for &addr in addrs {
-        joinset.spawn_local(connect(addr, cert.clone()));
+        joinset.spawn_local(connect(addr, cert.clone(), timeout));
     }
-    loop {
-        match joinset.join_next().await {
-            None => return Err(LanMouseConnectionError::NotConnected),
-            Some(r) => match r.expect("join error") {
-                Ok(conn) => return Ok(conn),
-                Err((a, e)) => {
-                    log::warn!("failed to connect to {a}: `{e}`")
-                }
-            },
-        };
-    }
-}
-
-pub(crate) struct LanMouseConnection {
-    cert: Certificate,
-    client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-}
-
-impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
-        let (recv_tx, recv_rx) = channel();
-        Self {
-            cert,
-            client_manager,
-            conns: Default::default(),
-            connecting: Default::default(),
-            recv_rx,
-            recv_tx,
-            ping_response: Default::default(),
-        }
-    }
-
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
-        self.recv_rx.recv().await.expect("channel closed")
-    }
-
-    pub(crate) async fn send(
-        &self,
-        event: ProtoEvent,
-        handle: ClientHandle,
-    ) -> Result<(), LanMouseConnectionError> {
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let buf = &buf[..len];
-        if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
-                let conns = self.conns.lock().await;
-                conns.get(&addr).cloned()
-            };
-            if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
-                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
-                }
-                match conn.send(buf).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    }
-                }
-                log::trace!("{event} >->->->->- {addr}");
-                return Ok(());
+    while let Some(result) = joinset.join_next().await {
+        match result {
+            Ok(Ok(conn)) => {
+                // Stop the other in-flight attempts: the first successful
+                // handshake wins (happy-eyeballs style).
+                joinset.abort_all();
+                return Ok(conn);
             }
+            Ok(Err((addr, e))) => log::warn!("failed to connect to {addr}: `{e}`"),
+            Err(e) => log::warn!("connection attempt task failed: {e}"),
         }
-
-        // check if we are already trying to connect
-        let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) {
-            connecting.insert(handle);
-            // connect in the background
-            spawn_local(connect_to_handle(
-                self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
-                self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-            ));
-        }
-        Err(LanMouseConnectionError::NotConnected)
     }
+    Err(LanMouseConnectionError::NotConnected)
 }
 
 async fn connect_to_handle(
-    client_manager: ClientManager,
-    cert: Certificate,
+    ctx: &ConnCtx,
     handle: ClientHandle,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
-    // sending did not work, figure out active conn.
-    if let Some(addrs) = client_manager.get_ips(handle) {
-        let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
-        let addrs = addrs
+
+    let result = async {
+        if ctx.client_manager.active_addr(handle).is_some() {
+            return Ok(());
+        }
+
+        let ips = ctx
+            .client_manager
+            .get_ips(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let port = ctx.client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
+        let addrs = ips
             .into_iter()
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
-        log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert).await;
-        let (conn, addr) = match res {
-            Ok(c) => c,
-            Err(e) => {
-                connecting.lock().await.remove(&handle);
-                return Err(e);
-            }
-        };
-        log::info!("client ({handle}) connected @ {addr}");
-        client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, conn.clone());
-        connecting.lock().await.remove(&handle);
 
-        // Best-effort version handshake. Send our commit hash once
-        // immediately after the DTLS handshake; the listen side
-        // mirrors a Hello back so the receive loop can populate
-        // `peer_commit`. Old peers will silently skip this event
-        // per the forward-compat handler in [`receive_loop`].
+        log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
+        let (conn, addr) = connect_any(&addrs, ctx.cert.clone(), ADDRESS_TIMEOUT).await?;
+        log::info!("client ({handle}) connected @ {addr}");
+
+        ctx.client_manager.set_active_addr(handle, Some(addr));
+        // The handshake succeeded. Treat the peer as available until a
+        // `Pong(false)` or a timeout says otherwise: waiting for the first
+        // Pong would otherwise make `send` fail right after connecting.
+        ctx.client_manager.set_alive(handle, true);
+        ctx.conns.borrow_mut().insert(addr, conn.clone());
+        ctx.fast_conns.borrow_mut().insert(handle, conn.clone());
+        ctx.notify_connected(handle, true);
+
+        // Best-effort version handshake. Sent once immediately after the
+        // DTLS handshake; the listen side mirrors a Hello back.
         let (buf, len) = ProtoEvent::Hello {
             commit: local_commit(),
+            proto_version: lan_mouse_proto::PROTO_VERSION,
+            capabilities: lan_mouse_proto::CAPABILITIES,
         }
         .into();
         if let Err(e) = conn.send(&buf[..len]).await {
             log::debug!("hello send to {addr} failed: {e}");
         }
 
-        // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
-
-        // receiver
-        spawn_local(receive_loop(
-            client_manager,
-            handle,
-            addr,
-            conn,
-            conns,
-            tx,
-            ping_response.clone(),
-        ));
-        return Ok(());
+        spawn_local(ping_pong(ctx.clone(), addr, conn.clone()));
+        spawn_local(receive_loop(ctx.clone(), handle, addr, conn));
+        Ok(())
     }
-    connecting.lock().await.remove(&handle);
-    Err(LanMouseConnectionError::NotConnected)
+    .await;
+
+    ctx.connecting.borrow_mut().remove(&handle);
+    if result.is_err() && ctx.client_manager.is_active(handle) {
+        // Retry in the background even though no connection has been
+        // established yet (the peer may still be booting).
+        ctx.schedule_reconnect(handle);
+    }
+    result
 }
 
-async fn ping_pong(
-    addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) {
+async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
+    let mut send_failures = 0u32;
+    let mut missed_rounds = 0u32;
     loop {
         let (buf, len) = ProtoEvent::Ping.into();
 
         // send 4 pings, at least one must be answered
         for _ in 0..4 {
+            ctx.ping_sent.borrow_mut().insert(addr, Instant::now());
             if let Err(e) = conn.send(&buf[..len]).await {
-                log::warn!("{addr}: send error `{e}`, closing connection");
-                let _ = conn.close().await;
-                break;
+                send_failures += 1;
+                log::warn!("{addr}: send error `{e}` ({send_failures} in a row)");
+                // Do not tear the connection down on a single error: Wi-Fi
+                // links drop individual datagrams all the time.
+                if send_failures >= 4 {
+                    log::warn!("{addr}: too many send errors, closing connection");
+                    let _ = conn.close().await;
+                    return;
+                }
+            } else {
+                send_failures = 0;
+                log::trace!("PING >->->->->- {addr}");
             }
-            log::trace!("PING >->->->->- {addr}");
 
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        if !ping_response.borrow_mut().remove(&addr) {
-            log::warn!("{addr} did not respond, closing connection");
-            let _ = conn.close().await;
-            return;
+        if !ctx.ping_response.borrow_mut().remove(&addr) {
+            // Tolerate one missed round: a busy peer or a short Wi-Fi hiccup
+            // should not tear down the session (and release the grab).
+            missed_rounds += 1;
+            log::warn!("{addr} did not respond to ping round {missed_rounds}");
+            if missed_rounds >= 2 {
+                log::warn!("{addr} missed two ping rounds, closing connection");
+                let _ = conn.close().await;
+                return;
+            }
+        } else {
+            missed_rounds = 0;
         }
     }
 }
 
-async fn receive_loop(
-    client_manager: ClientManager,
-    handle: ClientHandle,
-    addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        match buf.try_into() {
+async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn: ArcConn) {
+    let mut buf = [0u8; MAX_CLIPBOARD_FRAME];
+    loop {
+        let n = match conn.recv(&mut buf).await {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n > 0 && is_clipboard_frame(buf[0]) {
+            match ClipboardFrame::decode(&buf[..n]) {
+                Ok(frame) => ctx
+                    .clipboard_tx
+                    .send((handle, frame))
+                    .ok()
+                    .unwrap_or_default(),
+                Err(e) => log::debug!("ignoring undecodable clipboard frame from {addr}: {e}"),
+            }
+            continue;
+        }
+        match ProtoEvent::try_from(&buf[..n]) {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
                     ProtoEvent::Pong(b) => {
-                        client_manager.set_active_addr(handle, Some(addr));
-                        client_manager.set_alive(handle, b);
-                        ping_response.borrow_mut().insert(addr);
+                        ctx.client_manager.set_active_addr(handle, Some(addr));
+                        ctx.client_manager.set_alive(handle, b);
+                        ctx.ping_response.borrow_mut().insert(addr);
+                        if let Some(sent) = ctx.ping_sent.borrow().get(&addr).copied() {
+                            let rtt = sent.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            ctx.client_manager.set_rtt_ms(handle, Some(rtt));
+                        }
                     }
-                    ProtoEvent::Hello { commit } => {
-                        client_manager.set_peer_commit(handle, Some(commit));
+                    ProtoEvent::Hello {
+                        commit,
+                        proto_version,
+                        capabilities,
+                    } => {
+                        ctx.client_manager.set_peer_hello(
+                            handle,
+                            Some(commit),
+                            proto_version,
+                            capabilities,
+                        );
                     }
-                    event => tx.send((handle, event)).expect("channel closed"),
+                    event => ctx.tx.send((handle, event)).ok().unwrap_or_default(),
                 }
             }
             // Skip undecodable datagrams without dropping the
@@ -292,19 +592,548 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    ctx.disconnect(handle, addr);
 }
 
-async fn disconnect(
-    client_manager: &ClientManager,
-    handle: ClientHandle,
-    addr: SocketAddr,
-    conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
-) {
-    log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
-    client_manager.set_active_addr(handle, None);
-    client_manager.set_peer_commit(handle, None);
-    let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
-    log::info!("active connections: {active:?}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ClientManager;
+    use crate::config::ConfigClient;
+    use crate::crypto;
+    use crate::emulation::{Emulation, EmulationEvent};
+    use crate::listen::{LanMouseListener, ListenEvent};
+    use futures::StreamExt;
+    use lan_mouse_ipc::Position as IpcPosition;
+    use lan_mouse_proto::Position as ProtoPosition;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::{Arc, RwLock};
+    use tokio::task::LocalSet;
+    use webrtc_dtls::config::{Config as DtlsConfig, ExtendedMasterSecretType};
+    use webrtc_dtls::conn::DTLSConn;
+    use webrtc_util::Conn;
+
+    fn unique_cert(name: &str) -> Certificate {
+        let dir = std::env::temp_dir().join("lan-mouse-tests");
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let path = dir.join(format!("cert-{}-{name}.pem", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        crypto::generate_key_and_cert(&path).expect("generate certificate")
+    }
+
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+
+    fn free_udp_port() -> u16 {
+        loop {
+            let offset = PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let port = 30000 + (offset % 20000);
+            if let Ok(socket) = std::net::UdpSocket::bind(("127.0.0.1", port)) {
+                drop(socket);
+                return port;
+            }
+        }
+    }
+
+    /// Dial a listener directly with a raw DTLS client, bypassing
+    /// [`LanMouseConnection`], so tests can send hand-crafted datagrams.
+    async fn raw_dtls_client(port: u16, cert: Certificate) -> Arc<DTLSConn> {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        udp.connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+            .await
+            .expect("connect");
+        let config = DtlsConfig {
+            certificates: vec![cert],
+            server_name: "ignored".to_owned(),
+            insecure_skip_verify: true,
+            extended_master_secret: ExtendedMasterSecretType::Require,
+            ..Default::default()
+        };
+        Arc::new(
+            DTLSConn::new(udp, config, true, None)
+                .await
+                .expect("dtls handshake"),
+        )
+    }
+
+    async fn raw_send(conn: &DTLSConn, event: ProtoEvent) {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        conn.send(&buf[..len]).await.expect("send");
+    }
+
+    async fn raw_recv(conn: &DTLSConn) -> ProtoEvent {
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv(&mut buf))
+            .await
+            .expect("timed out waiting for a reply")
+            .expect("recv");
+        ProtoEvent::try_from(&buf[..n]).expect("decode reply")
+    }
+
+    fn client_manager_for(port: u16) -> (ClientManager, ClientHandle) {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(ConfigClient {
+            ips: HashSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+            hostname: None,
+            port,
+            pos: IpcPosition::Right,
+            active: true,
+            enter_hook: None,
+            leave_hook: None,
+        });
+        (manager, handle)
+    }
+
+    async fn listener_with_authorized(
+        port: u16,
+        cert: Certificate,
+        authorized: Vec<String>,
+    ) -> LanMouseListener {
+        let keys = authorized
+            .into_iter()
+            .enumerate()
+            .map(|(i, fp)| (fp, format!("peer-{i}")))
+            .collect::<HashMap<_, _>>();
+        LanMouseListener::new(port, cert, Arc::new(RwLock::new(keys)))
+            .await
+            .expect("listener")
+    }
+
+    async fn expect_event(listener: &mut LanMouseListener, matches: impl Fn(&ProtoEvent) -> bool) {
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
+                .await
+                .expect("timed out waiting for event")
+                .expect("listener stream closed");
+            match event {
+                ListenEvent::Accept { .. } => continue,
+                ListenEvent::Clipboard { .. } => continue,
+                ListenEvent::Rejected { fingerprint } => {
+                    panic!("peer rejected: {fingerprint}")
+                }
+                ListenEvent::Msg { event, .. } => {
+                    if matches(&event) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both directions must work with the same binary: each instance both
+    /// listens and dials out. This is the regression test for the "it is a
+    /// server and a client" misunderstanding and for the wire protocol.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_is_bidirectional() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port_a = free_udp_port();
+                let port_b = free_udp_port();
+
+                let cert_a = unique_cert("a");
+                let cert_b = unique_cert("b");
+                let fp_a = crypto::certificate_fingerprint(&cert_a);
+                let fp_b = crypto::certificate_fingerprint(&cert_b);
+
+                let mut listener_a =
+                    listener_with_authorized(port_a, cert_a.clone(), vec![fp_b.clone()]).await;
+                let mut listener_b =
+                    listener_with_authorized(port_b, cert_b.clone(), vec![fp_a.clone()]).await;
+
+                // A -> B
+                let (manager_a, handle_a) = client_manager_for(port_b);
+                let conn_a = LanMouseConnection::new(cert_a.clone(), manager_a, 2000);
+                conn_a
+                    .send(
+                        ProtoEvent::Enter {
+                            pos: ProtoPosition::Right,
+                            serial: 1,
+                        },
+                        handle_a,
+                    )
+                    .await
+                    .expect("A -> B enter");
+                conn_a
+                    .send(
+                        ProtoEvent::Input(input_event::Event::Pointer(
+                            input_event::PointerEvent::Motion {
+                                time: 1,
+                                dx: 5.0,
+                                dy: -3.0,
+                            },
+                        )),
+                        handle_a,
+                    )
+                    .await
+                    .expect("A -> B motion");
+                expect_event(&mut listener_b, |e| {
+                    matches!(e, ProtoEvent::Enter { serial: 1, .. })
+                })
+                .await;
+                expect_event(&mut listener_b, |e| {
+                    matches!(
+                        e,
+                        ProtoEvent::Input(input_event::Event::Pointer(
+                            input_event::PointerEvent::Motion { .. }
+                        ))
+                    )
+                })
+                .await;
+
+                // B -> A (the reverse direction, using its own outgoing connection)
+                let (manager_b, handle_b) = client_manager_for(port_a);
+                let conn_b = LanMouseConnection::new(cert_b.clone(), manager_b, 2000);
+                conn_b
+                    .send(
+                        ProtoEvent::Enter {
+                            pos: ProtoPosition::Left,
+                            serial: 2,
+                        },
+                        handle_b,
+                    )
+                    .await
+                    .expect("B -> A enter");
+                expect_event(&mut listener_a, |e| {
+                    matches!(e, ProtoEvent::Enter { serial: 2, .. })
+                })
+                .await;
+
+                listener_a.terminate().await;
+                listener_b.terminate().await;
+            })
+            .await;
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ipv6_loopback_works() {
+        // Skip when the host has no IPv6 loopback.
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            return;
+        }
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("ipv6-listener");
+                let client_cert = unique_cert("ipv6-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let mut listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+
+                let manager = ClientManager::default();
+                let handle = manager.add_with_config(ConfigClient {
+                    ips: HashSet::from([IpAddr::V6(Ipv6Addr::LOCALHOST)]),
+                    hostname: None,
+                    port,
+                    pos: IpcPosition::Right,
+                    active: true,
+                    enter_hook: None,
+                    leave_hook: None,
+                });
+                let conn = LanMouseConnection::new(client_cert, manager, 2000);
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 99,
+                    },
+                    handle,
+                )
+                .await
+                .expect("IPv6 connect");
+                expect_event(&mut listener, |event| {
+                    matches!(event, ProtoEvent::Enter { serial: 99, .. })
+                })
+                .await;
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unauthorized_peer_is_rejected() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("reject-listener");
+                let client_cert = unique_cert("reject-client");
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+
+                // No authorized fingerprints on the listener.
+                let mut listener = listener_with_authorized(port, listener_cert, Vec::new()).await;
+
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(client_cert, manager, 500);
+                let result = conn.send(ProtoEvent::Ping, handle).await;
+                assert!(result.is_err(), "the peer must not be reachable");
+
+                let mut rejected = false;
+                for _ in 0..5 {
+                    let event =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), listener.next())
+                            .await
+                            .expect("timeout")
+                            .expect("listener closed");
+                    match event {
+                        ListenEvent::Rejected { fingerprint } => {
+                            assert_eq!(fingerprint, client_fp);
+                            rejected = true;
+                            break;
+                        }
+                        ListenEvent::Accept { .. } => panic!("unauthorized peer was accepted"),
+                        ListenEvent::Msg { .. } | ListenEvent::Clipboard { .. } => {}
+                    }
+                }
+                assert!(rejected, "listener never reported the rejection");
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_now_never_waits_for_a_connection() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(unique_cert("send-now"), manager, 5_000);
+
+                let start = Instant::now();
+                let result = conn.send_now(ProtoEvent::Ping, handle).await;
+                assert!(result.is_err());
+                assert!(
+                    start.elapsed() < Duration::from_millis(250),
+                    "send_now blocked for {:?}",
+                    start.elapsed()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_listener_serves_two_outgoing_connections() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("multi-listener");
+                let cert_a = unique_cert("multi-a");
+                let cert_b = unique_cert("multi-b");
+                let fp_a = crypto::certificate_fingerprint(&cert_a);
+                let fp_b = crypto::certificate_fingerprint(&cert_b);
+
+                let mut listener =
+                    listener_with_authorized(port, listener_cert, vec![fp_a, fp_b]).await;
+
+                let (manager_a, handle_a) = client_manager_for(port);
+                let conn_a = LanMouseConnection::new(cert_a, manager_a, 2000);
+                conn_a
+                    .send(
+                        ProtoEvent::Enter {
+                            pos: ProtoPosition::Left,
+                            serial: 11,
+                        },
+                        handle_a,
+                    )
+                    .await
+                    .expect("client A");
+
+                let (manager_b, handle_b) = client_manager_for(port);
+                let conn_b = LanMouseConnection::new(cert_b, manager_b, 2000);
+                conn_b
+                    .send(
+                        ProtoEvent::Enter {
+                            pos: ProtoPosition::Right,
+                            serial: 22,
+                        },
+                        handle_b,
+                    )
+                    .await
+                    .expect("client B");
+
+                let mut serials = Vec::new();
+                while serials.len() < 2 {
+                    let event =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), listener.next())
+                            .await
+                            .expect("timeout")
+                            .expect("listener closed");
+                    if let ListenEvent::Msg {
+                        event: ProtoEvent::Enter { serial, .. },
+                        ..
+                    } = event
+                    {
+                        serials.push(serial);
+                    }
+                }
+                serials.sort();
+                assert_eq!(serials, vec![11, 22]);
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_hello_is_accepted_end_to_end() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("legacy-listener");
+                let client_cert = unique_cert("legacy-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+
+                let (clipboard_tx, _clipboard_rx) = local_channel::mpsc::channel();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    listener,
+                    clipboard_tx,
+                );
+                let client = raw_dtls_client(port, client_cert).await;
+
+                // The old wire format: type byte + 8 byte commit, no version
+                // and no capabilities.
+                let mut legacy = vec![11u8];
+                legacy.extend_from_slice(b"abcdefgh");
+                client.send(&legacy).await.expect("send legacy hello");
+
+                // The reply is always the extended format.
+                match raw_recv(client.as_ref()).await {
+                    ProtoEvent::Hello {
+                        proto_version,
+                        capabilities,
+                        ..
+                    } => {
+                        assert_eq!(proto_version, lan_mouse_proto::PROTO_VERSION);
+                        assert_eq!(capabilities, lan_mouse_proto::CAPABILITIES);
+                    }
+                    other => panic!("expected Hello reply, got {other}"),
+                }
+
+                // And the service sees the legacy metadata as version 0.
+                loop {
+                    let event =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), emulation.event())
+                            .await
+                            .expect("timed out waiting for the peer hello");
+                    match event {
+                        EmulationEvent::PeerHello {
+                            commit,
+                            proto_version,
+                            capabilities,
+                            ..
+                        } => {
+                            assert_eq!(&commit, b"abcdefgh");
+                            assert_eq!(proto_version, 0);
+                            assert_eq!(capabilities, 0);
+                            break;
+                        }
+                        EmulationEvent::Entered { .. } => {
+                            panic!("a Hello must not trigger a handoff")
+                        }
+                        _ => {}
+                    }
+                }
+
+                let _ = client.close().await;
+                emulation.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emulation_acks_enter_and_deduplicates_retransmissions() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("emulation-listener");
+                let client_cert = unique_cert("emulation-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+
+                let (clipboard_tx, _clipboard_rx) = local_channel::mpsc::channel();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    listener,
+                    clipboard_tx,
+                );
+
+                let client = raw_dtls_client(port, client_cert).await;
+
+                raw_send(
+                    client.as_ref(),
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Top,
+                        serial: 42,
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    raw_recv(client.as_ref()).await,
+                    ProtoEvent::Ack(42)
+                ));
+                expect_entered(&mut emulation).await;
+
+                // Retransmission with the same serial: acknowledged again,
+                // but it must not trigger another handoff.
+                raw_send(
+                    client.as_ref(),
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Top,
+                        serial: 42,
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    raw_recv(client.as_ref()).await,
+                    ProtoEvent::Ack(42)
+                ));
+
+                // A new serial must hand off again.
+                raw_send(
+                    client.as_ref(),
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Top,
+                        serial: 43,
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    raw_recv(client.as_ref()).await,
+                    ProtoEvent::Ack(43)
+                ));
+
+                let mut releases = 0;
+                loop {
+                    let event =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), emulation.event())
+                            .await
+                            .expect("timed out waiting for Entered");
+                    match event {
+                        EmulationEvent::ReleaseNotify => releases += 1,
+                        EmulationEvent::Entered { .. } => break,
+                        _ => {}
+                    }
+                }
+                assert_eq!(releases, 1, "only the new serial may trigger a handoff");
+
+                let _ = client.close().await;
+                emulation.terminate().await;
+            })
+            .await;
+    }
+
+    async fn expect_entered(emulation: &mut Emulation) {
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), emulation.event())
+                .await
+                .expect("timed out waiting for Entered");
+            if let EmulationEvent::Entered { .. } = event {
+                return;
+            }
+        }
+    }
 }

@@ -69,3 +69,71 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
     writer.write_all(serialized.as_bytes())?;
     Ok(cert)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("lan-mouse-crypto-tests");
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("{}-{id}-{name}.pem", std::process::id()))
+    }
+
+    #[test]
+    fn fingerprint_has_the_sha256_shape() {
+        let cert = generate_key_and_cert(&unique_path("shape")).expect("cert");
+        let fingerprint = certificate_fingerprint(&cert);
+        let parts = fingerprint.split(':').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 32, "sha256 is 32 bytes");
+        for part in parts {
+            assert_eq!(part.len(), 2);
+            assert!(
+                part.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "expected lowercase hex, got {part:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_then_load_returns_the_same_certificate() {
+        let path = unique_path("roundtrip");
+        let generated = load_or_generate_key_and_cert(&path).expect("generate");
+        assert!(path.exists());
+        let loaded = load_or_generate_key_and_cert(&path).expect("load");
+        assert_eq!(
+            certificate_fingerprint(&generated),
+            certificate_fingerprint(&loaded)
+        );
+        assert_eq!(
+            generated.certificate, loaded.certificate,
+            "loading must not regenerate"
+        );
+    }
+
+    #[test]
+    fn different_certificates_have_different_fingerprints() {
+        let a = generate_key_and_cert(&unique_path("a")).expect("cert a");
+        let b = generate_key_and_cert(&unique_path("b")).expect("cert b");
+        assert_ne!(certificate_fingerprint(&a), certificate_fingerprint(&b));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_path("perms");
+        generate_key_and_cert(&path).expect("cert");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o400);
+    }
+}

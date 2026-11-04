@@ -173,13 +173,22 @@ impl ClientRow {
             .as_ref()
             .and_then(|co| co.property::<Option<String>>("peer-commit"));
         let local = crate::local_commit_str();
+        let rtt = self
+            .imp()
+            .client_object
+            .borrow()
+            .as_ref()
+            .map(|co| co.property::<u32>("rtt-ms"))
+            .filter(|ms| *ms > 0)
+            .map(|ms| format!(" · {ms} ms"))
+            .unwrap_or_default();
         let markup = match peer.as_deref() {
-            None => format!("Peer version: unknown · Ours: {local}"),
+            None => format!("Peer version: unknown · Ours: {local}{rtt}"),
             Some(p) if p == local.as_str() => {
-                format!("Peer version: {p} · matched")
+                format!("Peer version: {p} · matched{rtt}")
             }
             Some(p) => {
-                format!("Peer version: {p} · Ours: {local}")
+                format!("Peer version: {p} · Ours: {local}{rtt}")
             }
         };
         self.remove_css_class("peer-mismatch");

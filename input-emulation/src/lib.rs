@@ -71,6 +71,7 @@ impl Display for Backend {
 
 pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
+    backend: Backend,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
 }
@@ -94,9 +95,15 @@ impl InputEmulation {
         };
         Ok(Self {
             emulation,
+            backend,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
         })
+    }
+
+    /// The backend that was actually selected.
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
@@ -237,4 +244,52 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dummy_backend_is_selectable_and_reports_itself() {
+        let emulation = InputEmulation::new(Some(Backend::Dummy))
+            .await
+            .expect("dummy emulation");
+        assert_eq!(emulation.backend(), Backend::Dummy);
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_events_are_filtered() {
+        let mut emulation = InputEmulation::new(Some(Backend::Dummy))
+            .await
+            .expect("dummy emulation");
+        assert!(emulation.create(0).await);
+
+        assert!(emulation.update_pressed_keys(0, 30, 1), "first press");
+        assert!(!emulation.update_pressed_keys(0, 30, 1), "duplicate press");
+        assert_eq!(emulation.pressed_keys.get(&0).map(HashSet::len), Some(1));
+
+        assert!(emulation.update_pressed_keys(0, 30, 0), "first release");
+        assert!(
+            !emulation.update_pressed_keys(0, 30, 0),
+            "duplicate release"
+        );
+        assert_eq!(emulation.pressed_keys.get(&0).map(HashSet::len), Some(0));
+
+        // events for an unknown handle are ignored
+        assert!(!emulation.update_pressed_keys(99, 30, 1));
+    }
+
+    #[tokio::test]
+    async fn destroy_drops_pressed_key_state() {
+        let mut emulation = InputEmulation::new(Some(Backend::Dummy))
+            .await
+            .expect("dummy emulation");
+        assert!(emulation.create(1).await);
+        assert!(!emulation.create(1).await, "duplicate create is a no-op");
+        emulation.update_pressed_keys(1, 42, 1);
+        emulation.destroy(1).await;
+        assert!(!emulation.handles.contains(&1));
+        assert!(!emulation.pressed_keys.contains_key(&1));
+    }
 }
