@@ -63,7 +63,7 @@ pub struct Window {
     #[template_child]
     pub scan_button: TemplateChild<Button>,
     #[template_child]
-    pub network_filter: TemplateChild<Switch>,
+    pub network_search: TemplateChild<gtk::SearchEntry>,
     /// last scan result, kept so the filter can re-render without rescanning
     pub network_devices: RefCell<Vec<DiscoveredDevice>>,
     /// address and side collected by the "add device" dialog, applied to the

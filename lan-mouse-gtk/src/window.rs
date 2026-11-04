@@ -50,7 +50,7 @@ impl Window {
             .replace(conn);
         // Populate the network table without waiting for the user to press
         // Scan; the service answers with `FrontendEvent::NetworkScan`.
-        window.imp().network_filter.connect_active_notify(clone!(
+        window.imp().network_search.connect_search_changed(clone!(
             #[weak]
             window,
             move |_| window.render_network()
@@ -491,13 +491,23 @@ impl Window {
             list.remove(&child);
         }
 
-        let only_lan_mouse = self.imp().network_filter.is_active();
+        let query = self.imp().network_search.text().to_string().to_lowercase();
+        let query = query.trim();
         let devices: Vec<DiscoveredDevice> = self
             .imp()
             .network_devices
             .borrow()
             .iter()
-            .filter(|device| !only_lan_mouse || device.lan_mouse)
+            .filter(|device| {
+                if query.is_empty() {
+                    return true;
+                }
+                device.ip.to_string().contains(query)
+                    || device
+                        .hostname
+                        .as_deref()
+                        .is_some_and(|name| name.to_lowercase().contains(query))
+            })
             .cloned()
             .collect();
 
