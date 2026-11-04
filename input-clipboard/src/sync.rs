@@ -122,9 +122,6 @@ impl<S: FrameSink> ClipboardSync<S> {
             return;
         }
         self.last_sent = Some(hash);
-        if self.peers.is_empty() {
-            return;
-        }
 
         let serial = self.next_serial.wrapping_add(1);
         self.next_serial = serial;
@@ -276,8 +273,14 @@ impl<S: FrameSink> ClipboardSync<S> {
                 finished.push(*peer);
             }
         }
+        if !failed.is_empty() {
+            // Allow the same content to be offered again: a failed transfer
+            // must not make the next copy look like a duplicate.
+            self.last_sent = None;
+        }
         for (peer, serial) in failed {
             self.outgoing.remove(&peer);
+            log::warn!("clipboard: transfer {serial} to peer {peer} failed");
             self.last_error = Some("clipboard transfer aborted".into());
             self.sink.send(peer, ClipboardFrame::Cancel { serial });
         }
@@ -551,5 +554,104 @@ mod tests {
         let mut h = Harness::new();
         h.a.on_local_change(ClipboardSnapshot::default(), h.now);
         assert!(h.wire.borrow().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+    use super::*;
+    use crate::Format;
+
+    type Wire = Rc<RefCell<VecDeque<(PeerId, ClipboardFrame)>>>;
+
+    #[derive(Clone)]
+    struct Sink {
+        wire: Wire,
+    }
+
+    impl FrameSink for Sink {
+        fn send(&self, _peer: PeerId, frame: ClipboardFrame) {
+            self.wire.borrow_mut().push_back((_peer, frame));
+        }
+    }
+
+    fn snapshot() -> ClipboardSnapshot {
+        ClipboardSnapshot::from_items([(Format::Text, b"same text".to_vec())])
+    }
+
+    fn sync_with_peer(wire: &Wire) -> ClipboardSync<Sink> {
+        let mut sync = ClipboardSync::new(
+            Sink { wire: wire.clone() },
+            Rc::new(Cell::new(Limits::default())),
+            0x1234,
+        );
+        sync.add_peer(2);
+        sync
+    }
+
+    fn offers(wire: &Wire) -> usize {
+        wire.borrow()
+            .iter()
+            .filter(|(_, frame)| matches!(frame, ClipboardFrame::Offer { .. }))
+            .count()
+    }
+
+    /// The compositor reports one change per MIME update; the same content
+    /// must not be offered two or three times.
+    #[test]
+    fn duplicate_change_events_are_offered_once() {
+        let wire: Wire = Default::default();
+        let mut sync = sync_with_peer(&wire);
+        let now = Instant::now();
+        sync.on_local_change(snapshot(), now);
+        sync.on_local_change(snapshot(), now);
+        sync.on_local_change(snapshot(), now);
+        assert_eq!(offers(&wire), 1);
+    }
+
+    /// A copy made while no peer is connected must still be sent once the
+    /// peer shows up (the hash must not be recorded with nobody to send to).
+    #[test]
+    fn change_without_peers_is_offered_when_a_peer_appears() {
+        let wire: Wire = Default::default();
+        let mut sync = sync_with_peer(&wire);
+        sync.remove_peer(2);
+
+        let now = Instant::now();
+        sync.on_local_change(snapshot(), now);
+        assert_eq!(offers(&wire), 0, "nothing to send to yet");
+
+        sync.add_peer(2);
+        sync.on_local_change(snapshot(), now);
+        assert_eq!(offers(&wire), 1, "the pending copy must be offered");
+    }
+
+    /// If a transfer dies (peer never acknowledges), copying the same content
+    /// again must be retried instead of being treated as a duplicate.
+    #[test]
+    fn failed_transfer_allows_reoffering_the_same_content() {
+        let wire: Wire = Default::default();
+        let mut sync = sync_with_peer(&wire);
+        let start = Instant::now();
+        sync.on_local_change(snapshot(), start);
+        assert_eq!(offers(&wire), 1);
+
+        // Nobody answers: let the retransmissions exhaust themselves.
+        let mut now = start;
+        for _ in 0..2_000 {
+            now += std::time::Duration::from_millis(10);
+            sync.tick(now);
+        }
+        assert!(sync.last_error().is_some(), "the transfer should fail");
+
+        wire.borrow_mut().clear();
+        sync.on_local_change(snapshot(), now);
+        assert_eq!(
+            offers(&wire),
+            1,
+            "the same content must be retried after a failure"
+        );
     }
 }
