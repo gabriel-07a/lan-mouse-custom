@@ -27,12 +27,12 @@ use windows::{
     core::{PCWSTR, w},
 };
 
-use crate::window::Window;
+use crate::{tray_menu, window::Window};
 
 const TRAY_ID: u32 = 1;
 const WM_TRAY: u32 = WM_APP + 1;
-const MENU_OPEN: usize = 1;
-const MENU_QUIT: usize = 2;
+const MENU_OPEN: usize = tray_menu::OPEN_ID as usize;
+const MENU_QUIT: usize = tray_menu::QUIT_ID as usize;
 
 thread_local! {
     static WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
@@ -172,7 +172,7 @@ fn quit() {
     WINDOW.with(|slot| {
         if let Some(window) = slot.borrow().as_ref() {
             if let Some(app) = window.application() {
-                app.activate_action("quit-app", None);
+                app.activate_action(tray_menu::QUIT_ACTION, None);
             }
         }
     });

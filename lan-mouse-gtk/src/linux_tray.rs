@@ -16,7 +16,7 @@ use gtk::{
     prelude::*,
 };
 
-use crate::window::Window;
+use crate::{tray_menu, window::Window};
 
 const ITEM_PATH: &str = "/StatusNotifierItem";
 const MENU_PATH: &str = "/MenuBar";
@@ -77,8 +77,7 @@ const MENU_XML: &str = r#"<node>
   </interface>
 </node>"#;
 
-const MENU_OPEN: i32 = 1;
-const MENU_QUIT: i32 = 2;
+use tray_menu::{OPEN_ID as MENU_OPEN, QUIT_ID as MENU_QUIT};
 
 thread_local! {
     /// Keeps the D-Bus connection (and therefore the registration) alive.
@@ -118,7 +117,7 @@ fn try_setup(window: &Window) -> Result<(), glib::Error> {
                 "Id" => "lan-mouse".to_variant(),
                 "Title" => "Lan Mouse".to_variant(),
                 "Status" => "Active".to_variant(),
-                "IconName" => "de.feschber.LanMouse".to_variant(),
+                "IconName" => tray_menu::APP_ICON.to_variant(),
                 "Menu" => glib::variant::ObjectPath::try_from(MENU_PATH.to_string())
                     .expect("valid object path")
                     .to_variant(),
@@ -139,10 +138,10 @@ fn try_setup(window: &Window) -> Result<(), glib::Error> {
                         "GetLayout" => invocation.return_value(Some(&layout().to_variant())),
                         // Out arguments are always a tuple, even for one value.
                         "GetGroupProperties" => invocation.return_value(Some(
-                            &(vec![
-                                (MENU_OPEN, item_properties("Open Lan Mouse")),
-                                (MENU_QUIT, item_properties("Quit Lan Mouse")),
-                            ],)
+                            &(tray_menu::ITEMS
+                                .iter()
+                                .map(|(id, label)| (*id, item_properties(label)))
+                                .collect::<Vec<_>>(),)
                                 .to_variant(),
                         )),
                         "Event" => {
@@ -152,7 +151,7 @@ fn try_setup(window: &Window) -> Result<(), glib::Error> {
                                         MENU_OPEN => window.present(),
                                         MENU_QUIT => {
                                             if let Some(app) = window.application() {
-                                                app.activate_action("quit-app", None);
+                                                app.activate_action(tray_menu::QUIT_ACTION, None);
                                             }
                                         }
                                         _ => {}
@@ -231,23 +230,58 @@ fn layout() -> Layout {
     let mut root = HashMap::new();
     root.insert("children-display".to_string(), "submenu".to_variant());
 
-    let children = vec![
-        (
-            MENU_OPEN,
-            item_properties("Open Lan Mouse"),
-            Vec::<glib::Variant>::new(),
-        )
-            .to_variant(),
-        (
-            MENU_QUIT,
-            item_properties("Quit Lan Mouse"),
-            Vec::<glib::Variant>::new(),
-        )
-            .to_variant(),
-    ];
+    let children = tray_menu::ITEMS
+        .iter()
+        .map(|(id, label)| (*id, item_properties(label), Vec::<glib::Variant>::new()).to_variant())
+        .collect();
 
     (1, (0, root, children))
 }
 
 #[allow(dead_code)]
 fn _assert_menu_item_type(_: MenuItem) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_exposes_the_shared_menu_items() {
+        let (revision, (root_id, root_props, children)) = layout();
+        assert_eq!(revision, 1);
+        assert_eq!(root_id, 0);
+        assert_eq!(
+            root_props
+                .get("children-display")
+                .and_then(|v| v.get::<String>()),
+            Some("submenu".to_string())
+        );
+        assert_eq!(children.len(), tray_menu::ITEMS.len());
+
+        for (child, (id, label)) in children.iter().zip(tray_menu::ITEMS) {
+            let (child_id, props, _) = child
+                .get::<(i32, HashMap<String, glib::Variant>, Vec<glib::Variant>)>()
+                .expect("menu item");
+            assert_eq!(child_id, id);
+            assert_eq!(
+                props.get("label").and_then(|v| v.get::<String>()),
+                Some(label.to_string())
+            );
+            assert_eq!(
+                props.get("visible").and_then(|v| v.get::<bool>()),
+                Some(true)
+            );
+            assert_eq!(
+                props.get("enabled").and_then(|v| v.get::<bool>()),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn the_quit_id_maps_to_the_quit_action() {
+        // Guards against swapping the ids in the shared table.
+        assert_eq!(tray_menu::QUIT_ID, 2);
+        assert_eq!(tray_menu::OPEN_ID, 1);
+    }
+}

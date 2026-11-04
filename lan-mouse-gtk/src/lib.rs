@@ -10,6 +10,7 @@ mod linux_tray;
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
+mod tray_menu;
 mod window;
 #[cfg(windows)]
 mod windows_tray;
@@ -262,7 +263,7 @@ fn build_ui(app: &Application) {
         // Hiding the window keeps it alive (GTK only quits when the last
         // window is destroyed), so no `hold()` is needed: the tray icon brings
         // it back and "Quit Lan Mouse" destroys nothing but calls quit().
-        let quit = gio::SimpleAction::new("quit-app", None);
+        let quit = gio::SimpleAction::new(tray_menu::QUIT_ACTION, None);
         quit.connect_activate(clone!(
             #[weak]
             app,
