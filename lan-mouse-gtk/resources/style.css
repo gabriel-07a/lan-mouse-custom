@@ -10,3 +10,12 @@
 .peer-unknown > box > list .subtitle {
     color: @warning_color;
 }
+
+/* collapsed subtitle: connection state is the important information */
+.client-offline > box > list .subtitle {
+    color: alpha(currentColor, 0.6);
+}
+
+.client-waiting > box > list .subtitle {
+    color: @warning_color;
+}

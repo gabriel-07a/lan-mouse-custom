@@ -127,8 +127,8 @@ impl ClientRow {
         // Render the initial collapsed subtitle from whatever
         // peer_commit the ClientObject was created with. Subsequent
         // changes are pushed by `Window::update_client_state` calling
-        // `refresh_version_status` after writing the new property.
-        self.refresh_version_status();
+        // `refresh_status` after writing the new properties.
+        self.refresh_status();
     }
 
     pub fn unbind(&self) {
@@ -165,40 +165,69 @@ impl ClientRow {
     /// `peer-commit`. The dns-status icon is left to its existing
     /// `set_dns_state` handler so the two indicators don't fight
     /// for the same CSS class.
-    pub fn refresh_version_status(&self) {
-        let peer: Option<String> = self
-            .imp()
-            .client_object
-            .borrow()
-            .as_ref()
-            .and_then(|co| co.property::<Option<String>>("peer-commit"));
-        let local = crate::local_commit_str();
-        let rtt = self
-            .imp()
-            .client_object
-            .borrow()
-            .as_ref()
-            .map(|co| co.property::<u32>("rtt-ms"))
-            .filter(|ms| *ms > 0)
-            .map(|ms| format!(" · {ms} ms"))
-            .unwrap_or_default();
-        let markup = match peer.as_deref() {
-            None => format!("Peer version: unknown · Ours: {local}{rtt}"),
-            Some(p) if p == local.as_str() => {
-                format!("Peer version: {p} · matched{rtt}")
-            }
-            Some(p) => {
-                format!("Peer version: {p} · Ours: {local}{rtt}")
-            }
+    /// Recompute the collapsed subtitle: connection state first, build
+    /// mismatch only as a warning suffix.
+    pub fn refresh_status(&self) {
+        let data = self.imp().client_object.borrow().as_ref().map(|co| {
+            (
+                co.property::<bool>("active"),
+                co.property::<bool>("alive"),
+                co.property::<Option<String>>("active-addr"),
+                co.property::<u32>("rtt-ms"),
+                co.property::<Option<String>>("peer-commit"),
+            )
+        });
+        let Some((active, alive, addr, rtt, peer)) = data else {
+            return;
         };
+
+        let local_commit = crate::local_commit_str();
+        let local = glib::markup_escape_text(&local_commit).to_string();
+        let rtt = if rtt > 0 {
+            format!(" · {rtt} ms")
+        } else {
+            String::new()
+        };
+
         self.remove_css_class("peer-mismatch");
         self.remove_css_class("peer-match");
         self.remove_css_class("peer-unknown");
-        match peer.as_deref() {
-            Some(p) if p == local.as_str() => self.add_css_class("peer-match"),
-            Some(_) => self.add_css_class("peer-mismatch"),
-            None => self.add_css_class("peer-unknown"),
+        self.remove_css_class("client-offline");
+        self.remove_css_class("client-waiting");
+
+        let addr = addr.map(|addr| glib::markup_escape_text(&addr).to_string());
+        let markup = match (active, addr, alive) {
+            (false, _, _) => {
+                self.add_css_class("client-offline");
+                "Disabled".to_string()
+            }
+            (true, Some(addr), true) => {
+                self.add_css_class("peer-match");
+                format!("Connected to {addr}{rtt}")
+            }
+            // Active but no usable connection yet: either the peer has not
+            // authorized this device or it is still booting.
+            (true, None, _) => {
+                self.add_css_class("client-waiting");
+                "Waiting for the other device — approve the request there".to_string()
+            }
+            (true, Some(_), false) => {
+                self.add_css_class("client-waiting");
+                format!("Connection lost — reconnecting{rtt}")
+            }
         };
+
+        // Only mention the build when it actually differs: matching builds
+        // are the normal case and the information is noise.
+        let markup = match peer.as_deref() {
+            Some(p) if p != local.as_str() => {
+                self.add_css_class("peer-mismatch");
+                let p = glib::markup_escape_text(p);
+                format!("{markup} · peer build {p} (ours {local})")
+            }
+            _ => markup,
+        };
+
         self.set_subtitle(&markup);
     }
 }

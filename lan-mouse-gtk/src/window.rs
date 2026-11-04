@@ -325,6 +325,22 @@ impl Window {
         self.clients().append(&client);
         self.update_placeholder_visibility();
         self.update_dns_state(handle, !state.ips.is_empty());
+
+        // A client created by the "add device" dialog carries its address and
+        // side; apply them as soon as the service reports the handle.
+        if let Some((address, position)) = self.imp().pending_add.borrow_mut().take() {
+            let address = address.trim().to_string();
+            self.request(FrontendRequest::UpdatePosition(handle, position));
+            match address.parse::<std::net::IpAddr>() {
+                Ok(ip) => self.request(FrontendRequest::UpdateFixIps(handle, vec![ip])),
+                Err(_) if !address.is_empty() => {
+                    self.request(FrontendRequest::UpdateHostname(handle, Some(address)))
+                }
+                Err(_) => {}
+            }
+            self.request(FrontendRequest::Activate(handle, true));
+            self.show_toast("Request sent — approve it on the other device");
+        }
     }
 
     pub(super) fn update_client_list(
@@ -406,7 +422,12 @@ impl Window {
             crate::client_object::peer_commit_to_string(state.peer_commit),
         );
         client_object.set_property("rtt-ms", state.rtt_ms.unwrap_or(0));
-        row.refresh_version_status();
+        client_object.set_property("alive", state.alive);
+        client_object.set_property(
+            "active-addr",
+            state.active_addr.map(|addr| addr.to_string()),
+        );
+        row.refresh_status();
     }
 
     fn client_object_for_handle(&self, handle: ClientHandle) -> Option<ClientObject> {
@@ -445,7 +466,86 @@ impl Window {
         self.request(FrontendRequest::EnableEmulation);
     }
 
-    fn request_client_create(&self) {
+    /// Collect an address and a screen side, then create the client and
+    /// activate it. The peer answers with an authorization request, so this
+    /// is the whole "send a connection request" flow.
+    pub(super) fn request_add_device(&self) {
+        let window = adw::Window::builder()
+            .title("Add device")
+            .modal(true)
+            .transient_for(self)
+            .default_width(420)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+
+        let info = gtk::Label::new(Some(
+            "Enter the address of the other computer. It will ask you to approve \
+             the connection there, and both directions are configured from that \
+             single approval.",
+        ));
+        info.set_wrap(true);
+        info.set_xalign(0.0);
+
+        let entry = gtk::Entry::new();
+        entry.set_placeholder_text(Some("192.168.0.10 or hostname"));
+
+        let position_label = gtk::Label::new(Some("The other device is on my:"));
+        position_label.set_xalign(0.0);
+        position_label.set_margin_top(6);
+
+        let positions = gtk::DropDown::from_strings(&["Left", "Right", "Top", "Bottom"]);
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons.set_halign(gtk::Align::End);
+        buttons.set_margin_top(12);
+        let cancel = gtk::Button::with_label("Cancel");
+        let send = gtk::Button::with_label("Send request");
+        send.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&send);
+
+        content.append(&info);
+        content.append(&entry);
+        content.append(&position_label);
+        content.append(&positions);
+        content.append(&buttons);
+        window.set_content(Some(&content));
+
+        let close_window = window.clone();
+        cancel.connect_clicked(move |_| close_window.close());
+
+        let parent = self.clone();
+        let close_window = window.clone();
+        let address_entry = entry.clone();
+        let position_dropdown = positions.clone();
+        send.connect_clicked(move |_| {
+            let address = address_entry.text().to_string();
+            let position = match position_dropdown.selected() {
+                1 => Position::Right,
+                2 => Position::Top,
+                3 => Position::Bottom,
+                _ => Position::Left,
+            };
+            parent.send_device_request(address, position);
+            close_window.close();
+        });
+
+        entry.connect_activate(glib::clone!(
+            #[weak]
+            send,
+            move |_| send.emit_clicked()
+        ));
+
+        window.present();
+    }
+
+    fn send_device_request(&self, address: String, position: Position) {
+        self.imp().pending_add.replace(Some((address, position)));
         self.request(FrontendRequest::Create);
     }
 

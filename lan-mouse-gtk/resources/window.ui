@@ -45,6 +45,73 @@
                     <property name="orientation">vertical</property>
                     <property name="spacing">12</property>
                     <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Connections</property>
+                        <property name="header-suffix">
+                          <object class="GtkButton">
+                            <signal name="clicked" handler="handle_add_client_pressed" swapped="true"/>
+                            <property name="child">
+                              <object class="AdwButtonContent">
+                                <property name="icon-name">list-add-symbolic</property>
+                                <property name="label" translatable="yes">Add device</property>
+                              </object>
+                            </property>
+                          <style>
+                            <class name="flat"/>
+                          </style>
+                          </object>
+                        </property>
+                        <child>
+                          <object class="GtkListBox" id="client_list">
+                            <property name="selection-mode">none</property>
+                            <child type="placeholder">
+                              <object class="AdwActionRow" id="client_placeholder">
+                                <property name="title" translatable="yes">No devices yet</property>
+                                <property name="subtitle" translatable="yes">Use “Add” to enter the address of another computer. It will ask you to approve the connection there.</property>
+                                <property name="subtitle-lines">2</property>
+                              </object>
+                            </child>
+                            <style>
+                              <class name="boxed-list" />
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Incoming Connections</property>
+                        <property name="header-suffix">
+                          <object class="GtkButton">
+                            <signal name="clicked" handler="handle_add_cert_fingerprint" swapped="true"/>
+                            <property name="child">
+                              <object class="AdwButtonContent">
+                                <property name="icon-name">auth-fingerprint-symbolic</property>
+                                <property name="label" translatable="yes">Authorize</property>
+                              </object>
+                            </property>
+                            <style>
+                              <class name="flat"/>
+                            </style>
+                          </object>
+                        </property>
+                        <child>
+                          <object class="GtkListBox" id="authorized_list">
+                            <property name="selection-mode">none</property>
+                            <child type="placeholder">
+                              <object class="AdwActionRow" id="authorized_placeholder">
+                                <property name="title">no devices registered!</property>
+                                <property name="subtitle">authorize a new device via the "Authorize" button</property>
+                              </object>
+                            </child>
+                            <style>
+                              <class name="boxed-list" />
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
                       <object class="AdwPreferencesGroup" id="capture_emulation_group">
                       <property name="title" translatable="yes">Capture / Emulation Status</property>
                         <child>
@@ -199,72 +266,6 @@
                                 <signal name="clicked" handler="handle_copy_fingerprint" swapped="true"/>
                               </object>
                             </child>
-                          </object>
-                        </child>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="AdwPreferencesGroup">
-                        <property name="title" translatable="yes">Connections</property>
-                        <property name="header-suffix">
-                          <object class="GtkButton">
-                            <signal name="clicked" handler="handle_add_client_pressed" swapped="true"/>
-                            <property name="child">
-                              <object class="AdwButtonContent">
-                                <property name="icon-name">list-add-symbolic</property>
-                                <property name="label" translatable="yes">Add</property>
-                              </object>
-                            </property>
-                          <style>
-                            <class name="flat"/>
-                          </style>
-                          </object>
-                        </property>
-                        <child>
-                          <object class="GtkListBox" id="client_list">
-                            <property name="selection-mode">none</property>
-                            <child type="placeholder">
-                              <object class="AdwActionRow" id="client_placeholder">
-                                <property name="title">No connections!</property>
-                                <property name="subtitle">add a new client via the + button</property>
-                              </object>
-                            </child>
-                            <style>
-                              <class name="boxed-list" />
-                            </style>
-                          </object>
-                        </child>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="AdwPreferencesGroup">
-                        <property name="title" translatable="yes">Incoming Connections</property>
-                        <property name="header-suffix">
-                          <object class="GtkButton">
-                            <signal name="clicked" handler="handle_add_cert_fingerprint" swapped="true"/>
-                            <property name="child">
-                              <object class="AdwButtonContent">
-                                <property name="icon-name">auth-fingerprint-symbolic</property>
-                                <property name="label" translatable="yes">Authorize</property>
-                              </object>
-                            </property>
-                            <style>
-                              <class name="flat"/>
-                            </style>
-                          </object>
-                        </property>
-                        <child>
-                          <object class="GtkListBox" id="authorized_list">
-                            <property name="selection-mode">none</property>
-                            <child type="placeholder">
-                              <object class="AdwActionRow" id="authorized_placeholder">
-                                <property name="title">no devices registered!</property>
-                                <property name="subtitle">authorize a new device via the "Authorize" button</property>
-                              </object>
-                            </child>
-                            <style>
-                              <class name="boxed-list" />
-                            </style>
                           </object>
                         </child>
                       </object>

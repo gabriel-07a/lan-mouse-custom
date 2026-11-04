@@ -21,6 +21,8 @@ pub struct ClientObject {
     #[property(name = "ips", get, set, type = Vec<String>, member = ips)]
     #[property(name = "peer-commit", get, set, type = Option<String>, member = peer_commit)]
     #[property(name = "rtt-ms", get, set, type = u32, member = rtt_ms)]
+    #[property(name = "alive", get, set, type = bool, member = alive)]
+    #[property(name = "active-addr", get, set, type = Option<String>, member = active_addr)]
     pub data: RefCell<ClientData>,
 }
 

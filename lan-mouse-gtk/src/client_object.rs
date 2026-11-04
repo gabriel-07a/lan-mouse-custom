@@ -28,6 +28,11 @@ impl ClientObject {
             .property("resolving", state.resolving)
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
             .property("rtt-ms", state.rtt_ms.unwrap_or(0))
+            .property("alive", state.alive)
+            .property(
+                "active-addr",
+                state.active_addr.map(|addr| addr.to_string()),
+            )
             .build()
     }
 
@@ -56,6 +61,10 @@ pub struct ClientData {
     pub peer_commit: Option<String>,
     /// 0 means unknown
     pub rtt_ms: u32,
+    /// the peer answered its last liveness check
+    pub alive: bool,
+    /// address of the established connection, if any
+    pub active_addr: Option<String>,
 }
 
 #[cfg(test)]
