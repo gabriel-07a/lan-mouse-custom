@@ -58,15 +58,14 @@ jobs:
       # depends on whichever Visual Studio version the runner happens to have).
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
-          update: true
+          msystem: UCRT64
           install: >-
-            mingw-w64-x86_64-rust
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-gtk4
-            mingw-w64-x86_64-libadwaita
-            mingw-w64-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-librsvg
       - name: Release build
         shell: msys2 {0}
         run: cargo build --release
@@ -76,12 +75,12 @@ jobs:
           mkdir -p lan-mouse-windows
           cp target/release/lan-mouse.exe lan-mouse-windows/
           ldd target/release/lan-mouse.exe \
-            | awk '/\/mingw64\/bin\// {print $3}' \
+            | awk '/\/ucrt64\/bin\// {print $3}' \
             | sort -u \
             | xargs -r cp -t lan-mouse-windows
           # GTK looks up its settings schemas next to the executable.
           mkdir -p lan-mouse-windows/share/glib-2.0
-          cp -r /mingw64/share/glib-2.0/schemas lan-mouse-windows/share/glib-2.0/
+          cp -r /ucrt64/share/glib-2.0/schemas lan-mouse-windows/share/glib-2.0/
           glib-compile-schemas lan-mouse-windows/share/glib-2.0/schemas
       - name: Create zip
         shell: pwsh
