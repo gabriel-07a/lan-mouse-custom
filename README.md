@@ -509,6 +509,31 @@ Clipboard backends: GNOME/KDE use the XDG portal, wlroots compositors use
 `wlr-data-control`, and X11 uses the `CLIPBOARD` selection. The X11 backend
 handles text, HTML and small PNG images; large payloads (INCR) are skipped.
 
+### Pairing a new device
+
+A device only has to be approved once. Publishing the fingerprint by hand is
+not necessary:
+
+1. On the machine you are sitting at, add a client with the other machine's
+   address (GUI: *add client* → hostname/IP; CLI:
+   `lan-mouse cli add-client --ips 192.168.1.50 --position left --activate`).
+2. The other machine shows an **Unauthorized Device** window. Pick where this
+   device sits on its screen and press **Authorize**.
+3. That single approval stores the fingerprint *and* creates the client entry
+   for the reverse direction, using the address of the accepted connection, so
+   both machines can control each other without editing the config by hand.
+
+From a terminal the approval can also be granted with
+
+```sh
+lan-mouse cli authorize-device <sha256-fingerprint> --position left
+```
+
+which has the same effect: the fingerprint is trusted and a client for the
+peer is created and activated when it connects. A fingerprint that was
+authorized this way is never asked for again unless the peer regenerates its
+certificate.
+
 ### GNOME asks once per login
 
 On GNOME the `InputCapture` portal is still at **version 1**, which has no

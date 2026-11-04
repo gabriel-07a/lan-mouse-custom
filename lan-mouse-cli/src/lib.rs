@@ -75,6 +75,16 @@ enum CliSubcommand {
         description: String,
         sha256_fingerprint: String,
     },
+    /// authorize a device and configure the reverse direction automatically
+    AuthorizeDevice {
+        sha256_fingerprint: String,
+        /// name for the new client (defaults to the peer's address)
+        #[arg(long)]
+        name: Option<String>,
+        /// where the peer sits relative to this device
+        #[arg(long, default_value = "left")]
+        position: Position,
+    },
     /// deauthorize a public key
     RemoveAuthorizedKey { sha256_fingerprint: String },
     /// save configuration to file
@@ -138,6 +148,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     }
                     if activate {
                         tx.request(FrontendRequest::Activate(handle, true)).await?;
+                        println!(
+                            "client {handle} activated; if this device is not authorized on \
+                             the peer yet, approve the request on that machine"
+                        );
                     }
                     break;
                 }
@@ -190,6 +204,22 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 sha256_fingerprint,
             ))
             .await?
+        }
+        CliSubcommand::AuthorizeDevice {
+            sha256_fingerprint,
+            name,
+            position,
+        } => {
+            tx.request(FrontendRequest::AuthorizeDevice {
+                fingerprint: sha256_fingerprint,
+                name: name.unwrap_or_default(),
+                position,
+            })
+            .await?;
+            println!(
+                "device authorized; a client at position {position} is created and \
+                 activated as soon as it connects"
+            );
         }
         CliSubcommand::RemoveAuthorizedKey { sha256_fingerprint } => {
             tx.request(FrontendRequest::RemoveAuthorizedKey(sha256_fingerprint))

@@ -337,6 +337,18 @@ pub enum FrontendRequest {
     Sync,
     /// authorize fingerprint (description, fingerprint)
     AuthorizeKey(String, String),
+    /// Authorize a device and configure the reverse direction in one step.
+    ///
+    /// `position` is where the peer sits relative to this device. The service
+    /// stores the fingerprint and, as soon as the peer's connection is
+    /// accepted (which yields its address), creates and activates a client
+    /// entry for it, so both machines can control each other without editing
+    /// the config by hand.
+    AuthorizeDevice {
+        fingerprint: String,
+        name: String,
+        position: Position,
+    },
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
     /// change the hook command
@@ -554,6 +566,11 @@ mod tests {
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
         ));
         json_roundtrip(FrontendRequest::AuthorizeKey("pc".into(), "fp".into()));
+        json_roundtrip(FrontendRequest::AuthorizeDevice {
+            fingerprint: "fp".into(),
+            name: "pc".into(),
+            position: Position::Right,
+        });
         json_roundtrip(FrontendRequest::EnableCapture);
         json_roundtrip(FrontendRequest::SaveConfiguration);
         json_roundtrip(FrontendRequest::SetClipboardEnabled(true));

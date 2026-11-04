@@ -588,9 +588,22 @@ impl Window {
             closure_local!(
                 #[strong(rename_to = parent)]
                 self,
-                move |w: AuthorizationWindow, fp: String| {
+                move |w: AuthorizationWindow, fp: String, position: u32| {
                     w.close();
-                    parent.open_fingerprint_dialog(Some(fp));
+                    // A single approval both trusts the device and creates the
+                    // client entry for the reverse direction; the address is
+                    // taken from the connection once it is accepted.
+                    let position = match position {
+                        1 => Position::Right,
+                        2 => Position::Top,
+                        3 => Position::Bottom,
+                        _ => Position::Left,
+                    };
+                    parent.request(FrontendRequest::AuthorizeDevice {
+                        fingerprint: fp,
+                        name: String::new(),
+                        position,
+                    });
                 }
             ),
         );

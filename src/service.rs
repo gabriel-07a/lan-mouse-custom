@@ -66,6 +66,9 @@ pub struct Service {
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+    /// devices authorized with [`FrontendRequest::AuthorizeDevice`] whose
+    /// reverse client entry must be created once their address is known
+    pending_reverse: HashMap<String, (String, Position)>,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -170,6 +173,7 @@ impl Service {
             frontend_listener,
             resolver,
             authorized_keys,
+            pending_reverse: Default::default(),
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -240,6 +244,15 @@ impl Service {
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
                 self.add_authorized_key(desc, fp);
+                self.save_config();
+            }
+            FrontendRequest::AuthorizeDevice {
+                fingerprint,
+                name,
+                position,
+            } => {
+                self.add_authorized_key(name.clone(), fingerprint.clone());
+                self.pending_reverse.insert(fingerprint, (name, position));
                 self.save_config();
             }
             FrontendRequest::ChangePort(port) => self.change_port(port),
@@ -390,6 +403,11 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::Connected { addr, fingerprint } => {
+                // The peer that was just authorized also becomes a configured
+                // client, so it can control this device too.
+                if let Some((name, position)) = self.pending_reverse.remove(&fingerprint) {
+                    self.add_reverse_client(name, addr.ip(), position);
+                }
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello {
@@ -605,6 +623,46 @@ impl Service {
     fn enumerate(&mut self) {
         let clients = self.client_manager.get_client_states();
         self.notify_frontend(FrontendEvent::Enumerate(clients));
+    }
+
+    /// Create and activate a client entry for a peer that was just authorized.
+    ///
+    /// The peer address comes from the accepted connection, so the user never
+    /// has to type it. An existing entry for the same address is reused
+    /// instead of creating a duplicate.
+    fn add_reverse_client(&mut self, name: String, ip: IpAddr, position: Position) {
+        // An empty name means "use the address": the peer's hostname is not
+        // known before the connection is authenticated.
+        let name = if name.trim().is_empty() {
+            ip.to_string()
+        } else {
+            name
+        };
+        if let Some(handle) = self.client_with_ip(ip) {
+            log::info!("reverse client for {ip} already exists (id {handle})");
+            self.update_pos(handle, position);
+            self.set_client_active(handle, true);
+            self.save_config();
+            return;
+        }
+
+        let handle = self.client_manager.add_client();
+        self.client_manager.set_hostname(handle, Some(name.clone()));
+        self.client_manager.set_fix_ips(handle, vec![ip]);
+        self.client_manager.set_pos(handle, position);
+        log::info!("adding client {handle} for authorized device {name} ({ip}, {position})");
+        let (config, state) = self.client_manager.get_state(handle).expect("client state");
+        self.notify_frontend(FrontendEvent::Created(handle, config, state));
+        self.activate_client(handle);
+        self.save_config();
+    }
+
+    fn client_with_ip(&self, ip: IpAddr) -> Option<ClientHandle> {
+        self.client_manager
+            .get_client_states()
+            .into_iter()
+            .find(|(_, _, state)| state.ips.contains(&ip))
+            .map(|(handle, _, _)| handle)
     }
 
     fn add_client(&mut self) {

@@ -15,6 +15,8 @@ pub struct AuthorizationWindow {
     #[template_child]
     pub fingerprint: TemplateChild<Label>,
     #[template_child]
+    pub position: TemplateChild<adw::ComboRow>,
+    #[template_child]
     pub cancel_button: TemplateChild<Button>,
     #[template_child]
     pub confirm_button: TemplateChild<Button>,
@@ -43,7 +45,9 @@ impl AuthorizationWindow {
     #[template_callback]
     fn handle_confirm(&self, _button: Button) {
         let fp = self.fingerprint.text().as_str().trim().to_owned();
-        self.obj().emit_by_name("confirm-clicked", &[&fp])
+        let position = self.position.selected();
+        self.obj()
+            .emit_by_name::<()>("confirm-clicked", &[&fp, &position])
     }
 
     #[template_callback]
@@ -62,7 +66,7 @@ impl ObjectImpl for AuthorizationWindow {
         SIGNALS.get_or_init(|| {
             vec![
                 Signal::builder("confirm-clicked")
-                    .param_types([String::static_type()])
+                    .param_types([String::static_type(), u32::static_type()])
                     .build(),
                 Signal::builder("cancel-clicked").build(),
             ]

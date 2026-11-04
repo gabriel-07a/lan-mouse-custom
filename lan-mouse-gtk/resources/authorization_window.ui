@@ -37,6 +37,26 @@
             </child>
             <child>
               <object class="AdwPreferencesGroup">
+                <property name="title">Position of this device on your screen</property>
+                <child>
+                  <object class="AdwComboRow" id="position">
+                    <property name="title" translatable="yes">position</property>
+                    <property name="model">
+                      <object class="GtkStringList">
+                        <items>
+                          <item>Left</item>
+                          <item>Right</item>
+                          <item>Top</item>
+                          <item>Bottom</item>
+                        </items>
+                      </object>
+                    </property>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <child>
+              <object class="AdwPreferencesGroup">
                 <property name="title">sha256 fingerprint</property>
                 <child>
                   <object class="AdwActionRow">
