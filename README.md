@@ -1,8 +1,15 @@
 # Lan Mouse
 
-[![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
+> [!NOTE]
+> **Unofficial fork.** This is a modified version of
+> [Lan Mouse](https://github.com/feschber/lan-mouse) by its original
+> contributors, licensed under GPL-3.0-or-later. Modifications © 2026
+> Gabriel Arcanjo, made on 2026-11-03. See [NOTICE](NOTICE) for details.
+> This fork is not endorsed by the upstream project.
 
-[![crates.io](https://img.shields.io/crates/v/lan-mouse.svg)](https://crates.io/crates/lan-mouse)  [![license](https://img.shields.io/crates/l/lan-mouse.svg)](https://github.com/feschber/lan-mouse/blob/main/Cargo.toml)
+[![CI](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/rust.yml/badge.svg)](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/rust.yml) [![Cachix](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/cachix.yml/badge.svg)](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/cachix.yml) [![Release](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/release.yml/badge.svg)](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/release.yml)
+
+[![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 
 Lan Mouse is a *cross-platform* mouse and keyboard sharing software similar to universal-control on Apple devices.
 It allows for using multiple PCs via a single set of mouse and keyboard.
@@ -35,6 +42,7 @@ Most current desktop environments and operating systems are fully supported, thi
 - GNOME >= 45
 - KDE Plasma >= 6.1
 - Most wlroots based compositors, including Sway (>= 1.8), Hyprland and Wayfire
+- X11
 - Windows
 - MacOS
 
@@ -42,7 +50,7 @@ Most current desktop environments and operating systems are fully supported, thi
 ### Caveats / Known Issues
 
 > [!Important]
-> - **X11** currently only has support for input emulation, i.e. can only be used on the receiving end.
+> - **X11**: input capture and emulation are supported. Clipboard support on X11 covers text, HTML and small PNG images; payloads that require the X11 INCR protocol are skipped (not corrupted) and large X11 clipboard entries are not synchronized.
 >
 > - **Sway / wlroots**: Wlroots based compositors without libei support on the receiving end currently do not handle modifier events on the client side.
 > This results in CTRL / SHIFT / ALT / SUPER keys not working with a sending device that is NOT using the `layer-shell` backend
@@ -497,8 +505,9 @@ max_image_bytes = 8388608
 max_snapshot_bytes = 10485760
 ```
 
-Clipboard backends for wlroots compositors and native X11 are not implemented
-yet.
+Clipboard backends: GNOME/KDE use the XDG portal, wlroots compositors use
+`wlr-data-control`, and X11 uses the `CLIPBOARD` selection. The X11 backend
+handles text, HTML and small PNG images; large payloads (INCR) are skipped.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
@@ -511,10 +520,10 @@ yet.
 - [x] MacOS Input Capture
 - [x] Windows Input Capture
 - [x] Encryption
-- [ ] X11 Input Capture
+- [x] X11 Input Capture
 - [x] Latency measurement and visualization (RTT per client)
 - [ ] Bandwidth usage measurement and visualization
-- [x] Clipboard support (text, HTML, PNG; portal + Windows/macOS)
+- [x] Clipboard support (text, HTML, PNG; portal + data-control + Windows/macOS/X11)
 
 
 ## Detailed OS Support
@@ -555,10 +564,10 @@ The following sections detail the emulation and capture backends provided by lan
 | Wayland (Gnome)           |                          | :heavy_check_mark:       |                          |                                        |     |
 | Windows                   |                          |                          | :heavy_check_mark:       |                                        |     |
 | MacOS                     |                          |                          |                          |   :heavy_check_mark:                   |     |
-| X11                       |                          |                          |                          |                                        | WIP |
+| X11                       |                          |                          |                          |                                        | :heavy_check_mark: |
 
 - `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
 - `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
 - `windows`: Backend for input capture on Windows.
 - `macos`: Backend for input capture on MacOS.
-- `x11`: TODO (not yet supported)
+- `x11`: Backend for X11 sessions (uses pointer barriers and the XTest extension).
