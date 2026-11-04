@@ -29,10 +29,19 @@ pub mod capabilities {
     pub const TIME_SYNC: u32 = 1 << 1;
     /// Reserved: keyboard layout negotiation.
     pub const KEYMAP_V1: u32 = 1 << 2;
+    /// The peer echoes `Enter` serials back in [`super::ProtoEvent::Ack`] and
+    /// drops duplicate serials. Peers without this bit predate the serial
+    /// field: they ignore `Ack` and never acknowledge an `Enter`, so the
+    /// sender must not wait for one (that would tear down a healthy grab).
+    pub const ENTER_ACK: u32 = 1 << 3;
+    /// The peer speaks the clipboard sync extension (frames 12-15).
+    /// Legacy peers cannot decode those frames, so nothing must be offered
+    /// to them.
+    pub const CLIPBOARD: u32 = 1 << 4;
 }
 
 /// Features this build can use when the peer also advertises them.
-pub const CAPABILITIES: u32 = 0;
+pub const CAPABILITIES: u32 = capabilities::ENTER_ACK | capabilities::CLIPBOARD;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -703,6 +712,8 @@ mod extra_tests {
             capabilities::BATCHED_INPUT,
             capabilities::TIME_SYNC,
             capabilities::KEYMAP_V1,
+            capabilities::ENTER_ACK,
+            capabilities::CLIPBOARD,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");

@@ -509,6 +509,21 @@ Clipboard backends: GNOME/KDE use the XDG portal, wlroots compositors use
 `wlr-data-control`, and X11 uses the `CLIPBOARD` selection. The X11 backend
 handles text, HTML and small PNG images; large payloads (INCR) are skipped.
 
+### Peers running an upstream release
+
+Peers advertise optional features in their `Hello` handshake, and everything
+added by this fork is negotiated:
+
+| Feature | Peer without the extension |
+| --- | --- |
+| `Enter` serial + acknowledgement | The handoff is sent once, exactly like upstream. Nothing waits for an `Ack` that a legacy peer never sends. |
+| Clipboard sync | No clipboard frame is offered, so a legacy peer never sees a frame it cannot decode. |
+| Ping liveness | A connection whose peer never answers a ping is kept for 30 rounds (about a minute) instead of being torn down after two. Some peers read a connection without ever writing to it. |
+
+Input sharing itself is wire-compatible in both directions, so mixed setups
+(this fork on one machine, an upstream release on the other) work for keyboard
+and mouse; only the features above degrade to upstream behaviour.
+
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
 - [x] respect xdg-config-home for config file location.

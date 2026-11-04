@@ -338,6 +338,21 @@ impl ClientManager {
         }
     }
 
+    /// Capabilities advertised by the peer in its `Hello`, if any.
+    pub(crate) fn peer_capabilities(&self, handle: ClientHandle) -> Option<u32> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, s)| s.peer_commit.map(|_| s.peer_capabilities))
+    }
+
+    /// Whether the peer advertised `cap` in its `Hello`. Peers that have not
+    /// completed the handshake yet never match.
+    pub(crate) fn peer_supports(&self, handle: ClientHandle, cap: u32) -> bool {
+        self.peer_capabilities(handle)
+            .is_some_and(|caps| caps & cap != 0)
+    }
+
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.clients
             .borrow()
@@ -502,6 +517,31 @@ mod tests {
             Some(143),
             "no sample keeps the previous value"
         );
+    }
+
+    #[test]
+    fn capability_queries_require_a_hello() {
+        use lan_mouse_proto::capabilities::{CLIPBOARD, ENTER_ACK};
+
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+
+        // No handshake yet: never assume a peer supports an extension.
+        assert_eq!(manager.peer_capabilities(handle), None);
+        assert!(!manager.peer_supports(handle, ENTER_ACK));
+        assert!(!manager.peer_supports(handle, CLIPBOARD));
+
+        // A legacy peer decodes with version 0 and no capabilities.
+        manager.set_peer_hello(handle, Some(*b"legacy00"), 0, 0);
+        assert_eq!(manager.peer_capabilities(handle), Some(0));
+        assert!(!manager.peer_supports(handle, ENTER_ACK));
+        assert!(!manager.peer_supports(handle, CLIPBOARD));
+
+        // A peer from this fork advertises both extensions.
+        manager.set_peer_hello(handle, Some(*b"fork0000"), 1, ENTER_ACK | CLIPBOARD);
+        assert!(manager.peer_supports(handle, ENTER_ACK));
+        assert!(manager.peer_supports(handle, CLIPBOARD));
+        assert!(!manager.peer_supports(handle, lan_mouse_proto::capabilities::TIME_SYNC));
     }
 
     #[test]

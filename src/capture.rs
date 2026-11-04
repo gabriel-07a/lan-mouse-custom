@@ -531,9 +531,21 @@ impl CaptureTask {
 
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
-            self.state = State::WaitingForAck;
-            self.enter.begin(Instant::now(), ENTER_TIMEOUT);
             self.active_client.replace(handle);
+            if self.conn.peer_supports_enter_ack(handle) {
+                // The peer echoes the serial back, so a lost `Enter` can be
+                // retransmitted and a duplicate one can be dropped.
+                self.state = State::WaitingForAck;
+                self.enter.begin(Instant::now(), ENTER_TIMEOUT);
+            } else {
+                // Legacy peer (e.g. any upstream release): it never
+                // acknowledges `Enter`. Waiting for an `Ack` would release
+                // the grab, immediately re-grab at the barrier and fight the
+                // peer for the pointer, freezing both machines.
+                log::debug!("client {handle} is a legacy peer: fire-and-forget Enter");
+                self.enter.reset();
+                self.state = State::Sending;
+            }
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .ok()

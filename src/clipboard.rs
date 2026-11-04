@@ -232,7 +232,9 @@ async fn run<C: Clipboard>(
                     }
                 }
                 for handle in active {
-                    let connected = client_manager.active_addr(handle).is_some();
+                    let connected = client_manager.active_addr(handle).is_some()
+                        && client_manager
+                            .peer_supports(handle, lan_mouse_proto::capabilities::CLIPBOARD);
                     if connected && known_outgoing.insert(handle) {
                         routes.borrow_mut().insert(handle, Route::Outgoing(handle));
                         sender.ensure_connected(handle);

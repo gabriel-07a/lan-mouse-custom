@@ -275,6 +275,13 @@ impl LanMouseConnection {
         self.sender.ctx.start_connecting(handle);
     }
 
+    /// Whether the peer advertised that it acknowledges `Enter` serials.
+    /// Legacy peers (including every upstream release) never acknowledge an
+    /// `Enter`, so the capture must use fire-and-forget handoff for them.
+    pub(crate) fn peer_supports_enter_ack(&self, handle: ClientHandle) -> bool {
+        self.sender.peer_supports_enter_ack(handle)
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
@@ -300,6 +307,17 @@ impl ConnectionSender {
     /// is registered before its first frame).
     pub(crate) fn ensure_connected(&self, handle: ClientHandle) {
         self.ctx.start_connecting(handle);
+    }
+
+    /// Whether the peer advertised that it acknowledges `Enter` serials.
+    /// Legacy peers (including every upstream release) do not, so the
+    /// caller must fall back to fire-and-forget handoff.
+    pub(crate) fn peer_supports_enter_ack(&self, handle: ClientHandle) -> bool {
+        let Some(caps) = self.ctx.client_manager.peer_capabilities(handle) else {
+            // No Hello yet: assume a legacy peer and never block on an Ack.
+            return false;
+        };
+        caps & lan_mouse_proto::capabilities::ENTER_ACK != 0
     }
 
     pub(crate) async fn send(
@@ -495,9 +513,75 @@ async fn connect_to_handle(
     result
 }
 
+/// Number of consecutive failed datagram sends tolerated before the
+/// connection is closed. A single error is normal on Wi-Fi.
+const MAX_PING_SEND_FAILURES: u32 = 4;
+/// Missed ping rounds tolerated before closing a connection whose peer has
+/// answered at least once.
+const MAX_MISSED_ROUNDS: u32 = 2;
+/// Missed rounds tolerated before closing a connection whose peer has never
+/// answered a ping.
+///
+/// Some peers accept the DTLS connection but never send anything back on it
+/// (observed with upstream Lan Mouse releases when *they* did not initiate
+/// the connection): they ignore `Ping` on that socket and reply on their own
+/// outgoing one. Closing such a connection after two rounds tears down a
+/// perfectly usable one-way link every couple of seconds, so liveness is only
+/// enforced after a longer grace period.
+const MAX_SILENT_ROUNDS: u32 = 30;
+
+/// Decides when a ping round should tear the connection down.
+#[derive(Debug, Default)]
+struct PingWatchdog {
+    send_failures: u32,
+    missed_rounds: u32,
+    /// The peer answered at least one ping on this connection.
+    ever_answered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PingVerdict {
+    Keep,
+    Close,
+}
+
+impl PingWatchdog {
+    fn on_send_error(&mut self) -> PingVerdict {
+        self.send_failures += 1;
+        if self.send_failures >= MAX_PING_SEND_FAILURES {
+            PingVerdict::Close
+        } else {
+            PingVerdict::Keep
+        }
+    }
+
+    fn on_send_ok(&mut self) {
+        self.send_failures = 0;
+    }
+
+    /// Record the outcome of one ping round.
+    fn on_round(&mut self, answered: bool) -> PingVerdict {
+        if answered {
+            self.ever_answered = true;
+            self.missed_rounds = 0;
+            return PingVerdict::Keep;
+        }
+        self.missed_rounds += 1;
+        let limit = if self.ever_answered {
+            MAX_MISSED_ROUNDS
+        } else {
+            MAX_SILENT_ROUNDS
+        };
+        if self.missed_rounds >= limit {
+            PingVerdict::Close
+        } else {
+            PingVerdict::Keep
+        }
+    }
+}
+
 async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
-    let mut send_failures = 0u32;
-    let mut missed_rounds = 0u32;
+    let mut watchdog = PingWatchdog::default();
     loop {
         let (buf, len) = ProtoEvent::Ping.into();
 
@@ -505,35 +589,44 @@ async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
         for _ in 0..4 {
             ctx.ping_sent.borrow_mut().insert(addr, Instant::now());
             if let Err(e) = conn.send(&buf[..len]).await {
-                send_failures += 1;
-                log::warn!("{addr}: send error `{e}` ({send_failures} in a row)");
-                // Do not tear the connection down on a single error: Wi-Fi
-                // links drop individual datagrams all the time.
-                if send_failures >= 4 {
+                if watchdog.on_send_error() == PingVerdict::Close {
                     log::warn!("{addr}: too many send errors, closing connection");
                     let _ = conn.close().await;
                     return;
                 }
+                log::warn!("{addr}: send error `{e}` ({})", watchdog.send_failures);
+                // Do not tear the connection down on a single error: Wi-Fi
+                // links drop individual datagrams all the time.
             } else {
-                send_failures = 0;
+                watchdog.on_send_ok();
                 log::trace!("PING >->->->->- {addr}");
             }
 
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        if !ctx.ping_response.borrow_mut().remove(&addr) {
-            // Tolerate one missed round: a busy peer or a short Wi-Fi hiccup
-            // should not tear down the session (and release the grab).
-            missed_rounds += 1;
-            log::warn!("{addr} did not respond to ping round {missed_rounds}");
-            if missed_rounds >= 2 {
-                log::warn!("{addr} missed two ping rounds, closing connection");
-                let _ = conn.close().await;
-                return;
+        let answered = ctx.ping_response.borrow_mut().remove(&addr);
+        if watchdog.on_round(answered) == PingVerdict::Close {
+            if watchdog.ever_answered {
+                log::warn!("{addr} stopped answering pings, closing connection");
+            } else {
+                log::warn!("{addr} never answered a ping, closing connection");
             }
-        } else {
-            missed_rounds = 0;
+            let _ = conn.close().await;
+            return;
+        }
+        if !answered {
+            let rounds = watchdog.missed_rounds;
+            if watchdog.ever_answered {
+                log::warn!("{addr} did not respond to ping round {rounds}");
+            } else if rounds == 2 {
+                // Log once: some peers never answer on this socket, which is
+                // not an error worth repeating every two seconds.
+                log::debug!(
+                    "{addr} never answers pings on this connection; \
+                     keeping it alive for {MAX_SILENT_ROUNDS} rounds"
+                );
+            }
         }
     }
 }
@@ -598,6 +691,60 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watchdog_closes_only_after_a_peer_that_answered_goes_quiet() {
+        let mut watchdog = PingWatchdog::default();
+
+        // A peer that answers: two missed rounds tear the link down.
+        assert_eq!(watchdog.on_round(true), PingVerdict::Keep);
+        assert_eq!(watchdog.on_round(false), PingVerdict::Keep);
+        assert_eq!(watchdog.on_round(false), PingVerdict::Close);
+    }
+
+    #[test]
+    fn watchdog_tolerates_a_peer_that_never_answers() {
+        let mut watchdog = PingWatchdog::default();
+        for round in 1..MAX_SILENT_ROUNDS {
+            assert_eq!(
+                watchdog.on_round(false),
+                PingVerdict::Keep,
+                "round {round} must not close a one-way connection"
+            );
+        }
+        assert_eq!(watchdog.on_round(false), PingVerdict::Close);
+    }
+
+    #[test]
+    fn watchdog_restarts_after_an_answer() {
+        let mut watchdog = PingWatchdog::default();
+        for _ in 0..(MAX_SILENT_ROUNDS - 1) {
+            watchdog.on_round(false);
+        }
+        // The peer wakes up: the silent grace resets.
+        assert_eq!(watchdog.on_round(true), PingVerdict::Keep);
+        assert!(watchdog.ever_answered);
+        assert_eq!(watchdog.missed_rounds, 0);
+        // From now on the fast two-round limit applies.
+        assert_eq!(watchdog.on_round(false), PingVerdict::Keep);
+        assert_eq!(watchdog.on_round(false), PingVerdict::Close);
+    }
+
+    #[test]
+    fn watchdog_closes_after_repeated_send_errors() {
+        let mut watchdog = PingWatchdog::default();
+        for _ in 1..MAX_PING_SEND_FAILURES {
+            assert_eq!(watchdog.on_send_error(), PingVerdict::Keep);
+        }
+        assert_eq!(watchdog.on_send_error(), PingVerdict::Close);
+
+        // A successful send clears the counter.
+        let mut watchdog = PingWatchdog::default();
+        watchdog.on_send_error();
+        watchdog.on_send_error();
+        watchdog.on_send_ok();
+        assert_eq!(watchdog.send_failures, 0);
+    }
     use crate::client::ClientManager;
     use crate::config::ConfigClient;
     use crate::crypto;
@@ -844,6 +991,68 @@ mod tests {
                     matches!(event, ProtoEvent::Enter { serial: 99, .. })
                 })
                 .await;
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// A peer may accept the DTLS connection and read it without ever
+    /// replying (upstream releases do exactly that when they did not
+    /// initiate the connection). Two silent ping rounds used to close such a
+    /// link every few seconds, which froze the pointer at the screen edge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn silent_listener_keeps_the_link_alive() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("silent-listener");
+                let client_cert = unique_cert("silent-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let mut listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(client_cert, manager.clone(), 2000);
+
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 7,
+                    },
+                    handle,
+                )
+                .await
+                .expect("enter");
+                expect_event(&mut listener, |event| {
+                    matches!(event, ProtoEvent::Enter { serial: 7, .. })
+                })
+                .await;
+
+                // No emulation task runs on the listener side, so nothing
+                // ever answers a `Ping`. Stay quiet for longer than the old
+                // two-round limit (about four seconds).
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                assert!(
+                    manager.active_addr(handle).is_some(),
+                    "the one-way link must survive unanswered pings"
+                );
+
+                // Input still flows: the peer reads the connection even
+                // though it never writes to it.
+                conn.send(
+                    ProtoEvent::Input(input_event::Event::Pointer(
+                        input_event::PointerEvent::Motion {
+                            time: 2,
+                            dx: 4.0,
+                            dy: 1.0,
+                        },
+                    )),
+                    handle,
+                )
+                .await
+                .expect("motion after the silent rounds");
+                expect_event(&mut listener, |event| matches!(event, ProtoEvent::Input(_))).await;
+
                 listener.terminate().await;
             })
             .await;
