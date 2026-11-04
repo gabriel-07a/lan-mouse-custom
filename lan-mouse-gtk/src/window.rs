@@ -11,8 +11,8 @@ use gtk::{
 };
 
 use lan_mouse_ipc::{
-    ClientConfig, ClientHandle, ClientState, ClipboardStatus, DEFAULT_PORT, FrontendRequest,
-    FrontendRequestWriter, Position,
+    ClientConfig, ClientHandle, ClientState, ClipboardStatus, DEFAULT_PORT, DiscoveredDevice,
+    FrontendRequest, FrontendRequestWriter, Position,
 };
 
 use crate::{
@@ -48,6 +48,14 @@ impl Window {
             .frontend_request_writer
             .borrow_mut()
             .replace(conn);
+        // Populate the network table without waiting for the user to press
+        // Scan; the service answers with `FrontendEvent::NetworkScan`.
+        window.imp().network_filter.connect_active_notify(clone!(
+            #[weak]
+            window,
+            move |_| window.render_network()
+        ));
+        window.request_scan();
 
         let clipboard_row = adw::ActionRow::new();
         clipboard_row.set_title("Clipboard");
@@ -466,10 +474,143 @@ impl Window {
         self.request(FrontendRequest::EnableEmulation);
     }
 
+    /// Ask the service for a fresh scan of the local network.
+    pub(super) fn request_scan(&self) {
+        self.request(FrontendRequest::ScanNetwork);
+    }
+
+    /// Render the network table.
+    pub(super) fn update_network(&self, devices: Vec<DiscoveredDevice>) {
+        self.imp().network_devices.replace(devices);
+        self.render_network();
+    }
+
+    fn render_network(&self) {
+        let list = &self.imp().network_list;
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+
+        let only_lan_mouse = self.imp().network_filter.is_active();
+        let devices: Vec<DiscoveredDevice> = self
+            .imp()
+            .network_devices
+            .borrow()
+            .iter()
+            .filter(|device| !only_lan_mouse || device.lan_mouse)
+            .cloned()
+            .collect();
+
+        for device in devices {
+            let title = device
+                .hostname
+                .clone()
+                .unwrap_or_else(|| device.ip.to_string());
+            let mut details = vec![device.ip.to_string(), device.link.to_string()];
+            if let Some(version) = &device.version {
+                details.push(format!("v{version}"));
+            }
+            if device.configured {
+                details.push("configured".to_string());
+            }
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(&title))
+                .subtitle(glib::markup_escape_text(&details.join(" · ")))
+                .build();
+
+            let icon = gtk::Image::from_icon_name(device.link.icon_name());
+            icon.set_tooltip_text(Some(match device.link {
+                lan_mouse_ipc::LinkKind::Wired => "reached over a cable",
+                lan_mouse_ipc::LinkKind::Wireless => "reached over Wi-Fi",
+                lan_mouse_ipc::LinkKind::Unknown => "link type unknown",
+            }));
+            row.add_prefix(&icon);
+
+            if device.lan_mouse {
+                let badge = gtk::Image::from_icon_name("emblem-ok-symbolic");
+                badge.add_css_class("success");
+                badge.set_tooltip_text(Some("Lan Mouse is running on this host"));
+                row.add_prefix(&badge);
+            }
+
+            if !device.configured {
+                let add = gtk::Button::from_icon_name("list-add-symbolic");
+                add.add_css_class("flat");
+                add.set_tooltip_text(Some("Add this device"));
+                let parent = self.clone();
+                let address = device.ip.to_string();
+                add.connect_clicked(move |_| parent.request_add_device_with(Some(address.clone())));
+                row.add_suffix(&add);
+
+                let probe = gtk::Button::from_icon_name("system-search-symbolic");
+                probe.add_css_class("flat");
+                probe.set_tooltip_text(Some("Test whether Lan Mouse answers on this host"));
+                let parent = self.clone();
+                let ip = device.ip;
+                let port = device.port.unwrap_or(DEFAULT_PORT);
+                probe.connect_clicked(move |_| parent.confirm_probe(ip, port));
+                row.add_suffix(&probe);
+            }
+
+            list.append(&row);
+        }
+    }
+
+    fn confirm_probe(&self, ip: std::net::IpAddr, port: u16) {
+        let window = adw::Window::builder()
+            .title("Test device")
+            .modal(true)
+            .transient_for(self)
+            .default_width(420)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+
+        let info = gtk::Label::new(Some(&format!(
+            "Send a test connection to {ip}:{port}?\n\nIf Lan Mouse runs there and does \
+             not know this computer yet, that machine will show an authorization request.",
+        )));
+        info.set_wrap(true);
+        info.set_xalign(0.0);
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        let probe = gtk::Button::with_label("Test");
+        probe.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&probe);
+
+        content.append(&info);
+        content.append(&buttons);
+        window.set_content(Some(&content));
+
+        let close_window = window.clone();
+        cancel.connect_clicked(move |_| close_window.close());
+
+        let parent = self.clone();
+        let close_window = window.clone();
+        probe.connect_clicked(move |_| {
+            parent.request(FrontendRequest::ProbeDevice { ip, port });
+            parent.show_toast(&format!("Testing {ip}:{port} …"));
+            close_window.close();
+        });
+
+        window.present();
+    }
+
     /// Collect an address and a screen side, then create the client and
     /// activate it. The peer answers with an authorization request, so this
     /// is the whole "send a connection request" flow.
     pub(super) fn request_add_device(&self) {
+        self.request_add_device_with(None);
+    }
+
+    pub(super) fn request_add_device_with(&self, initial_address: Option<String>) {
         let window = adw::Window::builder()
             .title("Add device")
             .modal(true)
@@ -493,6 +634,9 @@ impl Window {
 
         let entry = gtk::Entry::new();
         entry.set_placeholder_text(Some("192.168.0.10 or hostname"));
+        if let Some(address) = initial_address {
+            entry.set_text(&address);
+        }
 
         let position_label = gtk::Label::new(Some("The other device is on my:"));
         position_label.set_xalign(0.0);

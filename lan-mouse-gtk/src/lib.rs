@@ -308,6 +308,15 @@ fn build_ui(app: &Application) {
                     FrontendEvent::ConnectionAttempt { fingerprint } => {
                         window.request_authorization(&fingerprint);
                     }
+                    FrontendEvent::NetworkScan(devices) => window.update_network(devices),
+                    FrontendEvent::ProbeResult { ip, lan_mouse } => {
+                        let message = if lan_mouse {
+                            format!("{ip}: Lan Mouse is answering on this host")
+                        } else {
+                            format!("{ip}: no Lan Mouse listener found")
+                        };
+                        window.show_toast(&message);
+                    }
                     FrontendEvent::DeviceConnected {
                         fingerprint: _,
                         addr,

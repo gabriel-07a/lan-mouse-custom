@@ -203,6 +203,54 @@ pub struct ClientState {
     pub peer_caps_known: bool,
 }
 
+/// How a device is reached on the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LinkKind {
+    Wired,
+    Wireless,
+    #[default]
+    Unknown,
+}
+
+impl LinkKind {
+    /// Icon name used by the GTK frontend.
+    pub fn icon_name(&self) -> &'static str {
+        match self {
+            LinkKind::Wired => "network-wired-symbolic",
+            LinkKind::Wireless => "network-wireless-symbolic",
+            LinkKind::Unknown => "network-offline-symbolic",
+        }
+    }
+}
+
+impl std::fmt::Display for LinkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkKind::Wired => write!(f, "wired"),
+            LinkKind::Wireless => write!(f, "wireless"),
+            LinkKind::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// One entry of the network table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredDevice {
+    pub ip: std::net::IpAddr,
+    /// Host name reported by the peer (our builds only).
+    pub hostname: Option<String>,
+    /// Listen port reported by the peer.
+    pub port: Option<u16>,
+    /// Build version reported by the peer.
+    pub version: Option<String>,
+    /// Wired/wireless, as reported by the peer or derived from our route.
+    pub link: LinkKind,
+    /// The host answered the discovery beacon (runs this fork).
+    pub lan_mouse: bool,
+    /// Already configured as a client of this machine.
+    pub configured: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
     /// a client was created
@@ -244,6 +292,13 @@ pub enum FrontendEvent {
     ConnectionAttempt { fingerprint: String },
     /// runtime diagnostics (backends, protocol version, …)
     Diagnostics(Diagnostics),
+    /// result of a network scan
+    NetworkScan(Vec<DiscoveredDevice>),
+    /// result of an explicit Lan Mouse probe
+    ProbeResult {
+        ip: std::net::IpAddr,
+        lan_mouse: bool,
+    },
     /// clipboard synchronization status
     ClipboardStatus(ClipboardStatus),
 }
@@ -359,6 +414,10 @@ pub enum FrontendRequest {
     SaveConfiguration,
     /// enable or disable clipboard synchronization
     SetClipboardEnabled(bool),
+    /// rescan the local network
+    ScanNetwork,
+    /// explicitly test a host for a Lan Mouse listener
+    ProbeDevice { ip: std::net::IpAddr, port: u16 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

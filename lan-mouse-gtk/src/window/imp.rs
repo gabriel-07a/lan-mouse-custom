@@ -4,9 +4,11 @@ use adw::subclass::prelude::*;
 use adw::{ActionRow, PreferencesGroup, ToastOverlay, prelude::*};
 use glib::subclass::InitializingObject;
 use gtk::glib::clone;
-use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, Switch, gdk, gio, glib};
+use gtk::{
+    Button, CompositeTemplate, Entry, Image, Label, ListBox, Switch, TemplateChild, gdk, gio, glib,
+};
 
-use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter, Position};
+use lan_mouse_ipc::{DEFAULT_PORT, DiscoveredDevice, FrontendRequestWriter, Position};
 
 use crate::authorization_window::AuthorizationWindow;
 
@@ -56,6 +58,14 @@ pub struct Window {
     pub clipboard_row: RefCell<Option<(ActionRow, Switch)>>,
     pub updating_clipboard: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
+    #[template_child]
+    pub network_list: TemplateChild<gtk::ListBox>,
+    #[template_child]
+    pub scan_button: TemplateChild<Button>,
+    #[template_child]
+    pub network_filter: TemplateChild<Switch>,
+    /// last scan result, kept so the filter can re-render without rescanning
+    pub network_devices: RefCell<Vec<DiscoveredDevice>>,
     /// address and side collected by the "add device" dialog, applied to the
     /// client entry as soon as the service reports its handle
     pub pending_add: RefCell<Option<(String, Position)>>,
@@ -85,6 +95,11 @@ impl Window {
     #[template_callback]
     fn handle_add_client_pressed(&self, _button: &Button) {
         self.obj().request_add_device();
+    }
+
+    #[template_callback]
+    fn handle_scan_pressed(&self, _button: &Button) {
+        self.obj().request_scan();
     }
 
     #[template_callback]

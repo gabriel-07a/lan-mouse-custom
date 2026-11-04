@@ -3,18 +3,18 @@ use crate::{
     client::ClientManager,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
-    crypto,
+    crypto, discovery,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientHandle, ClipboardStatus, Diagnostics, FrontendEvent,
-    FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, ClientHandle, ClipboardStatus, Diagnostics, DiscoveredDevice,
+    FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
 };
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION};
-use local_channel::mpsc::Receiver;
+use local_channel::mpsc::{Receiver, Sender};
 use log;
 use std::{
     cell::Cell,
@@ -25,7 +25,15 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{process::Command, signal, sync::Notify, task::spawn_local};
+use tokio_util::sync::CancellationToken;
+
+/// Background network discovery results.
+#[derive(Debug)]
+enum DiscoveryEvent {
+    Scan(Vec<DiscoveredDevice>),
+    Probe { ip: IpAddr, lan_mouse: bool },
+}
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -69,6 +77,13 @@ pub struct Service {
     /// devices authorized with [`FrontendRequest::AuthorizeDevice`] whose
     /// reverse client entry must be created once their address is known
     pending_reverse: HashMap<String, (String, Position)>,
+    /// results of network scans / probes, produced by background tasks
+    discovery_rx: Receiver<DiscoveryEvent>,
+    discovery_tx: Sender<DiscoveryEvent>,
+    /// cancels the background discovery listener
+    discovery_cancel: CancellationToken,
+    /// certificate used for explicit Lan Mouse probes
+    cert: webrtc_dtls::crypto::Certificate,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// current port
@@ -155,6 +170,7 @@ impl Service {
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
+        let (discovery_tx, discovery_rx) = local_channel::mpsc::channel();
         let port = config.port();
         let service = Self {
             config,
@@ -174,6 +190,10 @@ impl Service {
             resolver,
             authorized_keys,
             pending_reverse: Default::default(),
+            discovery_rx,
+            discovery_tx,
+            discovery_cancel: CancellationToken::new(),
+            cert: cert.clone(),
             public_key_fingerprint,
             client_manager,
             frontend_event_pending: Default::default(),
@@ -201,6 +221,17 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // Answer discovery beacons for the whole session and list what is
+        // currently reachable, so the device table is populated when the
+        // window opens.
+        let discovery_port = discovery::DEFAULT_DISCOVERY_PORT;
+        spawn_local(discovery::beacon_task(
+            self.port,
+            discovery_port,
+            self.discovery_cancel.clone(),
+        ));
+        self.start_scan();
+
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -208,6 +239,7 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.discovery_rx.recv() => self.handle_discovery_event(event),
                 status = self.clipboard_status_rx.recv(), if self.clipboard_status_open => {
                     match status {
                         Some(status) => self.handle_clipboard_status(status),
@@ -220,6 +252,7 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+        self.discovery_cancel.cancel();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating clipboard ...");
@@ -297,6 +330,8 @@ impl Service {
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
+            FrontendRequest::ScanNetwork => self.start_scan(),
+            FrontendRequest::ProbeDevice { ip, port } => self.start_probe(ip, port),
         }
     }
 
@@ -623,6 +658,56 @@ impl Service {
     fn enumerate(&mut self) {
         let clients = self.client_manager.get_client_states();
         self.notify_frontend(FrontendEvent::Enumerate(clients));
+    }
+
+    /// Kick off a background scan of the local subnets.
+    fn start_scan(&self) {
+        let tx = self.discovery_tx.clone();
+        spawn_local(async move {
+            let devices = discovery::scan(discovery::DEFAULT_DISCOVERY_PORT).await;
+            let _ = tx.send(DiscoveryEvent::Scan(devices));
+        });
+    }
+
+    /// Explicitly test a host for a Lan Mouse listener.
+    fn start_probe(&self, ip: IpAddr, port: u16) {
+        let tx = self.discovery_tx.clone();
+        let cert = self.cert.clone();
+        spawn_local(async move {
+            let lan_mouse = discovery::probe_lan_mouse(
+                SocketAddr::new(ip, port),
+                cert,
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+            let _ = tx.send(DiscoveryEvent::Probe { ip, lan_mouse });
+        });
+    }
+
+    fn handle_discovery_event(&mut self, event: Option<DiscoveryEvent>) {
+        match event {
+            Some(DiscoveryEvent::Scan(mut devices)) => {
+                for device in &mut devices {
+                    device.configured = self.client_with_ip(device.ip).is_some();
+                }
+                // Devices that run Lan Mouse and devices that are already
+                // configured are the useful ones; keep them on top of the
+                // (possibly long) list of plain hosts on the network.
+                devices.sort_by_key(|device| {
+                    let ip = match device.ip {
+                        IpAddr::V4(ip) => u32::from(ip),
+                        IpAddr::V6(ip) => ip.segments().iter().map(|s| *s as u32).sum(),
+                    };
+                    (!device.lan_mouse, !device.configured, ip)
+                });
+                log::debug!("network scan found {} device(s)", devices.len());
+                self.notify_frontend(FrontendEvent::NetworkScan(devices));
+            }
+            Some(DiscoveryEvent::Probe { ip, lan_mouse }) => {
+                self.notify_frontend(FrontendEvent::ProbeResult { ip, lan_mouse });
+            }
+            None => {}
+        }
     }
 
     /// Create and activate a client entry for a peer that was just authorized.

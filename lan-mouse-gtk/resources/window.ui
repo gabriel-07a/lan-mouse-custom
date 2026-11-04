@@ -112,6 +112,53 @@
                       </object>
                     </child>
                     <child>
+                      <object class="AdwPreferencesGroup" id="network_group">
+                        <property name="title" translatable="yes">Devices on the network</property>
+                        <property name="header-suffix">
+                          <object class="GtkButton" id="scan_button">
+                            <signal name="clicked" handler="handle_scan_pressed" swapped="true"/>
+                            <property name="child">
+                              <object class="AdwButtonContent">
+                                <property name="icon-name">view-refresh-symbolic</property>
+                                <property name="label" translatable="yes">Scan</property>
+                              </object>
+                            </property>
+                            <style>
+                              <class name="flat"/>
+                            </style>
+                          </object>
+                        </property>
+                        <child>
+                          <object class="AdwActionRow" id="network_filter_row">
+                            <property name="title" translatable="yes">Only devices running Lan Mouse</property>
+                            <property name="subtitle" translatable="yes">Hide the other hosts found on this network</property>
+                            <property name="activatable">True</property>
+                            <property name="activatable-widget">network_filter</property>
+                            <child>
+                              <object class="GtkSwitch" id="network_filter">
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkListBox" id="network_list">
+                            <property name="selection-mode">none</property>
+                            <child type="placeholder">
+                              <object class="AdwActionRow" id="network_placeholder">
+                                <property name="title" translatable="yes">Scanning the local network…</property>
+                                <property name="subtitle" translatable="yes">Hosts without Lan Mouse appear too; a green check marks the ones running it.</property>
+                                <property name="subtitle-lines">2</property>
+                              </object>
+                            </child>
+                            <style>
+                              <class name="boxed-list" />
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
                       <object class="AdwPreferencesGroup" id="capture_emulation_group">
                       <property name="title" translatable="yes">Capture / Emulation Status</property>
                         <child>

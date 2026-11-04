@@ -55,6 +55,8 @@ enum CliSubcommand {
     Deactivate { id: ClientHandle },
     /// list configured clients
     List,
+    /// scan the local network for hosts and Lan Mouse instances
+    Scan,
     /// change hostname
     SetHost {
         id: ClientHandle,
@@ -174,6 +176,29 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                         let ips = state.ips;
                         println!(
                             "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}"
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        CliSubcommand::Scan => {
+            tx.request(FrontendRequest::ScanNetwork).await?;
+            while let Some(event) = rx.next().await {
+                if let FrontendEvent::NetworkScan(devices) = event? {
+                    for device in devices {
+                        let name = device.hostname.unwrap_or_else(|| "-".to_string());
+                        let lm = if device.lan_mouse { "lan-mouse" } else { "-" };
+                        let configured = if device.configured { "configured" } else { "" };
+                        let version = device.version.unwrap_or_default();
+                        println!(
+                            "{:<15} {:<20} {:<8} {:<10} {:<8} {}",
+                            device.ip,
+                            name,
+                            device.link.to_string(),
+                            lm,
+                            version,
+                            configured
                         );
                     }
                     break;
