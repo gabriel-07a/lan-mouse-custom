@@ -238,6 +238,9 @@ async fn run<C: Clipboard>(
                     if connected && known_outgoing.insert(handle) {
                         routes.borrow_mut().insert(handle, Route::Outgoing(handle));
                         sender.ensure_connected(handle);
+                        log::debug!(
+                            "clipboard: client {handle} speaks the clipboard extension, syncing with it"
+                        );
                         sync.add_peer(handle);
                         // Make the clipboard that was copied before the link
                         // came up available on the peer as well.
@@ -247,6 +250,14 @@ async fn run<C: Clipboard>(
                     } else if !connected && known_outgoing.remove(&handle) {
                         routes.borrow_mut().remove(&handle);
                         sync.remove_peer(handle);
+                    } else if !connected
+                        && client_manager.active_addr(handle).is_some()
+                        && !client_manager
+                            .peer_supports(handle, lan_mouse_proto::capabilities::CLIPBOARD)
+                    {
+                        log::debug!(
+                            "clipboard: client {handle} does not advertise the clipboard extension"
+                        );
                     }
                 }
 
@@ -272,6 +283,13 @@ async fn run<C: Clipboard>(
             change = backend.changed() => {
                 match change {
                     Ok(Some(snapshot)) => {
+                        status.detected += 1;
+                        let bytes: usize = snapshot.formats().map(|f| snapshot.get(f).map_or(0, |d| d.len())).sum();
+                        let formats: Vec<&str> = snapshot.formats().map(|f| f.mime()).collect();
+                        log::info!(
+                            "clipboard: local change detected ({bytes} bytes, {formats:?})"
+                        );
+                        let _ = status_tx.send(status.clone());
                         if enabled.get() {
                             sync.on_local_change(snapshot, Instant::now());
                         }

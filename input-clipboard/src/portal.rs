@@ -13,7 +13,7 @@ use std::{
     os::fd::OwnedFd,
     path::PathBuf,
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ashpd::desktop::{
@@ -33,6 +33,10 @@ const TOKEN_FILE: &str = "clipboard.token";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_MIME_BYTES: usize = 16 * 1024 * 1024;
 const PIPE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-format read budget. A slow owner must not block the whole selection.
+const MIME_TIMEOUT: Duration = Duration::from_secs(2);
+/// Total budget for reading one clipboard selection.
+const SELECTION_BUDGET: Duration = Duration::from_secs(4);
 
 /// Check whether the desktop exposes the clipboard portal.
 ///
@@ -150,8 +154,14 @@ impl PortalClipboard {
                 tokio::select! {
                     event = owner_changes.next() => match event {
                         Some((session, event)) => {
+                            // Do not skip events where this session owns the
+                            // selection: after we apply a remote snapshot we
+                            // own it, and on GNOME the flag can stay true for
+                            // later user copies — which silently dropped the
+                            // whole Ubuntu -> Windows direction. The echo is
+                            // dropped by the hash check in the sync layer.
                             if event.session_is_owner() == Some(true) {
-                                continue;
+                                log::trace!("portal clipboard owner is us, re-reading");
                             }
                             if event.mime_types().iter().any(|mime| is_secret_mime(mime)) {
                                 log::debug!("portal clipboard is marked as secret, skipping");
@@ -257,34 +267,75 @@ impl std::fmt::Debug for PortalClipboard {
     }
 }
 
+/// Formats we understand, in the order that is cheapest to read.
+fn canonical_mimes() -> Vec<String> {
+    [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "text/html",
+        "image/png",
+    ]
+    .iter()
+    .map(|mime| (*mime).to_string())
+    .collect()
+}
+
+/// Supported MIME types first (text, then HTML, then image), then the rest.
+fn ordered_mimes(mimes: &[String]) -> Vec<String> {
+    let rank = |mime: &str| match format_for_mime(mime) {
+        Some(Format::Text) => 0,
+        Some(Format::Html) => 1,
+        Some(Format::Png) => 2,
+        None => 3,
+    };
+    let mut ordered = mimes.to_vec();
+    ordered.sort_by_key(|mime| rank(mime));
+    ordered.dedup();
+    ordered
+}
+
 async fn read_selection(
     clipboard: &AshpdClipboard,
     session: &Session<RemoteDesktop>,
     mime_types: &[String],
 ) -> Option<ClipboardSnapshot> {
-    if mime_types.is_empty() {
-        return None;
+    // An event without (usable) MIME types still usually means "the clipboard
+    // changed"; try the canonical list instead of giving up.
+    let mut mimes = ordered_mimes(mime_types);
+    if !mimes.iter().any(|mime| format_for_mime(mime).is_some()) {
+        mimes = canonical_mimes();
     }
+
+    let deadline = Instant::now() + SELECTION_BUDGET;
     let mut snapshot = ClipboardSnapshot::new();
-    for mime in mime_types {
-        let Some(format) = format_for_mime(mime) else {
+    for mime in mimes {
+        let Some(format) = format_for_mime(&mime) else {
             continue;
         };
         if snapshot.get(format).is_some() {
             continue;
         }
-        let read = tokio::time::timeout(PIPE_TIMEOUT, async {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            log::debug!("portal clipboard read budget exhausted");
+            break;
+        }
+        let read = tokio::time::timeout(remaining.min(MIME_TIMEOUT), async {
             let fd = clipboard
-                .selection_read(session, mime)
+                .selection_read(session, &mime)
                 .await
                 .map_err(|e| Error::Backend(format!("selection read: {e}")))?;
             read_fd(fd.into(), MAX_MIME_BYTES).await
         })
         .await;
-        if let Ok(Ok(bytes)) = read {
-            if !bytes.is_empty() {
+        match read {
+            Ok(Ok(bytes)) if !bytes.is_empty() => {
                 snapshot.insert(format, bytes);
             }
+            Ok(Err(e)) => log::debug!("portal clipboard read of {mime} failed: {e}"),
+            Err(_) => log::debug!("portal clipboard read of {mime} timed out"),
+            Ok(Ok(_)) => {}
         }
     }
     (!snapshot.is_empty()).then_some(snapshot)
@@ -419,5 +470,47 @@ mod tests {
             Some(b"<b>hello</b>".to_vec())
         );
         assert_eq!(data_for_mime(&snapshot, "image/png"), None);
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::*;
+
+    #[test]
+    fn supported_mimes_come_first_and_in_cheap_order() {
+        let mimes = vec![
+            "image/png".to_string(),
+            "text/html".to_string(),
+            "application/x-qt-image".to_string(),
+            "UTF8_STRING".to_string(),
+        ];
+        let ordered = ordered_mimes(&mimes);
+        assert_eq!(ordered.first().unwrap(), "UTF8_STRING");
+        assert_eq!(ordered[1], "text/html");
+        assert_eq!(ordered[2], "image/png");
+        // unsupported entries are kept at the end, not dropped
+        assert!(ordered.contains(&"application/x-qt-image".to_string()));
+    }
+
+    #[test]
+    fn canonical_list_has_text_before_image() {
+        let mimes = canonical_mimes();
+        let text = mimes.iter().position(|m| m.contains("text/plain")).unwrap();
+        let png = mimes.iter().position(|m| m == "image/png").unwrap();
+        assert!(text < png);
+    }
+
+    #[test]
+    fn an_event_without_mimes_falls_back_to_the_canonical_list() {
+        let ordered = ordered_mimes(&[]);
+        assert!(ordered.is_empty());
+        // read_selection replaces an unusable list with canonical_mimes();
+        // this asserts the condition it uses.
+        assert!(
+            !canonical_mimes()
+                .iter()
+                .all(|mime| format_for_mime(mime).is_none())
+        );
     }
 }

@@ -93,11 +93,13 @@ impl WindowsClipboard {
     }
 
     async fn open(&self) -> Result<OpenGuard, Error> {
-        for _ in 0..5 {
+        // Another app (clipboard manager, Office, remote desktop) can hold
+        // the clipboard for a few milliseconds.
+        for _ in 0..10 {
             if unsafe { OpenClipboard(None) }.is_ok() {
                 return Ok(OpenGuard);
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Err(Error::Backend(
             "could not open the Windows clipboard (another app is holding it)".into(),

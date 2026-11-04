@@ -335,6 +335,10 @@ pub struct ClipboardStatus {
     pub available: bool,
     /// number of snapshots applied from a peer since startup
     pub applied: u64,
+    /// number of local clipboard changes detected since startup. A zero here
+    /// while copying means the backend is not observing the clipboard at all.
+    #[serde(default)]
+    pub detected: u64,
     /// last error, if any
     pub last_error: Option<String>,
 }
@@ -349,7 +353,10 @@ impl ClipboardStatus {
             return "backend unavailable".to_string();
         }
         let backend = self.backend.as_deref().unwrap_or("unknown backend");
-        let mut summary = format!("{backend} · {} synced", self.applied);
+        let mut summary = format!(
+            "{backend} · {} received · {} local",
+            self.applied, self.detected
+        );
         if let Some(error) = &self.last_error {
             summary.push_str(&format!(" · {error}"));
         }
@@ -640,6 +647,7 @@ mod tests {
             backend: Some("portal".into()),
             available: true,
             applied: 3,
+            detected: 4,
             last_error: None,
         }));
     }
@@ -680,7 +688,12 @@ mod tests {
             applied: 7,
             ..Default::default()
         };
-        assert_eq!(ok.summary(), "portal · 7 synced");
+        assert_eq!(ok.summary(), "portal · 7 received · 0 local");
+        let both = ClipboardStatus {
+            detected: 3,
+            ..ok.clone()
+        };
+        assert_eq!(both.summary(), "portal · 7 received · 3 local");
         let failed = ClipboardStatus {
             last_error: Some("permission denied".into()),
             ..ok

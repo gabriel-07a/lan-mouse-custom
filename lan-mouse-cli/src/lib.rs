@@ -115,6 +115,8 @@ enum CliSubcommand {
 enum ClipboardAction {
     Enable,
     Disable,
+    /// print the current state (backend, counters, last error)
+    Status,
 }
 
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
@@ -290,13 +292,36 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 .await?
         }
         CliSubcommand::SaveConfig => tx.request(FrontendRequest::SaveConfiguration).await?,
-        CliSubcommand::Clipboard { action } => {
-            tx.request(FrontendRequest::SetClipboardEnabled(matches!(
-                action,
-                ClipboardAction::Enable
-            )))
-            .await?
-        }
+        CliSubcommand::Clipboard { action } => match action {
+            ClipboardAction::Status => {
+                // `Sync` makes the service broadcast the current status.
+                tx.request(FrontendRequest::Sync).await?;
+                while let Some(event) = rx.next().await {
+                    if let FrontendEvent::ClipboardStatus(status) = event? {
+                        println!("enabled:   {}", status.enabled);
+                        println!(
+                            "backend:   {}",
+                            status.backend.unwrap_or_else(|| "-".into())
+                        );
+                        println!("available: {}", status.available);
+                        println!("received:  {} snapshot(s) from peers", status.applied);
+                        println!("detected:  {} local change(s)", status.detected);
+                        match status.last_error {
+                            Some(error) => println!("last error: {error}"),
+                            None => println!("last error: -"),
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            action => {
+                tx.request(FrontendRequest::SetClipboardEnabled(matches!(
+                    action,
+                    ClipboardAction::Enable
+                )))
+                .await?
+            }
+        },
     }
     Ok(())
 }
@@ -399,6 +424,13 @@ mod tests {
             args.command,
             CliSubcommand::Clipboard {
                 action: ClipboardAction::Disable
+            }
+        ));
+        let args = parse(&["lan-mouse-cli", "clipboard", "status"]);
+        assert!(matches!(
+            args.command,
+            CliSubcommand::Clipboard {
+                action: ClipboardAction::Status
             }
         ));
         assert!(CliArgs::try_parse_from(["lan-mouse-cli", "clipboard", "maybe"]).is_err());
