@@ -196,6 +196,11 @@ pub struct ClientState {
     /// optional protocol features advertised by the peer
     #[serde(default)]
     pub peer_capabilities: u32,
+    /// whether [`Self::peer_capabilities`] was actually reported by the peer
+    /// (a legacy peer never reports anything, which is not the same as
+    /// "not asked yet").
+    #[serde(default)]
+    pub peer_caps_known: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -474,6 +479,7 @@ mod tests {
             peer_commit: Some(*b"abcd1234"),
             peer_proto_version: 1,
             peer_capabilities: 0b101,
+            peer_caps_known: true,
         };
         let decoded = json_roundtrip(state);
         assert_eq!(decoded.rtt_ms, Some(12));

@@ -511,8 +511,14 @@ handles text, HTML and small PNG images; large payloads (INCR) are skipped.
 
 ### Peers running an upstream release
 
-Peers advertise optional features in their `Hello` handshake, and everything
-added by this fork is negotiated:
+Peers advertise optional features in the `Pong` they send for the first `Ping`
+of a connection. The trailing bytes are ignored by older releases, so the
+negotiation itself can never break them. The `Hello` build handshake is only
+sent once a peer has proved that it understands it: released versions before
+`Hello` existed disconnect on an unknown event id, which used to turn the
+outgoing connection into a write-only one that the peer never answered.
+
+Everything this fork adds is negotiated:
 
 | Feature | Peer without the extension |
 | --- | --- |

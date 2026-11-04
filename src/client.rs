@@ -335,15 +335,24 @@ impl ClientManager {
             s.peer_commit = commit;
             s.peer_proto_version = proto_version;
             s.peer_capabilities = capabilities;
+            s.peer_caps_known = true;
         }
     }
 
-    /// Capabilities advertised by the peer in its `Hello`, if any.
+    /// Record capabilities learned from a `Pong`, before any `Hello` arrives.
+    pub(crate) fn set_peer_capabilities(&self, handle: ClientHandle, capabilities: u32) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            s.peer_capabilities = capabilities;
+            s.peer_caps_known = true;
+        }
+    }
+
+    /// Capabilities advertised by the peer, if it reported any.
     pub(crate) fn peer_capabilities(&self, handle: ClientHandle) -> Option<u32> {
         self.clients
             .borrow()
             .get(handle as usize)
-            .and_then(|(_, s)| s.peer_commit.map(|_| s.peer_capabilities))
+            .and_then(|(_, s)| s.peer_caps_known.then_some(s.peer_capabilities))
     }
 
     /// Whether the peer advertised `cap` in its `Hello`. Peers that have not

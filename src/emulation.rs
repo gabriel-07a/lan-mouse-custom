@@ -227,7 +227,13 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
-                            ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
+                            ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong {
+                                alive: self.emulation_proxy.emulation_active.get(),
+                                // Advertise what we understand so the peer
+                                // can enable the extensions safely. Legacy
+                                // peers ignore the trailing bytes.
+                                capabilities: Some(CAPABILITIES),
+                            }).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
                             // receive_loop populates its `peer_commit`,

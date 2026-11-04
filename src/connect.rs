@@ -84,6 +84,11 @@ struct ConnCtx {
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     /// timestamp of the last ping sent, used to derive RTT from `Pong`
     ping_sent: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
+    /// addresses that already received our build `Hello`. A `Hello` is only
+    /// sent once the peer proved it understands the extension by answering a
+    /// `Ping` with capabilities: older releases close the connection when
+    /// they receive an event id they do not know.
+    hello_sent: Rc<RefCell<HashSet<SocketAddr>>>,
     /// how long a single `send` blocks waiting for a connection
     grace: Duration,
 }
@@ -245,6 +250,7 @@ impl LanMouseConnection {
             clipboard_tx,
             ping_response: Default::default(),
             ping_sent: Default::default(),
+            hello_sent: Default::default(),
             grace: Duration::from_millis(connect_grace_ms),
         };
         Self {
@@ -486,18 +492,10 @@ async fn connect_to_handle(
         ctx.fast_conns.borrow_mut().insert(handle, conn.clone());
         ctx.notify_connected(handle, true);
 
-        // Best-effort version handshake. Sent once immediately after the
-        // DTLS handshake; the listen side mirrors a Hello back.
-        let (buf, len) = ProtoEvent::Hello {
-            commit: local_commit(),
-            proto_version: lan_mouse_proto::PROTO_VERSION,
-            capabilities: lan_mouse_proto::CAPABILITIES,
-        }
-        .into();
-        if let Err(e) = conn.send(&buf[..len]).await {
-            log::debug!("hello send to {addr} failed: {e}");
-        }
-
+        // The version handshake is deferred until the peer answers a `Ping`
+        // with capabilities: releases predating `Hello` disconnect on an
+        // unknown event id, which would silently make this connection
+        // write-only.
         spawn_local(ping_pong(ctx.clone(), addr, conn.clone()));
         spawn_local(receive_loop(ctx.clone(), handle, addr, conn));
         Ok(())
@@ -631,6 +629,24 @@ async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
     }
 }
 
+/// Send our build `Hello` once per connection, as soon as the peer proved it
+/// can decode events added by this fork.
+async fn send_hello_once(ctx: &ConnCtx, addr: SocketAddr, conn: &ArcConn) {
+    if !ctx.hello_sent.borrow_mut().insert(addr) {
+        return;
+    }
+    let (buf, len) = ProtoEvent::Hello {
+        commit: local_commit(),
+        proto_version: lan_mouse_proto::PROTO_VERSION,
+        capabilities: lan_mouse_proto::CAPABILITIES,
+    }
+    .into();
+    if let Err(e) = conn.send(&buf[..len]).await {
+        ctx.hello_sent.borrow_mut().remove(&addr);
+        log::debug!("hello send to {addr} failed: {e}");
+    }
+}
+
 async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn: ArcConn) {
     let mut buf = [0u8; MAX_CLIPBOARD_FRAME];
     loop {
@@ -653,13 +669,21 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
-                    ProtoEvent::Pong(b) => {
+                    ProtoEvent::Pong {
+                        alive,
+                        capabilities,
+                    } => {
                         ctx.client_manager.set_active_addr(handle, Some(addr));
-                        ctx.client_manager.set_alive(handle, b);
+                        ctx.client_manager.set_alive(handle, alive);
                         ctx.ping_response.borrow_mut().insert(addr);
                         if let Some(sent) = ctx.ping_sent.borrow().get(&addr).copied() {
                             let rtt = sent.elapsed().as_millis().min(u32::MAX as u128) as u32;
                             ctx.client_manager.set_rtt_ms(handle, Some(rtt));
+                        }
+                        if let Some(capabilities) = capabilities {
+                            ctx.client_manager
+                                .set_peer_capabilities(handle, capabilities);
+                            send_hello_once(&ctx, addr, &conn).await;
                         }
                     }
                     ProtoEvent::Hello {
@@ -1030,11 +1054,32 @@ mod tests {
 
                 // No emulation task runs on the listener side, so nothing
                 // ever answers a `Ping`. Stay quiet for longer than the old
-                // two-round limit (about four seconds).
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                // two-round limit (about four seconds), draining whatever
+                // arrives to check for a premature `Hello`.
+                let mut seen_hello = false;
+                let quiet_until = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < quiet_until {
+                    match tokio::time::timeout(Duration::from_millis(100), listener.next()).await {
+                        Ok(Some(ListenEvent::Msg { event, .. })) => {
+                            if matches!(event, ProtoEvent::Hello { .. }) {
+                                seen_hello = true;
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {}
+                    }
+                }
                 assert!(
                     manager.active_addr(handle).is_some(),
                     "the one-way link must survive unanswered pings"
+                );
+
+                // The version `Hello` must not have been sent: an event id
+                // this fork added makes older releases drop the connection.
+                assert!(
+                    !seen_hello,
+                    "a Hello must never be sent to a peer that did not                      advertise capabilities"
                 );
 
                 // Input still flows: the peer reads the connection even
@@ -1054,6 +1099,70 @@ mod tests {
                 expect_event(&mut listener, |event| matches!(event, ProtoEvent::Input(_))).await;
 
                 listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// A peer from this fork advertises its capabilities in the `Pong` for
+    /// our first `Ping`; only then do we send the `Hello` carrying our build
+    /// hash, because older releases disconnect on the unknown event id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn capabilities_are_learned_from_pong_before_the_hello() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("caps-listener");
+                let client_cert = unique_cert("caps-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+
+                let (clipboard_tx, _clipboard_rx) = local_channel::mpsc::channel();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    listener,
+                    clipboard_tx,
+                );
+
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(client_cert, manager.clone(), 2000);
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 3,
+                    },
+                    handle,
+                )
+                .await
+                .expect("enter");
+
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut hello_caps = None;
+                while Instant::now() < deadline {
+                    match tokio::time::timeout(Duration::from_millis(500), emulation.event()).await
+                    {
+                        Ok(EmulationEvent::PeerHello { capabilities, .. }) => {
+                            hello_caps = Some(capabilities);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => {}
+                    }
+                }
+
+                assert_eq!(
+                    hello_caps,
+                    Some(lan_mouse_proto::CAPABILITIES),
+                    "the Hello must carry our capabilities once the peer proved it speaks them"
+                );
+                assert_eq!(
+                    manager.peer_capabilities(handle),
+                    Some(lan_mouse_proto::CAPABILITIES),
+                    "capabilities learned from the Pong are stored before the Hello"
+                );
+                assert!(manager.peer_supports(handle, lan_mouse_proto::capabilities::ENTER_ACK));
+
+                emulation.terminate().await;
             })
             .await;
     }

@@ -98,8 +98,18 @@ pub enum ProtoEvent {
     /// Ping event for tracking unresponsive clients.
     /// A client has to respond with [`ProtoEvent::Pong`].
     Ping,
-    /// Response to [`ProtoEvent::Ping`], true if emulation is enabled / available
-    Pong(bool),
+    /// Response to [`ProtoEvent::Ping`]. `alive` is true if emulation is
+    /// enabled / available.
+    ///
+    /// Peers from this fork append the optional capabilities they support.
+    /// Legacy peers send only the bool, and their decoders ignore the
+    /// trailing bytes, which is why this extension cannot break them (unlike
+    /// a new event type: releases before `Hello` existed close the
+    /// connection when they see an unknown event id).
+    Pong {
+        alive: bool,
+        capabilities: Option<u32>,
+    },
     /// Build identification for the sending peer. Sent by the
     /// connect side once after the connection authenticates, and
     /// echoed back by the listen side in reply, so each end can
@@ -125,12 +135,19 @@ impl Display for ProtoEvent {
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
             ProtoEvent::Ping => write!(f, "ping"),
-            ProtoEvent::Pong(alive) => {
+            ProtoEvent::Pong {
+                alive,
+                capabilities,
+            } => {
                 write!(
                     f,
                     "pong: {}",
                     if *alive { "alive" } else { "not available" }
-                )
+                )?;
+                if let Some(capabilities) = capabilities {
+                    write!(f, " (caps={capabilities:#x})")?;
+                }
+                Ok(())
             }
             ProtoEvent::Hello {
                 commit,
@@ -177,7 +194,7 @@ impl ProtoEvent {
                 },
             },
             ProtoEvent::Ping => EventType::Ping,
-            ProtoEvent::Pong(_) => EventType::Pong,
+            ProtoEvent::Pong { .. } => EventType::Pong,
             ProtoEvent::Enter { .. } => EventType::Enter,
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
@@ -232,7 +249,20 @@ impl TryFrom<&[u8]> for ProtoEvent {
                 },
             ))),
             EventType::Ping => Ok(Self::Ping),
-            EventType::Pong => Ok(Self::Pong(decode_u8(&mut buf)? != 0)),
+            EventType::Pong => {
+                let alive = decode_u8(&mut buf)? != 0;
+                // Peers from this fork append their capabilities; legacy
+                // peers send only the flag.
+                let capabilities = if buf.len() >= size_of::<u32>() {
+                    Some(decode_u32(&mut buf)?)
+                } else {
+                    None
+                };
+                Ok(Self::Pong {
+                    alive,
+                    capabilities,
+                })
+            }
             EventType::Enter => {
                 let pos = decode_u8(&mut buf)?.try_into()?;
                 // Legacy peers only send the position; newer peers append
@@ -327,7 +357,15 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     },
                 },
                 ProtoEvent::Ping => {}
-                ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
+                ProtoEvent::Pong {
+                    alive,
+                    capabilities,
+                } => {
+                    encode_u8(buf, len, alive as u8);
+                    if let Some(capabilities) = capabilities {
+                        encode_u32(buf, len, capabilities);
+                    }
+                }
                 ProtoEvent::Enter { pos, serial } => {
                     encode_u8(buf, len, pos as u8);
                     encode_u32(buf, len, serial);
@@ -438,7 +476,10 @@ mod tests {
                 group: 4,
             })),
             ProtoEvent::Ping,
-            ProtoEvent::Pong(true),
+            ProtoEvent::Pong {
+                alive: true,
+                capabilities: None,
+            },
             ProtoEvent::Enter {
                 pos: Position::Right,
                 serial: 7,
@@ -463,8 +504,29 @@ mod tests {
     #[test]
     fn golden_vectors() {
         assert_eq!(encode(ProtoEvent::Ping), vec![6]);
-        assert_eq!(encode(ProtoEvent::Pong(false)), vec![7, 0]);
-        assert_eq!(encode(ProtoEvent::Pong(true)), vec![7, 1]);
+        assert_eq!(
+            encode(ProtoEvent::Pong {
+                alive: false,
+                capabilities: None
+            }),
+            vec![7, 0]
+        );
+        assert_eq!(
+            encode(ProtoEvent::Pong {
+                alive: true,
+                capabilities: None
+            }),
+            vec![7, 1]
+        );
+        // A peer from this fork appends its capabilities; legacy peers
+        // ignore the trailing bytes.
+        assert_eq!(
+            encode(ProtoEvent::Pong {
+                alive: true,
+                capabilities: Some(0x11)
+            }),
+            vec![7, 1, 0, 0, 0, 0x11]
+        );
         assert_eq!(
             encode(ProtoEvent::Enter {
                 pos: Position::Top,
@@ -639,7 +701,10 @@ mod extra_tests {
                 group: rng.next_u32(),
             })),
             6 => ProtoEvent::Ping,
-            7 => ProtoEvent::Pong(rng.next_u32() % 2 == 1),
+            7 => ProtoEvent::Pong {
+                alive: rng.next_u32() % 2 == 1,
+                capabilities: None,
+            },
             8 => ProtoEvent::Enter {
                 pos: rng.position(),
                 serial: rng.next_u32(),
@@ -741,7 +806,13 @@ mod extra_tests {
             ),
             (ProtoEvent::Leave(1), "Leave"),
             (ProtoEvent::Ack(2), "Ack"),
-            (ProtoEvent::Pong(true), "pong"),
+            (
+                ProtoEvent::Pong {
+                    alive: true,
+                    capabilities: None,
+                },
+                "pong",
+            ),
         ];
         for (event, needle) in cases {
             let rendered = format!("{event}");
