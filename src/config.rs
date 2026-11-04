@@ -76,6 +76,8 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    /// addresses that may connect without an authorization prompt
+    trusted_ips: Option<Vec<String>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, Eq, PartialEq)]
@@ -509,6 +511,14 @@ impl Config {
     }
 
     /// public key fingerprints authorized for connection
+    /// addresses (IP or CIDR) allowed to connect without a prompt
+    pub fn trusted_ips(&self) -> Vec<String> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.trusted_ips.clone())
+            .unwrap_or_default()
+    }
+
     pub fn authorized_fingerprints(&self) -> HashMap<String, String> {
         self.config_toml
             .as_ref()
@@ -616,6 +626,18 @@ impl Config {
         }
         self.config_toml.as_mut().expect("config").clients =
             Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+    }
+
+    /// set the trusted address allowlist
+    pub fn set_trusted_ips(&mut self, trusted: Vec<String>) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml.as_mut().expect("config").trusted_ips = if trusted.is_empty() {
+            None
+        } else {
+            Some(trusted)
+        };
     }
 
     /// set authorized keys

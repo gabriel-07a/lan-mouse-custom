@@ -17,6 +17,8 @@ pub struct AuthorizationWindow {
     #[template_child]
     pub position: TemplateChild<adw::ComboRow>,
     #[template_child]
+    pub peer: TemplateChild<Label>,
+    #[template_child]
     pub cancel_button: TemplateChild<Button>,
     #[template_child]
     pub confirm_button: TemplateChild<Button>,
@@ -57,6 +59,10 @@ impl AuthorizationWindow {
 
     pub(super) fn set_fingerprint(&self, fingerprint: &str) {
         self.fingerprint.set_text(fingerprint);
+    }
+
+    pub(super) fn set_peer(&self, addr: std::net::SocketAddr) {
+        self.peer.set_text(&format!("Device at {}", addr.ip()));
     }
 }
 

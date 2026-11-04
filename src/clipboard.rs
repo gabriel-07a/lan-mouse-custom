@@ -415,6 +415,7 @@ mod tests {
                         client_fp,
                         "peer".to_string(),
                     )]))),
+                    Arc::new(RwLock::new(Vec::new())),
                 )
                 .await
                 .expect("listener");
@@ -451,7 +452,8 @@ mod tests {
                     match event {
                         ListenEvent::Clipboard { frame, addr } => break (frame, addr),
                         ListenEvent::Accept { .. } | ListenEvent::Msg { .. } => {}
-                        ListenEvent::Rejected { fingerprint } => {
+                        ListenEvent::AutoAuthorized { .. } => {}
+                        ListenEvent::Rejected { fingerprint, .. } => {
                             panic!("unexpected rejection: {fingerprint}")
                         }
                     }

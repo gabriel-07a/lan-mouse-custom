@@ -865,9 +865,14 @@ mod tests {
             .enumerate()
             .map(|(i, fp)| (fp, format!("peer-{i}")))
             .collect::<HashMap<_, _>>();
-        LanMouseListener::new(port, cert, Arc::new(RwLock::new(keys)))
-            .await
-            .expect("listener")
+        LanMouseListener::new(
+            port,
+            cert,
+            Arc::new(RwLock::new(keys)),
+            Arc::new(RwLock::new(Vec::new())),
+        )
+        .await
+        .expect("listener")
     }
 
     async fn expect_event(listener: &mut LanMouseListener, matches: impl Fn(&ProtoEvent) -> bool) {
@@ -878,8 +883,9 @@ mod tests {
                 .expect("listener stream closed");
             match event {
                 ListenEvent::Accept { .. } => continue,
+                ListenEvent::AutoAuthorized { .. } => continue,
                 ListenEvent::Clipboard { .. } => continue,
-                ListenEvent::Rejected { fingerprint } => {
+                ListenEvent::Rejected { fingerprint, .. } => {
                     panic!("peer rejected: {fingerprint}")
                 }
                 ListenEvent::Msg { event, .. } => {
@@ -1167,6 +1173,74 @@ mod tests {
             .await;
     }
 
+    /// An address in the allowlist is trusted on first use: the handshake
+    /// succeeds without a prompt and the certificate is stored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn allowlisted_address_is_authorized_without_a_prompt() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("trusted-listener");
+                let client_cert = unique_cert("trusted-client");
+                let fingerprint = crypto::certificate_fingerprint(&client_cert);
+
+                let authorized: Arc<RwLock<HashMap<String, String>>> =
+                    Arc::new(RwLock::new(HashMap::new()));
+                let trusted = Arc::new(RwLock::new(vec![
+                    crate::trusted::TrustedNet::parse("127.0.0.1").expect("cidr"),
+                ]));
+                let mut listener =
+                    LanMouseListener::new(port, listener_cert, authorized.clone(), trusted)
+                        .await
+                        .expect("listener");
+
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(client_cert, manager, 2000);
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 5,
+                    },
+                    handle,
+                )
+                .await
+                .expect("allowlisted peer connects");
+
+                // The listener reports the automatic decision and then the
+                // usual acceptance.
+                let mut auto = false;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline && !auto {
+                    let event = tokio::time::timeout(Duration::from_secs(10), listener.next())
+                        .await
+                        .expect("timed out")
+                        .expect("listener closed");
+                    match event {
+                        ListenEvent::AutoAuthorized {
+                            fingerprint: reported,
+                            ..
+                        } => {
+                            assert_eq!(reported, fingerprint);
+                            auto = true;
+                        }
+                        ListenEvent::Rejected { .. } => {
+                            panic!("an allowlisted address must not be rejected")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(auto, "expected an automatic authorization");
+                assert!(
+                    authorized.read().expect("lock").contains_key(&fingerprint),
+                    "the certificate must be stored for later connections"
+                );
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn unauthorized_peer_is_rejected() {
         let local = LocalSet::new();
@@ -1193,7 +1267,8 @@ mod tests {
                             .expect("timeout")
                             .expect("listener closed");
                     match event {
-                        ListenEvent::Rejected { fingerprint } => {
+                        ListenEvent::AutoAuthorized { .. } => {}
+                        ListenEvent::Rejected { fingerprint, .. } => {
                             assert_eq!(fingerprint, client_fp);
                             rejected = true;
                             break;

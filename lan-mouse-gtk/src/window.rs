@@ -50,6 +50,17 @@ impl Window {
             .replace(conn);
         // Populate the network table without waiting for the user to press
         // Scan; the service answers with `FrontendEvent::NetworkScan`.
+        window.imp().trusted_entry.connect_activate(clone!(
+            #[weak]
+            window,
+            move |entry| {
+                let address = entry.text().to_string();
+                if !address.trim().is_empty() {
+                    window.trust_address(address);
+                    entry.set_text("");
+                }
+            }
+        ));
         window.imp().network_search.connect_search_changed(clone!(
             #[weak]
             window,
@@ -474,6 +485,34 @@ impl Window {
         self.request(FrontendRequest::EnableEmulation);
     }
 
+    /// Add an address to the allowlist.
+    pub(super) fn trust_address(&self, address: String) {
+        self.request(FrontendRequest::TrustAddress(address));
+    }
+
+    /// Render the allowlist.
+    pub(super) fn update_trusted_addresses(&self, addresses: Vec<String>) {
+        let list = &self.imp().trusted_list;
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+        for address in addresses {
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(&address))
+                .build();
+            let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+            delete.add_css_class("flat");
+            delete.set_tooltip_text(Some("Remove this address"));
+            let parent = self.clone();
+            let address = address.clone();
+            delete.connect_clicked(move |_| {
+                parent.request(FrontendRequest::UntrustAddress(address.clone()));
+            });
+            row.add_suffix(&delete);
+            list.append(&row);
+        }
+    }
+
     /// Ask the service for a fresh scan of the local network.
     pub(super) fn request_scan(&self) {
         self.request(FrontendRequest::ScanNetwork);
@@ -830,11 +869,11 @@ impl Window {
         self.imp().fingerprint_row.set_subtitle(fingerprint);
     }
 
-    pub(super) fn request_authorization(&self, fingerprint: &str) {
+    pub(super) fn request_authorization(&self, addr: std::net::SocketAddr, fingerprint: &str) {
         if let Some(w) = self.imp().authorization_window.borrow_mut().take() {
             w.close();
         }
-        let window = AuthorizationWindow::new(fingerprint);
+        let window = AuthorizationWindow::new(addr, fingerprint);
         window.set_transient_for(Some(self));
         window.connect_closure(
             "confirm-clicked",

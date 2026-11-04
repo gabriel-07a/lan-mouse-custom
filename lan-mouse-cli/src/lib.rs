@@ -57,6 +57,10 @@ enum CliSubcommand {
     List,
     /// scan the local network for hosts and Lan Mouse instances
     Scan,
+    /// allow connections from an address (IP or CIDR) without a prompt
+    Trust { address: String },
+    /// remove an address from the allowlist
+    Untrust { address: String },
     /// change hostname
     SetHost {
         id: ClientHandle,
@@ -204,6 +208,16 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     break;
                 }
             }
+        }
+        CliSubcommand::Trust { address } => {
+            tx.request(FrontendRequest::TrustAddress(address.clone()))
+                .await?;
+            println!("trusted {address}: connections from it are accepted without a prompt");
+        }
+        CliSubcommand::Untrust { address } => {
+            tx.request(FrontendRequest::UntrustAddress(address.clone()))
+                .await?;
+            println!("removed {address} from the allowlist");
         }
         CliSubcommand::SetHost { id, host } => {
             tx.request(FrontendRequest::UpdateHostname(id, host))

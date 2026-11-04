@@ -82,6 +82,10 @@ pub struct Service {
     discovery_tx: Sender<DiscoveryEvent>,
     /// cancels the background discovery listener
     discovery_cancel: CancellationToken,
+    /// addresses that may connect without an authorization prompt
+    trusted_nets: Arc<RwLock<Vec<crate::trusted::TrustedNet>>>,
+    /// raw allowlist entries as written by the user
+    trusted_ips: Vec<String>,
     /// certificate used for explicit Lan Mouse probes
     cert: webrtc_dtls::crypto::Certificate,
     /// (outgoing) client information
@@ -127,9 +131,16 @@ impl Service {
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let trusted_ips = config.trusted_ips();
+        let trusted_nets = Arc::new(RwLock::new(crate::trusted::parse_all(&trusted_ips)));
         // listener + connection
-        let listener =
-            LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+        let listener = LanMouseListener::new(
+            config.port(),
+            cert.clone(),
+            authorized_keys.clone(),
+            trusted_nets.clone(),
+        )
+        .await?;
         let mut conn = LanMouseConnection::new(
             cert.clone(),
             client_manager.clone(),
@@ -193,6 +204,8 @@ impl Service {
             discovery_rx,
             discovery_tx,
             discovery_cancel: CancellationToken::new(),
+            trusted_nets,
+            trusted_ips,
             cert: cert.clone(),
             public_key_fingerprint,
             client_manager,
@@ -332,6 +345,14 @@ impl Service {
             FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
             FrontendRequest::ScanNetwork => self.start_scan(),
             FrontendRequest::ProbeDevice { ip, port } => self.start_probe(ip, port),
+            FrontendRequest::TrustAddress(entry) => {
+                self.trust_address(entry);
+                self.save_config();
+            }
+            FrontendRequest::UntrustAddress(entry) => {
+                self.untrust_address(&entry);
+                self.save_config();
+            }
         }
     }
 
@@ -394,8 +415,8 @@ impl Service {
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
-            EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
+            EmulationEvent::ConnectionAttempt { addr, fingerprint } => {
+                self.notify_frontend(FrontendEvent::ConnectionAttempt { addr, fingerprint });
             }
             EmulationEvent::Entered {
                 addr,
@@ -437,6 +458,18 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::AutoAuthorized { addr, fingerprint } => {
+                // The listener already trusted the certificate because the
+                // address is allowlisted; persist it so the next connection
+                // matches by fingerprint instead of by address.
+                let keys = self.authorized_keys.read().expect("lock").clone();
+                self.config.set_authorized_keys(keys);
+                self.save_config();
+                log::info!("auto-authorized {addr} ({fingerprint}) from a trusted address");
+                let keys = self.authorized_keys.read().expect("lock").clone();
+                self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+                self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
+            }
             EmulationEvent::Connected { addr, fingerprint } => {
                 // The peer that was just authorized also becomes a configured
                 // client, so it can control this device too.
@@ -532,6 +565,7 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_frontend(FrontendEvent::TrustedAddresses(self.trusted_ips.clone()));
         self.notify_frontend(FrontendEvent::ClipboardStatus(
             self.clipboard_status.clone(),
         ));
@@ -658,6 +692,40 @@ impl Service {
     fn enumerate(&mut self) {
         let clients = self.client_manager.get_client_states();
         self.notify_frontend(FrontendEvent::Enumerate(clients));
+    }
+
+    /// Add an address (IP or CIDR) to the allowlist.
+    fn trust_address(&mut self, entry: String) {
+        let entry = entry.trim().to_string();
+        if crate::trusted::TrustedNet::parse(&entry).is_none() {
+            log::warn!("ignoring invalid trusted address `{entry}`");
+            return;
+        }
+        if self.trusted_ips.iter().any(|e| e == &entry) {
+            return;
+        }
+        self.trusted_ips.push(entry.clone());
+        self.refresh_trusted_nets();
+        self.config.set_trusted_ips(self.trusted_ips.clone());
+        log::info!("trusted address added: {entry}");
+        self.notify_frontend(FrontendEvent::TrustedAddresses(self.trusted_ips.clone()));
+    }
+
+    fn untrust_address(&mut self, entry: &str) {
+        let before = self.trusted_ips.len();
+        self.trusted_ips.retain(|e| e != entry);
+        if self.trusted_ips.len() == before {
+            return;
+        }
+        self.refresh_trusted_nets();
+        self.config.set_trusted_ips(self.trusted_ips.clone());
+        log::info!("trusted address removed: {entry}");
+        self.notify_frontend(FrontendEvent::TrustedAddresses(self.trusted_ips.clone()));
+    }
+
+    fn refresh_trusted_nets(&self) {
+        let nets = crate::trusted::parse_all(&self.trusted_ips);
+        *self.trusted_nets.write().expect("lock") = nets;
     }
 
     /// Kick off a background scan of the local subnets.

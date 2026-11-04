@@ -64,6 +64,10 @@ pub struct Window {
     pub scan_button: TemplateChild<Button>,
     #[template_child]
     pub network_search: TemplateChild<gtk::SearchEntry>,
+    #[template_child]
+    pub trusted_entry: TemplateChild<Entry>,
+    #[template_child]
+    pub trusted_list: TemplateChild<gtk::ListBox>,
     /// last scan result, kept so the filter can re-render without rescanning
     pub network_devices: RefCell<Vec<DiscoveredDevice>>,
     /// address and side collected by the "add device" dialog, applied to the
@@ -100,6 +104,15 @@ impl Window {
     #[template_callback]
     fn handle_scan_pressed(&self, _button: &Button) {
         self.obj().request_scan();
+    }
+
+    #[template_callback]
+    fn handle_trust_address(&self, _button: &Button) {
+        let entry = self.trusted_entry.text().to_string();
+        if !entry.trim().is_empty() {
+            self.obj().trust_address(entry);
+            self.trusted_entry.set_text("");
+        }
     }
 
     #[template_callback]

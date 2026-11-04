@@ -305,10 +305,13 @@ fn build_ui(app: &Application) {
                     FrontendEvent::EmulationStatus(s) => window.set_emulation(s.into()),
                     FrontendEvent::AuthorizedUpdated(keys) => window.set_authorized_keys(keys),
                     FrontendEvent::PublicKeyFingerprint(fp) => window.set_pk_fp(&fp),
-                    FrontendEvent::ConnectionAttempt { fingerprint } => {
-                        window.request_authorization(&fingerprint);
+                    FrontendEvent::ConnectionAttempt { addr, fingerprint } => {
+                        window.request_authorization(addr, &fingerprint);
                     }
                     FrontendEvent::NetworkScan(devices) => window.update_network(devices),
+                    FrontendEvent::TrustedAddresses(addresses) => {
+                        window.update_trusted_addresses(addresses)
+                    }
                     FrontendEvent::ProbeResult { ip, lan_mouse } => {
                         let message = if lan_mouse {
                             format!("{ip}: Lan Mouse is answering on this host")

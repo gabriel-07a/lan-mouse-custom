@@ -112,6 +112,49 @@
                       </object>
                     </child>
                     <child>
+                      <object class="AdwPreferencesGroup" id="trusted_group">
+                        <property name="title" translatable="yes">Allowed addresses</property>
+                        <property name="description" translatable="yes">Devices connecting from these addresses are authorized without a prompt. An IP or a CIDR range, e.g. 192.168.1.50 or 10.0.0.0/24.</property>
+                        <child>
+                          <object class="AdwActionRow" id="trusted_add_row">
+                            <property name="title" translatable="yes">Add an address</property>
+                            <child>
+                              <object class="GtkEntry" id="trusted_entry">
+                                <property name="placeholder-text">192.168.1.50 or 10.0.0.0/24</property>
+                                <property name="valign">center</property>
+                                <property name="width-chars">24</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="trusted_add_button">
+                                <signal name="clicked" handler="handle_trust_address" swapped="true"/>
+                                <property name="icon-name">list-add-symbolic</property>
+                                <property name="valign">center</property>
+                                <style>
+                                  <class name="flat"/>
+                                </style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkListBox" id="trusted_list">
+                            <property name="selection-mode">none</property>
+                            <child type="placeholder">
+                              <object class="AdwActionRow" id="trusted_placeholder">
+                                <property name="title" translatable="yes">No allowed addresses</property>
+                                <property name="subtitle" translatable="yes">Every new device has to be approved in the authorization dialog.</property>
+                                <property name="subtitle-lines">2</property>
+                              </object>
+                            </child>
+                            <style>
+                              <class name="boxed-list" />
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
                       <object class="AdwPreferencesGroup" id="network_group">
                         <property name="title" translatable="yes">Devices on the network</property>
                         <property name="header-suffix">

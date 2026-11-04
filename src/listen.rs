@@ -6,11 +6,10 @@ use lan_mouse_proto::{
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
 };
 use thiserror::Error;
 use tokio::{
@@ -21,11 +20,10 @@ use webrtc_dtls::{
     config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
     conn::DTLSConn,
     crypto::Certificate,
-    listener::listen,
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::crypto;
+use crate::{crypto, trusted::TrustedNet};
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -57,6 +55,13 @@ pub(crate) enum ListenEvent {
         fingerprint: String,
     },
     Rejected {
+        addr: SocketAddr,
+        fingerprint: String,
+    },
+    /// A peer connected from an allowlisted address and its certificate was
+    /// adopted without asking the user.
+    AutoAuthorized {
+        addr: SocketAddr,
         fingerprint: String,
     },
 }
@@ -81,48 +86,19 @@ impl LanMouseListener {
         port: u16,
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+        trusted_nets: Arc<RwLock<Vec<TrustedNet>>>,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, mut request_port_change_rx) = channel();
         let (port_changed_tx, port_changed) = channel();
-        let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
-
-        let authorized = authorized_keys.clone();
-        let verify_peer_certificate: Option<VerifyPeerCertificateFn> = {
-            let connection_attempts = connection_attempts.clone();
-            Some(Arc::new(
-                move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
-                        Ok(())
-                    } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
-                        connection_attempts
-                            .lock()
-                            .expect("lock")
-                            .push_back(fingerprint);
-                        Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
-                    }
-                },
-            ))
-        };
         let cfg = Config {
             certificates: vec![cert.clone()],
             extended_master_secret: ExtendedMasterSecretType::Require,
             client_auth: RequireAnyClientCert,
-            verify_peer_certificate,
             ..Default::default()
         };
 
-        let mut listener = bind_listener(port, cfg.clone()).await?;
+        let mut listener = bind_listener(port).await?;
 
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
@@ -130,48 +106,92 @@ impl LanMouseListener {
         let conns_clone = conns.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
-            let connection_attempts = connection_attempts.clone();
+            let authorized = authorized_keys.clone();
+            let trusted = trusted_nets.clone();
             spawn_local(async move {
+                // Bound the number of half-open handshakes so stray UDP
+                // traffic cannot spawn unbounded tasks.
+                let handshakes = Arc::new(tokio::sync::Semaphore::new(32));
                 loop {
-                    let sleep = tokio::time::sleep(Duration::from_secs(2));
                     tokio::select! {
-                        /* workaround for https://github.com/webrtc-rs/webrtc/issues/614 */
-                        _ = sleep => continue,
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 let addr = normalize_addr(addr);
-                                log::info!("dtls client connected, ip: {addr}");
-                                let mut conns = conns_clone.lock().await;
-                                conns.push((addr, conn.clone()));
-                                let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-                                let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
-                                let fingerprint = crypto::generate_fingerprint(cert);
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
-                            },
-                            Err(e) => {
-                                if let Error::Std(ref e) = e {
-                                    if let Some(e) = e.0.downcast_ref::<webrtc_dtls::Error>() {
-                                        match e {
-                                            webrtc_dtls::Error::ErrVerifyDataMismatch => {
-                                                if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
-                                                    listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
-                                                }
+                                let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+                                    log::warn!("too many handshakes in flight, dropping {addr}");
+                                    continue;
+                                };
+                                let listen_tx = listen_tx.clone();
+                                let authorized = authorized.clone();
+                                let trusted = trusted.clone();
+                                let conns = conns_clone.clone();
+                                let cfg = cfg.clone();
+                                spawn_local(async move {
+                                    let _permit = permit;
+                                    let recorded: Arc<Mutex<Option<String>>> = Default::default();
+                                    let auto_authorized =
+                                        Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                    let mut cfg = cfg;
+                                    cfg.verify_peer_certificate = Some(per_connection_verify(
+                                        authorized,
+                                        trusted,
+                                        addr,
+                                        recorded.clone(),
+                                        auto_authorized.clone(),
+                                    ));
+                                    // `false` = server role, as in the
+                                    // upstream listener wrapper.
+                                    match DTLSConn::new(conn, cfg, false, None).await {
+                                        Ok(dtls) => {
+                                            let dtls = Arc::new(dtls);
+                                            log::info!("dtls client connected, ip: {addr}");
+                                            conns.lock().await.push((addr, dtls.clone()));
+                                            let fingerprint = dtls
+                                                .connection_state()
+                                                .await
+                                                .peer_certificates
+                                                .first()
+                                                .map(|cert| crypto::generate_fingerprint(cert))
+                                                .unwrap_or_default();
+                                            if auto_authorized.load(
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            ) {
+                                                let _ = listen_tx.send(
+                                                    ListenEvent::AutoAuthorized {
+                                                        addr,
+                                                        fingerprint: fingerprint.clone(),
+                                                    },
+                                                );
                                             }
-                                            _ => log::warn!("accept: {e}"),
+                                            let _ = listen_tx
+                                                .send(ListenEvent::Accept { addr, fingerprint });
+                                            spawn_local(read_loop(
+                                                conns,
+                                                addr,
+                                                dtls,
+                                                listen_tx,
+                                            ));
                                         }
-                                    } else {
-                                        log::warn!("accept: {e:?}");
+                                        Err(e) => {
+                                            if matches!(
+                                                e,
+                                                webrtc_dtls::Error::ErrVerifyDataMismatch
+                                            ) {
+                                                if let Some(fingerprint) = recorded.lock().expect("lock").take() {
+                                                    let _ = listen_tx.send(ListenEvent::Rejected { addr, fingerprint });
+                                                }
+                                            } else {
+                                                log::debug!("handshake with {addr} failed: {e}");
+                                            }
+                                        }
                                     }
-                                } else {
-                                    log::warn!("accept: {e:?}");
-                                }
+                                });
                             }
+                            Err(e) => log::warn!("accept: {e:?}"),
                         },
                         port = request_port_change_rx.recv() => {
                             let port = port.expect("channel closed");
-                            match bind_listener(port, cfg.clone()).await {
+                            match bind_listener(port).await {
                                 Ok(new_listener) => {
                                     let _ = listener.close().await;
                                     listener = new_listener;
@@ -262,22 +282,71 @@ impl Stream for LanMouseListener {
     }
 }
 
+/// Build the certificate verifier for a single incoming connection.
+///
+/// It runs inside the DTLS handshake, which is the only place that knows both
+/// the peer certificate *and* the address it came from — the address is what
+/// makes an allowlist possible at all.
+fn per_connection_verify(
+    authorized: Arc<RwLock<HashMap<String, String>>>,
+    trusted: Arc<RwLock<Vec<TrustedNet>>>,
+    addr: SocketAddr,
+    recorded: Arc<Mutex<Option<String>>>,
+    auto_authorized: Arc<std::sync::atomic::AtomicBool>,
+) -> VerifyPeerCertificateFn {
+    Arc::new(
+        move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
+            let Some(cert) = certs.first() else {
+                return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+            };
+            let fingerprint = crypto::generate_fingerprint(cert);
+            *recorded.lock().expect("lock") = Some(fingerprint.clone());
+
+            if authorized.read().expect("lock").contains_key(&fingerprint) {
+                return Ok(());
+            }
+
+            // An allowlisted address is trusted on first use: the certificate
+            // is stored, so later connections are matched by fingerprint.
+            let trusted_match = trusted
+                .read()
+                .expect("lock")
+                .iter()
+                .any(|net| net.contains(addr.ip()));
+            if trusted_match {
+                authorized
+                    .write()
+                    .expect("lock")
+                    .insert(fingerprint.clone(), format!("trusted {}", addr.ip()));
+                log::info!(
+                    "trusted address {}: authorizing device {fingerprint}",
+                    addr.ip()
+                );
+                auto_authorized.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+
+            Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+        },
+    )
+}
+
 /// Listen on a dual-stack socket on Linux (IPv4-mapped addresses are
 /// normalized when accepted), and on IPv4 elsewhere.
-async fn bind_listener(port: u16, cfg: Config) -> Result<impl Listener, webrtc_dtls::Error> {
+async fn bind_listener(port: u16) -> Result<impl Listener, webrtc_util::Error> {
     #[cfg(target_os = "linux")]
     let primary = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
     #[cfg(not(target_os = "linux"))]
     let primary = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
 
-    match listen(primary, cfg.clone()).await {
+    match webrtc_util::conn::conn_udp_listener::listen(primary).await {
         Ok(listener) => Ok(listener),
         Err(e) => {
             #[cfg(target_os = "linux")]
             {
                 log::warn!("could not listen on [::]:{port} ({e}); falling back to 0.0.0.0");
                 let fallback = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-                listen(fallback, cfg).await
+                webrtc_util::conn::conn_udp_listener::listen(fallback).await
             }
             #[cfg(not(target_os = "linux"))]
             {

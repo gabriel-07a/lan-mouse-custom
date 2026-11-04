@@ -289,7 +289,10 @@ pub enum FrontendEvent {
     /// incoming disconnected
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
-    ConnectionAttempt { fingerprint: String },
+    ConnectionAttempt {
+        addr: SocketAddr,
+        fingerprint: String,
+    },
     /// runtime diagnostics (backends, protocol version, …)
     Diagnostics(Diagnostics),
     /// result of a network scan
@@ -299,6 +302,8 @@ pub enum FrontendEvent {
         ip: std::net::IpAddr,
         lan_mouse: bool,
     },
+    /// addresses allowed to connect without an authorization prompt
+    TrustedAddresses(Vec<String>),
     /// clipboard synchronization status
     ClipboardStatus(ClipboardStatus),
 }
@@ -418,6 +423,10 @@ pub enum FrontendRequest {
     ScanNetwork,
     /// explicitly test a host for a Lan Mouse listener
     ProbeDevice { ip: std::net::IpAddr, port: u16 },
+    /// allow connections from this address (IP or CIDR) without a prompt
+    TrustAddress(String),
+    /// remove an address from the allowlist
+    UntrustAddress(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -587,6 +596,7 @@ mod tests {
         json_roundtrip(FrontendEvent::CaptureStatus(Status::Disabled));
         json_roundtrip(FrontendEvent::EmulationStatus(Status::Enabled));
         json_roundtrip(FrontendEvent::ConnectionAttempt {
+            addr: "192.168.1.5:4242".parse().unwrap(),
             fingerprint: "aa:bb".into(),
         });
         json_roundtrip(FrontendEvent::Diagnostics(Diagnostics {

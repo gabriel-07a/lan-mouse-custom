@@ -37,7 +37,13 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
+    /// a peer from an allowlisted address was trusted without a prompt
+    AutoAuthorized {
+        addr: SocketAddr,
+        fingerprint: String,
+    },
     ConnectionAttempt {
+        addr: SocketAddr,
         fingerprint: String,
     },
     /// new connection
@@ -50,9 +56,7 @@ pub(crate) enum EmulationEvent {
         fingerprint: String,
     },
     /// connection closed
-    Disconnected {
-        addr: SocketAddr,
-    },
+    Disconnected { addr: SocketAddr },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
@@ -274,10 +278,16 @@ impl ListenTask {
                         last_enter.clear(addr);
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).ok().unwrap_or_default();
                     }
-                    Some(ListenEvent::Rejected { fingerprint }) => {
+                    Some(ListenEvent::AutoAuthorized { addr, fingerprint }) => {
+                        self.event_tx
+                            .send(EmulationEvent::AutoAuthorized { addr, fingerprint })
+                            .ok()
+                            .unwrap_or_default();
+                    }
+                    Some(ListenEvent::Rejected { addr, fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
                             .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).ok().unwrap_or_default();
+                                self.event_tx.send(EmulationEvent::ConnectionAttempt { addr, fingerprint }).ok().unwrap_or_default();
                             }
                     }
                     None => break
