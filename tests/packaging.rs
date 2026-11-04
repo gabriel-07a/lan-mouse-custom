@@ -41,6 +41,14 @@ fn windows_installer_creates_shortcuts_and_keeps_the_icon() {
         "launch after install"
     );
     assert!(script.contains("netsh advfirewall"), "firewall rule");
+    assert!(
+        script.contains("CreateShortCut \"$SMSTARTUP\\Lan Mouse.lnk\""),
+        "start with Windows shortcut"
+    );
+    assert!(
+        script.contains("Delete \"$SMSTARTUP\\Lan Mouse.lnk\""),
+        "the startup shortcut must be removed on uninstall"
+    );
 }
 
 #[test]

@@ -32,6 +32,7 @@ Unicode true
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${EXENAME}"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -44,7 +45,7 @@ Function .onInit
   nsExec::ExecToLog 'taskkill /F /IM ${EXENAME}'
 FunctionEnd
 
-Section "Install"
+Section "Lan Mouse" SEC_MAIN
   SetOutPath "$INSTDIR"
   File /r "..\..\lan-mouse-windows\*.*"
   File "..\..\assets\icon.ico"
@@ -70,6 +71,16 @@ Section "Install"
   nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Lan Mouse" dir=in action=allow program="$INSTDIR\${EXENAME}" enable=yes profile=private,domain'
 SectionEnd
 
+; Checked by default: a KVM is only useful if it is running.
+Section "Start with Windows" SEC_STARTUP
+  CreateShortCut "$SMSTARTUP\Lan Mouse.lnk" "$INSTDIR\${EXENAME}" "" "$INSTDIR\icon.ico" 0
+SectionEnd
+
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_MAIN} "Lan Mouse itself, its icons and shortcuts."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STARTUP} "Start Lan Mouse automatically on login (recommended)."
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
 Function .onInstSuccess
   ; Refresh the shell so the new shortcuts get their icon immediately.
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
@@ -78,6 +89,7 @@ FunctionEnd
 Section "Uninstall"
   nsExec::ExecToLog 'taskkill /F /IM ${EXENAME}'
 
+  Delete "$SMSTARTUP\Lan Mouse.lnk"
   Delete "$DESKTOP\Lan Mouse.lnk"
   Delete "$SMPROGRAMS\Lan Mouse\Lan Mouse.lnk"
   Delete "$SMPROGRAMS\Lan Mouse\Uninstall.lnk"

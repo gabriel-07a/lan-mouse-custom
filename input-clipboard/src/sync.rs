@@ -36,6 +36,10 @@ pub struct ClipboardSync<S: FrameSink> {
     outgoing: HashMap<PeerId, OutgoingTransfer>,
     incoming: HashMap<PeerId, IncomingTransfer>,
     last_applied: Option<[u8; 32]>,
+    /// Hash of the last snapshot offered to the peers. The compositor emits
+    /// several owner-change events per copy (one per MIME update); without
+    /// this the same content was offered two or three times.
+    last_sent: Option<[u8; 32]>,
     next_serial: u32,
     last_error: Option<String>,
     applied: u64,
@@ -51,6 +55,7 @@ impl<S: FrameSink> ClipboardSync<S> {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             last_applied: None,
+            last_sent: None,
             next_serial: 0,
             last_error: None,
             applied: 0,
@@ -106,6 +111,17 @@ impl<S: FrameSink> ClipboardSync<S> {
             log::debug!("clipboard change originated from a peer, not syncing back");
             return;
         }
+        if self.last_sent == Some(hash) {
+            log::debug!("clipboard: ignoring a duplicate change event");
+            return;
+        }
+        // Record the hash only if there is someone to send it to; otherwise a
+        // later copy of the same content would be skipped.
+        if self.peers.is_empty() {
+            log::debug!("clipboard: local change with no peers, not offering it");
+            return;
+        }
+        self.last_sent = Some(hash);
         if self.peers.is_empty() {
             return;
         }
@@ -215,9 +231,16 @@ impl<S: FrameSink> ClipboardSync<S> {
                 bitmap,
             } => {
                 let Some(transfer) = self.outgoing.get_mut(&peer) else {
+                    log::debug!(
+                        "clipboard: ack for serial {serial} from peer {peer} without a transfer"
+                    );
                     return;
                 };
-                if transfer.on_ack(serial, mime, base, bitmap) {
+                let accepted = transfer.on_ack(serial, mime, base, bitmap);
+                log::trace!(
+                    "clipboard: ack serial {serial} mime {mime} from peer {peer} (accepted: {accepted})"
+                );
+                if accepted {
                     let frames = transfer.poll(now);
                     for frame in frames {
                         self.sink.send(peer, frame);

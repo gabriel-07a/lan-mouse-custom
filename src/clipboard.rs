@@ -236,6 +236,20 @@ async fn run<C: Clipboard>(
                         && client_manager
                             .peer_supports(handle, lan_mouse_proto::capabilities::CLIPBOARD);
                     if connected && known_outgoing.insert(handle) {
+                        // A connection from the same peer may have been
+                        // registered by address before this handle existed.
+                        // Its ACKs are attributed to the handle, so the
+                        // address peer would wait forever and abort every
+                        // transfer.
+                        if let Some(addr) = client_manager.active_addr(handle) {
+                            if let Some(stale) = addr_peers.remove(&addr) {
+                                routes.borrow_mut().remove(&stale);
+                                sync.remove_peer(stale);
+                                log::debug!(
+                                    "clipboard: merged duplicate peer {stale} into client {handle}"
+                                );
+                            }
+                        }
                         routes.borrow_mut().insert(handle, Route::Outgoing(handle));
                         sender.ensure_connected(handle);
                         log::debug!(
