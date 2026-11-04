@@ -32,7 +32,12 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug)]
 enum DiscoveryEvent {
     Scan(Vec<DiscoveredDevice>),
-    Probe { ip: IpAddr, lan_mouse: bool },
+    Probe {
+        ip: IpAddr,
+        lan_mouse: bool,
+    },
+    /// the pairing window closed
+    Pairing(bool),
 }
 
 #[derive(Debug, Error)]
@@ -80,12 +85,19 @@ pub struct Service {
     /// results of network scans / probes, produced by background tasks
     discovery_rx: Receiver<DiscoveryEvent>,
     discovery_tx: Sender<DiscoveryEvent>,
+    /// devices announced by peers between scans
+    announced_rx: Receiver<discovery::Announced>,
+    announced_tx: Sender<discovery::Announced>,
+    /// last known devices, keyed by address
+    discovered: HashMap<IpAddr, DiscoveredDevice>,
     /// cancels the background discovery listener
     discovery_cancel: CancellationToken,
     /// addresses that may connect without an authorization prompt
     trusted_nets: Arc<RwLock<Vec<crate::trusted::TrustedNet>>>,
     /// raw allowlist entries as written by the user
     trusted_ips: Vec<String>,
+    /// while this is in the future, any connecting device is authorized
+    pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
     /// certificate used for explicit Lan Mouse probes
     cert: webrtc_dtls::crypto::Certificate,
     /// (outgoing) client information
@@ -133,12 +145,14 @@ impl Service {
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
         let trusted_ips = config.trusted_ips();
         let trusted_nets = Arc::new(RwLock::new(crate::trusted::parse_all(&trusted_ips)));
+        let pairing_until: Arc<RwLock<Option<std::time::Instant>>> = Default::default();
         // listener + connection
         let listener = LanMouseListener::new(
             config.port(),
             cert.clone(),
             authorized_keys.clone(),
             trusted_nets.clone(),
+            pairing_until.clone(),
         )
         .await?;
         let mut conn = LanMouseConnection::new(
@@ -156,6 +170,7 @@ impl Service {
             conn,
             config.release_bind(),
             config.motion_batch_ms(),
+            config.connect_grace_ms(),
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let (clipboard_from_listener_tx, clipboard_from_listener_rx) =
@@ -182,6 +197,7 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let (discovery_tx, discovery_rx) = local_channel::mpsc::channel();
+        let (announced_tx, announced_rx) = local_channel::mpsc::channel();
         let port = config.port();
         let service = Self {
             config,
@@ -203,9 +219,13 @@ impl Service {
             pending_reverse: Default::default(),
             discovery_rx,
             discovery_tx,
+            announced_rx,
+            announced_tx,
+            discovered: Default::default(),
             discovery_cancel: CancellationToken::new(),
             trusted_nets,
             trusted_ips,
+            pairing_until,
             cert: cert.clone(),
             public_key_fingerprint,
             client_manager,
@@ -242,6 +262,8 @@ impl Service {
             self.port,
             discovery_port,
             self.discovery_cancel.clone(),
+            self.public_key_fingerprint.clone(),
+            self.announced_tx.clone(),
         ));
         self.start_scan();
 
@@ -253,6 +275,12 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.discovery_rx.recv() => self.handle_discovery_event(event),
+                event = self.announced_rx.recv() => {
+                    if let Some(announced) = event {
+                        self.discovered.insert(announced.ip, announced.device);
+                        self.broadcast_network();
+                    }
+                }
                 status = self.clipboard_status_rx.recv(), if self.clipboard_status_open => {
                     match status {
                         Some(status) => self.handle_clipboard_status(status),
@@ -329,6 +357,10 @@ impl Service {
                 self.update_pos(handle, pos);
                 self.save_config();
             }
+            FrontendRequest::UpdateSensitivity(handle, sensitivity) => {
+                self.update_sensitivity(handle, sensitivity);
+                self.save_config();
+            }
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
@@ -353,6 +385,7 @@ impl Service {
                 self.untrust_address(&entry);
                 self.save_config();
             }
+            FrontendRequest::StartPairing(seconds) => self.start_pairing(seconds),
         }
     }
 
@@ -368,6 +401,7 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                sensitivity: c.sensitivity,
             })
             .collect();
         self.config.set_clients(clients);
@@ -466,6 +500,9 @@ impl Service {
                 self.config.set_authorized_keys(keys);
                 self.save_config();
                 log::info!("auto-authorized {addr} ({fingerprint}) from a trusted address");
+                if self.client_with_ip(addr.ip()).is_none() {
+                    self.add_reverse_client(String::new(), addr.ip(), Position::Left);
+                }
                 let keys = self.authorized_keys.read().expect("lock").clone();
                 self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
@@ -728,6 +765,26 @@ impl Service {
         *self.trusted_nets.write().expect("lock") = nets;
     }
 
+    /// Trust any device that connects during the next `seconds`.
+    fn start_pairing(&mut self, seconds: u64) {
+        let seconds = seconds.clamp(5, 600);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        *self.pairing_until.write().expect("lock") = Some(deadline);
+        log::info!("pairing mode open for {seconds}s");
+        self.notify_frontend(FrontendEvent::PairingActive(true));
+
+        let pairing = self.pairing_until.clone();
+        let tx = self.discovery_tx.clone();
+        spawn_local(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            let still_open = pairing.write().expect("lock").take().is_some();
+            if still_open {
+                log::info!("pairing mode closed");
+                let _ = tx.send(DiscoveryEvent::Pairing(false));
+            }
+        });
+    }
+
     /// Kick off a background scan of the local subnets.
     fn start_scan(&self) {
         let tx = self.discovery_tx.clone();
@@ -758,6 +815,10 @@ impl Service {
                 for device in &mut devices {
                     device.configured = self.client_with_ip(device.ip).is_some();
                 }
+                self.discovered.clear();
+                for device in &devices {
+                    self.discovered.insert(device.ip, device.clone());
+                }
                 // Devices that run Lan Mouse and devices that are already
                 // configured are the useful ones; keep them on top of the
                 // (possibly long) list of plain hosts on the network.
@@ -769,13 +830,32 @@ impl Service {
                     (!device.lan_mouse, !device.configured, ip)
                 });
                 log::debug!("network scan found {} device(s)", devices.len());
-                self.notify_frontend(FrontendEvent::NetworkScan(devices));
+                self.broadcast_network();
             }
             Some(DiscoveryEvent::Probe { ip, lan_mouse }) => {
                 self.notify_frontend(FrontendEvent::ProbeResult { ip, lan_mouse });
             }
+            Some(DiscoveryEvent::Pairing(active)) => {
+                self.notify_frontend(FrontendEvent::PairingActive(active));
+            }
             None => {}
         }
+    }
+
+    /// Send the current device table to the frontend, useful entries first.
+    fn broadcast_network(&mut self) {
+        let mut devices: Vec<DiscoveredDevice> = self.discovered.values().cloned().collect();
+        for device in &mut devices {
+            device.configured = self.client_with_ip(device.ip).is_some();
+        }
+        devices.sort_by_key(|device| {
+            let ip = match device.ip {
+                IpAddr::V4(ip) => u32::from(ip),
+                IpAddr::V6(ip) => ip.segments().iter().map(|s| *s as u32).sum(),
+            };
+            (!device.lan_mouse, !device.configured, ip)
+        });
+        self.notify_frontend(FrontendEvent::NetworkScan(devices));
     }
 
     /// Create and activate a client entry for a peer that was just authorized.
@@ -863,6 +943,10 @@ impl Service {
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
             self.capture.create(handle, pos, CaptureType::Default);
+            self.capture.set_sensitivity(
+                handle,
+                self.client_manager.get_sensitivity(handle) as f64 / 100.0,
+            );
             /* pre-establish the connection so the first crossing is instant */
             self.capture.connect(handle);
             self.broadcast_client(handle);
@@ -913,6 +997,15 @@ impl Service {
         if self.client_manager.set_pos(handle, pos) {
             self.deactivate_client(handle);
             self.activate_client(handle);
+        }
+        self.broadcast_client(handle);
+    }
+
+    fn update_sensitivity(&mut self, handle: ClientHandle, sensitivity: u16) {
+        let sensitivity = sensitivity.clamp(10, 500);
+        if self.client_manager.set_sensitivity(handle, sensitivity) {
+            self.capture
+                .set_sensitivity(handle, sensitivity as f64 / 100.0);
         }
         self.broadcast_client(handle);
     }

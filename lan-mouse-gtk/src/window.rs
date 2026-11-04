@@ -270,6 +270,22 @@ impl Window {
                         ),
                     );
                     row.connect_closure(
+                        "request-sensitivity-change",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, percent: u32| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    window.request(FrontendRequest::UpdateSensitivity(
+                                        client.handle(),
+                                        percent.min(u16::MAX as u32) as u16,
+                                    ));
+                                }
+                            }
+                        ),
+                    );
+                    row.connect_closure(
                         "request-position-change",
                         false,
                         closure_local!(
@@ -347,9 +363,17 @@ impl Window {
 
         // A client created by the "add device" dialog carries its address and
         // side; apply them as soon as the service reports the handle.
-        if let Some((address, position)) = self.imp().pending_add.borrow_mut().take() {
+        if let Some((address, position, fingerprint)) = self.imp().pending_add.borrow_mut().take() {
             let address = address.trim().to_string();
             self.request(FrontendRequest::UpdatePosition(handle, position));
+            // A discovered Lan Mouse device already told us its certificate:
+            // authorize it here so the other machine does not have to ask.
+            if let Some(fingerprint) = fingerprint {
+                self.request(FrontendRequest::AuthorizeKey(address.clone(), fingerprint));
+                if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+                    self.request(FrontendRequest::TrustAddress(ip.to_string()));
+                }
+            }
             match address.parse::<std::net::IpAddr>() {
                 Ok(ip) => self.request(FrontendRequest::UpdateFixIps(handle, vec![ip])),
                 Err(_) if !address.is_empty() => {
@@ -409,6 +433,7 @@ impl Window {
         row.set_hostname(client.hostname);
         row.set_port(client.port);
         row.set_position(client.pos);
+        row.set_sensitivity(client.sensitivity);
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {
@@ -483,6 +508,12 @@ impl Window {
 
     fn request_emulation(&self) {
         self.request(FrontendRequest::EnableEmulation);
+    }
+
+    /// Open the pairing window: any device may connect for `seconds`.
+    pub(super) fn start_pairing(&self, seconds: u64) {
+        self.request(FrontendRequest::StartPairing(seconds));
+        self.show_toast("Pairing mode open — accept any device that connects");
     }
 
     /// Add an address to the allowlist.
@@ -588,7 +619,10 @@ impl Window {
                 add.set_tooltip_text(Some("Add this device"));
                 let parent = self.clone();
                 let address = device.ip.to_string();
-                add.connect_clicked(move |_| parent.request_add_device_with(Some(address.clone())));
+                let fingerprint = device.fingerprint.clone();
+                add.connect_clicked(move |_| {
+                    parent.request_add_device_with(Some(address.clone()), fingerprint.clone())
+                });
                 row.add_suffix(&add);
 
                 let probe = gtk::Button::from_icon_name("system-search-symbolic");
@@ -656,10 +690,14 @@ impl Window {
     /// activate it. The peer answers with an authorization request, so this
     /// is the whole "send a connection request" flow.
     pub(super) fn request_add_device(&self) {
-        self.request_add_device_with(None);
+        self.request_add_device_with(None, None);
     }
 
-    pub(super) fn request_add_device_with(&self, initial_address: Option<String>) {
+    pub(super) fn request_add_device_with(
+        &self,
+        initial_address: Option<String>,
+        fingerprint: Option<String>,
+    ) {
         let window = adw::Window::builder()
             .title("Add device")
             .modal(true)
@@ -724,7 +762,7 @@ impl Window {
                 3 => Position::Bottom,
                 _ => Position::Left,
             };
-            parent.send_device_request(address, position);
+            parent.send_device_request(address, position, fingerprint.clone());
             close_window.close();
         });
 
@@ -737,8 +775,15 @@ impl Window {
         window.present();
     }
 
-    fn send_device_request(&self, address: String, position: Position) {
-        self.imp().pending_add.replace(Some((address, position)));
+    fn send_device_request(
+        &self,
+        address: String,
+        position: Position,
+        fingerprint: Option<String>,
+    ) {
+        self.imp()
+            .pending_add
+            .replace(Some((address, position, fingerprint)));
         self.request(FrontendRequest::Create);
     }
 

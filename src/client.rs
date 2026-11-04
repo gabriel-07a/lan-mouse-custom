@@ -34,6 +34,7 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            sensitivity: config_client.sensitivity,
         };
         let state = ClientState {
             active: config_client.active,
@@ -230,6 +231,25 @@ impl ClientManager {
         }
     }
 
+    /// update the motion scale of the client (percent)
+    pub(crate) fn set_sensitivity(&self, handle: ClientHandle, sensitivity: u16) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.sensitivity != sensitivity => {
+                c.sensitivity = sensitivity;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn get_sensitivity(&self, handle: ClientHandle) -> u16 {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.sensitivity)
+            .unwrap_or(100)
+    }
+
     /// update the enter hook command of the client
     pub(crate) fn set_enter_hook(&self, handle: ClientHandle, enter_hook: Option<String>) {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
@@ -411,6 +431,7 @@ mod tests {
             active,
             enter_hook: None,
             leave_hook: None,
+            sensitivity: 100,
         }
     }
 

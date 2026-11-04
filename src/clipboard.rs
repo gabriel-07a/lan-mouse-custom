@@ -392,6 +392,7 @@ mod tests {
             active: true,
             enter_hook: None,
             leave_hook: None,
+            sensitivity: 100,
         });
         (manager, handle)
     }
@@ -416,6 +417,7 @@ mod tests {
                         "peer".to_string(),
                     )]))),
                     Arc::new(RwLock::new(Vec::new())),
+                    Default::default(),
                 )
                 .await
                 .expect("listener");

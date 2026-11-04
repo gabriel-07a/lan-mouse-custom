@@ -15,6 +15,9 @@ use super::{Emulation, EmulationHandle, error::X11EmulationCreationError};
 
 pub(crate) struct X11Emulation {
     display: *mut xlib::Display,
+    /// Fractional part of the last motion, so slow movements are not lost to
+    /// the integer-only XTest delta.
+    subpixel: super::subpixel::SubPixel,
 }
 
 unsafe impl Send for X11Emulation {}
@@ -29,7 +32,10 @@ impl X11Emulation {
                 display => Ok(display),
             }
         }?;
-        Ok(Self { display })
+        Ok(Self {
+            display,
+            subpixel: Default::default(),
+        })
     }
 
     fn relative_motion(&self, dx: i32, dy: i32) {
@@ -104,7 +110,10 @@ impl Emulation for X11Emulation {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    self.relative_motion(dx as i32, dy as i32);
+                    let (move_x, move_y) = self.subpixel.consume(dx, dy);
+                    if move_x != 0 || move_y != 0 {
+                        self.relative_motion(move_x, move_y);
+                    }
                 }
                 PointerEvent::Button {
                     time: _,

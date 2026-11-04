@@ -41,6 +41,8 @@ struct Client {
     enter_hook: Option<String>,
     #[arg(long)]
     leave_hook: Option<String>,
+    #[arg(long)]
+    sensitivity: Option<u16>,
 }
 
 #[derive(Clone, Subcommand, Debug, PartialEq, Eq)]
@@ -61,6 +63,11 @@ enum CliSubcommand {
     Trust { address: String },
     /// remove an address from the allowlist
     Untrust { address: String },
+    /// accept any device that connects in the next seconds (default 60)
+    Pair {
+        #[arg(long, default_value = "60")]
+        seconds: u64,
+    },
     /// change hostname
     SetHost {
         id: ClientHandle,
@@ -70,6 +77,8 @@ enum CliSubcommand {
     SetPort { id: ClientHandle, port: u16 },
     /// set position
     SetPosition { id: ClientHandle, pos: Position },
+    /// set the motion scale of a client in percent (100 = unchanged)
+    SetSensitivity { id: ClientHandle, percent: u16 },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
     /// re-enable capture
@@ -124,6 +133,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             activate,
             enter_hook,
             leave_hook,
+            sensitivity,
         }) => {
             tx.request(FrontendRequest::Create).await?;
             while let Some(e) = rx.next().await {
@@ -150,6 +160,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     }
                     if let Some(leave_hook) = leave_hook {
                         tx.request(FrontendRequest::UpdateLeaveHook(handle, Some(leave_hook)))
+                            .await?;
+                    }
+                    if let Some(sensitivity) = sensitivity {
+                        tx.request(FrontendRequest::UpdateSensitivity(handle, sensitivity))
                             .await?;
                     }
                     if activate {
@@ -214,6 +228,13 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 .await?;
             println!("trusted {address}: connections from it are accepted without a prompt");
         }
+        CliSubcommand::Pair { seconds } => {
+            tx.request(FrontendRequest::StartPairing(seconds)).await?;
+            println!(
+                "pairing mode open for {seconds}s: any device that connects is authorized \
+                 and gets a client entry for the reverse direction"
+            );
+        }
         CliSubcommand::Untrust { address } => {
             tx.request(FrontendRequest::UntrustAddress(address.clone()))
                 .await?;
@@ -228,6 +249,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::SetPosition { id, pos } => {
             tx.request(FrontendRequest::UpdatePosition(id, pos)).await?
+        }
+        CliSubcommand::SetSensitivity { id, percent } => {
+            tx.request(FrontendRequest::UpdateSensitivity(id, percent))
+                .await?
         }
         CliSubcommand::SetIps { id, ips } => {
             tx.request(FrontendRequest::UpdateFixIps(id, ips)).await?

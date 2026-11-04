@@ -87,6 +87,7 @@ impl LanMouseListener {
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         trusted_nets: Arc<RwLock<Vec<TrustedNet>>>,
+        pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, mut request_port_change_rx) = channel();
@@ -108,6 +109,7 @@ impl LanMouseListener {
             let listen_tx = listen_tx.clone();
             let authorized = authorized_keys.clone();
             let trusted = trusted_nets.clone();
+            let pairing = pairing_until.clone();
             spawn_local(async move {
                 // Bound the number of half-open handshakes so stray UDP
                 // traffic cannot spawn unbounded tasks.
@@ -124,6 +126,7 @@ impl LanMouseListener {
                                 let listen_tx = listen_tx.clone();
                                 let authorized = authorized.clone();
                                 let trusted = trusted.clone();
+                                let pairing = pairing.clone();
                                 let conns = conns_clone.clone();
                                 let cfg = cfg.clone();
                                 spawn_local(async move {
@@ -135,6 +138,7 @@ impl LanMouseListener {
                                     cfg.verify_peer_certificate = Some(per_connection_verify(
                                         authorized,
                                         trusted,
+                                        pairing,
                                         addr,
                                         recorded.clone(),
                                         auto_authorized.clone(),
@@ -290,6 +294,7 @@ impl Stream for LanMouseListener {
 fn per_connection_verify(
     authorized: Arc<RwLock<HashMap<String, String>>>,
     trusted: Arc<RwLock<Vec<TrustedNet>>>,
+    pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
     addr: SocketAddr,
     recorded: Arc<Mutex<Option<String>>>,
     auto_authorized: Arc<std::sync::atomic::AtomicBool>,
@@ -308,11 +313,18 @@ fn per_connection_verify(
 
             // An allowlisted address is trusted on first use: the certificate
             // is stored, so later connections are matched by fingerprint.
-            let trusted_match = trusted
+            // Pairing mode trusts anyone for a short window, which covers the
+            // case where the other machine has no mouse to click "approve".
+            let pairing = pairing_until
                 .read()
                 .expect("lock")
-                .iter()
-                .any(|net| net.contains(addr.ip()));
+                .is_some_and(|deadline| std::time::Instant::now() < deadline);
+            let trusted_match = pairing
+                || trusted
+                    .read()
+                    .expect("lock")
+                    .iter()
+                    .any(|net| net.contains(addr.ip()));
             if trusted_match {
                 authorized
                     .write()

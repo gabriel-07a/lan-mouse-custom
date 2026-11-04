@@ -169,6 +169,16 @@ fn start_routine(
         cnd.notify_one();
     }
 
+    // Without this the coordinates seen by the low level hooks are
+    // virtualized by DPI scaling, which shifts every delta when the two
+    // machines use different scale factors.
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+        };
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     let mouse_proc: HOOKPROC = Some(mouse_proc);
     let kybrd_proc: HOOKPROC = Some(kybrd_proc);
     let window_proc: WNDPROC = Some(window_proc);
@@ -295,13 +305,22 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
     ENTRY_POINT.replace(entry_point);
+    // Pin the real cursor to the entry point. Windows may have moved it past
+    // the edge (DPI scaling, multiple displays); every later delta is measured
+    // against ENTRY_POINT, so a mismatch would offset the whole session.
+    PREV_POS.replace(Some(entry_point));
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(entry_point.0, entry_point.1);
+    }
 
     /* notify main thread */
-    log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
+    log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}, pinned to {entry_point:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
     blocking_send_event(active, CaptureEvent::Begin);
 
-    ret
+    // Swallow the crossing event itself: the cursor is already where we want
+    // it, so passing it on would move it off the entry point again.
+    true
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -514,6 +533,11 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
             let (ex, ey) = ENTRY_POINT.get();
             let (dx, dy) = (x - ex, y - ey);
+            // SetCursorPos generates a synthetic move at the entry point;
+            // forwarding it as a zero delta would just flood the network.
+            if dx == 0 && dy == 0 {
+                return None;
+            }
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }

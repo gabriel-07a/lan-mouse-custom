@@ -25,6 +25,9 @@ pub struct ClientRow {
     #[template_child]
     pub position: TemplateChild<ComboRow>,
     #[template_child]
+    pub sensitivity: TemplateChild<gtk::SpinButton>,
+    sensitivity_change_handler: RefCell<Option<SignalHandlerId>>,
+    #[template_child]
     pub delete_row: TemplateChild<ActionRow>,
     #[template_child]
     pub delete_button: TemplateChild<gtk::Button>,
@@ -83,6 +86,18 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.port_change_handler.replace(Some(handler));
+        let sensitivity_handler = self.sensitivity.connect_value_changed(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |_| {
+                let value = row.sensitivity.value() as u32;
+                row.obj()
+                    .emit_by_name::<()>("request-sensitivity-change", &[&value]);
+            }
+        ));
+        self.sensitivity_change_handler
+            .replace(Some(sensitivity_handler));
+
         let handler = self.position.connect_selected_notify(clone!(
             #[weak(rename_to = row)]
             self,
@@ -120,6 +135,9 @@ impl ObjectImpl for ClientRow {
                     .param_types([u32::static_type()])
                     .build(),
                 Signal::builder("request-position-change")
+                    .param_types([u32::static_type()])
+                    .build(),
+                Signal::builder("request-sensitivity-change")
                     .param_types([u32::static_type()])
                     .build(),
             ]
@@ -160,6 +178,16 @@ impl ClientRow {
     fn handle_position_changed(&self, position: &ComboRow) {
         self.obj()
             .emit_by_name("request-position-change", &[&position.selected()])
+    }
+
+    pub(super) fn set_sensitivity(&self, sensitivity: u16) {
+        if let Some(handler) = self.sensitivity_change_handler.borrow().as_ref() {
+            self.sensitivity.block_signal(handler);
+        }
+        self.sensitivity.set_value(sensitivity as f64);
+        if let Some(handler) = self.sensitivity_change_handler.borrow().as_ref() {
+            self.sensitivity.unblock_signal(handler);
+        }
     }
 
     pub(super) fn set_hostname(&self, hostname: Option<String>) {

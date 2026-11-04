@@ -174,6 +174,20 @@ mod tests {
         assert!(c.push(1, 0, 1.0, 0.0, t0 + Duration::from_millis(5)));
     }
 
+    /// The first movement after the mouse was idle must not wait for the
+    /// batch window: that delay is felt on every movement start.
+    #[test]
+    fn first_event_after_a_pause_is_due_immediately() {
+        let mut c = MotionCoalescer::new(2);
+        let t0 = Instant::now();
+        c.push(1, 0, 1.0, 0.0, t0);
+        assert!(c.take(1).is_some(), "flush before the pause");
+        assert!(
+            c.push(1, 1, 1.0, 0.0, t0 + Duration::from_millis(50)),
+            "idle for longer than the window must flush at once"
+        );
+    }
+
     #[test]
     fn take_all_drains_everything() {
         let mut c = MotionCoalescer::new(4);

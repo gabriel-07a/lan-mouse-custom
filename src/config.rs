@@ -115,6 +115,8 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    /// motion scale in percent (100 = unchanged)
+    sensitivity: Option<u16>,
 }
 
 impl ConfigToml {
@@ -326,6 +328,8 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    /// motion scale in percent (100 = unchanged)
+    pub sensitivity: u16,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -333,6 +337,7 @@ impl From<TomlClient> for ConfigClient {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
         let leave_hook = toml.leave_hook;
+        let sensitivity = toml.sensitivity.unwrap_or(100).clamp(10, 500);
         let hostname = toml.hostname;
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
@@ -345,6 +350,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            sensitivity,
         }
     }
 }
@@ -365,6 +371,11 @@ impl From<ConfigClient> for TomlClient {
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
         let leave_hook = client.leave_hook;
+        let sensitivity = if client.sensitivity == 100 {
+            None
+        } else {
+            Some(client.sensitivity)
+        };
         Self {
             hostname,
             host_name,
@@ -374,6 +385,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            sensitivity,
         }
     }
 }
@@ -393,10 +405,10 @@ pub enum ConfigError {
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
     [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt];
 
-/// Default batching window for pointer motion events. 4 ms caps the
-/// motion packet rate at ~250/s while staying below the latency of a
+/// Default batching window for pointer motion events. 2 ms caps the
+/// motion packet rate at ~500/s while staying below the latency of a
 /// typical wireless mouse. `0` disables coalescing.
-const DEFAULT_MOTION_BATCH_MS: u64 = 4;
+const DEFAULT_MOTION_BATCH_MS: u64 = 2;
 
 /// How long a single input event may block on a broken connection before
 /// the capture is released. Keeps the grab during short Wi-Fi hiccups
@@ -731,6 +743,7 @@ mod tests {
             activate_on_startup: None,
             enter_hook: None,
             leave_hook: None,
+            sensitivity: None,
         }
     }
 
@@ -802,7 +815,7 @@ mod tests {
 
     #[test]
     fn default_network_constants_are_documented_values() {
-        assert_eq!(DEFAULT_MOTION_BATCH_MS, 4);
+        assert_eq!(DEFAULT_MOTION_BATCH_MS, 2);
         assert_eq!(DEFAULT_CONNECT_GRACE_MS, 400);
         assert_eq!(DEFAULT_RELEASE_KEYS.len(), 4);
     }

@@ -144,6 +144,15 @@ pub struct ClientConfig {
     pub cmd: Option<String>,
     /// leave hook
     pub leave_cmd: Option<String>,
+    /// motion scale in percent (100 = unchanged). Wayland captures raw
+    /// deltas while Windows/macOS report accelerated ones, so the speed
+    /// differs between peer combinations and needs a per-client trim.
+    #[serde(default = "default_sensitivity")]
+    pub sensitivity: u16,
+}
+
+pub fn default_sensitivity() -> u16 {
+    100
 }
 
 impl Default for ClientConfig {
@@ -155,6 +164,7 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            sensitivity: default_sensitivity(),
         }
     }
 }
@@ -249,6 +259,10 @@ pub struct DiscoveredDevice {
     pub lan_mouse: bool,
     /// Already configured as a client of this machine.
     pub configured: bool,
+    /// Certificate fingerprint reported by the peer (our builds only), so a
+    /// device can be authorized before it ever connects.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +318,8 @@ pub enum FrontendEvent {
     },
     /// addresses allowed to connect without an authorization prompt
     TrustedAddresses(Vec<String>),
+    /// whether the pairing window is currently open
+    PairingActive(bool),
     /// clipboard synchronization status
     ClipboardStatus(ClipboardStatus),
 }
@@ -387,6 +403,8 @@ pub enum FrontendRequest {
     UpdatePort(ClientHandle, u16),
     /// update position
     UpdatePosition(ClientHandle, Position),
+    /// update the motion scale of a client, in percent
+    UpdateSensitivity(ClientHandle, u16),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// request reenabling input capture
@@ -427,6 +445,8 @@ pub enum FrontendRequest {
     TrustAddress(String),
     /// remove an address from the allowlist
     UntrustAddress(String),
+    /// accept any device that connects during the next `seconds`
+    StartPairing(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

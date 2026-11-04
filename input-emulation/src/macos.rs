@@ -419,8 +419,11 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
-                        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        // CoreGraphics accepts fractional deltas; truncating
+                        // them made slow movements from Wayland clients stop
+                        // moving the cursor at all.
+                        event.set_double_value_field(EventField::MOUSE_EVENT_DELTA_X, dx);
+                        event.set_double_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy);
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Button {

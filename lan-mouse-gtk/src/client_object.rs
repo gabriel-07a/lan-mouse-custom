@@ -28,6 +28,7 @@ impl ClientObject {
             .property("resolving", state.resolving)
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
             .property("rtt-ms", state.rtt_ms.unwrap_or(0))
+            .property("sensitivity", client.sensitivity as u32)
             .property("alive", state.alive)
             .property(
                 "active-addr",
@@ -65,6 +66,8 @@ pub struct ClientData {
     pub alive: bool,
     /// address of the established connection, if any
     pub active_addr: Option<String>,
+    /// motion scale in percent
+    pub sensitivity: u32,
 }
 
 #[cfg(test)]

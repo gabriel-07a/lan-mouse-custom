@@ -26,11 +26,17 @@ const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
+    /// Fractional part of the last motion, so slow movements are not lost to
+    /// the integer-only `SendInput` delta.
+    subpixel: super::subpixel::SubPixel,
 }
 
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
-        Ok(Self { repeat_task: None })
+        Ok(Self {
+            repeat_task: None,
+            subpixel: Default::default(),
+        })
     }
 }
 
@@ -40,7 +46,10 @@ impl Emulation for WindowsEmulation {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    rel_mouse(dx as i32, dy as i32);
+                    let (move_x, move_y) = self.subpixel.consume(dx, dy);
+                    if move_x != 0 || move_y != 0 {
+                        rel_mouse(move_x, move_y);
+                    }
                 }
                 PointerEvent::Button {
                     time: _,

@@ -153,6 +153,10 @@ impl ClientRow {
         self.imp().set_pos(pos);
     }
 
+    pub fn set_sensitivity(&self, sensitivity: u16) {
+        self.imp().set_sensitivity(sensitivity);
+    }
+
     pub fn set_dns_state(&self, resolved: bool) {
         self.imp().set_dns_state(resolved);
     }

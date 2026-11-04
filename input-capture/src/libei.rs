@@ -236,7 +236,9 @@ impl LibeiInputCapture {
         let input_capture_ptr = input_capture.as_ref().get_ref() as *const InputCapture;
         let first_session = Some(create_session(unsafe { &*input_capture_ptr }).await?);
 
-        let (event_tx, event_rx) = mpsc::channel(1);
+        // One slot made the reader task suspend on every single event; a
+        // small queue lets it batch while still bounding memory.
+        let (event_tx, event_rx) = mpsc::channel(256);
         let (notify_capture, notify_rx) = mpsc::channel(1);
         let notify_release = Arc::new(Notify::new());
 

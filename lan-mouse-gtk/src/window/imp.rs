@@ -72,7 +72,7 @@ pub struct Window {
     pub network_devices: RefCell<Vec<DiscoveredDevice>>,
     /// address and side collected by the "add device" dialog, applied to the
     /// client entry as soon as the service reports its handle
-    pub pending_add: RefCell<Option<(String, Position)>>,
+    pub pending_add: RefCell<Option<(String, Position, Option<String>)>>,
 }
 
 #[glib::object_subclass]
@@ -104,6 +104,11 @@ impl Window {
     #[template_callback]
     fn handle_scan_pressed(&self, _button: &Button) {
         self.obj().request_scan();
+    }
+
+    #[template_callback]
+    fn handle_start_pairing(&self, _button: &Button) {
+        self.obj().start_pairing(60);
     }
 
     #[template_callback]

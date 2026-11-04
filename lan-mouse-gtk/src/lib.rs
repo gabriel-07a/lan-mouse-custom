@@ -312,6 +312,11 @@ fn build_ui(app: &Application) {
                     FrontendEvent::TrustedAddresses(addresses) => {
                         window.update_trusted_addresses(addresses)
                     }
+                    FrontendEvent::PairingActive(active) => {
+                        if !active {
+                            window.show_toast("Pairing mode closed");
+                        }
+                    }
                     FrontendEvent::ProbeResult { ip, lan_mouse } => {
                         let message = if lan_mouse {
                             format!("{ip}: Lan Mouse is answering on this host")

@@ -29,6 +29,7 @@ mod macos;
 /// fallback input emulation (logs events)
 mod dummy;
 mod error;
+mod subpixel;
 
 pub type EmulationHandle = u64;
 

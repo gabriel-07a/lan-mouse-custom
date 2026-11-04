@@ -41,7 +41,9 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
+        // 1000 Hz mice deliver events faster than the capture thread can
+        // forward them; a 10 slot buffer dropped movements.
+        let (event_tx, event_rx) = channel(512);
         let event_thread = EventThread::new(event_tx);
         Self {
             event_thread,

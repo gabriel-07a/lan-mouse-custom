@@ -534,6 +534,37 @@ peer is created and activated when it connects. A fingerprint that was
 authorized this way is never asked for again unless the peer regenerates its
 certificate.
 
+### Sensitivity per device
+
+Wayland reports raw pointer deltas while Windows and macOS report accelerated
+ones, so the cursor speed differs between peer combinations. Each client has a
+`sensitivity` (percent, `100` = unchanged) that scales the forwarded motion:
+
+```toml
+[[clients]]
+hostname = "windows11"
+ips = ["192.168.166.166"]
+position = "right"
+sensitivity = 120   # 20% faster
+```
+
+The GUI exposes it in the client row; the CLI has
+`lan-mouse cli set-sensitivity <id> <percent>`. Fractional deltas from Wayland
+are accumulated instead of truncated, so slow movements are not lost on the
+integer-only Windows/X11 backends.
+
+### Pairing without a mouse on the other machine
+
+`lan-mouse cli pair --seconds 60` (or the *Pairing mode* button in the GUI)
+opens a window during which **any** connecting device is authorized and also
+gets a client entry for the reverse direction. Useful when the other computer
+has no mouse to click "approve". After the window closes, unknown devices need
+the normal approval again; already-seen ones are matched by certificate.
+
+Devices running this fork also announce themselves every 10 seconds with their
+certificate fingerprint, so they show up in the network table immediately and
+can be authorized in one click.
+
 ### GNOME asks once per login
 
 On GNOME the `InputCapture` portal is still at **version 1**, which has no

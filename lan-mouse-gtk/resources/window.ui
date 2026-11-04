@@ -138,6 +138,20 @@
                           </object>
                         </child>
                         <child>
+                          <object class="AdwActionRow" id="pairing_row">
+                            <property name="title" translatable="yes">Pairing mode</property>
+                            <property name="subtitle" translatable="yes">Accept any device that connects in the next 60 seconds — useful when the other computer has no mouse to approve the request.</property>
+                            <property name="subtitle-lines">2</property>
+                            <child>
+                              <object class="GtkButton" id="pairing_button">
+                                <signal name="clicked" handler="handle_start_pairing" swapped="true"/>
+                                <property name="label" translatable="yes">Open (60s)</property>
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
                           <object class="GtkListBox" id="trusted_list">
                             <property name="selection-mode">none</property>
                             <child type="placeholder">

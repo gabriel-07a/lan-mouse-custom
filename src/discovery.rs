@@ -36,6 +36,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const MAX_HOSTS_PER_SUBNET: usize = 254;
 const CONCURRENCY: usize = 64;
 
+/// Datagram prefix of the unsolicited announcement a peer broadcasts when it
+/// starts (and every few seconds while it runs).
+pub const ANNOUNCE_MAGIC: &[u8; 8] = b"LMANNC01";
+
+/// How often a running instance announces itself.
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Payload a discovering fork sends back.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct BeaconReply {
@@ -43,6 +50,16 @@ struct BeaconReply {
     link: LinkKind,
     hostname: String,
     version: String,
+    /// certificate fingerprint, so the peer can be authorized in advance
+    #[serde(default)]
+    fingerprint: Option<String>,
+}
+
+/// A device that announced itself without being asked.
+#[derive(Debug, Clone)]
+pub struct Announced {
+    pub ip: IpAddr,
+    pub device: DiscoveredDevice,
 }
 
 /// A local IPv4 interface and the network it covers.
@@ -269,6 +286,7 @@ pub async fn scan(discovery_port: u16) -> Vec<DiscoveredDevice> {
                 link: link_kind_for_ip(IpAddr::V4(ip)),
                 lan_mouse: false,
                 configured: false,
+                fingerprint: None,
             });
         }
     }
@@ -291,6 +309,7 @@ fn device_from_probe(ip: Ipv4Addr, outcome: HostProbe) -> DiscoveredDevice {
             link: reply.link,
             lan_mouse: true,
             configured: false,
+            fingerprint: reply.fingerprint,
         },
         HostProbe::HostOnly => DiscoveredDevice {
             ip: IpAddr::V4(ip),
@@ -300,6 +319,7 @@ fn device_from_probe(ip: Ipv4Addr, outcome: HostProbe) -> DiscoveredDevice {
             link: link_kind_for_ip(IpAddr::V4(ip)),
             lan_mouse: false,
             configured: false,
+            fingerprint: None,
         },
     }
 }
@@ -330,17 +350,7 @@ async fn broadcast_probe(
     if sock.set_broadcast(true).is_err() {
         return;
     }
-    let mut targets = vec![Ipv4Addr::BROADCAST];
-    for iface in local_interfaces() {
-        let prefix = iface.prefix.clamp(24, 32);
-        let mask = u32::MAX << (32 - prefix);
-        let broadcast = Ipv4Addr::from((u32::from(iface.addr) & mask) | !mask);
-        targets.push(broadcast);
-    }
-    targets.sort();
-    targets.dedup();
-
-    for target in targets {
+    for target in broadcast_targets() {
         if sock.send_to(MAGIC, (target, discovery_port)).await.is_err() {
             continue;
         }
@@ -377,6 +387,12 @@ fn parse_reply(buf: &[u8]) -> Option<HostProbe> {
     Some(HostProbe::LanMouse(reply))
 }
 
+/// Parse an unsolicited announcement.
+fn parse_announce(buf: &[u8]) -> Option<BeaconReply> {
+    let payload = buf.strip_prefix(ANNOUNCE_MAGIC.as_slice())?;
+    serde_json::from_slice(payload).ok()
+}
+
 fn is_unreachable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -390,7 +406,13 @@ fn is_unreachable(error: &io::Error) -> bool {
 ///
 /// Runs for the whole lifetime of the service. A bind failure (another
 /// instance, a sandbox) is not fatal: the machine is simply not discoverable.
-pub async fn beacon_task(port: u16, discovery_port: u16, cancel: CancellationToken) {
+pub async fn beacon_task(
+    port: u16,
+    discovery_port: u16,
+    cancel: CancellationToken,
+    fingerprint: String,
+    announce_tx: local_channel::mpsc::Sender<Announced>,
+) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discovery_port)).await {
         Ok(sock) => sock,
         Err(e) => {
@@ -398,6 +420,7 @@ pub async fn beacon_task(port: u16, discovery_port: u16, cancel: CancellationTok
             return;
         }
     };
+    let _ = sock.set_broadcast(true);
     log::info!("network discovery listening on udp/{discovery_port}");
 
     let reply = BeaconReply {
@@ -407,35 +430,82 @@ pub async fn beacon_task(port: u16, discovery_port: u16, cancel: CancellationTok
             .map(|h| h.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "unknown".to_string()),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        fingerprint: Some(fingerprint),
     };
-    let payload = match serde_json::to_vec(&reply) {
-        Ok(json) => {
-            let mut payload = MAGIC.to_vec();
-            payload.extend_from_slice(&json);
-            payload
-        }
+    let payload = match encode(MAGIC, &reply) {
+        Ok(payload) => payload,
         Err(e) => {
             log::warn!("could not encode the discovery reply: {e}");
             return;
         }
     };
+    let announce = match encode(ANNOUNCE_MAGIC, &reply) {
+        Ok(payload) => payload,
+        Err(e) => {
+            log::warn!("could not encode the discovery announcement: {e}");
+            return;
+        }
+    };
 
-    let mut buf = [0u8; 256];
+    let own_addresses: HashSet<Ipv4Addr> = local_interfaces().into_iter().map(|i| i.addr).collect();
+    let mut announce_interval = tokio::time::interval(ANNOUNCE_INTERVAL);
+    // Announce immediately: a peer that is already running should learn about
+    // this machine without waiting for the next scan.
+    announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut buf = [0u8; 1024];
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            _ = announce_interval.tick() => {
+                for target in broadcast_targets() {
+                    if let Err(e) = sock.send_to(&announce, (target, discovery_port)).await {
+                        log::debug!("could not announce to {target}: {e}");
+                    }
+                }
+            }
             received = sock.recv_from(&mut buf) => {
                 let Ok((n, from)) = received else { continue };
-                if !buf[..n].starts_with(MAGIC.as_slice()) {
-                    continue;
-                }
-                let reply = with_link_for(&payload, from.ip());
-                if let Err(e) = sock.send_to(&reply, from).await {
-                    log::debug!("could not answer discovery probe from {from}: {e}");
+                let packet = &buf[..n];
+                if packet.starts_with(MAGIC.as_slice()) {
+                    let reply = with_link_for(&payload, from.ip());
+                    if let Err(e) = sock.send_to(&reply, from).await {
+                        log::debug!("could not answer discovery probe from {from}: {e}");
+                    }
+                } else if let Some(reply) = parse_announce(packet) {
+                    let IpAddr::V4(ip) = from.ip() else { continue };
+                    if own_addresses.contains(&ip) {
+                        continue;
+                    }
+                    let device = device_from_probe(ip, HostProbe::LanMouse(reply));
+                    let _ = announce_tx.send(Announced {
+                        ip: IpAddr::V4(ip),
+                        device,
+                    });
                 }
             }
         }
     }
+}
+
+fn encode(prefix: &[u8; 8], reply: &BeaconReply) -> Result<Vec<u8>, serde_json::Error> {
+    let json = serde_json::to_vec(reply)?;
+    let mut payload = prefix.to_vec();
+    payload.extend_from_slice(&json);
+    Ok(payload)
+}
+
+/// Broadcast addresses of the local subnets plus the limited broadcast.
+fn broadcast_targets() -> Vec<Ipv4Addr> {
+    let mut targets = vec![Ipv4Addr::BROADCAST];
+    for iface in local_interfaces() {
+        let prefix = iface.prefix.clamp(24, 32);
+        let mask = u32::MAX << (32 - prefix);
+        targets.push(Ipv4Addr::from((u32::from(iface.addr) & mask) | !mask));
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 /// Re-encode the reply with the link type of the interface that reaches the
@@ -584,6 +654,7 @@ mod tests {
             link: LinkKind::Wireless,
             hostname: "predator".into(),
             version: "0.11.0".into(),
+            fingerprint: Some("aa:bb".into()),
         };
         let mut payload = MAGIC.to_vec();
         payload.extend_from_slice(&serde_json::to_vec(&reply).unwrap());

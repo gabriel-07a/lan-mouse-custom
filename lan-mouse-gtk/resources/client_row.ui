@@ -69,6 +69,27 @@
 				</property>
 			</object>
 		</child>
+		<!-- sensitivity -->
+		<child>
+			<object class="AdwActionRow" id="sensitivity_row">
+				<property name="title" translatable="yes">sensitivity</property>
+				<property name="subtitle" translatable="yes">motion scale in percent (100 = unchanged)</property>
+				<child>
+					<object class="GtkSpinButton" id="sensitivity">
+						<property name="adjustment">
+							<object class="GtkAdjustment">
+								<property name="lower">10</property>
+								<property name="upper">400</property>
+								<property name="step-increment">5</property>
+								<property name="page-increment">25</property>
+								<property name="value">100</property>
+							</object>
+						</property>
+						<property name="valign">center</property>
+					</object>
+				</child>
+			</object>
+		</child>
 		<!-- delete button -->
 		<child>
 			<object class="AdwActionRow" id="delete_row">

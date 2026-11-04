@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -71,6 +72,8 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// scale the motion of a client (1.0 = unchanged)
+    SetSensitivity(CaptureHandle, f64),
 }
 
 impl Capture {
@@ -79,6 +82,7 @@ impl Capture {
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
         motion_batch_ms: u64,
+        connect_grace_ms: u64,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -92,6 +96,9 @@ impl Capture {
             coalescer: MotionCoalescer::new(motion_batch_ms),
             conn,
             enter: EnterState::default(),
+            sensitivity: Default::default(),
+            grace: Duration::from_millis(connect_grace_ms),
+            disconnected_since: None,
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
@@ -146,6 +153,14 @@ impl Capture {
         let pos = to_capture_pos(pos);
         self.request_tx
             .send(CaptureRequest::Create(handle, pos, capture_type))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Scale the motion forwarded to a client.
+    pub(crate) fn set_sensitivity(&self, handle: CaptureHandle, scale: f64) {
+        self.request_tx
+            .send(CaptureRequest::SetSensitivity(handle, scale))
             .ok()
             .unwrap_or_default();
     }
@@ -272,6 +287,13 @@ struct CaptureTask {
     conn: LanMouseConnection,
     /// `Enter`/`Ack` handoff state
     enter: EnterState,
+    /// per-client motion scale (1.0 = unchanged)
+    sensitivity: HashMap<CaptureHandle, f64>,
+    /// how long a failed motion send may stay down before the capture is
+    /// released, matching `connect_grace_ms`
+    grace: Duration,
+    /// when the active connection was first seen as down
+    disconnected_since: Option<Instant>,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
@@ -325,6 +347,9 @@ impl CaptureTask {
                         CaptureRequest::Release => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
+                        }
+                        CaptureRequest::SetSensitivity(handle, scale) => {
+                            self.sensitivity.insert(handle, scale);
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -424,6 +449,16 @@ impl CaptureTask {
                 },
                 _ = enter_retry.tick() => {
                     self.retransmit_enter(capture).await?;
+                    if let Some(since) = self.disconnected_since {
+                        if self.active_client.is_some() && since.elapsed() >= self.grace {
+                            log::warn!(
+                                "releasing capture: connection stayed down for {:?}",
+                                since.elapsed()
+                            );
+                            self.disconnected_since = None;
+                            self.release_capture(capture).await?;
+                        }
+                    }
                 },
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
@@ -467,6 +502,9 @@ impl CaptureTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Connect(h) => self.conn.ensure_connected(h),
+                    CaptureRequest::SetSensitivity(h, scale) => {
+                        self.sensitivity.insert(h, scale);
+                    }
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t) => {
@@ -551,6 +589,25 @@ impl CaptureTask {
                 .ok()
                 .unwrap_or_default();
         }
+
+        // Trim the speed for this client: Wayland (layer-shell) reports raw
+        // deltas while Windows/macOS report accelerated ones, so each peer
+        // combination may need a different scale.
+        let event = match event {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })) => {
+                let scale = self.sensitivity.get(&handle).copied().unwrap_or(1.0);
+                if scale == 1.0 {
+                    event
+                } else {
+                    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                        time,
+                        dx: dx * scale,
+                        dy: dy * scale,
+                    }))
+                }
+            }
+            other => other,
+        };
 
         // Coalesce pointer motion while a client is active. Motion that
         // arrives while we are still waiting for `Ack` is buffered and
@@ -642,17 +699,32 @@ impl CaptureTask {
         }
     }
 
-    async fn send_motion(&self, handle: CaptureHandle, motion: crate::coalesce::Motion) -> bool {
+    async fn send_motion(
+        &mut self,
+        handle: CaptureHandle,
+        motion: crate::coalesce::Motion,
+    ) -> bool {
         let event = ProtoEvent::Input(Event::Pointer(PointerEvent::Motion {
             time: motion.time,
             dx: motion.dx,
             dy: motion.dy,
         }));
-        match self.conn.send(event, handle).await {
-            Ok(()) => true,
+        // Never wait for a (re)connection here: a motion event that is a few
+        // hundred milliseconds old is useless, and blocking the capture loop
+        // on it queued up hundreds of events that then arrived in one jump.
+        // The capture is released after `grace` instead.
+        match self.conn.send_now(event, handle).await {
+            Ok(()) => {
+                self.disconnected_since = None;
+                true
+            }
             Err(e) => {
-                log::warn!("failed to send coalesced motion to client {handle}: {e}");
-                false
+                log::debug!("dropping motion for client {handle}: {e}");
+                if self.disconnected_since.is_none() {
+                    self.disconnected_since = Some(Instant::now());
+                }
+                self.conn.ensure_connected(handle);
+                true
             }
         }
     }

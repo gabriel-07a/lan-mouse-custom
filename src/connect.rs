@@ -397,6 +397,38 @@ impl ConnectionSender {
     }
 }
 
+/// Mark a UDP socket for low latency.
+///
+/// `IP_TOS`/`IPV6_TCLASS` with DSCP EF (46) puts the packets in the WMM
+/// voice queue on Wi-Fi and in the priority queue on routers that honour
+/// DiffServ, which cuts bufferbloat jitter when the network is busy.
+pub(crate) fn configure_low_latency_udp(socket: &UdpSocket) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let tos: libc::c_int = 0xB8; // DSCP EF (46) << 2
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                &tos as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&tos) as libc::socklen_t,
+            );
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_TCLASS,
+                &tos as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&tos) as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = socket;
+}
+
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
@@ -413,6 +445,7 @@ async fn connect(
             .await
             .map_err(|e| (addr, e.into()))?,
     );
+    configure_low_latency_udp(&conn);
     conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
     let config = Config {
         certificates: vec![cert],
@@ -585,7 +618,12 @@ async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
 
         // send 4 pings, at least one must be answered
         for _ in 0..4 {
-            ctx.ping_sent.borrow_mut().insert(addr, Instant::now());
+            // Keep the timestamp of the first unanswered ping of the round so
+            // the RTT is not reset by the following three probes.
+            ctx.ping_sent
+                .borrow_mut()
+                .entry(addr)
+                .or_insert_with(Instant::now);
             if let Err(e) = conn.send(&buf[..len]).await {
                 if watchdog.on_send_error() == PingVerdict::Close {
                     log::warn!("{addr}: too many send errors, closing connection");
@@ -676,7 +714,7 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
                         ctx.client_manager.set_active_addr(handle, Some(addr));
                         ctx.client_manager.set_alive(handle, alive);
                         ctx.ping_response.borrow_mut().insert(addr);
-                        if let Some(sent) = ctx.ping_sent.borrow().get(&addr).copied() {
+                        if let Some(sent) = ctx.ping_sent.borrow_mut().remove(&addr) {
                             let rtt = sent.elapsed().as_millis().min(u32::MAX as u128) as u32;
                             ctx.client_manager.set_rtt_ms(handle, Some(rtt));
                         }
@@ -851,6 +889,7 @@ mod tests {
             active: true,
             enter_hook: None,
             leave_hook: None,
+            sensitivity: 100,
         });
         (manager, handle)
     }
@@ -870,6 +909,7 @@ mod tests {
             cert,
             Arc::new(RwLock::new(keys)),
             Arc::new(RwLock::new(Vec::new())),
+            Default::default(),
         )
         .await
         .expect("listener")
@@ -1006,6 +1046,7 @@ mod tests {
                     active: true,
                     enter_hook: None,
                     leave_hook: None,
+                    sensitivity: 100,
                 });
                 let conn = LanMouseConnection::new(client_cert, manager, 2000);
                 conn.send(
@@ -1190,10 +1231,15 @@ mod tests {
                 let trusted = Arc::new(RwLock::new(vec![
                     crate::trusted::TrustedNet::parse("127.0.0.1").expect("cidr"),
                 ]));
-                let mut listener =
-                    LanMouseListener::new(port, listener_cert, authorized.clone(), trusted)
-                        .await
-                        .expect("listener");
+                let mut listener = LanMouseListener::new(
+                    port,
+                    listener_cert,
+                    authorized.clone(),
+                    trusted,
+                    Default::default(),
+                )
+                .await
+                .expect("listener");
 
                 let (manager, handle) = client_manager_for(port);
                 let conn = LanMouseConnection::new(client_cert, manager, 2000);
@@ -1236,6 +1282,73 @@ mod tests {
                     "the certificate must be stored for later connections"
                 );
 
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// While pairing mode is open, any certificate is accepted and stored, so
+    /// the other machine needs no mouse to approve the request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pairing_mode_accepts_any_device() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("pairing-listener");
+                let client_cert = unique_cert("pairing-client");
+                let fingerprint = crypto::certificate_fingerprint(&client_cert);
+
+                let authorized: Arc<RwLock<HashMap<String, String>>> =
+                    Arc::new(RwLock::new(HashMap::new()));
+                let pairing: Arc<RwLock<Option<Instant>>> =
+                    Arc::new(RwLock::new(Some(Instant::now() + Duration::from_secs(60))));
+                let mut listener = LanMouseListener::new(
+                    port,
+                    listener_cert,
+                    authorized.clone(),
+                    Arc::new(RwLock::new(Vec::new())),
+                    pairing,
+                )
+                .await
+                .expect("listener");
+
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(client_cert, manager, 2000);
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 9,
+                    },
+                    handle,
+                )
+                .await
+                .expect("pairing accepts the peer");
+
+                let mut accepted = false;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline && !accepted {
+                    let event = tokio::time::timeout(Duration::from_secs(10), listener.next())
+                        .await
+                        .expect("timed out")
+                        .expect("listener closed");
+                    match event {
+                        ListenEvent::AutoAuthorized {
+                            fingerprint: reported,
+                            ..
+                        } => {
+                            assert_eq!(reported, fingerprint);
+                            accepted = true;
+                        }
+                        ListenEvent::Rejected { .. } => panic!("pairing must not reject"),
+                        _ => {}
+                    }
+                }
+                assert!(
+                    accepted,
+                    "expected the pairing window to authorize the peer"
+                );
+                assert!(authorized.read().expect("lock").contains_key(&fingerprint));
                 listener.terminate().await;
             })
             .await;
