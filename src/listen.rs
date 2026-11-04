@@ -7,7 +7,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
 };
@@ -335,7 +335,7 @@ fn per_connection_verify(
 /// normalized when accepted), and on IPv4 elsewhere.
 async fn bind_listener(port: u16) -> Result<impl Listener, webrtc_util::Error> {
     #[cfg(target_os = "linux")]
-    let primary = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+    let primary = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
     #[cfg(not(target_os = "linux"))]
     let primary = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
 
