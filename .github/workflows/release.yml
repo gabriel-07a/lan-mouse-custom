@@ -13,6 +13,9 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -26,6 +29,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install libx11-dev libxtst-dev
         sudo apt-get install libadwaita-1-dev libgtk-4-dev
+        sudo apt-get install libwayland-dev libxkbcommon-dev
     - name: Release Build
       run: |
         cargo build --release
@@ -53,6 +57,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install libx11-dev libxtst-dev
         sudo apt-get install libadwaita-1-dev libgtk-4-dev
+        sudo apt-get install libwayland-dev libxkbcommon-dev
     - name: Release Build
       run: |
         cargo build --release
@@ -117,11 +122,17 @@ jobs:
         Get-Childitem -Path "C:\\gtk-build\\gtk\\x64\\release\\bin\\*.dll" -File -Recurse | Copy-Item -Destination "lan-mouse-windows"
         Copy-Item -Path "target\release\lan-mouse.exe" -Destination "lan-mouse-windows"
         Compress-Archive -Path "lan-mouse-windows\*" -DestinationPath lan-mouse-windows-x86_64.zip
+    - name: Build installer
+      run: |
+        choco install nsis -y --no-progress
+        makensis installer/windows/lan-mouse-custom.nsi
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
         name: lan-mouse-windows-x86_64
-        path: lan-mouse-windows-x86_64.zip
+        path: |
+          lan-mouse-windows-x86_64.zip
+          lan-mouse-custom-setup-x86_64.exe
 
   macos-release-build:
     runs-on: macos-15-intel
@@ -212,6 +223,7 @@ jobs:
           lan-mouse-macos-intel/lan-mouse-macos-intel.zip
           lan-mouse-macos-arm64/lan-mouse-macos-arm64.zip
           lan-mouse-windows-x86_64/lan-mouse-windows-x86_64.zip
+          lan-mouse-windows-x86_64/lan-mouse-custom-setup-x86_64.exe
     - name: Create Tagged Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
@@ -229,3 +241,4 @@ jobs:
           lan-mouse-macos-intel/lan-mouse-macos-intel.zip
           lan-mouse-macos-arm64/lan-mouse-macos-arm64.zip
           lan-mouse-windows-x86_64/lan-mouse-windows-x86_64.zip
+          lan-mouse-windows-x86_64/lan-mouse-custom-setup-x86_64.exe
