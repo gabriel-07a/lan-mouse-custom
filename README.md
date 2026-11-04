@@ -509,6 +509,22 @@ Clipboard backends: GNOME/KDE use the XDG portal, wlroots compositors use
 `wlr-data-control`, and X11 uses the `CLIPBOARD` selection. The X11 backend
 handles text, HTML and small PNG images; large payloads (INCR) are skipped.
 
+### GNOME asks once per login
+
+On GNOME the `InputCapture` portal is still at **version 1**, which has no
+`restore_token`/`persist_mode`: the compositor asks for permission every time
+a capture session is created. This fork therefore creates exactly **one**
+capture session per daemon start and keeps it for the whole session, so the
+dialog appears once per login and never while you cross the screen edges.
+
+Click **Share** (and enable the toggle) once. If you cancel, input capture
+stays off until you re-enable it (`lan-mouse cli enable-capture`, or the
+button in the GUI) — the daemon does not retry, so it will not spam the
+dialog.
+
+The emulation (`RemoteDesktop`, portal v2) and clipboard sessions store their
+restore tokens under `~/.cache/lan-mouse/`, so they are only approved once.
+
 ### Peers running an upstream release
 
 Peers advertise optional features in the `Pong` they send for the first `Ping`
