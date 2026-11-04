@@ -9,15 +9,25 @@ use std::ops::BitOrAssign;
 use std::time::Duration;
 use tokio::task::AbortHandle;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+use windows::Win32::{
+    Foundation::POINT,
+    UI::{
+        HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext},
+        Input::KeyboardAndMouse::{
+            INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+        },
+        WindowsAndMessaging::{
+            GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        },
+    },
+};
 
 use super::{Emulation, EmulationHandle};
 
@@ -26,6 +36,11 @@ const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
+    /// Absolute moves bypass the Windows pointer acceleration curve, which
+    /// would otherwise speed up every fast movement twice (once here, once in
+    /// the sender). `LAN_MOUSE_WINDOWS_RELATIVE_MOUSE=1` restores the old
+    /// relative path for troubleshooting.
+    absolute: bool,
     /// Fractional part of the last motion, so slow movements are not lost to
     /// the integer-only `SendInput` delta.
     subpixel: super::subpixel::SubPixel,
@@ -33,8 +48,14 @@ pub(crate) struct WindowsEmulation {
 
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
+        // Coordinates from `GetCursorPos` and `SendInput` are only comparable
+        // when the process sees physical pixels.
+        unsafe {
+            let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
         Ok(Self {
             repeat_task: None,
+            absolute: !std::env::var("LAN_MOUSE_WINDOWS_RELATIVE_MOUSE").is_ok_and(|v| v == "1"),
             subpixel: Default::default(),
         })
     }
@@ -48,7 +69,11 @@ impl Emulation for WindowsEmulation {
                 PointerEvent::Motion { time: _, dx, dy } => {
                     let (move_x, move_y) = self.subpixel.consume(dx, dy);
                     if move_x != 0 || move_y != 0 {
-                        rel_mouse(move_x, move_y);
+                        if self.absolute {
+                            move_mouse_absolute(move_x, move_y);
+                        } else {
+                            rel_mouse(move_x, move_y);
+                        }
                     }
                 }
                 PointerEvent::Button {
@@ -146,6 +171,46 @@ fn rel_mouse(dx: i32, dy: i32) {
         dwExtraInfo: 0,
     };
     send_mouse_input(mi);
+}
+
+/// Move the cursor by `dx`/`dy` using absolute coordinates.
+///
+/// Relative `SendInput` movement is scaled by the system pointer speed and
+/// acceleration ("enhance pointer precision"), so a fast flick arrives
+/// amplified. Absolute moves map straight to a screen position and are not
+/// accelerated, which is what a KVM needs.
+fn move_mouse_absolute(dx: i32, dy: i32) {
+    unsafe {
+        let mut current = POINT::default();
+        if GetCursorPos(&mut current).is_err() {
+            rel_mouse(dx, dy);
+            return;
+        }
+
+        let origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let origin_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        // The virtual desktop spans every monitor; clamp so the pointer stays
+        // on screen instead of wrapping.
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2) - 1;
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2) - 1;
+
+        let target_x = super::absolute::clamp_to_span(current.x, dx, origin_x, width);
+        let target_y = super::absolute::clamp_to_span(current.y, dy, origin_y, height);
+
+        // Absolute coordinates are normalised to 0..=65535 over the virtual
+        // desktop when MOUSEEVENTF_VIRTUALDESK is set.
+        let normalised_x = super::absolute::normalise(target_x, origin_x, width);
+        let normalised_y = super::absolute::normalise(target_y, origin_y, height);
+
+        send_mouse_input(MOUSEINPUT {
+            dx: normalised_x,
+            dy: normalised_y,
+            mouseData: 0,
+            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            time: 0,
+            dwExtraInfo: 0,
+        });
+    }
 }
 
 fn mouse_button(button: u32, state: u32) {
