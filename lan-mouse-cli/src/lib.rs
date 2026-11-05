@@ -64,8 +64,20 @@ enum CliSubcommand {
     List,
     /// scan the local network for hosts and Lan Mouse instances
     Scan,
-    /// allow connections from an address (IP or CIDR) without a prompt
-    Trust { address: String },
+    /// allow connections from an address (IP or CIDR) without a prompt,
+    /// with explicit permissions for the adopted devices
+    Trust {
+        /// IP or CIDR, e.g. `192.168.1.50` or `10.0.0.0/24`
+        address: String,
+        /// permissions adopted devices get here (pointer,keyboard,clipboard | all | none)
+        #[arg(long, default_value = "all")]
+        incoming: String,
+        /// permissions this machine gets on adopted devices
+        #[arg(long, default_value = "all")]
+        outgoing: String,
+    },
+    /// list the address rules and their permissions
+    Trusted,
     /// remove an address from the allowlist
     Untrust { address: String },
     /// accept any device that connects in the next seconds (default 60)
@@ -314,10 +326,54 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 }
             }
         }
-        CliSubcommand::Trust { address } => {
-            tx.request(FrontendRequest::TrustAddress(address.clone()))
-                .await?;
-            println!("trusted {address}: connections from it are accepted without a prompt");
+        CliSubcommand::Trust {
+            address,
+            incoming,
+            outgoing,
+        } => {
+            let incoming = parse_policy(&incoming)?;
+            let outgoing = parse_policy(&outgoing)?;
+            tx.request(FrontendRequest::AddAddressRule {
+                address: address.clone(),
+                incoming,
+                outgoing,
+            })
+            .await?;
+            println!(
+                "trusted {address}: incoming [{}], outgoing [{}]",
+                incoming.capabilities.summary(),
+                outgoing.capabilities.summary()
+            );
+        }
+        CliSubcommand::Trusted => {
+            tx.request(FrontendRequest::ListAddressRules).await?;
+            while let Some(e) = rx.next().await {
+                if let FrontendEvent::AddressRules(rules) = e? {
+                    if rules.is_empty() {
+                        println!("no address rules");
+                    }
+                    for rule in rules {
+                        println!(
+                            "{:<24} in [{}]{} out [{}]{}{}",
+                            rule.address,
+                            rule.incoming.capabilities.summary(),
+                            if rule.incoming.allowed {
+                                ""
+                            } else {
+                                " (disabled)"
+                            },
+                            rule.outgoing.capabilities.summary(),
+                            if rule.outgoing.allowed {
+                                ""
+                            } else {
+                                " (disabled)"
+                            },
+                            if rule.broad { " (broad!)" } else { "" }
+                        );
+                    }
+                    break;
+                }
+            }
         }
         CliSubcommand::Pair { seconds } => {
             tx.request(FrontendRequest::StartPairing(seconds)).await?;

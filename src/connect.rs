@@ -1312,9 +1312,9 @@ mod tests {
 
                 let authorized: Arc<RwLock<HashMap<String, String>>> =
                     Arc::new(RwLock::new(HashMap::new()));
-                let trusted = Arc::new(RwLock::new(vec![
+                let trusted = Arc::new(RwLock::new(vec![crate::trusted::AddressRule::legacy(
                     crate::trusted::TrustedNet::parse("127.0.0.1").expect("cidr"),
-                ]));
+                )]));
                 let mut listener = LanMouseListener::new(
                     port,
                     listener_cert,
@@ -1984,9 +1984,9 @@ mod tests {
                     port,
                     listener_cert,
                     authorized,
-                    Arc::new(RwLock::new(vec![
+                    Arc::new(RwLock::new(vec![crate::trusted::AddressRule::legacy(
                         crate::trusted::TrustedNet::parse("127.0.0.1").expect("cidr"),
-                    ])),
+                    )])),
                     Arc::new(RwLock::new(Some(Instant::now() + Duration::from_secs(60)))),
                     denied,
                     Default::default(),
@@ -2220,6 +2220,75 @@ mod tests {
                         "pointer input must be filtered out"
                     );
                 }
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// An address rule carries the permissions of the devices it adopts; the
+    /// listener reports them so the service can register a restricted device
+    /// instead of granting full access.
+    #[tokio::test(flavor = "current_thread")]
+    async fn address_rule_permissions_reach_the_auto_authorization() {
+        use lan_mouse_ipc::{Capabilities, DirectionPolicy};
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("rule-listener");
+                let client_cert = unique_cert("rule-client");
+                let incoming = DirectionPolicy {
+                    allowed: true,
+                    capabilities: Capabilities::CLIPBOARD,
+                };
+                let outgoing = DirectionPolicy::deny();
+                let rule = crate::trusted::AddressRule::new(
+                    crate::trusted::TrustedNet::parse("127.0.0.1").expect("cidr"),
+                    incoming,
+                    outgoing,
+                );
+                let mut listener = LanMouseListener::new(
+                    port,
+                    listener_cert,
+                    Arc::new(RwLock::new(HashMap::new())),
+                    Arc::new(RwLock::new(vec![rule])),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                )
+                .await
+                .expect("listener");
+
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(client_cert, manager, 2000);
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 2,
+                    },
+                    handle,
+                )
+                .await
+                .expect("connect");
+
+                let (granted_in, granted_out) =
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            match listener.next().await {
+                                Some(ListenEvent::AutoAuthorized {
+                                    incoming, outgoing, ..
+                                }) => break (incoming, outgoing),
+                                Some(_) => continue,
+                                None => panic!("listener closed"),
+                            }
+                        }
+                    })
+                    .await
+                    .expect("timed out waiting for the auto authorization");
+                assert_eq!(granted_in, incoming, "rule incoming policy is reported");
+                assert_eq!(granted_out, outgoing, "rule outgoing policy is reported");
 
                 listener.terminate().await;
             })

@@ -23,9 +23,9 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::{crypto, devices::DeviceStore, trusted::TrustedNet};
+use crate::{crypto, devices::DeviceStore, trusted::AddressRule};
 use input_event::{Event as InputEvent, PointerEvent};
-use lan_mouse_ipc::Capabilities;
+use lan_mouse_ipc::{Capabilities, DirectionPolicy};
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -64,8 +64,11 @@ pub(crate) enum ListenEvent {
         addr: SocketAddr,
         fingerprint: String,
         /// The peer was accepted because the pairing window was open (in
-        /// contrast to an allowlisted address).
+        /// contrast to an address rule).
         from_pairing: bool,
+        /// permissions granted by the address rule that adopted the device
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
     },
     /// An incoming DTLS connection was closed.
     Closed {
@@ -93,7 +96,7 @@ impl LanMouseListener {
         port: u16,
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
-        trusted_nets: Arc<RwLock<Vec<TrustedNet>>>,
+        trusted_nets: Arc<RwLock<Vec<AddressRule>>>,
         pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
         denied: Arc<RwLock<HashSet<String>>>,
         devices: Arc<RwLock<DeviceStore>>,
@@ -180,10 +183,16 @@ impl LanMouseListener {
                                             if let Some(source) =
                                                 auto_source.lock().expect("lock").take()
                                             {
-                                                let description = match source {
-                                                    AutoSource::TrustedAddress => {
-                                                        format!("trusted {}", addr.ip())
-                                                    }
+                                                let (description, incoming, outgoing) = match source
+                                                {
+                                                    AutoSource::TrustedAddress {
+                                                        incoming,
+                                                        outgoing,
+                                                    } => (
+                                                        format!("trusted {}", addr.ip()),
+                                                        incoming,
+                                                        outgoing,
+                                                    ),
                                                     AutoSource::Pairing => {
                                                         // Single use: the
                                                         // window allows exactly
@@ -192,7 +201,11 @@ impl LanMouseListener {
                                                             .write()
                                                             .expect("lock")
                                                             .take();
-                                                        format!("paired {}", addr.ip())
+                                                        (
+                                                            format!("paired {}", addr.ip()),
+                                                            DirectionPolicy::allow_all(),
+                                                            DirectionPolicy::allow_all(),
+                                                        )
                                                     }
                                                 };
                                                 authorized
@@ -210,6 +223,8 @@ impl LanMouseListener {
                                                             source,
                                                             AutoSource::Pairing
                                                         ),
+                                                        incoming,
+                                                        outgoing,
                                                     },
                                                 );
                                             }
@@ -359,8 +374,12 @@ impl Stream for LanMouseListener {
 /// Why an incoming certificate was accepted without an interactive prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutoSource {
-    /// The peer's address is in the trusted address allowlist.
-    TrustedAddress,
+    /// The peer's address matched an address rule; the rule carries the
+    /// permissions the adopted device gets.
+    TrustedAddress {
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    },
     /// The user opened the pairing window, which accepts one new device.
     Pairing,
 }
@@ -374,7 +393,7 @@ enum AutoSource {
 /// orphaned pin.
 fn per_connection_verify(
     authorized: Arc<RwLock<HashMap<String, String>>>,
-    trusted: Arc<RwLock<Vec<TrustedNet>>>,
+    trusted: Arc<RwLock<Vec<AddressRule>>>,
     pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
     denied: Arc<RwLock<HashSet<String>>>,
     addr: SocketAddr,
@@ -411,16 +430,21 @@ fn per_connection_verify(
                 return Ok(());
             }
 
-            // An allowlisted address is trusted on first use; the fingerprint
-            // is stored after the handshake so later connections match by
-            // certificate instead of by address.
-            if trusted
+            // An address rule is trusted on first use; the fingerprint is
+            // stored after the handshake so later connections match by
+            // certificate instead of by address. The rule also decides the
+            // permissions the adopted device gets.
+            if let Some(rule) = trusted
                 .read()
                 .expect("lock")
                 .iter()
-                .any(|net| net.contains(addr.ip()))
+                .copied()
+                .find(|rule| rule.incoming.allowed && rule.contains(addr.ip()))
             {
-                *auto_source.lock().expect("lock") = Some(AutoSource::TrustedAddress);
+                *auto_source.lock().expect("lock") = Some(AutoSource::TrustedAddress {
+                    incoming: rule.incoming,
+                    outgoing: rule.outgoing,
+                });
                 return Ok(());
             }
 

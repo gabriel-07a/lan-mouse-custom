@@ -12,9 +12,9 @@ use crate::{
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, Capabilities, ClientHandle, ClipboardStatus, DeviceView, Diagnostics,
-    DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, PendingView, Position, Status,
+    AddressRuleView, AsyncFrontendListener, Capabilities, ClientHandle, ClipboardStatus,
+    DeviceView, Diagnostics, DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest,
+    IpcError, IpcListenerCreationError, PendingView, Position, Status,
 };
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION};
 use local_channel::mpsc::{Receiver, Sender};
@@ -105,10 +105,9 @@ pub struct Service {
     discovered: HashMap<IpAddr, DiscoveredDevice>,
     /// cancels the background discovery listener
     discovery_cancel: CancellationToken,
-    /// addresses that may connect without an authorization prompt
-    trusted_nets: Arc<RwLock<Vec<crate::trusted::TrustedNet>>>,
-    /// raw allowlist entries as written by the user
-    trusted_ips: Vec<String>,
+    /// address rules that may connect without a prompt, carrying permissions;
+    /// shared with the listener so policy changes apply to new handshakes
+    trusted_nets: Arc<RwLock<Vec<crate::trusted::AddressRule>>>,
     /// while this is in the future, any connecting device is authorized
     pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
     /// certificate used for explicit Lan Mouse probes
@@ -167,8 +166,7 @@ impl Service {
         let devices = Arc::new(RwLock::new(device_store));
         let authorized_keys = Arc::new(RwLock::new(Self::authorized_map(&devices)));
         let denied_keys: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(denied_fingerprints));
-        let trusted_ips = config.trusted_ips();
-        let trusted_nets = Arc::new(RwLock::new(crate::trusted::parse_all(&trusted_ips)));
+        let trusted_nets = Arc::new(RwLock::new(config.address_rules()));
         let pairing_until: Arc<RwLock<Option<std::time::Instant>>> = Default::default();
         // listener + connection
         let listener = LanMouseListener::new(
@@ -255,7 +253,6 @@ impl Service {
             discovered: Default::default(),
             discovery_cancel: CancellationToken::new(),
             trusted_nets,
-            trusted_ips,
             pairing_until,
             cert: cert.clone(),
             public_key_fingerprint,
@@ -335,6 +332,7 @@ impl Service {
                                     name,
                                     DeviceSource::Legacy,
                                     DirectionPolicy::deny(),
+                                    DirectionPolicy::allow_all(),
                                 );
                                 self.learned_fingerprints.insert(handle, fingerprint.clone());
                                 self.refresh_maps();
@@ -500,6 +498,15 @@ impl Service {
                 self.trust_address(entry);
                 self.save_config();
             }
+            FrontendRequest::AddAddressRule {
+                address,
+                incoming,
+                outgoing,
+            } => {
+                self.add_address_rule(address, incoming, outgoing);
+                self.save_config();
+            }
+            FrontendRequest::ListAddressRules => self.broadcast_address_rules(),
             FrontendRequest::UntrustAddress(entry) => {
                 self.untrust_address(&entry);
                 self.save_config();
@@ -525,6 +532,8 @@ impl Service {
             })
             .collect();
         self.config.set_clients(clients);
+        let rules = self.trusted_nets.read().expect("lock").clone();
+        self.config.set_address_rules(rules);
         let devices = self
             .devices
             .read()
@@ -569,6 +578,7 @@ impl Service {
                 .filter_map(|fp| crypto::normalize_fingerprint(&fp)),
         );
         *self.devices.write().expect("lock") = store;
+        *self.trusted_nets.write().expect("lock") = self.config.address_rules();
         self.refresh_maps();
         for handle in self.client_manager.active_clients() {
             if let Some(fingerprint) = self.client_manager.fingerprint(handle) {
@@ -666,6 +676,8 @@ impl Service {
                 addr,
                 fingerprint,
                 from_pairing,
+                incoming,
+                outgoing,
             } => {
                 // The listener trusted the certificate (allowlisted address
                 // or open pairing window). It only inserted the fingerprint
@@ -682,14 +694,9 @@ impl Service {
                 } else {
                     DeviceSource::AddressRule
                 };
-                self.ensure_device(
-                    &fingerprint,
-                    name.clone(),
-                    source,
-                    DirectionPolicy::allow_all(),
-                );
+                self.ensure_device(&fingerprint, name.clone(), source, incoming, outgoing);
                 self.refresh_maps();
-                log::info!("auto-authorized {addr} ({fingerprint}) from a trusted address");
+                log::info!("auto-authorized {addr} ({fingerprint})");
                 if self
                     .devices
                     .read()
@@ -720,6 +727,7 @@ impl Service {
                     &fingerprint,
                     name,
                     DeviceSource::Manual,
+                    DirectionPolicy::allow_all(),
                     DirectionPolicy::allow_all(),
                 );
                 self.refresh_maps();
@@ -837,7 +845,10 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-        self.notify_frontend(FrontendEvent::TrustedAddresses(self.trusted_ips.clone()));
+        self.notify_frontend(FrontendEvent::TrustedAddresses(
+            self.trusted_address_strings(),
+        ));
+        self.notify_frontend(FrontendEvent::AddressRules(self.address_rule_views()));
         self.notify_frontend(FrontendEvent::ClipboardStatus(
             self.clipboard_status.clone(),
         ));
@@ -1052,6 +1063,7 @@ impl Service {
         name: String,
         source: DeviceSource,
         incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
     ) -> bool {
         let mut store = self.devices.write().expect("lock");
         if store.is_known(fingerprint) {
@@ -1066,7 +1078,7 @@ impl Service {
             fingerprint: fingerprint.to_string(),
             name,
             incoming,
-            outgoing: DirectionPolicy::allow_all(),
+            outgoing,
             source,
         });
         true
@@ -1321,49 +1333,111 @@ impl Service {
         self.notify_frontend(FrontendEvent::Enumerate(clients));
     }
 
-    /// Add an address (IP or CIDR) to the allowlist.
-    fn trust_address(&mut self, entry: String) {
-        let entry = entry.trim().to_string();
-        let Some(net) = crate::trusted::TrustedNet::parse(&entry) else {
-            log::warn!("ignoring invalid trusted address `{entry}`");
+    /// Address rule entries, rendered for the legacy address list event.
+    fn trusted_address_strings(&self) -> Vec<String> {
+        self.trusted_nets
+            .read()
+            .expect("lock")
+            .iter()
+            .map(|rule| rule.net.to_string())
+            .collect()
+    }
+
+    /// Structured address rules with their permissions.
+    fn address_rule_views(&self) -> Vec<AddressRuleView> {
+        self.trusted_nets
+            .read()
+            .expect("lock")
+            .iter()
+            .map(|rule| AddressRuleView {
+                address: rule.net.to_string(),
+                incoming: rule.incoming,
+                outgoing: rule.outgoing,
+                broad: rule.net.is_broad(),
+            })
+            .collect()
+    }
+
+    fn broadcast_address_rules(&mut self) {
+        self.notify_frontend(FrontendEvent::TrustedAddresses(
+            self.trusted_address_strings(),
+        ));
+        self.notify_frontend(FrontendEvent::AddressRules(self.address_rule_views()));
+    }
+
+    /// Add an address rule (IP or CIDR) with explicit permissions.
+    ///
+    /// A device adopted through the rule gets exactly these permissions; the
+    /// user can still narrow or revoke it per device afterwards.
+    fn add_address_rule(
+        &mut self,
+        address: String,
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    ) {
+        let address = address.trim().to_string();
+        let Some(net) = crate::trusted::TrustedNet::parse(&address) else {
+            log::warn!("ignoring invalid address rule `{address}`");
             self.notify_frontend(FrontendEvent::Error(format!(
-                "invalid trusted address: {entry}"
+                "invalid address rule: {address}"
             )));
             return;
         };
         if net.is_broad() {
             log::warn!(
-                "trusted address `{entry}` is very broad: every certificate in it                  will be authorized without a prompt"
+                "address rule `{address}` is very broad: every certificate in it \
+                 will be authorized without a prompt"
             );
             self.notify_frontend(FrontendEvent::Error(format!(
-                "warning: trusted address {entry} is very broad"
+                "warning: address rule {address} is very broad"
             )));
         }
-        if self.trusted_ips.iter().any(|e| e == &entry) {
-            return;
+        {
+            let mut rules = self.trusted_nets.write().expect("lock");
+            if rules.iter().any(|rule| rule.net == net) {
+                return;
+            }
+            rules.push(crate::trusted::AddressRule::new(net, incoming, outgoing));
         }
-        self.trusted_ips.push(entry.clone());
-        self.refresh_trusted_nets();
-        self.config.set_trusted_ips(self.trusted_ips.clone());
-        log::info!("trusted address added: {entry}");
-        self.notify_frontend(FrontendEvent::TrustedAddresses(self.trusted_ips.clone()));
+        let rules = self.trusted_nets.read().expect("lock").clone();
+        self.config.set_address_rules(rules);
+        log::info!(
+            "address rule added: {address} (in [{}], out [{}])",
+            incoming.capabilities.summary(),
+            outgoing.capabilities.summary()
+        );
+        self.broadcast_address_rules();
+    }
+
+    /// Legacy request: add an address with full access.
+    fn trust_address(&mut self, entry: String) {
+        self.add_address_rule(
+            entry,
+            DirectionPolicy::allow_all(),
+            DirectionPolicy::allow_all(),
+        );
     }
 
     fn untrust_address(&mut self, entry: &str) {
-        let before = self.trusted_ips.len();
-        self.trusted_ips.retain(|e| e != entry);
-        if self.trusted_ips.len() == before {
+        let entry = entry.trim();
+        let Some(net) = crate::trusted::TrustedNet::parse(entry) else {
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "invalid address rule: {entry}"
+            )));
+            return;
+        };
+        let before = self.trusted_nets.read().expect("lock").len();
+        self.trusted_nets
+            .write()
+            .expect("lock")
+            .retain(|rule| rule.net != net);
+        if self.trusted_nets.read().expect("lock").len() == before {
             return;
         }
-        self.refresh_trusted_nets();
-        self.config.set_trusted_ips(self.trusted_ips.clone());
-        log::info!("trusted address removed: {entry}");
-        self.notify_frontend(FrontendEvent::TrustedAddresses(self.trusted_ips.clone()));
-    }
-
-    fn refresh_trusted_nets(&self) {
-        let nets = crate::trusted::parse_all(&self.trusted_ips);
-        *self.trusted_nets.write().expect("lock") = nets;
+        let rules = self.trusted_nets.read().expect("lock").clone();
+        self.config.set_address_rules(rules);
+        log::info!("address rule removed: {entry}");
+        self.broadcast_address_rules();
     }
 
     /// Trust one new device for the next `seconds`.

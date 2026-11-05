@@ -504,6 +504,10 @@ caps; eventos `AuthRequest/AuthResponse/AuthRevoke` + capability `PERMISSIONS`; 
 histórico persistido e tela de auditoria; `doctor`/`status --json`; remover auto-`TrustAddress` no
 clique de descoberta.
 
+> Estado (fase 2): `address_rules` com capacidades implementadas (config, migração de
+> `trusted_ips`, listener/service/CLI/eventos `AddressRules`; políticas chegadas ao
+> `AutoAuthorized`). Próximo: pairing escopado/review, auditoria e SAS.
+
 Aceite: MITM no primeiro pareamento detectado por SAS; peer antigo conecta sob política legada
 marcada na UI; regra de endereço com `incoming=["clipboard"]` só entrega clipboard.
 

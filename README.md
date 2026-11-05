@@ -505,6 +505,38 @@ so nothing changes until a policy is narrowed. A device can also be granted
 *connect-only* access (`allowed = true`, `capabilities = 0`): it may stay
 connected and answer pings but cannot inject any input.
 
+### Auto-authorizing address rules
+
+An address rule lets devices from an IP or CIDR connect without an approval
+prompt. Unlike the old `trusted_ips` allowlist, a rule carries the permissions
+the adopted device gets, so a whole subnet can be allowed to use the clipboard
+but not to control the mouse or keyboard:
+
+```toml
+[[address_rules]]
+address = "10.0.0.0/24"
+
+[address_rules.incoming]    # what devices from this range may do here
+allowed = true
+capabilities = 4            # clipboard only
+
+[address_rules.outgoing]    # what this PC may do there
+allowed = true
+capabilities = 0            # connect-only
+```
+
+```sh
+lan-mouse cli trust 10.0.0.0/24 --incoming clipboard --outgoing none
+lan-mouse cli trusted        # list rules and their permissions
+lan-mouse cli untrust 10.0.0.0/24
+```
+
+Rules that cover more than a local subnet (for example `10.0.0.0/8` or
+`0.0.0.0/0`) are accepted but logged and reported as a warning. The adopted
+device still appears in the device list with the rule's permissions and can be
+narrowed or revoked per device; `trusted_ips` from older configs is migrated to
+full-access rules so existing setups keep working.
+
 ## Two-way (mutual) operation
 
 Lan Mouse has **no fixed server/client role**: every instance listens for

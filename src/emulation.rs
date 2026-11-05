@@ -37,12 +37,15 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
-    /// a peer was auto-authorized (allowlisted address or pairing window)
+    /// a peer was auto-authorized (address rule or pairing window)
     AutoAuthorized {
         addr: SocketAddr,
         fingerprint: String,
         /// the pairing window accepted this peer (single use)
         from_pairing: bool,
+        /// permissions granted by the address rule that adopted the device
+        incoming: lan_mouse_ipc::DirectionPolicy,
+        outgoing: lan_mouse_ipc::DirectionPolicy,
     },
     ConnectionAttempt {
         addr: SocketAddr,
@@ -292,9 +295,21 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).ok().unwrap_or_default();
                     }
-                    Some(ListenEvent::AutoAuthorized { addr, fingerprint, from_pairing }) => {
+                    Some(ListenEvent::AutoAuthorized {
+                        addr,
+                        fingerprint,
+                        from_pairing,
+                        incoming,
+                        outgoing,
+                    }) => {
                         self.event_tx
-                            .send(EmulationEvent::AutoAuthorized { addr, fingerprint, from_pairing })
+                            .send(EmulationEvent::AutoAuthorized {
+                                addr,
+                                fingerprint,
+                                from_pairing,
+                                incoming,
+                                outgoing,
+                            })
                             .ok()
                             .unwrap_or_default();
                     }

@@ -373,6 +373,10 @@ fn build_ui(app: &Application) {
                     FrontendEvent::TrustedAddresses(addresses) => {
                         window.update_trusted_addresses(addresses)
                     }
+                    FrontendEvent::AddressRules(_rules) => {
+                        // Structured view of the same list; the GUI shows the
+                        // legacy address strings until the rule editor lands.
+                    }
                     FrontendEvent::PairingActive(active) => {
                         window.set_pairing_active(active);
                         if active {

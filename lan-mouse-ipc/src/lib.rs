@@ -375,6 +375,24 @@ pub struct DeviceView {
     pub source: String,
 }
 
+/// An address range that auto-authorizes connecting devices with fixed
+/// permissions.
+///
+/// Replaces the old `trusted_ips` list, which always granted full access:
+/// every device adopted through a rule now gets exactly the capabilities the
+/// rule carries, and the user can still narrow or revoke it per device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressRuleView {
+    /// `192.168.1.50` or `10.0.0.0/24`
+    pub address: String,
+    /// permissions the adopted device gets in the incoming direction
+    pub incoming: DirectionPolicy,
+    /// permissions the adopted device gets in the outgoing direction
+    pub outgoing: DirectionPolicy,
+    /// the range authorizes more than a typical local subnet
+    pub broad: bool,
+}
+
 /// A device asking to connect that has not been authorized yet.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingView {
@@ -499,6 +517,8 @@ pub enum FrontendEvent {
     },
     /// addresses allowed to connect without an authorization prompt
     TrustedAddresses(Vec<String>),
+    /// structured view of the auto-authorizing address rules
+    AddressRules(Vec<AddressRuleView>),
     /// whether the pairing window is currently open
     PairingActive(bool),
     /// clipboard synchronization status
@@ -660,8 +680,17 @@ pub enum FrontendRequest {
     ScanNetwork,
     /// explicitly test a host for a Lan Mouse listener
     ProbeDevice { ip: std::net::IpAddr, port: u16 },
-    /// allow connections from this address (IP or CIDR) without a prompt
+    /// allow connections from this address (IP or CIDR) without a prompt,
+    /// granting full access (legacy)
     TrustAddress(String),
+    /// allow connections from this address with explicit permissions
+    AddAddressRule {
+        address: String,
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    },
+    /// request the structured address-rule list
+    ListAddressRules,
     /// remove an address from the allowlist
     UntrustAddress(String),
     /// accept any device that connects during the next `seconds`
@@ -1119,6 +1148,32 @@ mod ipc_tests {
             attempts: 3,
         };
         assert_eq!(json_roundtrip(pending.clone()), pending);
+    }
+
+    #[test]
+    fn address_rule_views_and_requests_roundtrip() {
+        let rule = AddressRuleView {
+            address: "10.0.0.0/24".into(),
+            incoming: DirectionPolicy {
+                allowed: true,
+                capabilities: Capabilities::CLIPBOARD,
+            },
+            outgoing: DirectionPolicy::deny(),
+            broad: true,
+        };
+        assert_eq!(json_roundtrip(rule.clone()), rule);
+
+        let requests = vec![
+            FrontendRequest::AddAddressRule {
+                address: "10.0.0.0/24".into(),
+                incoming: DirectionPolicy::allow_all(),
+                outgoing: DirectionPolicy::deny(),
+            },
+            FrontendRequest::ListAddressRules,
+        ];
+        for request in requests {
+            assert_eq!(json_roundtrip(request.clone()), request);
+        }
     }
 
     #[test]

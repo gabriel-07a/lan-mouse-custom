@@ -82,7 +82,10 @@ struct ConfigToml {
     /// fingerprints that must never connect again (survives pairing and
     /// address rules), written when a device is revoked
     denied_fingerprints: Option<Vec<String>>,
-    /// addresses that may connect without an authorization prompt
+    /// address ranges that may connect without an authorization prompt,
+    /// with the permissions granted to devices adopted through them
+    address_rules: Option<Vec<TomlAddressRule>>,
+    /// legacy full-access address allowlist (still written for older peers)
     trusted_ips: Option<Vec<String>>,
 }
 
@@ -189,6 +192,46 @@ impl From<Device> for TomlDevice {
             incoming: Some(device.incoming.into()),
             outgoing: Some(device.outgoing.into()),
             source: Some(device.source.as_str().to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+struct TomlAddressRule {
+    address: String,
+    #[serde(default)]
+    incoming: Option<TomlDirectionPolicy>,
+    #[serde(default)]
+    outgoing: Option<TomlDirectionPolicy>,
+}
+
+impl TomlAddressRule {
+    fn into_rule(self) -> Option<crate::trusted::AddressRule> {
+        let net = match crate::trusted::TrustedNet::parse(&self.address) {
+            Some(net) => net,
+            None => {
+                log::warn!("ignoring malformed address rule: {}", self.address);
+                return None;
+            }
+        };
+        Some(crate::trusted::AddressRule::new(
+            net,
+            self.incoming
+                .map(Into::into)
+                .unwrap_or_else(lan_mouse_ipc::DirectionPolicy::allow_all),
+            self.outgoing
+                .map(Into::into)
+                .unwrap_or_else(lan_mouse_ipc::DirectionPolicy::allow_all),
+        ))
+    }
+}
+
+impl From<&crate::trusted::AddressRule> for TomlAddressRule {
+    fn from(rule: &crate::trusted::AddressRule) -> Self {
+        Self {
+            address: rule.net.to_string(),
+            incoming: Some(rule.incoming.into()),
+            outgoing: Some(rule.outgoing.into()),
         }
     }
 }
@@ -732,6 +775,41 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Auto-authorizing address rules with their permission policies.
+    ///
+    /// Configs that predate the permission model only have `trusted_ips`;
+    /// those become full-access rules so the previous behavior is kept.
+    pub(crate) fn address_rules(&self) -> Vec<crate::trusted::AddressRule> {
+        if let Some(rules) = self
+            .config_toml
+            .as_ref()
+            .and_then(|config| config.address_rules.clone())
+        {
+            return rules
+                .into_iter()
+                .filter_map(TomlAddressRule::into_rule)
+                .collect();
+        }
+        crate::trusted::legacy_rules(&self.trusted_ips())
+    }
+
+    /// Persist the address rules.
+    ///
+    /// `trusted_ips` is dual-written for older binaries, which only know the
+    /// full-access allowlist and ignore `[[address_rules]]`.
+    pub(crate) fn set_address_rules(&mut self, rules: Vec<crate::trusted::AddressRule>) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        let legacy = rules.iter().map(|rule| rule.net.to_string()).collect();
+        {
+            let config = self.config_toml.as_mut().expect("config");
+            config.address_rules =
+                (!rules.is_empty()).then(|| rules.iter().map(TomlAddressRule::from).collect());
+        }
+        self.set_trusted_ips(legacy);
+    }
+
     /// path to certificate
     pub fn cert_path(&self) -> &Path {
         &self.cert_path
@@ -1182,5 +1260,84 @@ capabilities = 0
             .expect("one device")
             .into();
         assert_eq!(roundtripped, device);
+    }
+
+    #[test]
+    fn address_rule_table_parses_with_permissions() {
+        let config = parse(
+            r#"
+[[address_rules]]
+address = "10.0.0.0/24"
+
+[address_rules.incoming]
+allowed = true
+capabilities = 5
+
+[address_rules.outgoing]
+allowed = false
+capabilities = 0
+"#,
+        );
+        let rule = config
+            .address_rules
+            .expect("address rules")
+            .into_iter()
+            .next()
+            .expect("one rule")
+            .into_rule()
+            .expect("valid rule");
+        assert_eq!(rule.net.to_string(), "10.0.0.0/24");
+        assert!(rule.incoming.allowed);
+        assert!(rule.incoming.allows(lan_mouse_ipc::Capabilities::POINTER));
+        assert!(rule.incoming.allows(lan_mouse_ipc::Capabilities::CLIPBOARD));
+        assert!(!rule.incoming.allows(lan_mouse_ipc::Capabilities::KEYBOARD));
+        assert!(!rule.outgoing.allowed);
+    }
+
+    #[test]
+    fn address_rules_default_to_full_access_when_policies_are_omitted() {
+        let config = parse(
+            r#"
+[[address_rules]]
+address = "192.168.1.50"
+"#,
+        );
+        let rule = config
+            .address_rules
+            .expect("address rules")
+            .into_iter()
+            .next()
+            .expect("one rule")
+            .into_rule()
+            .expect("valid rule");
+        assert_eq!(rule.incoming, DirectionPolicy::allow_all());
+        assert_eq!(rule.outgoing, DirectionPolicy::allow_all());
+    }
+
+    #[test]
+    fn address_rules_roundtrip_through_toml() {
+        let rule = crate::trusted::AddressRule::new(
+            crate::trusted::TrustedNet::parse("10.0.0.0/24").expect("cidr"),
+            DirectionPolicy {
+                allowed: true,
+                capabilities: lan_mouse_ipc::Capabilities::KEYBOARD,
+            },
+            DirectionPolicy::deny(),
+        );
+        let config = ConfigToml {
+            address_rules: Some(vec![TomlAddressRule::from(&rule)]),
+            ..Default::default()
+        };
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: ConfigToml = toml::from_str(&serialized).expect("reparse");
+        let roundtripped = parsed
+            .address_rules
+            .expect("address rules")
+            .into_iter()
+            .next()
+            .expect("one rule")
+            .into_rule()
+            .expect("valid rule");
+        assert_eq!(roundtripped, rule);
     }
 }

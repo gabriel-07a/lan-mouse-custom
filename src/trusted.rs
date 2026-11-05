@@ -6,6 +6,8 @@
 //!
 //! Entries are plain IPs (`192.168.1.50`) or CIDR ranges (`10.0.0.0/24`).
 
+use lan_mouse_ipc::DirectionPolicy;
+use std::fmt;
 use std::net::IpAddr;
 
 /// One entry of the allowlist.
@@ -75,11 +77,54 @@ impl TrustedNet {
     }
 }
 
-/// Parse every valid entry, ignoring the malformed ones.
-pub fn parse_all(entries: &[String]) -> Vec<TrustedNet> {
+impl fmt::Display for TrustedNet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let max = if self.addr.is_ipv4() { 32 } else { 128 };
+        if self.prefix == max {
+            write!(f, "{}", self.addr)
+        } else {
+            write!(f, "{}/{}", self.addr, self.prefix)
+        }
+    }
+}
+
+/// An address allowlist entry plus the permissions granted to devices that
+/// are adopted through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressRule {
+    pub net: TrustedNet,
+    pub incoming: DirectionPolicy,
+    pub outgoing: DirectionPolicy,
+}
+
+impl AddressRule {
+    pub fn new(net: TrustedNet, incoming: DirectionPolicy, outgoing: DirectionPolicy) -> Self {
+        Self {
+            net,
+            incoming,
+            outgoing,
+        }
+    }
+
+    /// Legacy behavior: an allowlisted address grants full access both ways.
+    pub fn legacy(net: TrustedNet) -> Self {
+        Self::new(
+            net,
+            DirectionPolicy::allow_all(),
+            DirectionPolicy::allow_all(),
+        )
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.net.contains(ip)
+    }
+}
+
+/// Parse legacy `trusted_ips` entries as full-access rules.
+pub fn legacy_rules(entries: &[String]) -> Vec<AddressRule> {
     entries
         .iter()
-        .filter_map(|e| TrustedNet::parse(e))
+        .filter_map(|entry| TrustedNet::parse(entry).map(AddressRule::legacy))
         .collect()
 }
 
@@ -139,5 +184,46 @@ mod tests {
         assert!(TrustedNet::parse("not-an-ip").is_none());
         assert!(TrustedNet::parse("192.168.1.1/33").is_none());
         assert!(TrustedNet::parse("192.168.1.1/x").is_none());
+    }
+
+    #[test]
+    fn legacy_rules_grant_full_access() {
+        let rules = legacy_rules(&["10.0.0.0/24".to_string(), "not-an-ip".to_string()]);
+        assert_eq!(rules.len(), 1, "malformed entries are ignored");
+        assert_eq!(rules[0].incoming, DirectionPolicy::allow_all());
+        assert_eq!(rules[0].outgoing, DirectionPolicy::allow_all());
+        assert_eq!(rules[0].net.to_string(), "10.0.0.0/24");
+    }
+
+    #[test]
+    fn address_rule_can_restrict_each_direction() {
+        let rule = AddressRule::new(
+            TrustedNet::parse("192.168.1.50").expect("ip"),
+            DirectionPolicy {
+                allowed: true,
+                capabilities: lan_mouse_ipc::Capabilities::CLIPBOARD,
+            },
+            DirectionPolicy::deny(),
+        );
+        assert!(rule.contains(ip("192.168.1.50")));
+        assert!(rule.incoming.allows(lan_mouse_ipc::Capabilities::CLIPBOARD));
+        assert!(!rule.incoming.allows_input());
+        assert!(!rule.outgoing.allowed);
+    }
+
+    #[test]
+    fn display_roundtrips_single_addresses_and_ranges() {
+        assert_eq!(
+            TrustedNet::parse("192.168.1.50").expect("ip").to_string(),
+            "192.168.1.50"
+        );
+        assert_eq!(
+            TrustedNet::parse("10.0.0.0/24").expect("cidr").to_string(),
+            "10.0.0.0/24"
+        );
+        assert_eq!(
+            TrustedNet::parse("fd00::/64").expect("cidr6").to_string(),
+            "fd00::/64"
+        );
     }
 }
