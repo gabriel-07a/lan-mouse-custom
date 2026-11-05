@@ -10,6 +10,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::{
@@ -74,6 +75,49 @@ pub(crate) enum ListenEvent {
     Closed {
         addr: SocketAddr,
     },
+}
+
+/// Per-IP handshake budget: a hostile LAN peer cannot force an unbounded
+/// number of certificate verifications/tasks. Well above anything a normal
+/// reconnect storm produces (the connect side backs off to 5 s).
+const HANDSHAKES_PER_IP: u32 = 20;
+const HANDSHAKE_WINDOW: Duration = Duration::from_secs(60);
+/// Hard cap on simultaneous accepted connections.
+const MAX_LIVE_CONNECTIONS: usize = 128;
+
+/// Simple sliding-window attempt limiter, keyed by peer address.
+struct AttemptLimiter {
+    window: Duration,
+    max: u32,
+    attempts: HashMap<IpAddr, (u32, std::time::Instant)>,
+}
+
+impl AttemptLimiter {
+    fn new(max: u32, window: Duration) -> Self {
+        Self {
+            window,
+            max,
+            attempts: HashMap::new(),
+        }
+    }
+
+    /// Record an attempt and report whether it is within the budget.
+    fn allow(&mut self, ip: IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let entry = self.attempts.entry(ip).or_insert((0, now));
+        if now.duration_since(entry.1) >= self.window {
+            *entry = (0, now);
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.0 <= self.max
+    }
+
+    /// Drop stale entries so the map cannot grow with spoofed addresses.
+    fn prune(&mut self) {
+        let now = std::time::Instant::now();
+        self.attempts
+            .retain(|_, (_, last)| now.duration_since(*last) < self.window);
+    }
 }
 
 pub(crate) struct LanMouseListener {
@@ -141,11 +185,34 @@ impl LanMouseListener {
                 // Bound the number of half-open handshakes so stray UDP
                 // traffic cannot spawn unbounded tasks.
                 let handshakes = Arc::new(tokio::sync::Semaphore::new(32));
+                let mut limiter = AttemptLimiter::new(HANDSHAKES_PER_IP, HANDSHAKE_WINDOW);
+                let mut rate_limited = 0u64;
                 loop {
                     tokio::select! {
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 let addr = normalize_addr(addr);
+                                if limiter.attempts.len() > 1024 {
+                                    limiter.prune();
+                                }
+                                if !limiter.allow(addr.ip()) {
+                                    rate_limited = rate_limited.saturating_add(1);
+                                    if rate_limited == 1 || rate_limited.is_multiple_of(100) {
+                                        log::warn!(
+                                            "rate limiting handshakes from {} ({rate_limited} dropped so far)",
+                                            addr.ip()
+                                        );
+                                    }
+                                    let _ = conn.close().await;
+                                    continue;
+                                }
+                                if conns_clone.lock().await.len() >= MAX_LIVE_CONNECTIONS {
+                                    log::warn!(
+                                        "too many live connections, dropping handshake from {addr}"
+                                    );
+                                    let _ = conn.close().await;
+                                    continue;
+                                }
                                 let Ok(permit) = handshakes.clone().try_acquire_owned() else {
                                     log::warn!("too many handshakes in flight, dropping {addr}");
                                     continue;
@@ -534,7 +601,8 @@ async fn read_loop(
             Err(_) => break,
         };
         if n > 0 && is_clipboard_frame(b[0]) {
-            if !incoming_policy(&devices, &authorized, &fingerprint).allows(Capabilities::CLIPBOARD)
+            let clipboard_policy = incoming_policy(&devices, &authorized, &fingerprint);
+            if !(clipboard_policy.allowed && clipboard_policy.capabilities.allows_clipboard_write())
             {
                 blocked = blocked.saturating_add(1);
                 log::debug!(
@@ -641,5 +709,46 @@ fn event_allowed(
         }
         // Hand-off bookkeeping and keep-alives are always allowed.
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))
+    }
+
+    #[test]
+    fn limiter_caps_attempts_per_ip() {
+        let mut limiter = AttemptLimiter::new(2, Duration::from_secs(60));
+        assert!(limiter.allow(ip(1)));
+        assert!(limiter.allow(ip(1)));
+        assert!(!limiter.allow(ip(1)), "third attempt is over budget");
+    }
+
+    #[test]
+    fn limiter_isolates_addresses() {
+        let mut limiter = AttemptLimiter::new(1, Duration::from_secs(60));
+        assert!(limiter.allow(ip(1)));
+        assert!(!limiter.allow(ip(1)));
+        assert!(limiter.allow(ip(2)), "another peer has its own budget");
+    }
+
+    #[test]
+    fn limiter_window_resets() {
+        // A zero-length window resets every attempt, so nothing is blocked.
+        let mut limiter = AttemptLimiter::new(1, Duration::ZERO);
+        assert!(limiter.allow(ip(1)));
+        assert!(limiter.allow(ip(1)));
+    }
+
+    #[test]
+    fn prune_drops_stale_keys() {
+        let mut limiter = AttemptLimiter::new(1, Duration::ZERO);
+        assert!(limiter.allow(ip(1)));
+        limiter.prune();
+        assert!(limiter.attempts.is_empty());
     }
 }

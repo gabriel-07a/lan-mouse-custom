@@ -254,7 +254,11 @@ impl Capabilities {
     pub const POINTER: Self = Self(1 << 0);
     pub const KEYBOARD: Self = Self(1 << 1);
     pub const CLIPBOARD: Self = Self(1 << 2);
-    pub const ALL: Self = Self(1 | 2 | 4);
+    /// Peer may read this machine's clipboard (it is sent to them).
+    pub const CLIPBOARD_READ: Self = Self(1 << 3);
+    /// Peer may write this machine's clipboard (their frames are applied).
+    pub const CLIPBOARD_WRITE: Self = Self(1 << 4);
+    pub const ALL: Self = Self(1 | 2 | 4 | 8 | 16);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -268,6 +272,18 @@ impl Capabilities {
         self.0 == 0
     }
 
+    /// Whether the peer may read this machine's clipboard.
+    ///
+    /// The legacy `clipboard` capability (both directions) still grants it.
+    pub fn allows_clipboard_read(self) -> bool {
+        self.intersects(Self::CLIPBOARD) || self.intersects(Self::CLIPBOARD_READ)
+    }
+
+    /// Whether the peer may write this machine's clipboard.
+    pub fn allows_clipboard_write(self) -> bool {
+        self.intersects(Self::CLIPBOARD) || self.intersects(Self::CLIPBOARD_WRITE)
+    }
+
     /// Parse a comma separated list such as `pointer,clipboard`.
     pub fn from_names(names: &str) -> Option<Self> {
         let mut caps = Self::NONE;
@@ -276,6 +292,8 @@ impl Capabilities {
                 "pointer" | "mouse" => Self(caps.0 | Self::POINTER.0),
                 "keyboard" | "keys" => Self(caps.0 | Self::KEYBOARD.0),
                 "clipboard" => Self(caps.0 | Self::CLIPBOARD.0),
+                "clipboard-read" => Self(caps.0 | Self::CLIPBOARD_READ.0),
+                "clipboard-write" => Self(caps.0 | Self::CLIPBOARD_WRITE.0),
                 "all" => Self::ALL,
                 "none" => Self::NONE,
                 _ => return None,
@@ -295,6 +313,13 @@ impl Capabilities {
         }
         if self.contains(Self::CLIPBOARD) {
             names.push("clipboard");
+        } else {
+            if self.contains(Self::CLIPBOARD_READ) {
+                names.push("clipboard-read");
+            }
+            if self.contains(Self::CLIPBOARD_WRITE) {
+                names.push("clipboard-write");
+            }
         }
         names
     }
@@ -1168,6 +1193,12 @@ mod ipc_tests {
         );
         assert_eq!(
             Capabilities::from_names("mouse, keys, clipboard").expect("parse"),
+            Capabilities(
+                Capabilities::POINTER.0 | Capabilities::KEYBOARD.0 | Capabilities::CLIPBOARD.0
+            )
+        );
+        assert_eq!(
+            Capabilities::from_names("all").expect("parse"),
             Capabilities::ALL
         );
         assert_eq!(Capabilities::from_names("nonsense"), None);
@@ -1178,6 +1209,36 @@ mod ipc_tests {
         assert_eq!(Capabilities::NONE.summary(), "none");
         assert!(Capabilities::ALL.contains(Capabilities::CLIPBOARD));
         assert!(!Capabilities::NONE.intersects(Capabilities::POINTER));
+    }
+
+    #[test]
+    fn clipboard_capabilities_split_read_and_write() {
+        let legacy = Capabilities::CLIPBOARD;
+        assert!(legacy.allows_clipboard_read());
+        assert!(legacy.allows_clipboard_write());
+
+        let read_only = Capabilities::CLIPBOARD_READ;
+        assert!(read_only.allows_clipboard_read());
+        assert!(!read_only.allows_clipboard_write());
+
+        let write_only = Capabilities::CLIPBOARD_WRITE;
+        assert!(!write_only.allows_clipboard_read());
+        assert!(write_only.allows_clipboard_write());
+
+        assert_eq!(
+            Capabilities::from_names("clipboard-read")
+                .expect("parse")
+                .names(),
+            vec!["clipboard-read"]
+        );
+        assert_eq!(
+            Capabilities::from_names("pointer,clipboard-write")
+                .expect("parse")
+                .names(),
+            vec!["pointer", "clipboard-write"]
+        );
+        assert!(Capabilities::ALL.allows_clipboard_read());
+        assert!(Capabilities::ALL.allows_clipboard_write());
     }
 
     #[test]

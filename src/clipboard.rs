@@ -10,6 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,7 +24,9 @@ use lan_mouse_proto::clipboard::ClipboardFrame;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 
-use crate::{client::ClientManager, connect::ConnectionSender, listen::ListenerCommand};
+use crate::{
+    client::ClientManager, connect::ConnectionSender, devices::DeviceStore, listen::ListenerCommand,
+};
 
 /// How a peer is reachable.
 #[derive(Clone, Copy, Debug)]
@@ -38,12 +41,42 @@ enum Route {
 struct Sink {
     routes: Rc<RefCell<HashMap<PeerId, Route>>>,
     tx: Sender<(Route, Vec<u8>)>,
+    client_manager: ClientManager,
+    devices: Arc<RwLock<DeviceStore>>,
+}
+
+impl Sink {
+    /// Whether this peer may read our clipboard.
+    ///
+    /// The outgoing direction is gated by the peer's `incoming` policy: a
+    /// device granted only `clipboard-write` may set our clipboard but must
+    /// not receive it. Unknown fingerprints (legacy/unpinned links) keep the
+    /// permissive behavior.
+    fn peer_may_read(&self, route: Route) -> bool {
+        let fingerprint = match route {
+            Route::Outgoing(handle) => self.client_manager.fingerprint(handle),
+            Route::Incoming(addr) => self
+                .client_manager
+                .find_by_ip(addr.ip())
+                .and_then(|handle| self.client_manager.fingerprint(handle)),
+        };
+        let Some(fingerprint) = fingerprint else {
+            return true;
+        };
+        let store = self.devices.read().expect("lock");
+        let policy = store.incoming(&fingerprint);
+        policy.allowed && policy.capabilities.allows_clipboard_read()
+    }
 }
 
 impl FrameSink for Sink {
     fn send(&self, peer: PeerId, frame: ClipboardFrame) {
         let route = self.routes.borrow().get(&peer).copied();
         if let Some(route) = route {
+            if !self.peer_may_read(route) {
+                log::debug!("clipboard: peer may not read our clipboard, dropping frame");
+                return;
+            }
             let _ = self.tx.send((route, frame.encode()));
         }
     }
@@ -71,6 +104,7 @@ impl ClipboardTask {
         limits: Rc<Cell<Limits>>,
         enabled: Rc<Cell<bool>>,
         status_tx: Sender<ClipboardStatus>,
+        devices: Arc<RwLock<DeviceStore>>,
     ) -> Self {
         let task = spawn_local(async move {
             let mut status = ClipboardStatus {
@@ -124,6 +158,7 @@ impl ClipboardTask {
                 enabled,
                 status,
                 status_tx,
+                devices,
             )
             .await;
         });
@@ -163,6 +198,7 @@ async fn run<C: Clipboard>(
     enabled: Rc<Cell<bool>>,
     mut status: ClipboardStatus,
     status_tx: Sender<ClipboardStatus>,
+    devices: Arc<RwLock<DeviceStore>>,
 ) {
     let routes: Rc<RefCell<HashMap<PeerId, Route>>> = Default::default();
     let (transport_tx, mut transport_rx) = channel::<(Route, Vec<u8>)>();
@@ -186,6 +222,8 @@ async fn run<C: Clipboard>(
     let sink = Sink {
         routes: routes.clone(),
         tx: transport_tx,
+        client_manager: client_manager.clone(),
+        devices,
     };
     let mut sync = ClipboardSync::new(sink, limits, local_origin());
     let mut addr_peers: HashMap<SocketAddr, PeerId> = HashMap::new();

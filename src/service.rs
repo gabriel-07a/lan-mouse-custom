@@ -220,6 +220,7 @@ impl Service {
             clipboard_limits.clone(),
             clipboard_enabled.clone(),
             clipboard_status_tx,
+            devices.clone(),
         );
 
         // create dns resolver

@@ -429,6 +429,11 @@ impl ListenTask {
                             true
                         }
                     });
+                    // Rejected handshakes are deduplicated for a short window;
+                    // drop old entries so a stream of random certificates cannot
+                    // grow the map forever.
+                    rejected_connections
+                        .retain(|_, seen| seen.elapsed() < Duration::from_secs(60));
                 }
             }
         }

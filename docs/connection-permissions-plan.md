@@ -514,11 +514,14 @@ clique de descoberta.
 > detecção de troca de certificado (`cert_changed`, evento `CertificateChanged`).
 > Fase 2 concluída.
 >
-> Fase 3 em andamento: **3.1 implementada** — deny com expiração (`DenyDevice { expires_in }`,
-> `deny --for 1h`, checagem de deny com expiração no listener via DeviceStore) e grants de sessão
-> (`GrantSession`/`allow --once`: `put_ephemeral`, nunca persistido, expirado no disconnect com
-> auditoria `session_grant`/`session_grant_expired`). Próximo: clipboard read/write separados
-> (3.2), rate-limit/limites (3.3) e 3.4 (quiosque, import/export, IPC auth, ACL Windows).
+> Fase 3 em andamento: **3.1 implementada** (deny com expiração e grants de sessão `--once`);
+> **3.2 implementada** — capabilities `clipboard-read`/`clipboard-write` (com `clipboard` legado
+> = ambos), gate de escrita no listener e gate de leitura no envio do clipboard (sink por peer,
+> com fallback permissivo para fingerprints desconhecidos);
+> **3.3 implementada** — rate-limit por IP (20/min), limite de handshakes em voo (32), teto de
+> conexões vivas (128) e poda de rejeições/pendências antigas.
+> Próximo: 3.4 (modo quiosque, import/export de política, autenticação do IPC local, ACL da chave
+> no Windows) e fechamento.
 
 Aceite: MITM no primeiro pareamento detectado por SAS; peer antigo conecta sob política legada
 marcada na UI; regra de endereço com `incoming=["clipboard"]` só entrega clipboard.

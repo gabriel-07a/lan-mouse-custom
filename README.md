@@ -489,7 +489,10 @@ device is asked again next time. `deny --for 1h` (or `30m`, `2d`) makes a
 temporary revocation that stops blocking when it expires.
 
 `--incoming`/`--outgoing` accept `pointer,keyboard,clipboard`, `all` or `none`;
-`none` disables that direction. Policies are stored per device in the config:
+clipboard can also be split into `clipboard-read` (the peer may read this
+machine's clipboard) and `clipboard-write` (the peer may set it), while the
+legacy `clipboard` value grants both. `none` disables that direction. Policies
+are stored per device in the config:
 
 ```toml
 [[devices]]
@@ -558,6 +561,16 @@ that know each other's fingerprint display the same code; compare it out of
 band (screenshot, chat) before approving. If a known device later shows up with
 a **different certificate** for the same address or name, the frontend warns
 about the change, the request is flagged and the event is audited.
+
+### Connection limits
+
+The listener bounds abuse from the LAN even before a certificate is accepted:
+each IP may start at most 20 handshakes per minute (the connect side backs off
+to 5 s, so normal reconnects stay well below that), at most 32 handshakes can
+be in flight and at most 128 connections can be live at once. Rejected
+handshakes are only remembered for 60 s, so a stream of random certificates
+cannot grow the deduplication map forever. All limits are internal constants;
+they can be revisited if a large deployment needs more headroom.
 
 ### Audit log
 
