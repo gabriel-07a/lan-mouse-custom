@@ -37,6 +37,10 @@ impl Capture for WindowsInputCapture {
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }
+
+    fn set_remote_active(&mut self, active: bool) {
+        self.event_thread.set_remote_active(active);
+    }
 }
 
 impl WindowsInputCapture {

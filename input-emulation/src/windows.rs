@@ -288,6 +288,7 @@ impl WindowsEmulation {
 }
 
 fn send_input_safe(input: INPUT) {
+    input_event::injection::mark();
     unsafe {
         loop {
             /* retval = number of successfully submitted events */

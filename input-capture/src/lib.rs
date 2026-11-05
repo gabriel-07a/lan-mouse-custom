@@ -176,6 +176,11 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// Tell the backend that a remote peer is currently driving this machine.
+    pub fn set_remote_active(&mut self, active: bool) {
+        self.capture.set_remote_active(active);
+    }
+
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -316,6 +321,14 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
+
+    /// Tell the backend that a remote peer is currently driving this machine.
+    ///
+    /// Backends whose local edge detection can observe injected input (Windows
+    /// raw input / low level hooks) must not start a local capture while this
+    /// is true, otherwise the two machines hand control back and forth at the
+    /// shared border.
+    fn set_remote_active(&mut self, _active: bool) {}
 }
 
 async fn create_backend(

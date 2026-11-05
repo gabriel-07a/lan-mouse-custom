@@ -60,6 +60,15 @@ Most current desktop environments and operating systems are fully supported, thi
 >
 > - **Windows**: The mouse cursor will be invisible when sending input to a Windows system if
 > there is no real mouse connected to the machine.
+>
+> - **Windows pointer at the screen edge (10 and 11)**: pointer motion and barrier crossings
+> come from raw input (`WM_INPUT`), not from the low-level hook's clamped cursor position:
+> Windows stops the cursor at the edge pixel, so an "out of bounds" hook coordinate is not
+> reliable across OS versions and DPI scales. Raw deltas are also what drives motion while a
+> peer is controlled, and injected UI events (`SendInput`) are never mistaken for a local edge
+> crossing. If a pointer still sticks at an edge, run with `LAN_MOUSE_LOG_LEVEL=debug` and check
+> for the `ENTERED @ ...` line: without it the edge is not being treated as a barrier (usually
+> a missing client at that position or a display layout where that edge is not the outer one).
 
 For more detailed information about os support see [Detailed OS Support](#detailed-os-support)
 

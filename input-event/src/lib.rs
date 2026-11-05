@@ -3,6 +3,40 @@ use std::fmt::{self, Display};
 pub mod error;
 pub mod scancode;
 
+/// Tracks input that lan-mouse itself injected into the local OS.
+///
+/// Capture backends run in the same process as emulation. On Windows the
+/// injected `SendInput` motion is visible to the low level hook / raw input and
+/// would otherwise look like the local user pushing against a screen edge,
+/// making two machines hand control back and forth at the shared border.
+/// Emulation marks every injected event here; capture ignores barrier
+/// crossings that happen right after an injection.
+pub mod injection {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Timestamp (milliseconds) of the last injected input, 0 = never.
+    static LAST_INJECTED_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
+
+    /// Record that input was just injected into the OS.
+    pub fn mark() {
+        LAST_INJECTED_MS.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Whether input was injected within the last `window_ms` milliseconds.
+    pub fn is_recent(window_ms: u64) -> bool {
+        let last = LAST_INJECTED_MS.load(Ordering::Relaxed);
+        last != 0 && now_ms().saturating_sub(last) < window_ms
+    }
+}
+
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 
@@ -115,5 +149,17 @@ impl Display for Event {
             Event::Pointer(p) => write!(f, "{p}"),
             Event::Keyboard(k) => write!(f, "{k}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::injection;
+
+    #[test]
+    fn injection_marker_is_recent_after_marking() {
+        injection::mark();
+        assert!(injection::is_recent(60_000));
+        assert!(!injection::is_recent(0));
     }
 }

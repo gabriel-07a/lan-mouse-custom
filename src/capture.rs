@@ -76,6 +76,9 @@ enum CaptureRequest {
     SetSensitivity(CaptureHandle, f64),
     /// replace the capabilities this machine may use on the client
     SetOutgoingCaps(CaptureHandle, lan_mouse_ipc::Capabilities),
+    /// a remote peer started/stopped driving this machine; suppress local
+    /// barrier detection while it is in control
+    SetRemoteActive(bool),
 }
 
 impl Capture {
@@ -100,6 +103,7 @@ impl Capture {
             conn,
             enter: EnterState::default(),
             sensitivity: Default::default(),
+            remote_active: false,
             grace: Duration::from_millis(connect_grace_ms),
             disconnected_since: None,
             event_tx,
@@ -203,6 +207,13 @@ impl Capture {
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+    }
+
+    /// A remote peer started/stopped driving this machine.
+    pub(crate) fn set_remote_active(&self, active: bool) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetRemoteActive(active));
     }
 }
 
@@ -309,6 +320,9 @@ struct CaptureTask {
     sensitivity: HashMap<CaptureHandle, f64>,
     /// capabilities allowed in the outgoing direction, per client
     outgoing_caps: HashMap<CaptureHandle, lan_mouse_ipc::Capabilities>,
+    /// true while a remote peer is driving this machine (Windows raw input
+    /// otherwise mistakes the injected motion for a local barrier crossing)
+    remote_active: bool,
     /// how long a failed motion send may stay down before the capture is
     /// released, matching `connect_grace_ms`
     grace: Duration,
@@ -374,6 +388,9 @@ impl CaptureTask {
                         CaptureRequest::SetOutgoingCaps(handle, caps) => {
                             self.outgoing_caps.insert(handle, caps);
                         }
+                        CaptureRequest::SetRemoteActive(active) => {
+                            self.remote_active = active;
+                        }
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -387,6 +404,7 @@ impl CaptureTask {
             r = InputCapture::new(self.backend) => r?,
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
+        capture.set_remote_active(self.remote_active);
         self.selected_backend.set(Some(capture.backend()));
 
         let _capture_guard = DropGuard::new(
@@ -530,6 +548,10 @@ impl CaptureTask {
                     }
                     CaptureRequest::SetOutgoingCaps(h, caps) => {
                         self.outgoing_caps.insert(h, caps);
+                    }
+                    CaptureRequest::SetRemoteActive(active) => {
+                        self.remote_active = active;
+                        capture.set_remote_active(active);
                     }
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,

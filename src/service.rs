@@ -705,6 +705,10 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                // The peer is driving this machine: local barrier detection
+                // must not react to the injected pointer motion (ping-pong at
+                // the shared border).
+                self.capture.set_remote_active(true);
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
@@ -735,6 +739,9 @@ impl Service {
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
+                if self.incoming_conns.is_empty() {
+                    self.capture.set_remote_active(false);
+                }
             }
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
@@ -752,7 +759,10 @@ impl Service {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::ReleaseNotify => {
+                self.capture.release();
+                self.capture.set_remote_active(false);
+            }
             EmulationEvent::AutoAuthorized {
                 addr,
                 fingerprint,
