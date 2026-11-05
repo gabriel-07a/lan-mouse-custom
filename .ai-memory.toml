@@ -1,0 +1,8 @@
+# ai-memory project marker.
+#
+# Static MCP clients (such as the DSH MCP bridge, which runs with
+# `--no-session-id`) must pass this workspace/project pair explicitly on every
+# project-scoped memory call. Keeping the marker in the repository makes that
+# coordinate deterministic instead of deriving it from the git remotes.
+workspace = "default"
+project = "feschber-lan-mouse"
