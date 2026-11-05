@@ -28,9 +28,17 @@ pub struct FrontendRequestWriter {
 
 impl FrontendEventReader {
     pub fn next_event(&mut self) -> Option<Result<FrontendEvent, IpcError>> {
-        match self.lines.next()? {
-            Err(e) => Some(Err(e.into())),
-            Ok(l) => Some(serde_json::from_str(l.as_str()).map_err(|e| e.into())),
+        loop {
+            match self.lines.next()? {
+                Err(e) => return Some(Err(e.into())),
+                Ok(line) => match serde_json::from_str(line.as_str()) {
+                    Ok(event) => return Some(Ok(event)),
+                    // A newer daemon may know event variants this frontend
+                    // does not. Skipping the frame keeps an old GUI/CLI alive
+                    // instead of killing it on the first unknown event.
+                    Err(e) => log::warn!("skipping undecodable frontend event: {e}"),
+                },
+            }
         }
     }
 }

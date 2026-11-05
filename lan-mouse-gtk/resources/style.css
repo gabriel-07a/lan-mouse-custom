@@ -19,3 +19,26 @@
 .client-waiting > box > list .subtitle {
     color: @warning_color;
 }
+
+.status-badge {
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 0.82em;
+    font-weight: 600;
+}
+
+.status-connected {
+    background-color: alpha(@success_bg_color, 0.22);
+    color: @success_color;
+}
+
+.status-waiting {
+    background-color: alpha(@warning_bg_color, 0.22);
+    color: @warning_color;
+}
+
+.status-offline {
+    background-color: alpha(currentColor, 0.1);
+    color: alpha(currentColor, 0.7);
+}
+

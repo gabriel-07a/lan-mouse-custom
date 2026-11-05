@@ -6,6 +6,7 @@ mod coalesce;
 pub mod config;
 mod connect;
 mod crypto;
+mod devices;
 mod discovery;
 mod dns;
 pub mod doctor;

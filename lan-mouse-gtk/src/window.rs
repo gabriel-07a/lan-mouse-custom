@@ -11,8 +11,9 @@ use gtk::{
 };
 
 use lan_mouse_ipc::{
-    ClientConfig, ClientHandle, ClientState, ClipboardStatus, DEFAULT_PORT, DiscoveredDevice,
-    FrontendRequest, FrontendRequestWriter, Position,
+    Capabilities, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DEFAULT_PORT,
+    DeviceView, DirectionPolicy, DiscoveredDevice, FrontendRequest, FrontendRequestWriter,
+    IPC_VERSION, PendingView, Position,
 };
 
 use crate::{
@@ -20,7 +21,110 @@ use crate::{
     key_object::KeyObject, key_row::KeyRow,
 };
 
+use self::imp::DeviceControls;
 use super::{client_object::ClientObject, client_row::ClientRow};
+
+/// Capabilities in the exact order their checkboxes are rendered.
+const CAPABILITIES: [Capabilities; 3] = [
+    Capabilities::POINTER,
+    Capabilities::KEYBOARD,
+    Capabilities::CLIPBOARD,
+];
+
+/// Rebuild a capability mask from the three checkboxes of one direction.
+fn caps_from_checks(checks: &[gtk::CheckButton; 3]) -> Capabilities {
+    let mut bits = 0u8;
+    for (check, capability) in checks.iter().zip(CAPABILITIES) {
+        if check.is_active() {
+            bits |= capability.0;
+        }
+    }
+    Capabilities(bits)
+}
+
+/// A direction is only allowed when at least one capability is granted;
+/// unchecking everything therefore means "blocked".
+fn policy_from_checks(checks: &[gtk::CheckButton; 3]) -> DirectionPolicy {
+    let capabilities = caps_from_checks(checks);
+    DirectionPolicy {
+        allowed: !capabilities.is_empty(),
+        capabilities,
+    }
+}
+
+/// Rebuild a direction policy from the bitmask reported by the authorization
+/// window (0 means the direction was not granted at all).
+fn policy_from_mask(mask: u32) -> DirectionPolicy {
+    let capabilities = Capabilities(mask as u8 & Capabilities::ALL.0);
+    DirectionPolicy {
+        allowed: !capabilities.is_empty(),
+        capabilities,
+    }
+}
+
+/// Short form of a SHA-256 fingerprint for row titles.
+///
+/// The identity stays the full fingerprint (stored in `DeviceView`); the title
+/// only needs enough prefix to tell devices apart at a glance.
+fn short_fingerprint(fingerprint: &str) -> String {
+    const SHORT_LEN: usize = 17;
+    let mut short: String = fingerprint.chars().take(SHORT_LEN).collect();
+    if fingerprint.chars().count() > SHORT_LEN {
+        short.push('…');
+    }
+    short
+}
+
+/// One line status for a device row.
+fn device_subtitle(device: &DeviceView) -> String {
+    let state = if device.connected && device.active {
+        "Receiving"
+    } else if device.connected {
+        "Connected"
+    } else {
+        "Offline"
+    };
+    let incoming = if device.incoming.allowed {
+        device.incoming.capabilities.summary()
+    } else {
+        "blocked".to_string()
+    };
+    let outgoing = if device.outgoing.allowed {
+        device.outgoing.capabilities.summary()
+    } else {
+        "blocked".to_string()
+    };
+    let mut subtitle = format!(
+        "{state} · {} · controls me: {incoming} · I control it: {outgoing}",
+        device.position
+    );
+    if let Some(address) = device.addresses.first() {
+        subtitle.push_str(&format!(" · {address}:{}", device.port));
+    }
+    subtitle
+}
+
+/// Build an action row with a single capability checkbox as its suffix.
+fn capability_row(title: &str, subtitle: &str, active: bool) -> (adw::ActionRow, gtk::CheckButton) {
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(title))
+        .subtitle(glib::markup_escape_text(subtitle))
+        .build();
+    let check = gtk::CheckButton::new();
+    check.set_active(active);
+    check.set_valign(gtk::Align::Center);
+    row.add_suffix(&check);
+    row.set_activatable_widget(Some(&check));
+    (row, check)
+}
+
+/// Section header inside an expander row.
+fn direction_header_row(title: &str, subtitle: &str) -> adw::ActionRow {
+    adw::ActionRow::builder()
+        .title(glib::markup_escape_text(title))
+        .subtitle(glib::markup_escape_text(subtitle))
+        .build()
+}
 
 #[cfg(target_os = "macos")]
 fn set_button_content_label(button: &gtk::Button, label: &str) {
@@ -66,6 +170,17 @@ impl Window {
             window,
             move |_| window.render_network()
         ));
+        // Announce the IPC version before anything else: the service replies
+        // with `FrontendEvent::Hello` and a skew is surfaced in the UI instead
+        // of silently mis-decoding later events.
+        window.request(FrontendRequest::Hello {
+            ipc_version: IPC_VERSION,
+        });
+        // Device permissions and unauthorized connection requests are served
+        // as idempotent snapshots, so ask for both right away instead of
+        // waiting for the service to push them.
+        window.request(FrontendRequest::ListDevices);
+        window.request(FrontendRequest::ListPending);
         window.request_scan();
 
         let clipboard_row = adw::ActionRow::new();
@@ -86,7 +201,10 @@ impl Window {
                 window.request(FrontendRequest::SetClipboardEnabled(switch.is_active()));
             }
         ));
-        window.imp().capture_emulation_group.add(&clipboard_row);
+        // The clipboard toggle is global (not tied to capture/emulation), so
+        // it lives in its own group: `capture_emulation_group` is hidden on
+        // the happy path and would take the toggle with it.
+        window.imp().clipboard_group.add(&clipboard_row);
         window
             .imp()
             .clipboard_row
@@ -363,19 +481,37 @@ impl Window {
 
         // A client created by the "add device" dialog carries its address and
         // side; apply them as soon as the service reports the handle.
-        if let Some((address, position, fingerprint)) = self.imp().pending_add.borrow_mut().take() {
+        if let Some(imp::PendingAdd {
+            address,
+            hostname: known_hostname,
+            position,
+            fingerprint,
+        }) = self.imp().pending_add.borrow_mut().take()
+        {
             let address = address.trim().to_string();
+            let display_name = known_hostname
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| address.clone());
             self.request(FrontendRequest::UpdatePosition(handle, position));
             // A discovered Lan Mouse device already told us its certificate:
             // authorize it here so the other machine does not have to ask.
+            // The address itself is *not* added to the trusted allowlist:
+            // auto-trusting an IP advertised over unauthenticated UDP would
+            // let any host on that address in without the fingerprint check.
             if let Some(fingerprint) = fingerprint {
-                self.request(FrontendRequest::AuthorizeKey(address.clone(), fingerprint));
-                if let Ok(ip) = address.parse::<std::net::IpAddr>() {
-                    self.request(FrontendRequest::TrustAddress(ip.to_string()));
-                }
+                self.request(FrontendRequest::AuthorizeKey(
+                    display_name.clone(),
+                    fingerprint,
+                ));
             }
             match address.parse::<std::net::IpAddr>() {
-                Ok(ip) => self.request(FrontendRequest::UpdateFixIps(handle, vec![ip])),
+                Ok(ip) => {
+                    self.request(FrontendRequest::UpdateHostname(handle, Some(display_name)));
+                    self.request(FrontendRequest::UpdateFixIps(handle, vec![ip]));
+                }
                 Err(_) if !address.is_empty() => {
                     self.request(FrontendRequest::UpdateHostname(handle, Some(address)))
                 }
@@ -434,6 +570,7 @@ impl Window {
         row.set_port(client.port);
         row.set_position(client.pos);
         row.set_sensitivity(client.sensitivity);
+        row.refresh_status();
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {
@@ -470,6 +607,10 @@ impl Window {
         client_object.set_property(
             "active-addr",
             state.active_addr.map(|addr| addr.to_string()),
+        );
+        client_object.set_property(
+            "incoming-addr",
+            state.incoming_addr.map(|addr| addr.to_string()),
         );
         row.refresh_status();
     }
@@ -511,9 +652,22 @@ impl Window {
     }
 
     /// Open the pairing window: any device may connect for `seconds`.
+    ///
+    /// The toast and the button state are driven by the service's
+    /// `FrontendEvent::PairingActive` reply (see [`Self::set_pairing_active`]),
+    /// so pairing opened from the CLI is reflected in the GUI too.
     pub(super) fn start_pairing(&self, seconds: u64) {
         self.request(FrontendRequest::StartPairing(seconds));
-        self.show_toast("Pairing mode open — accept any device that connects");
+    }
+
+    /// Reflect whether a pairing window is currently open.
+    ///
+    /// The service owns the (single) pairing timer, so while it is active the
+    /// button is disabled and relabelled; closing or expiry restores it.
+    pub(super) fn set_pairing_active(&self, active: bool) {
+        let button = &self.imp().pairing_button;
+        button.set_sensitive(!active);
+        button.set_label(if active { "Pairing…" } else { "Open (60s)" });
     }
 
     /// Add an address to the allowlist.
@@ -619,9 +773,14 @@ impl Window {
                 add.set_tooltip_text(Some("Add this device"));
                 let parent = self.clone();
                 let address = device.ip.to_string();
+                let hostname = device.hostname.clone();
                 let fingerprint = device.fingerprint.clone();
                 add.connect_clicked(move |_| {
-                    parent.request_add_device_with(Some(address.clone()), fingerprint.clone())
+                    parent.request_add_device_with(
+                        Some(address.clone()),
+                        hostname.clone(),
+                        fingerprint.clone(),
+                    )
                 });
                 row.add_suffix(&add);
 
@@ -637,6 +796,473 @@ impl Window {
 
             list.append(&row);
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // Device permissions (`FrontendEvent::Devices`)
+    // ----------------------------------------------------------------------
+
+    /// Apply a device snapshot from the service.
+    pub(super) fn update_devices(&self, devices: Vec<DeviceView>) {
+        self.imp().devices.replace(devices);
+        self.render_devices();
+    }
+
+    fn render_devices(&self) {
+        let group = &self.imp().devices_group;
+        let mut rendered = self.imp().device_rows.borrow_mut();
+        for row in rendered.drain(..) {
+            group.remove(&row);
+        }
+        self.imp().device_controls.borrow_mut().clear();
+
+        let devices = self.imp().devices.borrow().clone();
+        if devices.is_empty() {
+            group.set_visible(false);
+            return;
+        }
+        group.set_visible(true);
+
+        let expanded = self.imp().expanded_devices.borrow().clone();
+        // Writing the checkbox states below must not be mistaken for a user
+        // edit (which would send the policy right back to the service).
+        self.imp().updating_devices.set(true);
+        for device in &devices {
+            let row = self.create_device_row(device);
+            // Snapshots are re-rendered on every policy change, so restore the
+            // expansion state instead of collapsing what the user just opened.
+            row.set_expanded(expanded.contains(&device.fingerprint));
+            group.add(&row);
+            rendered.push(row);
+        }
+        self.imp().updating_devices.set(false);
+    }
+
+    /// One `AdwExpanderRow` per device: name, state and the permission matrix.
+    fn create_device_row(&self, device: &DeviceView) -> adw::ExpanderRow {
+        let fingerprint = device.fingerprint.clone();
+        let display_name = match device.name.trim() {
+            "" => "Unknown device".to_string(),
+            name => name.to_string(),
+        };
+
+        let row = adw::ExpanderRow::new();
+        row.set_title(&glib::markup_escape_text(&format!(
+            "{display_name} · {}",
+            short_fingerprint(&fingerprint)
+        )));
+        row.set_subtitle(&glib::markup_escape_text(&device_subtitle(device)));
+
+        let icon = gtk::Image::from_icon_name(if device.connected {
+            "network-wired-symbolic"
+        } else {
+            "network-offline-symbolic"
+        });
+        icon.set_tooltip_text(Some(if device.connected {
+            "connected"
+        } else {
+            "offline"
+        }));
+        row.add_prefix(&icon);
+
+        // Direction presets: one click sets all six capability checkboxes.
+        let presets = adw::ActionRow::builder()
+            .title("Quick setup")
+            .subtitle("Presets are shortcuts; the checkboxes below are the stored policy.")
+            .build();
+        let preset_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        preset_buttons.set_halign(gtk::Align::Start);
+        let mut presets_to_connect = Vec::new();
+        for (label, incoming, outgoing) in [
+            ("Both", true, true),
+            ("Only controls me", true, false),
+            ("Only I control it", false, true),
+        ] {
+            let button = gtk::Button::with_label(label);
+            button.add_css_class("flat");
+            button.add_css_class("pill");
+            preset_buttons.append(&button);
+            presets_to_connect.push((button, incoming, outgoing));
+        }
+        presets.set_property("child", &preset_buttons);
+        row.add_row(&presets);
+
+        // What the device may do on this computer (authoritative, local).
+        row.add_row(&direction_header_row(
+            "Can control this PC",
+            "What this device may do on this computer. Unchecking everything blocks it.",
+        ));
+        let (in_pointer_row, in_pointer) = capability_row(
+            "Pointer",
+            "move the cursor, click and drag",
+            device.incoming.allows(Capabilities::POINTER),
+        );
+        let (in_keyboard_row, in_keyboard) = capability_row(
+            "Keyboard",
+            "type and use keyboard shortcuts",
+            device.incoming.allows(Capabilities::KEYBOARD),
+        );
+        let (in_clipboard_row, in_clipboard) = capability_row(
+            "Clipboard",
+            "exchange clipboard contents",
+            device.incoming.allows(Capabilities::CLIPBOARD),
+        );
+        row.add_row(&in_pointer_row);
+        row.add_row(&in_keyboard_row);
+        row.add_row(&in_clipboard_row);
+
+        // What this computer may do on the device (local guard).
+        row.add_row(&direction_header_row(
+            "This PC can control it",
+            "What this computer may do on the device. The device still enforces its own policy.",
+        ));
+        let (out_pointer_row, out_pointer) = capability_row(
+            "Pointer",
+            "move the other device's cursor",
+            device.outgoing.allows(Capabilities::POINTER),
+        );
+        let (out_keyboard_row, out_keyboard) = capability_row(
+            "Keyboard",
+            "type on the other device",
+            device.outgoing.allows(Capabilities::KEYBOARD),
+        );
+        let (out_clipboard_row, out_clipboard) = capability_row(
+            "Clipboard",
+            "exchange clipboard contents",
+            device.outgoing.allows(Capabilities::CLIPBOARD),
+        );
+        row.add_row(&out_pointer_row);
+        row.add_row(&out_keyboard_row);
+        row.add_row(&out_clipboard_row);
+
+        let rename = adw::ActionRow::builder()
+            .title("Rename")
+            .subtitle("Change the display name. The fingerprint stays the identity.")
+            .build();
+        let rename_button = gtk::Button::with_label("Rename");
+        rename_button.add_css_class("flat");
+        rename.add_suffix(&rename_button);
+        row.add_row(&rename);
+
+        let revoke = adw::ActionRow::builder()
+            .title("Revoke")
+            .subtitle("Deny this device and close sessions that are currently open.")
+            .build();
+        let revoke_button = gtk::Button::with_label("Revoke");
+        revoke_button.add_css_class("pill");
+        revoke_button.add_css_class("destructive-action");
+        revoke.add_suffix(&revoke_button);
+        row.add_row(&revoke);
+
+        let controls = DeviceControls {
+            incoming: [in_pointer, in_keyboard, in_clipboard],
+            outgoing: [out_pointer, out_keyboard, out_clipboard],
+        };
+        self.imp()
+            .device_controls
+            .borrow_mut()
+            .insert(fingerprint.clone(), controls.clone());
+
+        for check in controls.incoming.iter().chain(controls.outgoing.iter()) {
+            let window = self.downgrade();
+            let fingerprint = fingerprint.clone();
+            check.connect_toggled(move |_| {
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                if window.imp().updating_devices.get() {
+                    return;
+                }
+                window.request_device_policy(&fingerprint);
+            });
+        }
+
+        for (button, incoming, outgoing) in presets_to_connect {
+            let window = self.downgrade();
+            let fingerprint = fingerprint.clone();
+            button.connect_clicked(move |_| {
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                window.apply_device_preset(&fingerprint, incoming, outgoing);
+            });
+        }
+
+        let parent = self.clone();
+        let rename_fingerprint = fingerprint.clone();
+        let current_name = device.name.clone();
+        rename_button.connect_clicked(move |_| {
+            parent.open_rename_device_dialog(&rename_fingerprint, &current_name);
+        });
+
+        let parent = self.clone();
+        let revoke_fingerprint = fingerprint.clone();
+        let revoke_name = display_name.clone();
+        revoke_button.connect_clicked(move |_| {
+            parent.confirm_revoke_device(&revoke_fingerprint, &revoke_name);
+        });
+
+        let window = self.downgrade();
+        let expanded_fingerprint = fingerprint;
+        row.connect_notify_local(Some("expanded"), move |row, _| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            if window.imp().updating_devices.get() {
+                return;
+            }
+            let mut expanded = window.imp().expanded_devices.borrow_mut();
+            if row.is_expanded() {
+                expanded.insert(expanded_fingerprint.clone());
+            } else {
+                expanded.remove(&expanded_fingerprint);
+            }
+        });
+
+        row
+    }
+
+    /// Send the policy that the row's checkboxes currently describe.
+    fn request_device_policy(&self, fingerprint: &str) {
+        let Some(controls) = self
+            .imp()
+            .device_controls
+            .borrow()
+            .get(fingerprint)
+            .cloned()
+        else {
+            log::warn!("no controls registered for device {fingerprint}");
+            return;
+        };
+        self.request(FrontendRequest::SetDevicePolicy {
+            fingerprint: fingerprint.to_string(),
+            incoming: policy_from_checks(&controls.incoming),
+            outgoing: policy_from_checks(&controls.outgoing),
+        });
+    }
+
+    /// Apply a direction preset to all checkboxes and persist it once.
+    fn apply_device_preset(&self, fingerprint: &str, incoming: bool, outgoing: bool) {
+        let Some(controls) = self
+            .imp()
+            .device_controls
+            .borrow()
+            .get(fingerprint)
+            .cloned()
+        else {
+            log::warn!("no controls registered for device {fingerprint}");
+            return;
+        };
+        self.imp().updating_devices.set(true);
+        for check in &controls.incoming {
+            check.set_active(incoming);
+        }
+        for check in &controls.outgoing {
+            check.set_active(outgoing);
+        }
+        self.imp().updating_devices.set(false);
+        self.request_device_policy(fingerprint);
+    }
+
+    fn open_rename_device_dialog(&self, fingerprint: &str, current_name: &str) {
+        let window = adw::Window::builder()
+            .title("Rename device")
+            .modal(true)
+            .transient_for(self)
+            .default_width(420)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+
+        let info = gtk::Label::new(Some(
+            "The fingerprint stays the device identity; only the name shown in this \
+             list and in notifications changes.",
+        ));
+        info.set_wrap(true);
+        info.set_xalign(0.0);
+
+        let entry = gtk::Entry::new();
+        entry.set_placeholder_text(Some("Device name"));
+        entry.set_text(current_name);
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        let save = gtk::Button::with_label("Save");
+        save.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&save);
+
+        content.append(&info);
+        content.append(&entry);
+        content.append(&buttons);
+        window.set_content(Some(&content));
+
+        let close_window = window.clone();
+        cancel.connect_clicked(move |_| close_window.close());
+
+        let parent = self.clone();
+        let close_window = window.clone();
+        let fingerprint = fingerprint.to_string();
+        let entry_for_save = entry.clone();
+        save.connect_clicked(move |_| {
+            let name = entry_for_save.text().trim().to_string();
+            if name.is_empty() {
+                parent.show_toast("The device name cannot be empty");
+                return;
+            }
+            parent.request(FrontendRequest::RenameDevice {
+                fingerprint: fingerprint.clone(),
+                name,
+            });
+            close_window.close();
+        });
+
+        entry.connect_activate(glib::clone!(
+            #[weak]
+            save,
+            move |_| save.emit_clicked()
+        ));
+
+        window.present();
+    }
+
+    fn confirm_revoke_device(&self, fingerprint: &str, name: &str) {
+        let window = adw::Window::builder()
+            .title("Revoke device")
+            .modal(true)
+            .transient_for(self)
+            .default_width(420)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+
+        let info = gtk::Label::new(Some(&format!(
+            "Revoke “{name}”?\n\nOpen sessions with this device are closed and it is \
+             denied until you authorize it again."
+        )));
+        info.set_wrap(true);
+        info.set_xalign(0.0);
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        let revoke = gtk::Button::with_label("Revoke");
+        revoke.add_css_class("destructive-action");
+        buttons.append(&cancel);
+        buttons.append(&revoke);
+
+        content.append(&info);
+        content.append(&buttons);
+        window.set_content(Some(&content));
+
+        let close_window = window.clone();
+        cancel.connect_clicked(move |_| close_window.close());
+
+        let parent = self.clone();
+        let close_window = window.clone();
+        let fingerprint = fingerprint.to_string();
+        let name = name.to_string();
+        revoke.connect_clicked(move |_| {
+            parent.request(FrontendRequest::RevokeDevice {
+                fingerprint: fingerprint.clone(),
+                disconnect: true,
+            });
+            parent.show_toast(&format!("{name} revoked"));
+            close_window.close();
+        });
+
+        window.present();
+    }
+
+    // ----------------------------------------------------------------------
+    // Connection requests (`FrontendEvent::PendingRequests`)
+    // ----------------------------------------------------------------------
+
+    /// Apply a pending-request snapshot from the service.
+    pub(super) fn update_pending(&self, pending: Vec<PendingView>) {
+        self.imp().pending.replace(pending);
+        self.render_pending();
+    }
+
+    fn render_pending(&self) {
+        let group = &self.imp().requests_group;
+        let mut rendered = self.imp().request_rows.borrow_mut();
+        for row in rendered.drain(..) {
+            group.remove(&row);
+        }
+
+        let pending = self.imp().pending.borrow().clone();
+        if pending.is_empty() {
+            group.set_visible(false);
+            return;
+        }
+        group.set_visible(true);
+        group.set_title(&format!("Connection requests ({})", pending.len()));
+
+        for request in pending {
+            let name = request
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            let title = name.unwrap_or("Unknown device");
+            let subtitle = format!(
+                "{} · {} · {} attempt(s)",
+                request.addr.ip(),
+                short_fingerprint(&request.fingerprint),
+                request.attempts
+            );
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(title))
+                .subtitle(glib::markup_escape_text(&subtitle))
+                .build();
+
+            let deny = gtk::Button::with_label("Deny");
+            deny.add_css_class("flat");
+            let review = gtk::Button::with_label("Review");
+            review.add_css_class("pill");
+            review.add_css_class("suggested-action");
+
+            let parent = self.clone();
+            let fingerprint = request.fingerprint.clone();
+            deny.connect_clicked(move |_| {
+                parent.respond_pending_denied(&fingerprint);
+            });
+
+            let parent = self.clone();
+            let fingerprint = request.fingerprint.clone();
+            let addr = request.addr;
+            let hostname = request.name.clone();
+            review.connect_clicked(move |_| {
+                parent.show_authorization_window(addr, hostname.as_deref(), &fingerprint);
+            });
+
+            row.add_suffix(&deny);
+            row.add_suffix(&review);
+            group.add(&row);
+            rendered.push(row);
+        }
+    }
+
+    fn respond_pending_denied(&self, fingerprint: &str) {
+        self.request(FrontendRequest::RespondPending {
+            fingerprint: fingerprint.to_string(),
+            accept: false,
+            name: None,
+            position: None,
+            incoming: None,
+            outgoing: None,
+        });
+        self.show_toast("Connection request denied");
     }
 
     fn confirm_probe(&self, ip: std::net::IpAddr, port: u16) {
@@ -690,12 +1316,13 @@ impl Window {
     /// activate it. The peer answers with an authorization request, so this
     /// is the whole "send a connection request" flow.
     pub(super) fn request_add_device(&self) {
-        self.request_add_device_with(None, None);
+        self.request_add_device_with(None, None, None);
     }
 
     pub(super) fn request_add_device_with(
         &self,
         initial_address: Option<String>,
+        known_hostname: Option<String>,
         fingerprint: Option<String>,
     ) {
         let window = adw::Window::builder()
@@ -762,7 +1389,12 @@ impl Window {
                 3 => Position::Bottom,
                 _ => Position::Left,
             };
-            parent.send_device_request(address, position, fingerprint.clone());
+            parent.send_device_request(
+                address,
+                known_hostname.clone(),
+                position,
+                fingerprint.clone(),
+            );
             close_window.close();
         });
 
@@ -778,12 +1410,16 @@ impl Window {
     fn send_device_request(
         &self,
         address: String,
+        known_hostname: Option<String>,
         position: Position,
         fingerprint: Option<String>,
     ) {
-        self.imp()
-            .pending_add
-            .replace(Some((address, position, fingerprint)));
+        self.imp().pending_add.replace(Some(imp::PendingAdd {
+            address,
+            hostname: known_hostname,
+            position,
+            fingerprint,
+        }));
         self.request(FrontendRequest::Create);
     }
 
@@ -914,43 +1550,89 @@ impl Window {
         self.imp().fingerprint_row.set_subtitle(fingerprint);
     }
 
+    /// Open the authorization dialog for an incoming connection attempt.
     pub(super) fn request_authorization(&self, addr: std::net::SocketAddr, fingerprint: &str) {
+        // The discovery table usually knows the host name of the peer.
+        let known_hostname = self
+            .imp()
+            .network_devices
+            .borrow()
+            .iter()
+            .find(|d| d.ip == addr.ip())
+            .and_then(|d| d.hostname.clone());
+        self.show_authorization_window(addr, known_hostname.as_deref(), fingerprint);
+    }
+
+    /// Open (or replace) the authorization dialog.
+    ///
+    /// Approving sends [`FrontendRequest::RespondPending`] with the direction
+    /// and capability matrix chosen in the dialog; cancelling sends the same
+    /// request with `accept: false`, so the service can drop the pending entry
+    /// instead of leaving it around.
+    fn show_authorization_window(
+        &self,
+        addr: std::net::SocketAddr,
+        hostname: Option<&str>,
+        fingerprint: &str,
+    ) {
         if let Some(w) = self.imp().authorization_window.borrow_mut().take() {
             w.close();
         }
-        let window = AuthorizationWindow::new(addr, fingerprint);
+        let window = AuthorizationWindow::new(addr, hostname, fingerprint);
         window.set_transient_for(Some(self));
+        let peer_name = hostname
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
         window.connect_closure(
             "confirm-clicked",
             false,
             closure_local!(
                 #[strong(rename_to = parent)]
                 self,
-                move |w: AuthorizationWindow, fp: String, position: u32| {
+                move |w: AuthorizationWindow,
+                      fp: String,
+                      position: u32,
+                      incoming: u32,
+                      outgoing: u32| {
                     w.close();
-                    // A single approval both trusts the device and creates the
-                    // client entry for the reverse direction; the address is
-                    // taken from the connection once it is accepted.
                     let position = match position {
                         1 => Position::Right,
                         2 => Position::Top,
                         3 => Position::Bottom,
                         _ => Position::Left,
                     };
-                    parent.request(FrontendRequest::AuthorizeDevice {
+                    parent.request(FrontendRequest::RespondPending {
                         fingerprint: fp,
-                        name: String::new(),
-                        position,
+                        accept: true,
+                        name: peer_name.clone(),
+                        position: Some(position),
+                        incoming: Some(policy_from_mask(incoming)),
+                        outgoing: Some(policy_from_mask(outgoing)),
                     });
+                    parent.show_toast("Device authorized");
                 }
             ),
         );
         window.connect_closure(
             "cancel-clicked",
             false,
-            closure_local!(move |w: AuthorizationWindow| {
-                w.close();
-            }),
+            closure_local!(
+                #[strong(rename_to = parent)]
+                self,
+                move |w: AuthorizationWindow, fp: String| {
+                    w.close();
+                    parent.request(FrontendRequest::RespondPending {
+                        fingerprint: fp,
+                        accept: false,
+                        name: None,
+                        position: None,
+                        incoming: None,
+                        outgoing: None,
+                    });
+                    parent.show_toast("Connection request denied");
+                }
+            ),
         );
         window.present();
         self.imp().authorization_window.replace(Some(window));

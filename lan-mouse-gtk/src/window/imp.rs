@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use adw::subclass::prelude::*;
 use adw::{ActionRow, PreferencesGroup, ToastOverlay, prelude::*};
@@ -8,9 +9,30 @@ use gtk::{
     Button, CompositeTemplate, Entry, Image, Label, ListBox, Switch, TemplateChild, gdk, gio, glib,
 };
 
-use lan_mouse_ipc::{DEFAULT_PORT, DiscoveredDevice, FrontendRequestWriter, Position};
+use lan_mouse_ipc::{
+    DEFAULT_PORT, DeviceView, DiscoveredDevice, FrontendRequestWriter, PendingView, Position,
+};
 
 use crate::authorization_window::AuthorizationWindow;
+
+#[derive(Clone, Debug)]
+pub struct PendingAdd {
+    pub address: String,
+    pub hostname: Option<String>,
+    pub position: Position,
+    pub fingerprint: Option<String>,
+}
+
+/// The six capability checkboxes of a device row, keyed by fingerprint.
+///
+/// The toggled handlers look these up instead of capturing every widget, so a
+/// single handler shape can rebuild the whole [`lan_mouse_ipc::DirectionPolicy`]
+/// pair from whatever is currently checked.
+#[derive(Clone)]
+pub struct DeviceControls {
+    pub incoming: [gtk::CheckButton; 3],
+    pub outgoing: [gtk::CheckButton; 3],
+}
 
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/de/feschber/LanMouse/window.ui")]
@@ -27,6 +49,10 @@ pub struct Window {
     pub client_list: TemplateChild<ListBox>,
     #[template_child]
     pub client_placeholder: TemplateChild<ActionRow>,
+    #[template_child]
+    pub requests_group: TemplateChild<PreferencesGroup>,
+    #[template_child]
+    pub devices_group: TemplateChild<PreferencesGroup>,
     #[template_child]
     pub port_entry: TemplateChild<Entry>,
     #[template_child]
@@ -47,6 +73,8 @@ pub struct Window {
     pub input_emulation_button: TemplateChild<Button>,
     #[template_child]
     pub input_capture_button: TemplateChild<Button>,
+    #[template_child]
+    pub pairing_button: TemplateChild<Button>,
     #[template_child]
     pub authorized_list: TemplateChild<ListBox>,
     pub clients: RefCell<Option<gio::ListStore>>,
@@ -70,9 +98,25 @@ pub struct Window {
     pub trusted_list: TemplateChild<gtk::ListBox>,
     /// last scan result, kept so the filter can re-render without rescanning
     pub network_devices: RefCell<Vec<DiscoveredDevice>>,
-    /// address and side collected by the "add device" dialog, applied to the
-    /// client entry as soon as the service reports its handle
-    pub pending_add: RefCell<Option<(String, Position, Option<String>)>>,
+    /// address, optional hostname, side, and fingerprint collected by the
+    /// "add device" dialog, applied to the client entry as soon as the service
+    /// reports its handle
+    pub pending_add: RefCell<Option<PendingAdd>>,
+    /// last `FrontendEvent::Devices` snapshot, rendered as the "Devices" group
+    pub devices: RefCell<Vec<DeviceView>>,
+    /// checkboxes of each rendered device row, keyed by fingerprint
+    pub device_controls: RefCell<HashMap<String, DeviceControls>>,
+    /// fingerprints whose expander row is open, preserved across snapshots
+    pub expanded_devices: RefCell<HashSet<String>>,
+    /// guard so rendering/echoed snapshots do not look like user edits
+    pub updating_devices: Cell<bool>,
+    /// rows currently inside `devices_group` (the group only knows how to
+    /// remove widgets that were added through its own API)
+    pub device_rows: RefCell<Vec<adw::ExpanderRow>>,
+    /// last `FrontendEvent::PendingRequests` snapshot, rendered as "Requests"
+    pub pending: RefCell<Vec<PendingView>>,
+    /// rows currently inside `requests_group`
+    pub request_rows: RefCell<Vec<adw::ActionRow>>,
 }
 
 #[glib::object_subclass]

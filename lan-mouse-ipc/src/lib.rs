@@ -60,6 +60,14 @@ pub enum IpcError {
 
 pub const DEFAULT_PORT: u16 = 4242;
 
+/// Version of the local frontend IPC protocol.
+///
+/// The wire format is line-delimited JSON; adding enum variants is
+/// forward-compatible because readers skip frames they cannot decode. The
+/// handshake lets the service and the frontend advertise what they speak for
+/// future feature gating.
+pub const IPC_VERSION: u16 = 1;
+
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Position {
@@ -149,6 +157,14 @@ pub struct ClientConfig {
     /// differs between peer combinations and needs a per-client trim.
     #[serde(default = "default_sensitivity")]
     pub sensitivity: u16,
+    /// SHA-256 fingerprint of the peer's certificate, when known.
+    ///
+    /// This is the identity of the peer, independent of its address. When it
+    /// is set, outgoing connections verify the server's certificate against
+    /// it (TOFU pinning); when it is `None` the first successful connection
+    /// learns and stores it.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 pub fn default_sensitivity() -> u16 {
@@ -165,6 +181,7 @@ impl Default for ClientConfig {
             cmd: None,
             leave_cmd: None,
             sensitivity: default_sensitivity(),
+            fingerprint: None,
         }
     }
 }
@@ -211,6 +228,164 @@ pub struct ClientState {
     /// "not asked yet").
     #[serde(default)]
     pub peer_caps_known: bool,
+    /// address of an active incoming connection from this peer, if any
+    #[serde(default)]
+    pub incoming_addr: Option<SocketAddr>,
+}
+
+/// Bitset of input capabilities granted in one direction.
+///
+/// The three capabilities can be granted independently, so a device may e.g.
+/// only move the pointer and use the clipboard but never type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities(pub u8);
+
+impl Capabilities {
+    pub const NONE: Self = Self(0);
+    pub const POINTER: Self = Self(1 << 0);
+    pub const KEYBOARD: Self = Self(1 << 1);
+    pub const CLIPBOARD: Self = Self(1 << 2);
+    pub const ALL: Self = Self(1 | 2 | 4);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Parse a comma separated list such as `pointer,clipboard`.
+    pub fn from_names(names: &str) -> Option<Self> {
+        let mut caps = Self::NONE;
+        for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            caps = match name {
+                "pointer" | "mouse" => Self(caps.0 | Self::POINTER.0),
+                "keyboard" | "keys" => Self(caps.0 | Self::KEYBOARD.0),
+                "clipboard" => Self(caps.0 | Self::CLIPBOARD.0),
+                "all" => Self::ALL,
+                "none" => Self::NONE,
+                _ => return None,
+            };
+        }
+        Some(caps)
+    }
+
+    /// Human readable capability names, in stable order.
+    pub fn names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.contains(Self::POINTER) {
+            names.push("pointer");
+        }
+        if self.contains(Self::KEYBOARD) {
+            names.push("keyboard");
+        }
+        if self.contains(Self::CLIPBOARD) {
+            names.push("clipboard");
+        }
+        names
+    }
+
+    /// Compact summary for logs and CLI output.
+    pub fn summary(self) -> String {
+        if self.is_empty() {
+            "none".to_string()
+        } else {
+            self.names().join(",")
+        }
+    }
+}
+
+/// Permission granted in one direction between two devices.
+///
+/// `incoming` is authoritative and enforced by the machine that receives the
+/// input; `outgoing` is a local guard that decides whether this machine may
+/// control the peer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectionPolicy {
+    /// whether this direction is allowed at all
+    #[serde(default)]
+    pub allowed: bool,
+    /// capabilities granted when `allowed`
+    #[serde(default)]
+    pub capabilities: Capabilities,
+}
+
+impl DirectionPolicy {
+    pub fn allow_all() -> Self {
+        Self {
+            allowed: true,
+            capabilities: Capabilities::ALL,
+        }
+    }
+
+    pub fn deny() -> Self {
+        Self {
+            allowed: false,
+            capabilities: Capabilities::NONE,
+        }
+    }
+
+    pub fn allows(&self, capability: Capabilities) -> bool {
+        self.allowed && self.capabilities.contains(capability)
+    }
+
+    /// Whether the direction is enabled with at least one capability.
+    ///
+    /// A direction with `allowed = true` but no capabilities is connect-only:
+    /// the peer can stay connected but cannot do anything, so no link needs to
+    /// be activated for it.
+    pub fn grants_anything(&self) -> bool {
+        self.allowed && !self.capabilities.is_empty()
+    }
+
+    /// Whether any input capability (pointer or keyboard) is granted.
+    pub fn allows_input(&self) -> bool {
+        self.allowed
+            && (self.capabilities.intersects(Capabilities::POINTER)
+                || self.capabilities.intersects(Capabilities::KEYBOARD))
+    }
+}
+
+/// One device known to this machine, as shown to the frontend.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceView {
+    /// stable identity: SHA-256 fingerprint of the peer certificate
+    pub fingerprint: String,
+    /// user visible name (renameable)
+    pub name: String,
+    /// where the device sits relative to this one
+    pub position: Position,
+    /// route hints (outgoing connections)
+    pub addresses: Vec<IpAddr>,
+    pub port: u16,
+    /// what the device may do here (enforced locally)
+    pub incoming: DirectionPolicy,
+    /// what this machine may do there (local guard)
+    pub outgoing: DirectionPolicy,
+    /// outgoing link is activated
+    pub active: bool,
+    /// a session (incoming or outgoing) is live
+    pub connected: bool,
+    /// how the device was authorized (`manual`, `pairing`, `address`, `legacy`)
+    pub source: String,
+}
+
+/// A device asking to connect that has not been authorized yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingView {
+    pub fingerprint: String,
+    pub addr: SocketAddr,
+    /// name reported by discovery, when known
+    pub name: Option<String>,
+    /// unix timestamp (seconds) of the first/last attempt
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub attempts: u32,
 }
 
 /// How a device is reached on the network.
@@ -267,6 +442,12 @@ pub struct DiscoveredDevice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
+    /// IPC version spoken by the service (reply to [`FrontendRequest::Hello`])
+    Hello { ipc_version: u16 },
+    /// full snapshot of the known devices and their policies
+    Devices(Vec<DeviceView>),
+    /// full snapshot of unauthorized connection requests
+    PendingRequests(Vec<PendingView>),
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -392,6 +573,35 @@ pub struct Diagnostics {
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
+    /// announce the frontend IPC version
+    Hello { ipc_version: u16 },
+    /// request the device snapshot
+    ListDevices,
+    /// request the pending-request snapshot
+    ListPending,
+    /// update the permissions of a known device
+    SetDevicePolicy {
+        fingerprint: String,
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    },
+    /// rename a device (display only; the fingerprint stays the identity)
+    RenameDevice { fingerprint: String, name: String },
+    /// revoke a device: close live sessions, deny the fingerprint and drop it
+    RevokeDevice {
+        fingerprint: String,
+        /// close sessions that are currently live
+        disconnect: bool,
+    },
+    /// approve or deny a pending connection request
+    RespondPending {
+        fingerprint: String,
+        accept: bool,
+        name: Option<String>,
+        position: Option<Position>,
+        incoming: Option<DirectionPolicy>,
+        outgoing: Option<DirectionPolicy>,
+    },
     /// activate/deactivate client
     Activate(ClientHandle, bool),
     /// add a new client
@@ -414,6 +624,8 @@ pub enum FrontendRequest {
     UpdateSensitivity(ClientHandle, u16),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
+    /// pin (or clear) the expected certificate fingerprint of a client
+    UpdateFingerprint(ClientHandle, Option<String>),
     /// request reenabling input capture
     EnableCapture,
     /// request reenabling input emulation
@@ -587,6 +799,10 @@ mod tests {
             peer_proto_version: 1,
             peer_capabilities: 0b101,
             peer_caps_known: true,
+            incoming_addr: Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                51234,
+            )),
         };
         let decoded = json_roundtrip(state);
         assert_eq!(decoded.rtt_ms, Some(12));
@@ -727,9 +943,23 @@ mod tests {
 mod ipc_tests {
     use super::*;
     use futures::StreamExt;
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use std::net::Ipv4Addr;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    fn json_roundtrip<T>(value: T) -> T
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let encoded = serde_json::to_value(&value).expect("serialize");
+        let decoded: T = serde_json::from_value(encoded.clone()).expect("deserialize");
+        let re_encoded = serde_json::to_value(&decoded).expect("re-serialize");
+        assert_eq!(encoded, re_encoded);
+        decoded
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -813,5 +1043,113 @@ mod ipc_tests {
         assert!(listener.is_ok(), "stale socket must be cleaned up");
         drop(listener);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capabilities_parse_and_summarise() {
+        assert_eq!(
+            Capabilities::from_names("pointer,keyboard").expect("parse"),
+            Capabilities(Capabilities::POINTER.0 | Capabilities::KEYBOARD.0)
+        );
+        assert_eq!(
+            Capabilities::from_names("mouse, keys, clipboard").expect("parse"),
+            Capabilities::ALL
+        );
+        assert_eq!(Capabilities::from_names("nonsense"), None);
+        assert_eq!(
+            Capabilities::ALL.names(),
+            vec!["pointer", "keyboard", "clipboard"]
+        );
+        assert_eq!(Capabilities::NONE.summary(), "none");
+        assert!(Capabilities::ALL.contains(Capabilities::CLIPBOARD));
+        assert!(!Capabilities::NONE.intersects(Capabilities::POINTER));
+    }
+
+    #[test]
+    fn direction_policy_serialisation_roundtrips() {
+        let policy = DirectionPolicy {
+            allowed: true,
+            capabilities: Capabilities(Capabilities::POINTER.0 | Capabilities::CLIPBOARD.0),
+        };
+        let decoded = json_roundtrip(policy);
+        assert_eq!(decoded, policy);
+        assert!(decoded.allows(Capabilities::POINTER));
+        assert!(!decoded.allows(Capabilities::KEYBOARD));
+        assert!(decoded.allows_input());
+        assert!(!DirectionPolicy::deny().allows_input());
+        assert!(decoded.grants_anything());
+        assert!(DirectionPolicy::allow_all().grants_anything());
+        assert!(!DirectionPolicy::deny().grants_anything());
+        assert!(
+            !DirectionPolicy {
+                allowed: true,
+                capabilities: Capabilities::NONE,
+            }
+            .grants_anything(),
+            "connect-only directions do not need a link"
+        );
+        assert!(!DirectionPolicy::default().allowed, "default is deny");
+    }
+
+    #[test]
+    fn device_and_pending_views_roundtrip() {
+        let device = DeviceView {
+            fingerprint: "aa:bb".into(),
+            name: "laptop".into(),
+            position: Position::Right,
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))],
+            port: DEFAULT_PORT,
+            incoming: DirectionPolicy {
+                allowed: true,
+                capabilities: Capabilities::KEYBOARD,
+            },
+            outgoing: DirectionPolicy::deny(),
+            active: true,
+            connected: true,
+            source: "manual".into(),
+        };
+        assert_eq!(json_roundtrip(device.clone()), device);
+
+        let pending = PendingView {
+            fingerprint: "cc:dd".into(),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 4242),
+            name: Some("desktop".into()),
+            first_seen: 1,
+            last_seen: 2,
+            attempts: 3,
+        };
+        assert_eq!(json_roundtrip(pending.clone()), pending);
+    }
+
+    #[test]
+    fn permission_requests_roundtrip() {
+        let requests = vec![
+            FrontendRequest::ListDevices,
+            FrontendRequest::ListPending,
+            FrontendRequest::SetDevicePolicy {
+                fingerprint: "aa".into(),
+                incoming: DirectionPolicy::allow_all(),
+                outgoing: DirectionPolicy::deny(),
+            },
+            FrontendRequest::RenameDevice {
+                fingerprint: "aa".into(),
+                name: "new name".into(),
+            },
+            FrontendRequest::RevokeDevice {
+                fingerprint: "aa".into(),
+                disconnect: true,
+            },
+            FrontendRequest::RespondPending {
+                fingerprint: "bb".into(),
+                accept: true,
+                name: Some("peer".into()),
+                position: Some(Position::Bottom),
+                incoming: Some(DirectionPolicy::allow_all()),
+                outgoing: Some(DirectionPolicy::deny()),
+            },
+        ];
+        for request in requests {
+            assert_eq!(json_roundtrip(request.clone()), request);
+        }
     }
 }

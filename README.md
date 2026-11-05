@@ -433,6 +433,78 @@ port = 4242
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
 
+Each client may also carry the peer's certificate fingerprint:
+
+```toml
+[[clients]]
+position = "right"
+ips = ["192.168.178.156"]
+# pinned SHA-256 fingerprint of the peer certificate (optional)
+fingerprint = "bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80"
+```
+
+With a pinned fingerprint the outgoing connection verifies the server
+certificate and refuses a host that presents a different one (DHCP reuse, a
+wrong machine on that IP, or a man-in-the-middle). Without a pin the first
+successful connection learns and stores the fingerprint (trust on first use),
+so later connections are authenticated; `lan-mouse cli set-fingerprint <id>`
+can pin it explicitly and `set-fingerprint <id>` without a value clears it.
+
+### Device permissions and control direction
+
+Every authorized machine is a *device* keyed by its certificate fingerprint.
+Each device has **two independent directions**, and each direction has its own
+set of capabilities (`pointer`, `keyboard`, `clipboard`):
+
+- **incoming** — what that device may do on *this* machine. It is enforced
+  locally: keyboard/pointer/clipboard events that were not granted are dropped
+  before they reach the emulation backend.
+- **outgoing** — what *this* machine may do on the peer. It is a local guard:
+  the machine refuses to activate the link (and stops forwarding input) when
+  the direction or capability was not granted.
+
+This covers all direction combinations: "only this PC controls the other",
+"only the other controls this PC", "both control each other" (the default),
+optionally with different capabilities per direction, e.g. "the other machine
+may use the clipboard but not move my mouse".
+
+The GUI has a **Devices** section with one expandable row per device and
+checkboxes for each direction; the authorization dialog asks for the
+capabilities of both directions when a new device is approved. The CLI has:
+
+```sh
+lan-mouse cli devices                  # name, fingerprint, position, caps, state
+lan-mouse cli pending                 # devices waiting for approval
+lan-mouse cli allow <fingerprint> --name windows11 --position right \
+    --incoming pointer,keyboard,clipboard --outgoing pointer,keyboard
+lan-mouse cli deny <fingerprint>      # deny permanently (deny list)
+lan-mouse cli revoke <fingerprint>    # close sessions + deny
+lan-mouse cli rename <fingerprint> "desk pc"
+```
+
+`--incoming`/`--outgoing` accept `pointer,keyboard,clipboard`, `all` or `none`;
+`none` disables that direction. Policies are stored per device in the config:
+
+```toml
+[[devices]]
+fingerprint = "bc:05:ab:…"
+name = "windows11"
+
+[devices.incoming]          # what the peer may do here
+allowed = true
+capabilities = 7            # 1=pointer, 2=keyboard, 4=clipboard
+
+[devices.outgoing]          # what this PC may do there
+allowed = true
+capabilities = 7
+```
+
+Old configs are migrated on load: every entry in `authorized_fingerprints`
+becomes a device with full access in both directions (the previous behavior),
+so nothing changes until a policy is narrowed. A device can also be granted
+*connect-only* access (`allowed = true`, `capabilities = 0`): it may stay
+connected and answer pings but cannot inject any input.
+
 ## Two-way (mutual) operation
 
 Lan Mouse has **no fixed server/client role**: every instance listens for
@@ -553,17 +625,39 @@ The GUI exposes it in the client row; the CLI has
 are accumulated instead of truncated, so slow movements are not lost on the
 integer-only Windows/X11 backends.
 
+Motion is carried in logical (96 DPI) pixels. A Windows sender divides the
+physical deltas reported by its hooks by the display scale, and a Windows
+receiver multiplies them by the scale of the monitor under the cursor, so a
+150% laptop and a 100% desktop move the pointer the same logical distance.
+`sensitivity` is applied on top of that, so it only has to compensate for
+pointer acceleration, not for display scaling. A scale change on the receiver
+is picked up without a restart when the cursor moves to another monitor (the
+per-monitor scale is cached for two seconds).
+
 ### Pairing without a mouse on the other machine
 
 `lan-mouse cli pair --seconds 60` (or the *Pairing mode* button in the GUI)
-opens a window during which **any** connecting device is authorized and also
-gets a client entry for the reverse direction. Useful when the other computer
-has no mouse to click "approve". After the window closes, unknown devices need
+opens a window during which **one** new connecting device is authorized and
+also gets a client entry for the reverse direction. Useful when the other
+computer has no mouse to click "approve". The window is single use: it closes
+as soon as the first device is accepted. After it closes, unknown devices need
 the normal approval again; already-seen ones are matched by certificate.
 
 Devices running this fork also announce themselves every 10 seconds with their
 certificate fingerprint, so they show up in the network table immediately and
 can be authorized in one click.
+
+### Revoking a device
+
+`lan-mouse cli remove-authorized-key <fingerprint>` (or the delete button in
+the *Authorized Certificates* list) does more than forget the fingerprint: it
+closes the live session, deactivates the outgoing link and adds the
+fingerprint to a deny list (`denied_fingerprints` in the config), so an open
+pairing window or a trusted address cannot silently re-authorize the same
+certificate. Authorizing the device again explicitly removes it from the deny
+list. Trusted addresses that cover more than a local subnet (for example
+`10.0.0.0/8` or `0.0.0.0/0`) are accepted but logged and reported as a warning:
+every certificate from that range is authorized without a prompt.
 
 ### GNOME asks once per login
 

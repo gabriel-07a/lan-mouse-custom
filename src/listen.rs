@@ -6,7 +6,7 @@ use lan_mouse_proto::{
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
@@ -23,7 +23,9 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::{crypto, trusted::TrustedNet};
+use crate::{crypto, devices::DeviceStore, trusted::TrustedNet};
+use input_event::{Event as InputEvent, PointerEvent};
+use lan_mouse_ipc::Capabilities;
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -58,11 +60,16 @@ pub(crate) enum ListenEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
-    /// A peer connected from an allowlisted address and its certificate was
-    /// adopted without asking the user.
     AutoAuthorized {
         addr: SocketAddr,
         fingerprint: String,
+        /// The peer was accepted because the pairing window was open (in
+        /// contrast to an allowlisted address).
+        from_pairing: bool,
+    },
+    /// An incoming DTLS connection was closed.
+    Closed {
+        addr: SocketAddr,
     },
 }
 
@@ -88,6 +95,8 @@ impl LanMouseListener {
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         trusted_nets: Arc<RwLock<Vec<TrustedNet>>>,
         pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
+        denied: Arc<RwLock<HashSet<String>>>,
+        devices: Arc<RwLock<DeviceStore>>,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, mut request_port_change_rx) = channel();
@@ -110,6 +119,8 @@ impl LanMouseListener {
             let authorized = authorized_keys.clone();
             let trusted = trusted_nets.clone();
             let pairing = pairing_until.clone();
+            let denied = denied.clone();
+            let devices = devices.clone();
             spawn_local(async move {
                 // Bound the number of half-open handshakes so stray UDP
                 // traffic cannot spawn unbounded tasks.
@@ -127,21 +138,24 @@ impl LanMouseListener {
                                 let authorized = authorized.clone();
                                 let trusted = trusted.clone();
                                 let pairing = pairing.clone();
+                                let denied = denied.clone();
+                                let devices = devices.clone();
                                 let conns = conns_clone.clone();
                                 let cfg = cfg.clone();
                                 spawn_local(async move {
                                     let _permit = permit;
                                     let recorded: Arc<Mutex<Option<String>>> = Default::default();
-                                    let auto_authorized =
-                                        Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                    let auto_source: Arc<Mutex<Option<AutoSource>>> =
+                                        Default::default();
                                     let mut cfg = cfg;
                                     cfg.verify_peer_certificate = Some(per_connection_verify(
-                                        authorized,
+                                        authorized.clone(),
                                         trusted,
-                                        pairing,
+                                        pairing.clone(),
+                                        denied.clone(),
                                         addr,
                                         recorded.clone(),
-                                        auto_authorized.clone(),
+                                        auto_source.clone(),
                                     ));
                                     // `false` = server role, as in the
                                     // upstream listener wrapper.
@@ -157,23 +171,60 @@ impl LanMouseListener {
                                                 .first()
                                                 .map(|cert| crypto::generate_fingerprint(cert))
                                                 .unwrap_or_default();
-                                            if auto_authorized.load(
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            ) {
+                                            // Auto-authorization (allowlisted
+                                            // address or pairing window) is
+                                            // only persisted once the
+                                            // handshake actually succeeded, so
+                                            // a failed/aborted handshake
+                                            // cannot leave an orphaned pin.
+                                            if let Some(source) =
+                                                auto_source.lock().expect("lock").take()
+                                            {
+                                                let description = match source {
+                                                    AutoSource::TrustedAddress => {
+                                                        format!("trusted {}", addr.ip())
+                                                    }
+                                                    AutoSource::Pairing => {
+                                                        // Single use: the
+                                                        // window allows exactly
+                                                        // one new device.
+                                                        let _ = pairing
+                                                            .write()
+                                                            .expect("lock")
+                                                            .take();
+                                                        format!("paired {}", addr.ip())
+                                                    }
+                                                };
+                                                authorized
+                                                    .write()
+                                                    .expect("lock")
+                                                    .insert(fingerprint.clone(), description);
+                                                log::info!(
+                                                    "auto-authorized {addr} ({fingerprint})"
+                                                );
                                                 let _ = listen_tx.send(
                                                     ListenEvent::AutoAuthorized {
                                                         addr,
                                                         fingerprint: fingerprint.clone(),
+                                                        from_pairing: matches!(
+                                                            source,
+                                                            AutoSource::Pairing
+                                                        ),
                                                     },
                                                 );
                                             }
-                                            let _ = listen_tx
-                                                .send(ListenEvent::Accept { addr, fingerprint });
+                                            let _ = listen_tx.send(ListenEvent::Accept {
+                                                addr,
+                                                fingerprint: fingerprint.clone(),
+                                            });
                                             spawn_local(read_loop(
                                                 conns,
                                                 addr,
+                                                fingerprint,
                                                 dtls,
                                                 listen_tx,
+                                                devices,
+                                                authorized,
                                             ));
                                         }
                                         Err(e) => {
@@ -255,6 +306,25 @@ impl LanMouseListener {
         }
     }
 
+    /// Close an active incoming connection.
+    ///
+    /// Used when a device is revoked while it is still connected: removing the
+    /// fingerprint alone would leave the live DTLS session able to inject
+    /// input until it drops on its own.
+    pub(crate) async fn disconnect(&self, addr: SocketAddr) {
+        let conn = {
+            let mut conns = self.conns.lock().await;
+            conns
+                .iter()
+                .position(|(a, _)| *a == addr)
+                .map(|index| conns.remove(index).1)
+        };
+        if let Some(conn) = conn {
+            log::info!("closing incoming connection from {addr}");
+            let _ = conn.close().await;
+        }
+    }
+
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
         if let Some(conn) = self
             .conns
@@ -286,18 +356,30 @@ impl Stream for LanMouseListener {
     }
 }
 
+/// Why an incoming certificate was accepted without an interactive prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoSource {
+    /// The peer's address is in the trusted address allowlist.
+    TrustedAddress,
+    /// The user opened the pairing window, which accepts one new device.
+    Pairing,
+}
+
 /// Build the certificate verifier for a single incoming connection.
 ///
 /// It runs inside the DTLS handshake, which is the only place that knows both
-/// the peer certificate *and* the address it came from — the address is what
-/// makes an allowlist possible at all.
+/// the peer certificate *and* the address it came from. It only ever *reads*
+/// state: auto-authorization is recorded here but persisted by the accept
+/// task after the handshake succeeds, so an aborted handshake cannot leave an
+/// orphaned pin.
 fn per_connection_verify(
     authorized: Arc<RwLock<HashMap<String, String>>>,
     trusted: Arc<RwLock<Vec<TrustedNet>>>,
     pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
+    denied: Arc<RwLock<HashSet<String>>>,
     addr: SocketAddr,
     recorded: Arc<Mutex<Option<String>>>,
-    auto_authorized: Arc<std::sync::atomic::AtomicBool>,
+    auto_source: Arc<Mutex<Option<AutoSource>>>,
 ) -> VerifyPeerCertificateFn {
     Arc::new(
         move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
@@ -307,34 +389,38 @@ fn per_connection_verify(
             let fingerprint = crypto::generate_fingerprint(cert);
             *recorded.lock().expect("lock") = Some(fingerprint.clone());
 
+            // A revoked device must stay revoked: the deny list wins over the
+            // authorized map, the address allowlist and an open pairing window.
+            if denied.read().expect("lock").contains(&fingerprint) {
+                log::warn!("rejecting revoked device {fingerprint} from {addr}");
+                return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+            }
+
             if authorized.read().expect("lock").contains_key(&fingerprint) {
                 return Ok(());
             }
 
-            // An allowlisted address is trusted on first use: the certificate
-            // is stored, so later connections are matched by fingerprint.
-            // Pairing mode trusts anyone for a short window, which covers the
-            // case where the other machine has no mouse to click "approve".
+            // Pairing mode trusts one new device for a short window, which
+            // covers the case where the other machine has no mouse to approve.
             let pairing = pairing_until
                 .read()
                 .expect("lock")
                 .is_some_and(|deadline| std::time::Instant::now() < deadline);
-            let trusted_match = pairing
-                || trusted
-                    .read()
-                    .expect("lock")
-                    .iter()
-                    .any(|net| net.contains(addr.ip()));
-            if trusted_match {
-                authorized
-                    .write()
-                    .expect("lock")
-                    .insert(fingerprint.clone(), format!("trusted {}", addr.ip()));
-                log::info!(
-                    "trusted address {}: authorizing device {fingerprint}",
-                    addr.ip()
-                );
-                auto_authorized.store(true, std::sync::atomic::Ordering::Relaxed);
+            if pairing {
+                *auto_source.lock().expect("lock") = Some(AutoSource::Pairing);
+                return Ok(());
+            }
+
+            // An allowlisted address is trusted on first use; the fingerprint
+            // is stored after the handshake so later connections match by
+            // certificate instead of by address.
+            if trusted
+                .read()
+                .expect("lock")
+                .iter()
+                .any(|net| net.contains(addr.ip()))
+            {
+                *auto_source.lock().expect("lock") = Some(AutoSource::TrustedAddress);
                 return Ok(());
             }
 
@@ -383,10 +469,14 @@ fn normalize_addr(addr: SocketAddr) -> SocketAddr {
 async fn read_loop(
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     addr: SocketAddr,
+    fingerprint: String,
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
+    devices: Arc<RwLock<DeviceStore>>,
+    authorized: Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<(), Error> {
     let mut b = [0u8; MAX_CLIPBOARD_FRAME];
+    let mut blocked = 0u64;
 
     loop {
         let n = match conn.recv(&mut b).await {
@@ -394,6 +484,14 @@ async fn read_loop(
             Err(_) => break,
         };
         if n > 0 && is_clipboard_frame(b[0]) {
+            if !incoming_policy(&devices, &authorized, &fingerprint).allows(Capabilities::CLIPBOARD)
+            {
+                blocked = blocked.saturating_add(1);
+                log::debug!(
+                    "dropping clipboard frame from {addr}: device has no clipboard permission"
+                );
+                continue;
+            }
             match ClipboardFrame::decode(&b[..n]) {
                 Ok(frame) => {
                     if dtls_tx
@@ -409,6 +507,16 @@ async fn read_loop(
         }
         match ProtoEvent::try_from(&b[..n]) {
             Ok(event) => {
+                if !event_allowed(&devices, &authorized, &fingerprint, &event) {
+                    blocked = blocked.saturating_add(1);
+                    if blocked == 1 || blocked.is_multiple_of(1000) {
+                        log::warn!(
+                            "dropping input from {addr}: capability not granted \
+                             ({blocked} blocked event(s) so far)"
+                        );
+                    }
+                    continue;
+                }
                 if dtls_tx.send(ListenEvent::Msg { event, addr }).is_err() {
                     break;
                 }
@@ -432,5 +540,56 @@ async fn read_loop(
     if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
         conns.remove(index);
     }
+    let _ = dtls_tx.send(ListenEvent::Closed { addr });
     Ok(())
+}
+
+/// Incoming policy for a connection.
+///
+/// A fingerprint whose device record has not been registered yet (a device
+/// that was just auto-authorized, or a pre-permissions test/legacy setup) is
+/// only trusted when it is in the listener's authorized map; that keeps the
+/// safe default (deny unknown devices) without dropping the first events of
+/// a freshly authorized session.
+fn incoming_policy(
+    devices: &RwLock<DeviceStore>,
+    authorized: &RwLock<HashMap<String, String>>,
+    fingerprint: &str,
+) -> lan_mouse_ipc::DirectionPolicy {
+    let store = devices.read().expect("lock");
+    if store.is_known(fingerprint) {
+        return store.incoming(fingerprint);
+    }
+    drop(store);
+    if authorized.read().expect("lock").contains_key(fingerprint) {
+        lan_mouse_ipc::DirectionPolicy::allow_all()
+    } else {
+        lan_mouse_ipc::DirectionPolicy::deny()
+    }
+}
+
+/// Whether the peer is allowed to inject `event` under its incoming policy.
+fn event_allowed(
+    devices: &RwLock<DeviceStore>,
+    authorized: &RwLock<HashMap<String, String>>,
+    fingerprint: &str,
+    event: &ProtoEvent,
+) -> bool {
+    let policy = incoming_policy(devices, authorized, fingerprint);
+    match event {
+        ProtoEvent::Input(InputEvent::Pointer(
+            PointerEvent::Motion { .. }
+            | PointerEvent::Button { .. }
+            | PointerEvent::Axis { .. }
+            | PointerEvent::AxisDiscrete120 { .. },
+        )) => policy.allows(Capabilities::POINTER),
+        ProtoEvent::Input(InputEvent::Keyboard(_)) => policy.allows(Capabilities::KEYBOARD),
+        ProtoEvent::Enter { .. } => {
+            policy.allowed
+                && (policy.capabilities.contains(Capabilities::POINTER)
+                    || policy.capabilities.contains(Capabilities::KEYBOARD))
+        }
+        // Hand-off bookkeeping and keep-alives are always allowed.
+        _ => true,
+    }
 }

@@ -57,6 +57,22 @@ impl TrustedNet {
             _ => false,
         }
     }
+
+    /// Prefix length of the rule.
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
+    /// Whether this rule covers more than a typical local subnet.
+    ///
+    /// A broad rule authorizes every certificate that reaches the listener
+    /// from that range, so the user should be warned about it.
+    pub fn is_broad(&self) -> bool {
+        match self.addr {
+            IpAddr::V4(_) => self.prefix < 24,
+            IpAddr::V6(_) => self.prefix < 64,
+        }
+    }
 }
 
 /// Parse every valid entry, ignoring the malformed ones.
@@ -101,6 +117,20 @@ mod tests {
     fn families_never_match_each_other() {
         let net = TrustedNet::parse("0.0.0.0/0").expect("parse");
         assert!(!net.contains(ip("::1")));
+    }
+
+    #[test]
+    fn broad_rules_are_flagged() {
+        assert!(TrustedNet::parse("10.0.0.0/8").expect("parse").is_broad());
+        assert!(TrustedNet::parse("0.0.0.0/0").expect("parse").is_broad());
+        assert!(
+            !TrustedNet::parse("192.168.1.0/24")
+                .expect("parse")
+                .is_broad()
+        );
+        assert!(!TrustedNet::parse("192.168.1.5").expect("parse").is_broad());
+        assert!(!TrustedNet::parse("fd00::/64").expect("parse").is_broad());
+        assert!(TrustedNet::parse("fd00::/48").expect("parse").is_broad());
     }
 
     #[test]

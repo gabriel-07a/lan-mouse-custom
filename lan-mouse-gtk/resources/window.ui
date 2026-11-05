@@ -50,7 +50,8 @@
                     <property name="spacing">12</property>
                     <child>
                       <object class="AdwPreferencesGroup">
-                        <property name="title" translatable="yes">Connections</property>
+                        <property name="title" translatable="yes">Connected &amp;amp; Paired Devices</property>
+                        <property name="description" translatable="yes">Devices paired with this computer (both outgoing and incoming connections).</property>
                         <property name="header-suffix">
                           <object class="GtkButton">
                             <signal name="clicked" handler="handle_add_client_pressed" swapped="true"/>
@@ -83,8 +84,23 @@
                       </object>
                     </child>
                     <child>
+                      <object class="AdwPreferencesGroup" id="requests_group">
+                        <property name="visible">False</property>
+                        <property name="title" translatable="yes">Connection requests</property>
+                        <property name="description" translatable="yes">Devices that asked to connect but have not been authorized yet. Approve them to grant control in the directions and capabilities you choose.</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup" id="devices_group">
+                        <property name="visible">False</property>
+                        <property name="title" translatable="yes">Devices</property>
+                        <property name="description" translatable="yes">Per-device permissions. A device is identified by its certificate fingerprint, so renaming it or changing its address keeps the same permissions.</property>
+                      </object>
+                    </child>
+                    <child>
                       <object class="AdwPreferencesGroup">
-                        <property name="title" translatable="yes">Incoming Connections</property>
+                        <property name="title" translatable="yes">Authorized Certificates</property>
+                        <property name="description" translatable="yes">Trusted SHA-256 certificate fingerprints for paired devices.</property>
                         <property name="header-suffix">
                           <object class="GtkButton">
                             <signal name="clicked" handler="handle_add_cert_fingerprint" swapped="true"/>

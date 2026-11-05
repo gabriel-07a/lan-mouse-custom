@@ -37,10 +37,12 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
-    /// a peer from an allowlisted address was trusted without a prompt
+    /// a peer was auto-authorized (allowlisted address or pairing window)
     AutoAuthorized {
         addr: SocketAddr,
         fingerprint: String,
+        /// the pairing window accepted this peer (single use)
+        from_pairing: bool,
     },
     ConnectionAttempt {
         addr: SocketAddr,
@@ -83,6 +85,8 @@ pub(crate) enum EmulationEvent {
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
+    /// close an active incoming connection (device revoked)
+    Disconnect(SocketAddr),
     ChangePort(u16),
     Terminate,
 }
@@ -129,6 +133,15 @@ impl Emulation {
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
         self.request_tx
             .send(EmulationRequest::Release(addr))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Close the incoming connection from `addr` (used when a device is
+    /// revoked while its session is still live).
+    pub(crate) fn disconnect(&self, addr: SocketAddr) {
+        self.request_tx
+            .send(EmulationRequest::Disconnect(addr))
             .ok()
             .unwrap_or_default();
     }
@@ -276,13 +289,24 @@ impl ListenTask {
                         // A fresh connection from this address starts a new
                         // serial space; never dedupe against the old one.
                         last_enter.clear(addr);
+                        last_response.insert(addr, Instant::now());
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).ok().unwrap_or_default();
                     }
-                    Some(ListenEvent::AutoAuthorized { addr, fingerprint }) => {
+                    Some(ListenEvent::AutoAuthorized { addr, fingerprint, from_pairing }) => {
                         self.event_tx
-                            .send(EmulationEvent::AutoAuthorized { addr, fingerprint })
+                            .send(EmulationEvent::AutoAuthorized { addr, fingerprint, from_pairing })
                             .ok()
                             .unwrap_or_default();
+                    }
+                    Some(ListenEvent::Closed { addr }) => {
+                        if last_response.remove(&addr).is_some() {
+                            self.emulation_proxy.remove(addr);
+                            last_enter.clear(addr);
+                            self.event_tx
+                                .send(EmulationEvent::Disconnected { addr })
+                                .ok()
+                                .unwrap_or_default();
+                        }
                     }
                     Some(ListenEvent::Rejected { addr, fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
@@ -303,6 +327,7 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Disconnect(addr) => self.listener.disconnect(addr).await,
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;

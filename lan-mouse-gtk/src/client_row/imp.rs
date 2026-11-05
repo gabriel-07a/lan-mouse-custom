@@ -5,7 +5,7 @@ use adw::{ActionRow, ComboRow, prelude::*};
 use glib::{Binding, subclass::InitializingObject};
 use gtk::glib::subclass::Signal;
 use gtk::glib::{SignalHandlerId, clone};
-use gtk::{Button, CompositeTemplate, Entry, Switch, glib};
+use gtk::{Button, CompositeTemplate, Entry, Label, Switch, glib};
 use lan_mouse_ipc::Position;
 use std::sync::OnceLock;
 
@@ -16,6 +16,10 @@ use crate::client_object::ClientObject;
 pub struct ClientRow {
     #[template_child]
     pub enable_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub status_badge: TemplateChild<Label>,
+    #[template_child]
+    pub connect_button: TemplateChild<Button>,
     #[template_child]
     pub dns_button: TemplateChild<gtk::Button>,
     #[template_child]
@@ -151,6 +155,18 @@ impl ClientRow {
     fn handle_activate_switch(&self, state: bool, _switch: &Switch) -> bool {
         self.obj().emit_by_name::<()>("request-activate", &[&state]);
         true // dont run default handler
+    }
+
+    #[template_callback]
+    fn handle_toggle_connect(&self, _button: &Button) {
+        let currently_active = self
+            .client_object
+            .borrow()
+            .as_ref()
+            .map(|co| co.property::<bool>("active"))
+            .unwrap_or(false);
+        let next = !currently_active;
+        self.obj().emit_by_name::<()>("request-activate", &[&next]);
     }
 
     #[template_callback]

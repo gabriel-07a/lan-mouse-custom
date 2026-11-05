@@ -53,13 +53,6 @@ impl ClientRow {
             .sync_create()
             .build();
 
-        // bind hostname to title
-        let title_binding = client_object
-            .bind_property("hostname", self, "title")
-            .transform_to(|_, v: Option<String>| v.or(Some("<span font_style=\"italic\" font_weight=\"light\" foreground=\"darkgrey\">no hostname!</span>".to_string())))
-            .sync_create()
-            .build();
-
         // bind port to port edit field
         let port_binding = client_object
             .bind_property("port", &self.imp().port.get(), "text")
@@ -70,12 +63,6 @@ impl ClientRow {
                     Some(v.to_string())
                 }
             })
-            .sync_create()
-            .build();
-
-        // bind port to subtitle
-        let subtitle_binding = client_object
-            .bind_property("port", self, "subtitle")
             .sync_create()
             .build();
 
@@ -117,17 +104,14 @@ impl ClientRow {
         bindings.push(active_binding);
         bindings.push(switch_position_binding);
         bindings.push(hostname_binding);
-        bindings.push(title_binding);
         bindings.push(port_binding);
-        bindings.push(subtitle_binding);
         bindings.push(position_binding);
         bindings.push(resolve_binding);
         bindings.push(ip_binding);
 
-        // Render the initial collapsed subtitle from whatever
-        // peer_commit the ClientObject was created with. Subsequent
-        // changes are pushed by `Window::update_client_state` calling
-        // `refresh_status` after writing the new properties.
+        // Render the initial collapsed title, badge, and subtitle. Subsequent
+        // changes are pushed by `Window::update_client_state` / `update_client_config`
+        // calling `refresh_status` after writing the new properties.
         self.refresh_status();
     }
 
@@ -169,28 +153,58 @@ impl ClientRow {
     /// `peer-commit`. The dns-status icon is left to its existing
     /// `set_dns_state` handler so the two indicators don't fight
     /// for the same CSS class.
-    /// Recompute the collapsed subtitle: connection state first, build
-    /// mismatch only as a warning suffix.
+    /// Recompute the collapsed title, status badge, connect/disconnect button,
+    /// and subtitle: connection state first, build mismatch only as a warning suffix.
     pub fn refresh_status(&self) {
         let data = self.imp().client_object.borrow().as_ref().map(|co| {
             (
                 co.property::<bool>("active"),
                 co.property::<bool>("alive"),
                 co.property::<Option<String>>("active-addr"),
+                co.property::<Option<String>>("incoming-addr"),
                 co.property::<u32>("rtt-ms"),
                 co.property::<Option<String>>("peer-commit"),
+                co.property::<Option<String>>("hostname"),
+                co.property::<Vec<String>>("ips"),
+                co.property::<String>("position"),
             )
         });
-        let Some((active, alive, addr, rtt, peer)) = data else {
+        let Some((active, alive, addr, incoming_addr, rtt, peer, hostname, ips, position)) = data
+        else {
             return;
         };
 
+        // Compute row title: prefer hostname, fall back to first IP, then placeholder.
+        let primary_ip = ips.first().cloned();
+        let title_markup = match (
+            hostname.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            primary_ip.as_deref(),
+        ) {
+            (Some(host), Some(ip)) if host != ip => {
+                let h = glib::markup_escape_text(host);
+                let ip_esc = glib::markup_escape_text(ip);
+                format!("{h} <span alpha=\"65%\">({ip_esc})</span>")
+            }
+            (Some(host), _) => glib::markup_escape_text(host).to_string(),
+            (None, Some(ip)) => glib::markup_escape_text(ip).to_string(),
+            (None, None) => {
+                "<span font_style=\"italic\" font_weight=\"light\" foreground=\"darkgrey\">Unnamed device (set IP or hostname)</span>".to_string()
+            }
+        };
+        self.set_title(&title_markup);
+
         let local_commit = crate::local_commit_str();
         let local = glib::markup_escape_text(&local_commit).to_string();
-        let rtt = if rtt > 0 {
+        let rtt_suffix = if rtt > 0 {
             format!(" · {rtt} ms")
         } else {
             String::new()
+        };
+        let pos_label = match position.as_str() {
+            "right" => "Right",
+            "top" => "Top",
+            "bottom" => "Bottom",
+            _ => "Left",
         };
 
         self.remove_css_class("peer-mismatch");
@@ -199,25 +213,69 @@ impl ClientRow {
         self.remove_css_class("client-offline");
         self.remove_css_class("client-waiting");
 
-        let addr = addr.map(|addr| glib::markup_escape_text(&addr).to_string());
-        let markup = match (active, addr, alive) {
-            (false, _, _) => {
-                self.add_css_class("client-offline");
-                "Disabled".to_string()
-            }
-            (true, Some(addr), true) => {
+        let badge = &self.imp().status_badge;
+        badge.remove_css_class("status-connected");
+        badge.remove_css_class("status-waiting");
+        badge.remove_css_class("status-offline");
+
+        let connect_btn = &self.imp().connect_button;
+        if active {
+            connect_btn.set_label("Disconnect");
+            connect_btn.remove_css_class("suggested-action");
+        } else {
+            connect_btn.set_label("Connect");
+            connect_btn.add_css_class("suggested-action");
+        }
+
+        let addr = addr.map(|a| glib::markup_escape_text(&a).to_string());
+        let incoming = incoming_addr.map(|a| glib::markup_escape_text(&a).to_string());
+
+        let markup = match (active, addr, alive, incoming) {
+            (true, Some(addr), true, Some(_)) => {
                 self.add_css_class("peer-match");
-                format!("Connected to {addr}{rtt}")
+                badge.set_label("Connected");
+                badge.add_css_class("status-connected");
+                format!("Connected (bidirectional) · {addr} · Screen: {pos_label}{rtt_suffix}")
+            }
+            (true, Some(addr), true, None) => {
+                self.add_css_class("peer-match");
+                badge.set_label("Connected");
+                badge.add_css_class("status-connected");
+                format!("Connected to {addr} · Screen: {pos_label}{rtt_suffix}")
+            }
+            (true, _, _, Some(in_addr)) => {
+                self.add_css_class("peer-match");
+                badge.set_label("Connected");
+                badge.add_css_class("status-connected");
+                format!("Connected from {in_addr} · Screen: {pos_label}{rtt_suffix}")
             }
             // Active but no usable connection yet: either the peer has not
             // authorized this device or it is still booting.
-            (true, None, _) => {
+            (true, None, _, None) => {
                 self.add_css_class("client-waiting");
-                "Waiting for the other device — approve the request there".to_string()
+                badge.set_label("Waiting approval");
+                badge.add_css_class("status-waiting");
+                format!(
+                    "Waiting for the other device — approve the request there · Screen: {pos_label}"
+                )
             }
-            (true, Some(_), false) => {
+            (true, Some(_), false, None) => {
                 self.add_css_class("client-waiting");
-                format!("Connection lost — reconnecting{rtt}")
+                badge.set_label("Reconnecting");
+                badge.add_css_class("status-waiting");
+                format!("Connection lost — reconnecting · Screen: {pos_label}{rtt_suffix}")
+            }
+            (false, _, _, Some(in_addr)) => {
+                self.add_css_class("peer-match");
+                badge.set_label("Receiving");
+                badge.add_css_class("status-connected");
+                format!("Receiving input from {in_addr} (outgoing disabled) · Screen: {pos_label}")
+            }
+            (false, _, _, None) => {
+                self.add_css_class("client-offline");
+                badge.set_label("Disconnected");
+                badge.add_css_class("status-offline");
+                format!("Disconnected · Screen: {pos_label} — click Connect to pair")
             }
         };
 

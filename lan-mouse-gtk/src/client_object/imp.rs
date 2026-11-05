@@ -24,6 +24,7 @@ pub struct ClientObject {
     #[property(name = "sensitivity", get, set, type = u32, member = sensitivity)]
     #[property(name = "alive", get, set, type = bool, member = alive)]
     #[property(name = "active-addr", get, set, type = Option<String>, member = active_addr)]
+    #[property(name = "incoming-addr", get, set, type = Option<String>, member = incoming_addr)]
     pub data: RefCell<ClientData>,
 }
 

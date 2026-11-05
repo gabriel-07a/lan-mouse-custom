@@ -34,6 +34,10 @@ impl ClientObject {
                 "active-addr",
                 state.active_addr.map(|addr| addr.to_string()),
             )
+            .property(
+                "incoming-addr",
+                state.incoming_addr.map(|addr| addr.to_string()),
+            )
             .build()
     }
 
@@ -66,6 +70,8 @@ pub struct ClientData {
     pub alive: bool,
     /// address of the established connection, if any
     pub active_addr: Option<String>,
+    /// address of an active incoming connection from this peer, if any
+    pub incoming_addr: Option<String>,
     /// motion scale in percent
     pub sensitivity: u32,
 }

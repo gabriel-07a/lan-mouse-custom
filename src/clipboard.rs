@@ -425,6 +425,7 @@ mod tests {
             enter_hook: None,
             leave_hook: None,
             sensitivity: 100,
+            fingerprint: None,
         });
         (manager, handle)
     }
@@ -449,6 +450,8 @@ mod tests {
                         "peer".to_string(),
                     )]))),
                     Arc::new(RwLock::new(Vec::new())),
+                    Default::default(),
+                    Default::default(),
                     Default::default(),
                 )
                 .await
@@ -485,7 +488,9 @@ mod tests {
                         .expect("listener closed");
                     match event {
                         ListenEvent::Clipboard { frame, addr } => break (frame, addr),
-                        ListenEvent::Accept { .. } | ListenEvent::Msg { .. } => {}
+                        ListenEvent::Accept { .. }
+                        | ListenEvent::Msg { .. }
+                        | ListenEvent::Closed { .. } => {}
                         ListenEvent::AutoAuthorized { .. } => {}
                         ListenEvent::Rejected { fingerprint, .. } => {
                             panic!("unexpected rejection: {fingerprint}")

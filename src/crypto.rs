@@ -34,6 +34,29 @@ pub fn certificate_fingerprint(cert: &Certificate) -> String {
     generate_fingerprint(certificate)
 }
 
+/// Canonicalise a user-supplied SHA-256 fingerprint.
+///
+/// Accepts the same fingerprint with or without separators, in upper or lower
+/// case, and returns the canonical lowercase colon-separated form used
+/// everywhere else. Returns `None` when the input is not a SHA-256
+/// fingerprint, so a typo cannot silently pin an unusable key.
+pub fn normalize_fingerprint(input: &str) -> Option<String> {
+    let hex: String = input
+        .chars()
+        .filter(|c| *c != ':' && *c != '-' && !c.is_whitespace())
+        .collect();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        hex.as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).expect("hex").to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
 /// load certificate from file
 pub fn load_certificate(path: &Path) -> Result<Certificate, Error> {
     let f = File::open(path)?;
@@ -122,6 +145,40 @@ mod tests {
         let a = generate_key_and_cert(&unique_path("a")).expect("cert a");
         let b = generate_key_and_cert(&unique_path("b")).expect("cert b");
         assert_ne!(certificate_fingerprint(&a), certificate_fingerprint(&b));
+    }
+
+    #[test]
+    fn normalize_fingerprint_accepts_common_spellings() {
+        let canonical = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:\
+                         aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+        let upper = canonical.replace(':', "").to_uppercase();
+        assert_eq!(normalize_fingerprint(&upper).as_deref(), Some(canonical));
+        // Spaces and dashes are just visual separators.
+        let dashed = canonical.replace(':', "-");
+        assert_eq!(normalize_fingerprint(&dashed).as_deref(), Some(canonical));
+        let generated = certificate_fingerprint(
+            &generate_key_and_cert(&unique_path("normalize")).expect("cert"),
+        );
+        assert_eq!(
+            normalize_fingerprint(&generated).as_deref(),
+            Some(generated.as_str())
+        );
+    }
+
+    #[test]
+    fn normalize_fingerprint_rejects_typos() {
+        assert_eq!(normalize_fingerprint(""), None);
+        assert_eq!(normalize_fingerprint("aa:bb"), None);
+        assert_eq!(
+            normalize_fingerprint(&"zz".repeat(32)),
+            None,
+            "non-hex must not be pinned"
+        );
+        assert_eq!(
+            normalize_fingerprint(&"aa".repeat(31)),
+            None,
+            "sha256 is exactly 32 bytes"
+        );
     }
 
     #[cfg(unix)]

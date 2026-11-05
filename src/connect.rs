@@ -1,11 +1,13 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
+use crate::crypto;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
     MAX_EVENT_SIZE, ProtoEvent,
     clipboard::{ClipboardFrame, MAX_CLIPBOARD_FRAME, is_clipboard_frame},
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
+use rustls::pki_types::CertificateDer;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -80,6 +82,8 @@ struct ConnCtx {
     tx: Sender<(ClientHandle, ProtoEvent)>,
     /// receiver for clipboard frames arriving on outgoing connections
     clipboard_tx: Sender<(ClientHandle, ClipboardFrame)>,
+    /// notifies the service when a client's connection/liveness/RTT state changes
+    state_tx: Sender<ClientHandle>,
     /// addresses that answered the current ping round
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     /// timestamp of the last ping sent, used to derive RTT from `Pong`
@@ -98,6 +102,11 @@ impl ConnCtx {
         if let Some(tx) = self.waiters.borrow().get(&handle) {
             tx.send_replace(connected);
         }
+        let _ = self.state_tx.send(handle);
+    }
+
+    fn notify_state_changed(&self, handle: ClientHandle) {
+        let _ = self.state_tx.send(handle);
     }
 
     fn waiter(&self, handle: ClientHandle) -> watch::Receiver<bool> {
@@ -228,6 +237,7 @@ pub(crate) struct LanMouseConnection {
     sender: ConnectionSender,
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     clipboard_rx: Option<Receiver<(ClientHandle, ClipboardFrame)>>,
+    state_rx: Option<Receiver<ClientHandle>>,
 }
 
 impl LanMouseConnection {
@@ -238,6 +248,7 @@ impl LanMouseConnection {
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         let (clipboard_tx, clipboard_rx) = channel();
+        let (state_tx, state_rx) = channel();
         let ctx = ConnCtx {
             cert,
             client_manager,
@@ -248,6 +259,7 @@ impl LanMouseConnection {
             waiters: Default::default(),
             tx: recv_tx,
             clipboard_tx,
+            state_tx,
             ping_response: Default::default(),
             ping_sent: Default::default(),
             hello_sent: Default::default(),
@@ -257,6 +269,7 @@ impl LanMouseConnection {
             sender: ConnectionSender { ctx },
             recv_rx,
             clipboard_rx: Some(clipboard_rx),
+            state_rx: Some(state_rx),
         }
     }
 
@@ -269,6 +282,12 @@ impl LanMouseConnection {
     /// capture task keeps the input event receiver.
     pub(crate) fn take_clipboard_rx(&mut self) -> Option<Receiver<(ClientHandle, ClipboardFrame)>> {
         self.clipboard_rx.take()
+    }
+
+    /// Hand the connection state receiver to the service loop so it can
+    /// broadcast live connection/RTT updates to frontends.
+    pub(crate) fn take_state_rx(&mut self) -> Option<Receiver<ClientHandle>> {
+        self.state_rx.take()
     }
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
@@ -429,10 +448,21 @@ pub(crate) fn configure_low_latency_udp(socket: &UdpSocket) {
     let _ = socket;
 }
 
+/// Fingerprint of the certificate presented by an outgoing connection.
+async fn peer_fingerprint(conn: &ArcConn) -> Option<String> {
+    let dtls: &DTLSConn = conn.as_any().downcast_ref()?;
+    dtls.connection_state()
+        .await
+        .peer_certificates
+        .first()
+        .map(|cert| crypto::generate_fingerprint(cert))
+}
+
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
     timeout: Duration,
+    expected_fingerprint: Option<String>,
 ) -> Result<(ArcConn, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     let bind_addr = if addr.is_ipv4() {
@@ -447,13 +477,39 @@ async fn connect(
     );
     configure_low_latency_udp(&conn);
     conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
-    let config = Config {
+    let mut config = Config {
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
-        insecure_skip_verify: true,
         extended_master_secret: ExtendedMasterSecretType::Require,
         ..Default::default()
     };
+    match expected_fingerprint {
+        // Pin the server certificate to the identity we already know for this
+        // device. Without this a host that happens to occupy the configured IP
+        // (DHCP reuse, ARP/DNS spoofing, wrong machine) would receive our
+        // keyboard, mouse and clipboard without any warning.
+        Some(expected) => {
+            config.verify_peer_certificate = Some(Arc::new(
+                move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
+                    let Some(cert) = certs.first() else {
+                        return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+                    };
+                    let actual = crypto::generate_fingerprint(cert);
+                    if actual == expected {
+                        Ok(())
+                    } else {
+                        log::warn!(
+                            "server certificate mismatch: expected {expected}, got {actual}"
+                        );
+                        Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+                    }
+                },
+            ));
+        }
+        // Legacy/TOFU path: no pin known yet. The first successful connection
+        // learns the fingerprint (see `connect_to_handle`).
+        None => config.insecure_skip_verify = true,
+    }
     let timeout = tokio::time::sleep(timeout);
     tokio::select! {
         _ = timeout => Err((addr, LanMouseConnectionError::Timeout)),
@@ -468,13 +524,19 @@ async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
     timeout: Duration,
+    expected_fingerprint: Option<String>,
 ) -> Result<(ArcConn, SocketAddr), LanMouseConnectionError> {
     if addrs.is_empty() {
         return Err(LanMouseConnectionError::NotConnected);
     }
     let mut joinset = JoinSet::new();
     for &addr in addrs {
-        joinset.spawn_local(connect(addr, cert.clone(), timeout));
+        joinset.spawn_local(connect(
+            addr,
+            cert.clone(),
+            timeout,
+            expected_fingerprint.clone(),
+        ));
     }
     while let Some(result) = joinset.join_next().await {
         match result {
@@ -513,8 +575,23 @@ async fn connect_to_handle(
             .collect::<Vec<_>>();
 
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let (conn, addr) = connect_any(&addrs, ctx.cert.clone(), ADDRESS_TIMEOUT).await?;
+        let expected = ctx.client_manager.fingerprint(handle);
+        let (conn, addr) =
+            connect_any(&addrs, ctx.cert.clone(), ADDRESS_TIMEOUT, expected.clone()).await?;
         log::info!("client ({handle}) connected @ {addr}");
+
+        // Trust on first use: pin the certificate the peer actually presented
+        // so the next connection is verified against it.
+        if expected.is_none() {
+            if let Some(fingerprint) = peer_fingerprint(&conn).await {
+                log::info!(
+                    "pinned certificate fingerprint {fingerprint} for client {handle} (TOFU)"
+                );
+                ctx.client_manager
+                    .set_fingerprint(handle, Some(fingerprint));
+                ctx.notify_state_changed(handle);
+            }
+        }
 
         ctx.client_manager.set_active_addr(handle, Some(addr));
         // The handshake succeeded. Treat the peer as available until a
@@ -723,6 +800,7 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
                                 .set_peer_capabilities(handle, capabilities);
                             send_hello_once(&ctx, addr, &conn).await;
                         }
+                        ctx.notify_state_changed(handle);
                     }
                     ProtoEvent::Hello {
                         commit,
@@ -735,6 +813,7 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
                             proto_version,
                             capabilities,
                         );
+                        ctx.notify_state_changed(handle);
                     }
                     event => ctx.tx.send((handle, event)).ok().unwrap_or_default(),
                 }
@@ -890,6 +969,7 @@ mod tests {
             enter_hook: None,
             leave_hook: None,
             sensitivity: 100,
+            fingerprint: None,
         });
         (manager, handle)
     }
@@ -910,6 +990,8 @@ mod tests {
             Arc::new(RwLock::new(keys)),
             Arc::new(RwLock::new(Vec::new())),
             Default::default(),
+            Default::default(),
+            Default::default(),
         )
         .await
         .expect("listener")
@@ -925,6 +1007,7 @@ mod tests {
                 ListenEvent::Accept { .. } => continue,
                 ListenEvent::AutoAuthorized { .. } => continue,
                 ListenEvent::Clipboard { .. } => continue,
+                ListenEvent::Closed { .. } => continue,
                 ListenEvent::Rejected { fingerprint, .. } => {
                     panic!("peer rejected: {fingerprint}")
                 }
@@ -1047,6 +1130,7 @@ mod tests {
                     enter_hook: None,
                     leave_hook: None,
                     sensitivity: 100,
+                    fingerprint: None,
                 });
                 let conn = LanMouseConnection::new(client_cert, manager, 2000);
                 conn.send(
@@ -1237,6 +1321,8 @@ mod tests {
                     authorized.clone(),
                     trusted,
                     Default::default(),
+                    Default::default(),
+                    Default::default(),
                 )
                 .await
                 .expect("listener");
@@ -1309,6 +1395,8 @@ mod tests {
                     authorized.clone(),
                     Arc::new(RwLock::new(Vec::new())),
                     pairing,
+                    Default::default(),
+                    Default::default(),
                 )
                 .await
                 .expect("listener");
@@ -1387,7 +1475,9 @@ mod tests {
                             break;
                         }
                         ListenEvent::Accept { .. } => panic!("unauthorized peer was accepted"),
-                        ListenEvent::Msg { .. } | ListenEvent::Clipboard { .. } => {}
+                        ListenEvent::Msg { .. }
+                        | ListenEvent::Clipboard { .. }
+                        | ListenEvent::Closed { .. } => {}
                     }
                 }
                 assert!(rejected, "listener never reported the rejection");
@@ -1641,5 +1731,498 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// Full pipeline E2E test: [`crate::capture::Capture`] (using `DummyInputCapture`)
+    /// -> [`LanMouseConnection`] (DTLS) -> [`LanMouseListener`] -> [`Emulation`]
+    /// (using `DummyEmulation`) + clipboard frame delivery over the same DTLS
+    /// session, followed by explicit release and `Leave`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_capture_to_emulation_and_clipboard_pipeline_e2e() {
+        use crate::capture::{Capture, CaptureType, ICaptureEvent};
+        use lan_mouse_proto::clipboard::ClipboardFrame;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port_b = free_udp_port();
+                let cert_a = unique_cert("e2e-a");
+                let cert_b = unique_cert("e2e-b");
+                let fp_a = crypto::certificate_fingerprint(&cert_a);
+
+                // Peer B: Listener + Emulation (Dummy) + Clipboard receiver
+                let listener_b = listener_with_authorized(port_b, cert_b, vec![fp_a.clone()]).await;
+                let (clipboard_b_tx, mut clipboard_b_rx) = local_channel::mpsc::channel();
+                let mut emulation_b = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    listener_b,
+                    clipboard_b_tx,
+                );
+
+                // Peer A: ClientManager + LanMouseConnection + Capture (DummyInputCapture emits on Position::Left)
+                let manager_a = ClientManager::default();
+                let handle_a = manager_a.add_with_config(ConfigClient {
+                    ips: HashSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+                    hostname: None,
+                    port: port_b,
+                    pos: IpcPosition::Left,
+                    active: true,
+                    enter_hook: None,
+                    leave_hook: None,
+                    sensitivity: 100,
+                    fingerprint: None,
+                });
+                let conn_a = LanMouseConnection::new(cert_a, manager_a.clone(), 2000);
+                let clipboard_sender_a = conn_a.sender();
+
+                let mut capture_a =
+                    Capture::new(Some(input_capture::Backend::Dummy), conn_a, vec![], 0, 2000);
+                capture_a.create(handle_a, IpcPosition::Left, CaptureType::Default);
+
+                // 1. DummyInputCapture fires Begin -> Capture sends Enter -> Emulation B emits Entered
+                let mut a_entered = false;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline && !a_entered {
+                    if let Ok(ICaptureEvent::ClientEntered(h)) =
+                        tokio::time::timeout(Duration::from_millis(250), capture_a.event()).await
+                    {
+                        assert_eq!(h, handle_a);
+                        a_entered = true;
+                    }
+                }
+                assert!(a_entered, "Capture A must report ClientEntered");
+
+                let mut b_entered = false;
+                while Instant::now() < deadline && !b_entered {
+                    if let Ok(EmulationEvent::Entered {
+                        pos, fingerprint, ..
+                    }) =
+                        tokio::time::timeout(Duration::from_millis(250), emulation_b.event()).await
+                    {
+                        // Left on A enters from the Right on B
+                        assert_eq!(pos, IpcPosition::Right);
+                        assert_eq!(fingerprint, fp_a);
+                        b_entered = true;
+                    }
+                }
+                assert!(b_entered, "Emulation B must receive Entered from A");
+
+                // 2. Send a ClipboardFrame over the same established DTLS connection
+                let offer = ClipboardFrame::Offer {
+                    serial: 77,
+                    origin: 12345,
+                    hash: [0xAB; 32],
+                    items: vec![(lan_mouse_proto::clipboard::MIME_TEXT, 11)],
+                };
+                clipboard_sender_a
+                    .send_raw(handle_a, &offer.encode())
+                    .await
+                    .expect("send clipboard frame");
+
+                let (_, received_frame) =
+                    tokio::time::timeout(Duration::from_secs(5), clipboard_b_rx.recv())
+                        .await
+                        .expect("timed out waiting for clipboard frame on B")
+                        .expect("clipboard channel open");
+                assert_eq!(received_frame, offer);
+
+                // 3. Release Capture A -> must emit ClientLeft
+                capture_a.release();
+                let mut a_left = false;
+                while Instant::now() < deadline && !a_left {
+                    if let Ok(ICaptureEvent::ClientLeft(h)) =
+                        tokio::time::timeout(Duration::from_millis(250), capture_a.event()).await
+                    {
+                        assert_eq!(h, handle_a);
+                        a_left = true;
+                    }
+                }
+                assert!(a_left, "Capture A must report ClientLeft on release");
+
+                capture_a.terminate().await;
+                emulation_b.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_rx_notifies_when_connection_succeeds() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let cert_a = unique_cert("state-rx-a");
+                let cert_b = unique_cert("state-rx-b");
+                let fp_a = crypto::certificate_fingerprint(&cert_a);
+                let mut listener_b = listener_with_authorized(port, cert_b, vec![fp_a]).await;
+
+                let (manager_a, handle_a) = client_manager_for(port);
+                let mut conn_a = LanMouseConnection::new(cert_a, manager_a.clone(), 2000);
+                let mut state_rx = conn_a.take_state_rx().expect("state_rx");
+
+                conn_a.ensure_connected(handle_a);
+
+                let notified = tokio::time::timeout(Duration::from_secs(5), state_rx.recv())
+                    .await
+                    .expect("timed out waiting for state_rx notification")
+                    .expect("state_rx open");
+                assert_eq!(notified, handle_a);
+
+                let (_, state) = manager_a.get_state(handle_a).expect("client state");
+                assert!(state.active_addr.is_some(), "active_addr must be set");
+                assert!(state.alive, "alive must be set on connect");
+
+                listener_b.terminate().await;
+            })
+            .await;
+    }
+
+    /// A client without a pinned certificate learns the peer fingerprint on
+    /// the first successful connection (TOFU), so later connections can be
+    /// authenticated instead of blindly trusted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn outgoing_connection_learns_the_server_fingerprint() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("tofu-listener");
+                let client_cert = unique_cert("tofu-client");
+                let listener_fp = crypto::certificate_fingerprint(&listener_cert);
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+                let mut listener =
+                    listener_with_authorized(port, listener_cert, vec![client_fp]).await;
+
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(client_cert, manager.clone(), 2000);
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 7,
+                    },
+                    handle,
+                )
+                .await
+                .expect("enter");
+
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while manager.fingerprint(handle).is_none() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                assert_eq!(
+                    manager.fingerprint(handle).as_deref(),
+                    Some(listener_fp.as_str()),
+                    "the listening certificate must be pinned after the handshake"
+                );
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// With a pinned fingerprint the dialer must refuse a server that
+    /// presents a different certificate, even if it completes the DTLS
+    /// handshake (impersonation at a reused address).
+    #[tokio::test(flavor = "current_thread")]
+    async fn outgoing_connection_rejects_a_mismatched_pin() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("pin-listener");
+                let client_cert = unique_cert("pin-client");
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+                let mut listener =
+                    listener_with_authorized(port, listener_cert, vec![client_fp]).await;
+
+                let (manager, handle) = client_manager_for(port);
+                // Pin the wrong certificate (as if the IP now belongs to a
+                // different machine).
+                manager.set_fingerprint(
+                    handle,
+                    Some(crypto::certificate_fingerprint(&unique_cert("impostor"))),
+                );
+                let conn = LanMouseConnection::new(client_cert, manager.clone(), 500);
+                let result = conn
+                    .send(
+                        ProtoEvent::Enter {
+                            pos: ProtoPosition::Right,
+                            serial: 1,
+                        },
+                        handle,
+                    )
+                    .await;
+                assert!(result.is_err(), "mismatched server certificate must fail");
+                assert!(
+                    manager.active_addr(handle).is_none(),
+                    "no connection may be established"
+                );
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// A revoked fingerprint wins over the authorized map, the address
+    /// allowlist and an open pairing window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn denied_fingerprint_is_rejected_before_anything_else() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("deny-listener");
+                let client_cert = unique_cert("deny-client");
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+
+                let authorized = Arc::new(RwLock::new(HashMap::from([(
+                    client_fp.clone(),
+                    "peer".to_string(),
+                )])));
+                let denied = Arc::new(RwLock::new(HashSet::from([client_fp])));
+                let mut listener = LanMouseListener::new(
+                    port,
+                    listener_cert,
+                    authorized,
+                    Arc::new(RwLock::new(vec![
+                        crate::trusted::TrustedNet::parse("127.0.0.1").expect("cidr"),
+                    ])),
+                    Arc::new(RwLock::new(Some(Instant::now() + Duration::from_secs(60)))),
+                    denied,
+                    Default::default(),
+                )
+                .await
+                .expect("listener");
+
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                let result = connect(addr, client_cert, Duration::from_secs(2), None).await;
+                assert!(result.is_err(), "denied device must not connect");
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// Pairing is single use: accepting one device closes the window, so a
+    /// second unknown device cannot ride along.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pairing_window_accepts_only_one_device() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("pairing-once-listener");
+                let first_cert = unique_cert("pairing-first");
+                let second_cert = unique_cert("pairing-second");
+                let pairing: Arc<RwLock<Option<Instant>>> =
+                    Arc::new(RwLock::new(Some(Instant::now() + Duration::from_secs(60))));
+                let mut listener = LanMouseListener::new(
+                    port,
+                    listener_cert,
+                    Arc::new(RwLock::new(HashMap::new())),
+                    Arc::new(RwLock::new(Vec::new())),
+                    pairing.clone(),
+                    Default::default(),
+                    Default::default(),
+                )
+                .await
+                .expect("listener");
+
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                let first = connect(addr, first_cert, Duration::from_secs(2), None).await;
+                assert!(first.is_ok(), "first device may pair");
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while pairing.read().expect("lock").is_some() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(
+                    pairing.read().expect("lock").is_none(),
+                    "pairing window must close after the first device"
+                );
+
+                let second = connect(addr, second_cert, Duration::from_secs(2), None).await;
+                assert!(second.is_err(), "second device must be rejected");
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// Disconnecting a revoked session closes the live DTLS connection
+    /// instead of leaving it able to inject input until it drops.
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnect_closes_a_live_incoming_session() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("revoke-listener");
+                let client_cert = unique_cert("revoke-client");
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+                let mut listener =
+                    listener_with_authorized(port, listener_cert, vec![client_fp]).await;
+
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                let (conn, _) = connect(addr, client_cert, Duration::from_secs(2), None)
+                    .await
+                    .expect("connection");
+                // Wait until the listener registered the session, otherwise
+                // the disconnect races with the accept task. The event carries
+                // the peer address, not the listener's.
+                let peer = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match listener.next().await {
+                            Some(ListenEvent::Accept { addr: accepted, .. }) => break accepted,
+                            Some(_) => continue,
+                            None => panic!("listener closed before accepting"),
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for accept");
+
+                listener.disconnect(peer).await;
+
+                // The listener must report the session as closed.
+                let closed = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match listener.next().await {
+                            Some(ListenEvent::Closed { addr: closed }) if closed == peer => {
+                                break true;
+                            }
+                            Some(_) => continue,
+                            None => break false,
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for close");
+                assert!(closed, "listener stream ended unexpectedly");
+
+                // The session is gone from the listener's connection list, so
+                // revoking it again is a harmless no-op.
+                listener.disconnect(peer).await;
+                let _ = conn;
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// The listener enforces the incoming capability matrix per event: a
+    /// device granted only the keyboard cannot move the pointer or take the
+    /// capture, while its keyboard events still reach the service.
+    #[tokio::test(flavor = "current_thread")]
+    async fn incoming_capabilities_filter_peer_events() {
+        use crate::devices::{Device, DeviceSource, DeviceStore};
+        use lan_mouse_ipc::{Capabilities, DirectionPolicy};
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("caps-filter-listener");
+                let client_cert = unique_cert("caps-filter-client");
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+
+                let mut store = DeviceStore::default();
+                store.put(Device {
+                    fingerprint: client_fp.clone(),
+                    name: "keyboard-only".into(),
+                    incoming: DirectionPolicy {
+                        allowed: true,
+                        capabilities: Capabilities::KEYBOARD,
+                    },
+                    outgoing: DirectionPolicy::deny(),
+                    source: DeviceSource::Manual,
+                });
+                let devices = Arc::new(RwLock::new(store));
+                let mut listener = LanMouseListener::new(
+                    port,
+                    listener_cert,
+                    Arc::new(RwLock::new(HashMap::from([(
+                        client_fp,
+                        "keyboard-only".to_string(),
+                    )]))),
+                    Arc::new(RwLock::new(Vec::new())),
+                    Default::default(),
+                    Default::default(),
+                    devices,
+                )
+                .await
+                .expect("listener");
+
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                let (conn, _) = connect(addr, client_cert, Duration::from_secs(2), None)
+                    .await
+                    .expect("connection");
+
+                async fn send(conn: &ArcConn, event: ProtoEvent) {
+                    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+                    conn.send(&buf[..len]).await.expect("send");
+                }
+
+                // Pointer motion is not granted and must be dropped.
+                send(
+                    &conn,
+                    ProtoEvent::Input(input_event::Event::Pointer(
+                        input_event::PointerEvent::Motion {
+                            time: 0,
+                            dx: 4.0,
+                            dy: 2.0,
+                        },
+                    )),
+                )
+                .await;
+                // Keyboard is granted and must be forwarded.
+                send(
+                    &conn,
+                    ProtoEvent::Input(input_event::Event::Keyboard(
+                        input_event::KeyboardEvent::Key {
+                            time: 0,
+                            key: 30,
+                            state: 1,
+                        },
+                    )),
+                )
+                .await;
+
+                let event = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match listener.next().await {
+                            Some(ListenEvent::Msg { event, .. }) => break event,
+                            Some(_) => continue,
+                            None => panic!("listener closed"),
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for the keyboard event");
+                assert!(
+                    matches!(event, ProtoEvent::Input(input_event::Event::Keyboard(_))),
+                    "expected the keyboard event, got {event:?}"
+                );
+
+                // The pointer event must not show up behind it.
+                let unexpected = tokio::time::timeout(Duration::from_millis(300), async {
+                    loop {
+                        match listener.next().await {
+                            Some(ListenEvent::Msg { event, .. }) => break Some(event),
+                            Some(_) => continue,
+                            None => break None,
+                        }
+                    }
+                })
+                .await;
+                if let Ok(Some(event)) = unexpected {
+                    assert!(
+                        !matches!(event, ProtoEvent::Input(input_event::Event::Pointer(_))),
+                        "pointer input must be filtered out"
+                    );
+                }
+
+                listener.terminate().await;
+            })
+            .await;
     }
 }

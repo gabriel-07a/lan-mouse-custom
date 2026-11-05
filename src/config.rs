@@ -17,8 +17,9 @@ use thiserror::Error;
 use toml;
 use toml_edit::{self, DocumentMut};
 
+use crate::devices::{Device, DeviceSource};
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{DEFAULT_PORT, DirectionPolicy, Position};
 
 use input_event::scancode::{
     self,
@@ -75,7 +76,12 @@ struct ConfigToml {
     clipboard: Option<ClipboardConfig>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
+    /// known devices with identity and permission policies (config v2)
+    devices: Option<Vec<TomlDevice>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    /// fingerprints that must never connect again (survives pairing and
+    /// address rules), written when a device is revoked
+    denied_fingerprints: Option<Vec<String>>,
     /// addresses that may connect without an authorization prompt
     trusted_ips: Option<Vec<String>>,
 }
@@ -117,6 +123,74 @@ struct TomlClient {
     leave_hook: Option<String>,
     /// motion scale in percent (100 = unchanged)
     sensitivity: Option<u16>,
+    /// pinned SHA-256 fingerprint of the peer certificate
+    fingerprint: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+struct TomlDirectionPolicy {
+    #[serde(default)]
+    allowed: bool,
+    #[serde(default)]
+    capabilities: u8,
+}
+
+impl From<TomlDirectionPolicy> for DirectionPolicy {
+    fn from(policy: TomlDirectionPolicy) -> Self {
+        Self {
+            allowed: policy.allowed,
+            capabilities: lan_mouse_ipc::Capabilities(policy.capabilities),
+        }
+    }
+}
+
+impl From<DirectionPolicy> for TomlDirectionPolicy {
+    fn from(policy: DirectionPolicy) -> Self {
+        Self {
+            allowed: policy.allowed,
+            capabilities: policy.capabilities.0,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+struct TomlDevice {
+    fingerprint: String,
+    name: String,
+    #[serde(default)]
+    incoming: Option<TomlDirectionPolicy>,
+    #[serde(default)]
+    outgoing: Option<TomlDirectionPolicy>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+impl From<TomlDevice> for Device {
+    fn from(device: TomlDevice) -> Self {
+        Self {
+            fingerprint: device.fingerprint,
+            name: device.name,
+            incoming: device.incoming.map(Into::into).unwrap_or_default(),
+            outgoing: device.outgoing.map(Into::into).unwrap_or_default(),
+            source: device
+                .source
+                .as_deref()
+                .map(DeviceSource::parse)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<Device> for TomlDevice {
+    fn from(device: Device) -> Self {
+        Self {
+            fingerprint: device.fingerprint,
+            name: device.name,
+            incoming: Some(device.incoming.into()),
+            outgoing: Some(device.outgoing.into()),
+            source: Some(device.source.as_str().to_string()),
+        }
+    }
 }
 
 impl ConfigToml {
@@ -330,6 +404,8 @@ pub struct ConfigClient {
     pub leave_hook: Option<String>,
     /// motion scale in percent (100 = unchanged)
     pub sensitivity: u16,
+    /// pinned SHA-256 fingerprint of the peer certificate, if known
+    pub fingerprint: Option<String>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -342,6 +418,13 @@ impl From<TomlClient> for ConfigClient {
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
+        let fingerprint = toml.fingerprint.and_then(|fp| {
+            let normalized = crate::crypto::normalize_fingerprint(&fp);
+            if normalized.is_none() {
+                log::warn!("ignoring malformed fingerprint in config: {fp}");
+            }
+            normalized
+        });
         Self {
             ips,
             hostname,
@@ -351,6 +434,7 @@ impl From<TomlClient> for ConfigClient {
             enter_hook,
             leave_hook,
             sensitivity,
+            fingerprint,
         }
     }
 }
@@ -376,6 +460,7 @@ impl From<ConfigClient> for TomlClient {
         } else {
             Some(client.sensitivity)
         };
+        let fingerprint = client.fingerprint;
         Self {
             hostname,
             host_name,
@@ -386,6 +471,7 @@ impl From<ConfigClient> for TomlClient {
             enter_hook,
             leave_hook,
             sensitivity,
+            fingerprint,
         }
     }
 }
@@ -536,6 +622,114 @@ impl Config {
             .as_ref()
             .and_then(|c| c.authorized_fingerprints.clone())
             .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(fp, description)| {
+                // Canonical form: a fingerprint written by hand with different
+                // casing/spacing must still match the one from the handshake.
+                let normalized = crate::crypto::normalize_fingerprint(&fp);
+                if normalized.is_none() && !fp.is_empty() {
+                    log::warn!("ignoring malformed authorized fingerprint: {fp}");
+                }
+                normalized.map(|fp| (fp, description))
+            })
+            .collect()
+    }
+
+    /// Known devices with their permission policies.
+    ///
+    /// Configs without a `[[devices]]` table (everything written before the
+    /// permission model existed) are migrated in memory so old installs keep
+    /// working: every authorized fingerprint becomes a device with full
+    /// access in both directions (the previous behavior), and links that
+    /// carry a pinned fingerprint but are not authorized become
+    /// outgoing-only devices.
+    pub(crate) fn devices(&self) -> Vec<Device> {
+        if let Some(devices) = self
+            .config_toml
+            .as_ref()
+            .and_then(|config| config.devices.clone())
+        {
+            return devices
+                .into_iter()
+                .filter_map(|device| {
+                    let normalized = crate::crypto::normalize_fingerprint(&device.fingerprint);
+                    if normalized.is_none() {
+                        log::warn!(
+                            "ignoring device with malformed fingerprint: {}",
+                            device.fingerprint
+                        );
+                    }
+                    normalized.map(|fingerprint| Device {
+                        fingerprint,
+                        name: device.name,
+                        incoming: device.incoming.map(Into::into).unwrap_or_default(),
+                        outgoing: device.outgoing.map(Into::into).unwrap_or_default(),
+                        source: device
+                            .source
+                            .as_deref()
+                            .map(DeviceSource::parse)
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect();
+        }
+
+        // Legacy migration.
+        let mut devices: HashMap<String, Device> = HashMap::new();
+        for (fingerprint, name) in self.authorized_fingerprints() {
+            devices.insert(
+                fingerprint.clone(),
+                Device {
+                    fingerprint,
+                    name,
+                    incoming: DirectionPolicy::allow_all(),
+                    outgoing: DirectionPolicy::allow_all(),
+                    source: DeviceSource::Legacy,
+                },
+            );
+        }
+        for client in self.clients() {
+            let Some(fingerprint) = client.fingerprint else {
+                continue;
+            };
+            let name = client
+                .hostname
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| fingerprint.clone());
+            devices.entry(fingerprint.clone()).or_insert(Device {
+                fingerprint,
+                name,
+                // Not in `authorized_fingerprints`: the peer cannot connect
+                // inbound, but this machine may still control it.
+                incoming: DirectionPolicy::deny(),
+                outgoing: DirectionPolicy::allow_all(),
+                source: DeviceSource::Legacy,
+            });
+        }
+        let mut devices = devices.into_values().collect::<Vec<_>>();
+        devices.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        devices
+    }
+
+    /// Persist the device table (config v2).
+    pub(crate) fn set_devices(&mut self, devices: Vec<Device>) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        let mut devices = devices;
+        devices.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        self.config_toml.as_mut().expect("config").devices =
+            Some(devices.into_iter().map(TomlDevice::from).collect());
+    }
+
+    /// fingerprints that were revoked and must not be authorized again by
+    /// pairing or by an address rule
+    pub fn denied_fingerprints(&self) -> Vec<String> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.denied_fingerprints.clone())
+            .unwrap_or_default()
     }
 
     /// path to certificate
@@ -663,6 +857,17 @@ impl Config {
             .authorized_fingerprints = Some(fingerprints);
     }
 
+    /// set the revoked fingerprint list
+    pub fn set_denied_fingerprints(&mut self, fingerprints: Vec<String>) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml
+            .as_mut()
+            .expect("config")
+            .denied_fingerprints = (!fingerprints.is_empty()).then_some(fingerprints);
+    }
+
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
         log::info!("reading config from {:?}", self.config_path);
 
@@ -744,6 +949,7 @@ mod tests {
             enter_hook: None,
             leave_hook: None,
             sensitivity: None,
+            fingerprint: None,
         }
     }
 
@@ -852,5 +1058,129 @@ mod tests {
     fn local_commit_is_eight_bytes() {
         let commit = local_commit();
         assert_eq!(commit.len(), 8);
+    }
+
+    #[test]
+    fn client_fingerprint_is_normalised_on_load() {
+        let mut toml = toml_client();
+        toml.fingerprint = Some(
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:\
+             aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+                .replace(':', "")
+                .to_uppercase(),
+        );
+        let client: ConfigClient = toml.into();
+        assert_eq!(
+            client.fingerprint.as_deref(),
+            Some(
+                "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:\
+                 aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+            )
+        );
+    }
+
+    #[test]
+    fn client_fingerprint_survives_a_write_read_roundtrip() {
+        let fingerprint = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:\
+                           aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+        let mut toml = toml_client();
+        toml.fingerprint = Some(fingerprint.to_string());
+        let serialized = toml_edit::ser::to_string_pretty(&ConfigToml {
+            clients: Some(vec![toml]),
+            ..Default::default()
+        })
+        .expect("serialize");
+        let parsed: ConfigToml = toml::from_str(&serialized).expect("reparse");
+        let client: ConfigClient = parsed.clients.unwrap().remove(0).into();
+        assert_eq!(client.fingerprint.as_deref(), Some(fingerprint));
+    }
+
+    #[test]
+    fn malformed_client_fingerprint_is_dropped() {
+        let mut toml = toml_client();
+        toml.fingerprint = Some("not-a-fingerprint".into());
+        let client: ConfigClient = toml.into();
+        assert_eq!(client.fingerprint, None, "typos must not pin a key");
+    }
+
+    #[test]
+    fn denied_fingerprints_parse_and_serialize() {
+        let config = parse("denied_fingerprints = [\"aa\", \"bb\"]\n");
+        assert_eq!(
+            config.denied_fingerprints,
+            Some(vec!["aa".to_string(), "bb".to_string()])
+        );
+        let serialized = toml_edit::ser::to_string_pretty(&config).expect("serialize");
+        assert!(serialized.contains("denied_fingerprints"));
+    }
+
+    #[test]
+    fn device_table_parses_with_independent_direction_policies() {
+        let config = parse(
+            r#"
+[[devices]]
+fingerprint = "aa:bb"
+name = "laptop"
+
+[devices.incoming]
+allowed = true
+capabilities = 3
+
+[devices.outgoing]
+allowed = false
+capabilities = 0
+"#,
+        );
+        let device: Device = config
+            .devices
+            .expect("devices")
+            .into_iter()
+            .next()
+            .expect("one device")
+            .into();
+        assert_eq!(device.name, "laptop");
+        assert!(device.incoming.allowed);
+        assert!(device.incoming.allows(lan_mouse_ipc::Capabilities::POINTER));
+        assert!(
+            device
+                .incoming
+                .allows(lan_mouse_ipc::Capabilities::KEYBOARD)
+        );
+        assert!(
+            !device
+                .incoming
+                .allows(lan_mouse_ipc::Capabilities::CLIPBOARD)
+        );
+        assert!(!device.outgoing.allowed);
+        assert_eq!(device.source, DeviceSource::Manual);
+    }
+
+    #[test]
+    fn device_policies_roundtrip_through_toml() {
+        let device = Device {
+            fingerprint: "aa:bb".into(),
+            name: "desktop".into(),
+            incoming: DirectionPolicy {
+                allowed: true,
+                capabilities: lan_mouse_ipc::Capabilities::CLIPBOARD,
+            },
+            outgoing: DirectionPolicy::deny(),
+            source: DeviceSource::Pairing,
+        };
+        let toml = TomlDevice::from(device.clone());
+        let config = ConfigToml {
+            devices: Some(vec![toml]),
+            ..Default::default()
+        };
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: ConfigToml = toml::from_str(&serialized).expect("reparse");
+        let roundtripped: Device = parsed
+            .devices
+            .expect("devices")
+            .into_iter()
+            .next()
+            .expect("one device")
+            .into();
+        assert_eq!(roundtripped, device);
     }
 }

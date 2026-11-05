@@ -35,6 +35,7 @@ impl ClientManager {
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
             sensitivity: config_client.sensitivity,
+            fingerprint: config_client.fingerprint,
         };
         let state = ClientState {
             active: config_client.active,
@@ -86,6 +87,9 @@ impl ClientManager {
         match clients.get_mut(handle as usize) {
             Some((_, s)) if s.active => {
                 s.active = false;
+                s.active_addr = None;
+                s.alive = false;
+                s.rtt_ms = None;
                 true
             }
             _ => false,
@@ -207,6 +211,38 @@ impl ClientManager {
         }
     }
 
+    /// Update the display hostname without resetting `active_addr` or `dns_ips`
+    /// when a client was initially registered with no hostname or with a raw IP
+    /// string and network discovery subsequently learns the peer's real hostname.
+    pub(crate) fn upgrade_hostname_from_discovery(
+        &self,
+        handle: ClientHandle,
+        discovered_hostname: &str,
+    ) -> bool {
+        let trimmed = discovered_hostname.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let mut clients = self.clients.borrow_mut();
+        let Some((c, s)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        let needs_upgrade = match c.hostname.as_deref() {
+            None => true,
+            Some(current) => {
+                current.trim().is_empty()
+                    || current.parse::<IpAddr>().is_ok()
+                    || s.ips.iter().any(|ip| ip.to_string() == current)
+            }
+        };
+        if needs_upgrade && c.hostname.as_deref() != Some(trimmed) {
+            c.hostname = Some(trimmed.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
     /// update the port of the client
     pub(crate) fn set_port(&self, handle: ClientHandle, port: u16) {
         match self.clients.borrow_mut().get_mut(handle as usize) {
@@ -216,6 +252,39 @@ impl ClientManager {
             }
             _ => {}
         };
+    }
+
+    /// Pin the peer certificate fingerprint of a client.
+    ///
+    /// Returns `true` when the stored fingerprint changed, so the caller can
+    /// persist the config.
+    pub(crate) fn set_fingerprint(
+        &self,
+        handle: ClientHandle,
+        fingerprint: Option<String>,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.fingerprint != fingerprint => {
+                c.fingerprint = fingerprint;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Pinned certificate fingerprint of a client, if any.
+    pub(crate) fn fingerprint(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(c, _)| c.fingerprint.clone())
+    }
+
+    /// Find the client that is pinned to `fingerprint`.
+    pub(crate) fn find_by_fingerprint(&self, fingerprint: &str) -> Option<ClientHandle> {
+        self.clients.borrow().iter().find_map(|(k, (c, _))| {
+            (c.fingerprint.as_deref() == Some(fingerprint)).then_some(k as ClientHandle)
+        })
     }
 
     /// update the position of the client
@@ -310,6 +379,27 @@ impl ClientManager {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.active_addr = addr;
         }
+    }
+
+    pub(crate) fn set_incoming_addr(&self, handle: ClientHandle, addr: Option<SocketAddr>) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            s.incoming_addr = addr;
+        }
+    }
+
+    pub(crate) fn incoming_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, s)| s.incoming_addr)
+    }
+
+    /// Find any client (active or inactive) that has `ip` in its IP set.
+    pub(crate) fn find_by_ip(&self, ip: IpAddr) -> Option<ClientHandle> {
+        self.clients
+            .borrow()
+            .iter()
+            .find_map(|(k, (_, s))| s.ips.contains(&ip).then_some(k as ClientHandle))
     }
 
     pub(crate) fn set_alive(&self, handle: ClientHandle, alive: bool) {
@@ -432,6 +522,7 @@ mod tests {
             enter_hook: None,
             leave_hook: None,
             sensitivity: 100,
+            fingerprint: None,
         }
     }
 
@@ -612,5 +703,48 @@ mod tests {
         assert!(state.active);
         assert!(manager.get_state(handle).is_none());
         assert!(manager.remove_client(handle).is_none());
+    }
+
+    #[test]
+    fn deactivate_clears_live_connection_state() {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config_client(Position::Left, true));
+        manager.set_active_addr(handle, Some(SocketAddr::new(ip(10), 4242)));
+        manager.set_alive(handle, true);
+        manager.set_rtt_ms(handle, Some(15));
+        assert!(manager.deactivate_client(handle));
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert!(!state.active);
+        assert_eq!(state.active_addr, None);
+        assert!(!state.alive);
+        assert_eq!(state.rtt_ms, None);
+    }
+
+    #[test]
+    fn upgrade_hostname_from_discovery_replaces_ip_or_blank_only() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        manager.set_fix_ips(handle, vec![ip(10)]);
+        manager.set_hostname(handle, Some("192.168.1.10".to_string()));
+        manager.set_active_addr(handle, Some(SocketAddr::new(ip(10), 4242)));
+
+        // Replacing an IP-only hostname preserves active_addr and upgrades the name.
+        assert!(manager.upgrade_hostname_from_discovery(handle, "workstation"));
+        let (config, state) = manager.get_state(handle).expect("client");
+        assert_eq!(config.hostname.as_deref(), Some("workstation"));
+        assert_eq!(state.active_addr, Some(SocketAddr::new(ip(10), 4242)));
+
+        // Once the client has a real hostname, discovery does not overwrite it.
+        assert!(!manager.upgrade_hostname_from_discovery(handle, "other-name"));
+        let (config, _) = manager.get_state(handle).expect("client");
+        assert_eq!(config.hostname.as_deref(), Some("workstation"));
+    }
+
+    #[test]
+    fn find_by_ip_matches_inactive_and_active_clients() {
+        let manager = ClientManager::default();
+        let inactive = manager.add_with_config(config_client(Position::Left, false));
+        assert_eq!(manager.find_by_ip(ip(10)), Some(inactive));
+        assert_eq!(manager.find_by_ip(ip(99)), None);
     }
 }

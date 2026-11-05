@@ -7,7 +7,28 @@
 			<object class="GtkSwitch" id="enable_switch">
 				<property name="valign">center</property>
 				<property name="halign">end</property>
-				<property name="tooltip-text" translatable="yes">enable</property>
+				<property name="tooltip-text" translatable="yes">Enable or disable connection</property>
+			</object>
+		</child>
+		<child type="suffix">
+			<object class="GtkLabel" id="status_badge">
+				<property name="label" translatable="yes">Disconnected</property>
+				<property name="valign">center</property>
+				<style>
+					<class name="status-badge"/>
+					<class name="status-offline"/>
+				</style>
+			</object>
+		</child>
+		<child type="suffix">
+			<object class="GtkButton" id="connect_button">
+				<signal name="clicked" handler="handle_toggle_connect" swapped="true"/>
+				<property name="label" translatable="yes">Connect</property>
+				<property name="valign">center</property>
+				<property name="tooltip-text" translatable="yes">Connect or disconnect this device</property>
+				<style>
+					<class name="suggested-action"/>
+				</style>
 			</object>
 		</child>
 		<child type="suffix">
@@ -79,7 +100,7 @@
 						<property name="adjustment">
 							<object class="GtkAdjustment">
 								<property name="lower">10</property>
-								<property name="upper">400</property>
+								<property name="upper">500</property>
 								<property name="step-increment">5</property>
 								<property name="page-increment">25</property>
 								<property name="value">100</property>

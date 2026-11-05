@@ -37,7 +37,7 @@ pub(crate) fn local_commit_str() -> String {
         .to_string()
 }
 
-use lan_mouse_ipc::FrontendEvent;
+use lan_mouse_ipc::{FrontendEvent, IpcError};
 
 use adw::Application;
 use gtk::{IconTheme, gdk::Display, glib::clone, prelude::*};
@@ -242,9 +242,17 @@ fn build_ui(app: &Application) {
     let (sender, receiver) = async_channel::bounded(10);
 
     gio::spawn_blocking(move || {
-        while let Some(e) = frontend_rx.next_event() {
-            match e {
+        while let Some(result) = frontend_rx.next_event() {
+            match result {
                 Ok(e) => sender.send_blocking(e).unwrap(),
+                // A line that fails to decode most likely comes from a
+                // service built with a different protocol version. Killing
+                // the reader would close the channel and exit the whole
+                // GUI, so skip the event and keep listening. I/O errors
+                // mean the socket is gone and still end the loop.
+                Err(IpcError::Json(e)) => {
+                    log::warn!("ignoring undecodable frontend event: {e}");
+                }
                 Err(e) => {
                     log::error!("{e}");
                     break;
@@ -326,6 +334,22 @@ fn build_ui(app: &Application) {
             loop {
                 let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
                 match notify {
+                    FrontendEvent::Hello { ipc_version } => {
+                        let gui_version = lan_mouse_ipc::IPC_VERSION;
+                        if ipc_version == gui_version {
+                            log::debug!("service speaks IPC v{ipc_version}");
+                        } else {
+                            log::warn!(
+                                "service speaks IPC v{ipc_version}, GUI speaks v{gui_version}"
+                            );
+                            window.show_toast(&format!(
+                                "Service speaks IPC v{ipc_version}, GUI speaks \
+                                 v{gui_version} — restart Lan Mouse to update both"
+                            ));
+                        }
+                    }
+                    FrontendEvent::Devices(devices) => window.update_devices(devices),
+                    FrontendEvent::PendingRequests(pending) => window.update_pending(pending),
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)
                     }
@@ -350,7 +374,10 @@ fn build_ui(app: &Application) {
                         window.update_trusted_addresses(addresses)
                     }
                     FrontendEvent::PairingActive(active) => {
-                        if !active {
+                        window.set_pairing_active(active);
+                        if active {
+                            window.show_toast("Pairing mode open — one new device can connect");
+                        } else {
                             window.show_toast("Pairing mode closed");
                         }
                     }

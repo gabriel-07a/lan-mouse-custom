@@ -74,6 +74,8 @@ enum CaptureRequest {
     SetReleaseBind(Vec<scancode::Linux>),
     /// scale the motion of a client (1.0 = unchanged)
     SetSensitivity(CaptureHandle, f64),
+    /// replace the capabilities this machine may use on the client
+    SetOutgoingCaps(CaptureHandle, lan_mouse_ipc::Capabilities),
 }
 
 impl Capture {
@@ -94,6 +96,7 @@ impl Capture {
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
             coalescer: MotionCoalescer::new(motion_batch_ms),
+            outgoing_caps: Default::default(),
             conn,
             enter: EnterState::default(),
             sensitivity: Default::default(),
@@ -158,6 +161,21 @@ impl Capture {
     }
 
     /// Scale the motion forwarded to a client.
+    /// Update the capabilities allowed in the outgoing direction for a client.
+    ///
+    /// Events that need a capability the user did not grant are dropped by
+    /// the capture task instead of being sent to the peer.
+    pub(crate) fn set_outgoing_caps(
+        &self,
+        handle: CaptureHandle,
+        caps: lan_mouse_ipc::Capabilities,
+    ) {
+        self.request_tx
+            .send(CaptureRequest::SetOutgoingCaps(handle, caps))
+            .ok()
+            .unwrap_or_default();
+    }
+
     pub(crate) fn set_sensitivity(&self, handle: CaptureHandle, scale: f64) {
         self.request_tx
             .send(CaptureRequest::SetSensitivity(handle, scale))
@@ -289,6 +307,8 @@ struct CaptureTask {
     enter: EnterState,
     /// per-client motion scale (1.0 = unchanged)
     sensitivity: HashMap<CaptureHandle, f64>,
+    /// capabilities allowed in the outgoing direction, per client
+    outgoing_caps: HashMap<CaptureHandle, lan_mouse_ipc::Capabilities>,
     /// how long a failed motion send may stay down before the capture is
     /// released, matching `connect_grace_ms`
     grace: Duration,
@@ -350,6 +370,9 @@ impl CaptureTask {
                         }
                         CaptureRequest::SetSensitivity(handle, scale) => {
                             self.sensitivity.insert(handle, scale);
+                        }
+                        CaptureRequest::SetOutgoingCaps(handle, caps) => {
+                            self.outgoing_caps.insert(handle, caps);
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -505,6 +528,9 @@ impl CaptureTask {
                     CaptureRequest::SetSensitivity(h, scale) => {
                         self.sensitivity.insert(h, scale);
                     }
+                    CaptureRequest::SetOutgoingCaps(h, caps) => {
+                        self.outgoing_caps.insert(h, caps);
+                    }
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t) => {
@@ -535,6 +561,23 @@ impl CaptureTask {
         Ok(())
     }
 
+    /// Whether the client's outgoing policy allows this capture event.
+    fn outgoing_event_allowed(&self, handle: CaptureHandle, event: &CaptureEvent) -> bool {
+        use lan_mouse_ipc::Capabilities;
+        let Some(caps) = self.outgoing_caps.get(&handle).copied() else {
+            // No policy registered yet: keep the previous (permissive)
+            // behavior until the service pushes the real policy.
+            return true;
+        };
+        match event {
+            CaptureEvent::Begin => {
+                caps.intersects(Capabilities::POINTER) || caps.intersects(Capabilities::KEYBOARD)
+            }
+            CaptureEvent::Input(Event::Pointer(_)) => caps.contains(Capabilities::POINTER),
+            CaptureEvent::Input(Event::Keyboard(_)) => caps.contains(Capabilities::KEYBOARD),
+        }
+    }
+
     async fn handle_capture_event(
         &mut self,
         capture: &mut InputCapture,
@@ -546,6 +589,13 @@ impl CaptureTask {
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
+        }
+
+        if !self.outgoing_event_allowed(handle, &event) {
+            log::debug!(
+                "dropping {event:?} for client {handle}: capability not granted for the outgoing direction"
+            );
+            return Ok(());
         }
 
         if event == CaptureEvent::Begin {

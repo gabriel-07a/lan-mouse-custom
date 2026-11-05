@@ -11,10 +11,14 @@ glib::wrapper! {
 }
 
 impl AuthorizationWindow {
-    pub(crate) fn new(addr: std::net::SocketAddr, fingerprint: &str) -> Self {
+    pub(crate) fn new(
+        addr: std::net::SocketAddr,
+        hostname: Option<&str>,
+        fingerprint: &str,
+    ) -> Self {
         let window: Self = Object::builder().build();
         window.imp().set_fingerprint(fingerprint);
-        window.imp().set_peer(addr);
+        window.imp().set_peer(addr, hostname);
         window
     }
 }

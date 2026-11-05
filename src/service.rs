@@ -3,15 +3,18 @@ use crate::{
     client::ClientManager,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
-    crypto, discovery,
+    crypto,
+    devices::{Device, DeviceSource, DeviceStore},
+    discovery,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientHandle, ClipboardStatus, Diagnostics, DiscoveredDevice,
-    FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, Capabilities, ClientHandle, ClipboardStatus, DeviceView, Diagnostics,
+    DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest, IpcError,
+    IpcListenerCreationError, PendingView, Position, Status,
 };
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION};
 use local_channel::mpsc::{Receiver, Sender};
@@ -77,8 +80,18 @@ pub struct Service {
     resolver: DnsResolver,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
-    /// authorized public key sha256 fingerprints
+    /// known devices, their policies and pending requests (shared with the listener)
+    devices: Arc<RwLock<DeviceStore>>,
+    /// authorized public key sha256 fingerprints (derived from `devices`)
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+    /// revoked fingerprints that must never be authorized again
+    denied_keys: Arc<RwLock<HashSet<String>>>,
+    /// generation counter for the pairing window; stale timers compare it so
+    /// opening the window twice cannot close the new window early
+    pairing_generation: Rc<Cell<u64>>,
+    /// fingerprints learned from outgoing connections (TOFU), so a change can
+    /// be persisted without writing the config on every state update
+    learned_fingerprints: HashMap<ClientHandle, String>,
     /// devices authorized with [`FrontendRequest::AuthorizeDevice`] whose
     /// reverse client entry must be created once their address is known
     pending_reverse: HashMap<String, (String, Position)>,
@@ -102,6 +115,8 @@ pub struct Service {
     cert: webrtc_dtls::crypto::Certificate,
     /// (outgoing) client information
     client_manager: ClientManager,
+    /// notifications when an outgoing connection changes live state (addr, alive, rtt, hello)
+    conn_state_rx: Receiver<ClientHandle>,
     /// current port
     port: u16,
     /// the public key fingerprint for (D)TLS
@@ -142,7 +157,16 @@ impl Service {
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
-        let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let denied_fingerprints = config
+            .denied_fingerprints()
+            .into_iter()
+            .filter_map(|fp| crypto::normalize_fingerprint(&fp))
+            .collect::<HashSet<_>>();
+        let mut device_store = DeviceStore::default();
+        device_store.seed(config.devices(), denied_fingerprints.iter().cloned());
+        let devices = Arc::new(RwLock::new(device_store));
+        let authorized_keys = Arc::new(RwLock::new(Self::authorized_map(&devices)));
+        let denied_keys: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(denied_fingerprints));
         let trusted_ips = config.trusted_ips();
         let trusted_nets = Arc::new(RwLock::new(crate::trusted::parse_all(&trusted_ips)));
         let pairing_until: Arc<RwLock<Option<std::time::Instant>>> = Default::default();
@@ -153,6 +177,8 @@ impl Service {
             authorized_keys.clone(),
             trusted_nets.clone(),
             pairing_until.clone(),
+            denied_keys.clone(),
+            devices.clone(),
         )
         .await?;
         let mut conn = LanMouseConnection::new(
@@ -162,6 +188,7 @@ impl Service {
         );
         let clipboard_sender = conn.sender();
         let clipboard_from_connection = conn.take_clipboard_rx();
+        let conn_state_rx = conn.take_state_rx().expect("connection state receiver");
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -215,7 +242,11 @@ impl Service {
             emulation,
             frontend_listener,
             resolver,
+            devices,
             authorized_keys,
+            denied_keys,
+            pairing_generation: Default::default(),
+            learned_fingerprints: Default::default(),
             pending_reverse: Default::default(),
             discovery_rx,
             discovery_tx,
@@ -229,6 +260,7 @@ impl Service {
             cert: cert.clone(),
             public_key_fingerprint,
             client_manager,
+            conn_state_rx,
             frontend_event_pending: Default::default(),
             port,
             pending_frontend_events: Default::default(),
@@ -277,8 +309,40 @@ impl Service {
                 event = self.discovery_rx.recv() => self.handle_discovery_event(event),
                 event = self.announced_rx.recv() => {
                     if let Some(announced) = event {
+                        self.apply_discovered_hostname(&announced.device);
                         self.discovered.insert(announced.ip, announced.device);
                         self.broadcast_network();
+                    }
+                }
+                handle = self.conn_state_rx.recv() => {
+                    if let Some(handle) = handle {
+                        self.broadcast_client(handle);
+                        // A successful outgoing connection with an unpinned
+                        // client learns the peer certificate (TOFU) and pins
+                        // it, so later connections cannot be impersonated.
+                        if let Some(fingerprint) = self.client_manager.fingerprint(handle) {
+                            if self.learned_fingerprints.get(&handle) != Some(&fingerprint) {
+                                let name = self
+                                    .client_manager
+                                    .get_state(handle)
+                                    .and_then(|(config, _)| config.hostname)
+                                    .unwrap_or_else(|| fingerprint.clone());
+                                // Learning an outgoing peer must not grant it
+                                // inbound control: incoming stays denied until
+                                // the user authorizes the device.
+                                self.ensure_device(
+                                    &fingerprint,
+                                    name,
+                                    DeviceSource::Legacy,
+                                    DirectionPolicy::deny(),
+                                );
+                                self.learned_fingerprints.insert(handle, fingerprint.clone());
+                                self.refresh_maps();
+                                self.save_config();
+                                self.broadcast_devices();
+                            }
+                            self.apply_outgoing_policy(&fingerprint);
+                        }
                     }
                 }
                 status = self.clipboard_status_rx.recv(), if self.clipboard_status_open => {
@@ -312,6 +376,39 @@ impl Service {
             Err(e) => return log::error!("error receiving request: {e}"),
         };
         match request {
+            FrontendRequest::Hello { ipc_version } => {
+                if ipc_version != lan_mouse_ipc::IPC_VERSION {
+                    log::warn!(
+                        "frontend speaks IPC v{ipc_version}, service speaks v{}",
+                        lan_mouse_ipc::IPC_VERSION
+                    );
+                }
+                self.notify_frontend(FrontendEvent::Hello {
+                    ipc_version: lan_mouse_ipc::IPC_VERSION,
+                });
+            }
+            FrontendRequest::ListDevices => self.broadcast_devices(),
+            FrontendRequest::ListPending => self.broadcast_pending(),
+            FrontendRequest::SetDevicePolicy {
+                fingerprint,
+                incoming,
+                outgoing,
+            } => self.set_device_policy(fingerprint, incoming, outgoing),
+            FrontendRequest::RenameDevice { fingerprint, name } => {
+                self.rename_device(fingerprint, name)
+            }
+            FrontendRequest::RevokeDevice {
+                fingerprint,
+                disconnect,
+            } => self.revoke_device(fingerprint, disconnect),
+            FrontendRequest::RespondPending {
+                fingerprint,
+                accept,
+                name,
+                position,
+                incoming,
+                outgoing,
+            } => self.respond_pending(fingerprint, accept, name, position, incoming, outgoing),
             FrontendRequest::Activate(handle, active) => {
                 self.set_client_active(handle, active);
                 self.save_config();
@@ -324,11 +421,16 @@ impl Service {
                 fingerprint,
                 name,
                 position,
-            } => {
-                self.add_authorized_key(name.clone(), fingerprint.clone());
-                self.pending_reverse.insert(fingerprint, (name, position));
-                self.save_config();
-            }
+            } => match crypto::normalize_fingerprint(&fingerprint) {
+                Some(fingerprint) => {
+                    self.add_authorized_key(name.clone(), fingerprint.clone());
+                    self.pending_reverse.insert(fingerprint, (name, position));
+                    self.save_config();
+                }
+                None => self.notify_frontend(FrontendEvent::Error(format!(
+                    "invalid fingerprint: {fingerprint}"
+                ))),
+            },
             FrontendRequest::ChangePort(port) => self.change_port(port),
             FrontendRequest::Create => {
                 self.add_client();
@@ -361,6 +463,21 @@ impl Service {
                 self.update_sensitivity(handle, sensitivity);
                 self.save_config();
             }
+            FrontendRequest::UpdateFingerprint(handle, fingerprint) => {
+                let fingerprint = fingerprint.and_then(|fp| {
+                    let normalized = crypto::normalize_fingerprint(&fp);
+                    if normalized.is_none() {
+                        self.notify_frontend(FrontendEvent::Error(format!(
+                            "invalid fingerprint: {fp}"
+                        )));
+                    }
+                    normalized
+                });
+                if self.client_manager.set_fingerprint(handle, fingerprint) {
+                    self.broadcast_client(handle);
+                    self.save_config();
+                }
+            }
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
@@ -368,10 +485,12 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
-                self.update_enter_hook(handle, enter_hook)
+                self.update_enter_hook(handle, enter_hook);
+                self.save_config();
             }
             FrontendRequest::UpdateLeaveHook(handle, leave_hook) => {
-                self.update_leave_hook(handle, leave_hook)
+                self.update_leave_hook(handle, leave_hook);
+                self.save_config();
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
@@ -402,11 +521,22 @@ impl Service {
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
                 sensitivity: c.sensitivity,
+                fingerprint: c.fingerprint,
             })
             .collect();
         self.config.set_clients(clients);
+        let devices = self
+            .devices
+            .read()
+            .expect("lock")
+            .devices()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.config.set_devices(devices);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
+        self.config
+            .set_denied_fingerprints(self.devices.read().expect("lock").denied());
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
         }
@@ -428,11 +558,23 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
-        let authorized_keys = self.config.authorized_fingerprints();
-        self.authorized_keys
-            .write()
-            .unwrap()
-            .clone_from(&authorized_keys);
+        // Rebuild the device store from disk. Policies edited by hand in the
+        // config file take effect immediately.
+        let mut store = DeviceStore::default();
+        store.seed(
+            self.config.devices(),
+            self.config
+                .denied_fingerprints()
+                .into_iter()
+                .filter_map(|fp| crypto::normalize_fingerprint(&fp)),
+        );
+        *self.devices.write().expect("lock") = store;
+        self.refresh_maps();
+        for handle in self.client_manager.active_clients() {
+            if let Some(fingerprint) = self.client_manager.fingerprint(handle) {
+                self.apply_outgoing_policy(&fingerprint);
+            }
+        }
 
         // Size limits can change at runtime. The enabled toggle is owned by
         // the frontend/CLI, so an external config edit only takes effect on
@@ -450,7 +592,23 @@ impl Service {
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { addr, fingerprint } => {
-                self.notify_frontend(FrontendEvent::ConnectionAttempt { addr, fingerprint });
+                // Track the request so it can be reviewed later (also from the
+                // CLI or after a GUI restart) instead of showing a one-shot
+                // dialog.
+                let name = self.peer_display_name(addr.ip(), &fingerprint);
+                let is_new = self.devices.write().expect("lock").pending_upsert(
+                    &fingerprint,
+                    addr,
+                    Some(name.clone()),
+                );
+                if is_new {
+                    log::info!("connection request from {addr} ({fingerprint})");
+                }
+                self.notify_frontend(FrontendEvent::ConnectionAttempt {
+                    addr,
+                    fingerprint: fingerprint.clone(),
+                });
+                self.broadcast_pending();
             }
             EmulationEvent::Entered {
                 addr,
@@ -468,9 +626,21 @@ impl Service {
                 } else {
                     self.update_incoming(addr, pos, fingerprint);
                 }
+                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                    if self.client_manager.incoming_addr(handle) != Some(addr) {
+                        self.client_manager.set_incoming_addr(handle, Some(addr));
+                        self.broadcast_client(handle);
+                    }
+                }
             }
             EmulationEvent::Disconnected { addr } => {
                 let _ = self.clipboard_peer_events.send(addr);
+                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                    if self.client_manager.incoming_addr(handle).is_some() {
+                        self.client_manager.set_incoming_addr(handle, None);
+                        self.broadcast_client(handle);
+                    }
+                }
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -492,26 +662,94 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
-            EmulationEvent::AutoAuthorized { addr, fingerprint } => {
-                // The listener already trusted the certificate because the
-                // address is allowlisted; persist it so the next connection
-                // matches by fingerprint instead of by address.
-                let keys = self.authorized_keys.read().expect("lock").clone();
-                self.config.set_authorized_keys(keys);
-                self.save_config();
-                log::info!("auto-authorized {addr} ({fingerprint}) from a trusted address");
-                if self.client_with_ip(addr.ip()).is_none() {
-                    self.add_reverse_client(String::new(), addr.ip(), Position::Left);
+            EmulationEvent::AutoAuthorized {
+                addr,
+                fingerprint,
+                from_pairing,
+            } => {
+                // The listener trusted the certificate (allowlisted address
+                // or open pairing window). It only inserted the fingerprint
+                // after the handshake succeeded; persist it here so the next
+                // connection matches by certificate instead of by address.
+                if from_pairing {
+                    // The pairing window is single use: close it as soon as a
+                    // device was accepted through it.
+                    self.end_pairing();
                 }
-                let keys = self.authorized_keys.read().expect("lock").clone();
-                self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+                let name = self.peer_display_name(addr.ip(), &fingerprint);
+                let source = if from_pairing {
+                    DeviceSource::Pairing
+                } else {
+                    DeviceSource::AddressRule
+                };
+                self.ensure_device(
+                    &fingerprint,
+                    name.clone(),
+                    source,
+                    DirectionPolicy::allow_all(),
+                );
+                self.refresh_maps();
+                log::info!("auto-authorized {addr} ({fingerprint}) from a trusted address");
+                if self
+                    .devices
+                    .read()
+                    .expect("lock")
+                    .outgoing(&fingerprint)
+                    .grants_anything()
+                {
+                    self.add_reverse_client(
+                        name,
+                        addr.ip(),
+                        Position::Left,
+                        Some(fingerprint.clone()),
+                    );
+                }
+                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                    self.client_manager.set_incoming_addr(handle, Some(addr));
+                    self.broadcast_client(handle);
+                }
+                self.save_config();
+                self.broadcast_devices();
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::Connected { addr, fingerprint } => {
                 // The peer that was just authorized also becomes a configured
                 // client, so it can control this device too.
+                let name = self.peer_display_name(addr.ip(), &fingerprint);
+                self.ensure_device(
+                    &fingerprint,
+                    name,
+                    DeviceSource::Manual,
+                    DirectionPolicy::allow_all(),
+                );
+                self.refresh_maps();
+                let outgoing = self.devices.read().expect("lock").outgoing(&fingerprint);
                 if let Some((name, position)) = self.pending_reverse.remove(&fingerprint) {
-                    self.add_reverse_client(name, addr.ip(), position);
+                    let resolved_name = if name.trim().is_empty() {
+                        self.peer_display_name(addr.ip(), &fingerprint)
+                    } else {
+                        name
+                    };
+                    if outgoing.grants_anything() {
+                        self.add_reverse_client(
+                            resolved_name,
+                            addr.ip(),
+                            position,
+                            Some(fingerprint.clone()),
+                        );
+                    }
+                } else if self.client_with_ip(addr.ip()).is_none() && outgoing.grants_anything() {
+                    let name = self.peer_display_name(addr.ip(), &fingerprint);
+                    self.add_reverse_client(
+                        name,
+                        addr.ip(),
+                        Position::Left,
+                        Some(fingerprint.clone()),
+                    );
+                }
+                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                    self.client_manager.set_incoming_addr(handle, Some(addr));
+                    self.broadcast_client(handle);
                 }
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
@@ -522,11 +760,8 @@ impl Service {
                 capabilities,
             } => {
                 // Map the peer's source addr back to its client handle
-                // and stamp the version. Skip if we don't have an
-                // outgoing client configured for this peer (incoming-
-                // only setup) — there's nowhere to display the version
-                // in that case anyway.
-                if let Some(handle) = self.client_manager.get_client(addr) {
+                // and stamp the version.
+                if let Some(handle) = self.client_with_ip(addr.ip()) {
                     self.client_manager.set_peer_hello(
                         handle,
                         Some(commit),
@@ -608,6 +843,14 @@ impl Service {
         ));
         let diagnostics = self.diagnostics();
         self.notify_frontend(FrontendEvent::Diagnostics(diagnostics));
+        let pairing_active = self
+            .pairing_until
+            .read()
+            .expect("lock")
+            .is_some_and(|deadline| std::time::Instant::now() < deadline);
+        self.notify_frontend(FrontendEvent::PairingActive(pairing_active));
+        self.broadcast_devices();
+        self.broadcast_pending();
     }
 
     fn handle_clipboard_status(&mut self, status: ClipboardStatus) {
@@ -714,16 +957,363 @@ impl Service {
         self.frontend_event_pending.notify_one();
     }
 
+    /// Identity allowlist derived from the devices whose incoming direction
+    /// is enabled. This is what the listener's certificate verifier checks.
+    fn authorized_map(devices: &RwLock<DeviceStore>) -> HashMap<String, String> {
+        devices
+            .read()
+            .expect("lock")
+            .devices()
+            .filter(|device| device.incoming.allowed)
+            .map(|device| (device.fingerprint.clone(), device.name.clone()))
+            .collect()
+    }
+
+    /// Re-derive the listener-facing maps from the device store and notify.
+    fn refresh_maps(&mut self) {
+        let authorized = Self::authorized_map(&self.devices);
+        *self.authorized_keys.write().expect("lock") = authorized.clone();
+        let denied = self
+            .devices
+            .read()
+            .expect("lock")
+            .denied()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        *self.denied_keys.write().expect("lock") = denied;
+        self.notify_frontend(FrontendEvent::AuthorizedUpdated(authorized));
+    }
+
+    fn device_snapshot(&self) -> Vec<DeviceView> {
+        let store = self.devices.read().expect("lock");
+        let mut devices = store
+            .devices()
+            .map(|device| {
+                let link = self
+                    .client_manager
+                    .find_by_fingerprint(&device.fingerprint)
+                    .and_then(|handle| {
+                        let (config, state) = self.client_manager.get_state(handle)?;
+                        Some((config, state))
+                    });
+                let incoming_session = self
+                    .incoming_conn_info
+                    .values()
+                    .any(|incoming| incoming.fingerprint == device.fingerprint);
+                let (position, addresses, port, active, connected) = match link {
+                    Some((config, state)) => (
+                        config.pos,
+                        config.fix_ips.to_vec(),
+                        config.port,
+                        state.active,
+                        state.alive || state.incoming_addr.is_some() || incoming_session,
+                    ),
+                    None => (
+                        Position::Left,
+                        Vec::new(),
+                        lan_mouse_ipc::DEFAULT_PORT,
+                        false,
+                        incoming_session,
+                    ),
+                };
+                DeviceView {
+                    fingerprint: device.fingerprint.clone(),
+                    name: device.name.clone(),
+                    position,
+                    addresses,
+                    port,
+                    incoming: device.incoming,
+                    outgoing: device.outgoing,
+                    active,
+                    connected,
+                    source: device.source.as_str().to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        devices.sort_by_key(|device| device.name.to_lowercase());
+        devices
+    }
+
+    fn broadcast_devices(&mut self) {
+        let devices = self.device_snapshot();
+        self.notify_frontend(FrontendEvent::Devices(devices));
+    }
+
+    fn broadcast_pending(&mut self) {
+        let pending: Vec<PendingView> = self.devices.write().expect("lock").pending_views();
+        self.notify_frontend(FrontendEvent::PendingRequests(pending));
+    }
+
+    /// Register a device if it is not known yet; keeps the existing record
+    /// (name, policies) otherwise. Returns `true` when it was created.
+    fn ensure_device(
+        &mut self,
+        fingerprint: &str,
+        name: String,
+        source: DeviceSource,
+        incoming: DirectionPolicy,
+    ) -> bool {
+        let mut store = self.devices.write().expect("lock");
+        if store.is_known(fingerprint) {
+            return false;
+        }
+        let name = if name.trim().is_empty() {
+            fingerprint.to_string()
+        } else {
+            name
+        };
+        store.put(Device {
+            fingerprint: fingerprint.to_string(),
+            name,
+            incoming,
+            outgoing: DirectionPolicy::allow_all(),
+            source,
+        });
+        true
+    }
+
+    fn disconnect_fingerprint(&mut self, fingerprint: &str) {
+        let live: Vec<SocketAddr> = self
+            .incoming_conn_info
+            .values()
+            .filter(|incoming| incoming.fingerprint == fingerprint)
+            .map(|incoming| incoming.addr)
+            .collect();
+        for addr in live {
+            self.emulation.disconnect(addr);
+        }
+    }
+
+    /// Push the outgoing policy of a device to the capture task and stop the
+    /// link if the direction was revoked.
+    fn apply_outgoing_policy(&mut self, fingerprint: &str) {
+        let policy = match self.devices.read().expect("lock").device(fingerprint) {
+            Some(device) => device.outgoing,
+            // A link whose fingerprint was learned but whose client still has
+            // no device record keeps the legacy permissive behavior.
+            None => return,
+        };
+        let Some(handle) = self.client_manager.find_by_fingerprint(fingerprint) else {
+            return;
+        };
+        self.capture.set_outgoing_caps(handle, policy.capabilities);
+        if self.client_manager.is_active(handle) && !policy.grants_anything() {
+            log::info!("deactivating client {handle}: outgoing direction revoked");
+            self.deactivate_client(handle);
+        }
+    }
+
     fn add_authorized_key(&mut self, desc: String, fp: String) {
-        self.authorized_keys.write().expect("lock").insert(fp, desc);
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        let Some(fingerprint) = crypto::normalize_fingerprint(&fp) else {
+            log::warn!("ignoring malformed fingerprint `{fp}`");
+            self.notify_frontend(FrontendEvent::Error(format!("invalid fingerprint: {fp}")));
+            return;
+        };
+        {
+            let mut store = self.devices.write().expect("lock");
+            match store.device_mut(&fingerprint) {
+                Some(device) => {
+                    // An explicit authorization grants full incoming access.
+                    device.incoming = DirectionPolicy::allow_all();
+                    if !desc.trim().is_empty() {
+                        device.name = desc;
+                    }
+                }
+                None => {
+                    let name = if desc.trim().is_empty() {
+                        fingerprint.clone()
+                    } else {
+                        desc
+                    };
+                    store.put(Device::new(fingerprint, name));
+                }
+            }
+        }
+        self.refresh_maps();
+        self.broadcast_devices();
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        self.authorized_keys.write().expect("lock").remove(&fp);
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.revoke_device(fp, true);
+    }
+
+    fn set_device_policy(
+        &mut self,
+        fingerprint: String,
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    ) {
+        let Some(fingerprint) = crypto::normalize_fingerprint(&fingerprint) else {
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "invalid fingerprint: {fingerprint}"
+            )));
+            return;
+        };
+        {
+            let mut store = self.devices.write().expect("lock");
+            if store.device(&fingerprint).is_none() {
+                let name = self
+                    .client_manager
+                    .find_by_fingerprint(&fingerprint)
+                    .and_then(|handle| self.client_manager.get_state(handle))
+                    .and_then(|(config, _)| config.hostname)
+                    .unwrap_or_else(|| fingerprint.clone());
+                store.put(Device {
+                    fingerprint: fingerprint.clone(),
+                    name,
+                    incoming: DirectionPolicy::allow_all(),
+                    outgoing: DirectionPolicy::allow_all(),
+                    source: DeviceSource::Manual,
+                });
+            }
+            store.set_policy(&fingerprint, incoming, outgoing);
+        }
+        log::info!(
+            "device {fingerprint}: incoming={} [{}], outgoing={} [{}]",
+            incoming.allowed,
+            incoming.capabilities.summary(),
+            outgoing.allowed,
+            outgoing.capabilities.summary()
+        );
+        self.refresh_maps();
+        if !incoming.allowed {
+            self.disconnect_fingerprint(&fingerprint);
+        }
+        self.apply_outgoing_policy(&fingerprint);
+        self.save_config();
+        self.broadcast_devices();
+    }
+
+    fn rename_device(&mut self, fingerprint: String, name: String) {
+        let Some(fingerprint) = crypto::normalize_fingerprint(&fingerprint) else {
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "invalid fingerprint: {fingerprint}"
+            )));
+            return;
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if !self
+            .devices
+            .write()
+            .expect("lock")
+            .rename(&fingerprint, name.clone())
+        {
+            return;
+        }
+        // Keep the link display in sync with the device name.
+        if let Some(handle) = self.client_manager.find_by_fingerprint(&fingerprint) {
+            self.update_hostname(handle, Some(name));
+        }
+        self.refresh_maps();
+        self.save_config();
+        self.broadcast_devices();
+    }
+
+    /// Revoke a device: forget its identity, deny the fingerprint and drop
+    /// live sessions. The outgoing link is kept (deactivated) so it can be
+    /// re-authorized without retyping the address.
+    fn revoke_device(&mut self, fp: String, disconnect: bool) {
+        let Some(fingerprint) = crypto::normalize_fingerprint(&fp) else {
+            log::warn!("ignoring malformed fingerprint `{fp}`");
+            return;
+        };
+        self.devices
+            .write()
+            .expect("lock")
+            .deny(fingerprint.clone());
+        self.devices
+            .write()
+            .expect("lock")
+            .pending_remove(&fingerprint);
+        self.refresh_maps();
+        if disconnect {
+            self.disconnect_fingerprint(&fingerprint);
+        }
+        if let Some(handle) = self.client_manager.find_by_fingerprint(&fingerprint) {
+            self.deactivate_client(handle);
+        }
+        self.save_config();
+        self.broadcast_devices();
+        self.broadcast_pending();
+        log::info!("revoked device {fingerprint}");
+    }
+
+    fn respond_pending(
+        &mut self,
+        fingerprint: String,
+        accept: bool,
+        name: Option<String>,
+        position: Option<Position>,
+        incoming: Option<DirectionPolicy>,
+        outgoing: Option<DirectionPolicy>,
+    ) {
+        let Some(fingerprint) = crypto::normalize_fingerprint(&fingerprint) else {
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "invalid fingerprint: {fingerprint}"
+            )));
+            return;
+        };
+        let pending = self
+            .devices
+            .write()
+            .expect("lock")
+            .pending_remove(&fingerprint);
+        if !accept {
+            self.devices
+                .write()
+                .expect("lock")
+                .deny(fingerprint.clone());
+            self.refresh_maps();
+            // Denying a device also ends any live session and stops the
+            // outgoing link instead of leaving it active.
+            self.disconnect_fingerprint(&fingerprint);
+            if let Some(handle) = self.client_manager.find_by_fingerprint(&fingerprint) {
+                self.deactivate_client(handle);
+            }
+            self.save_config();
+            self.broadcast_devices();
+            self.broadcast_pending();
+            log::info!("connection request from {fingerprint} denied");
+            return;
+        }
+
+        let name = name
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| pending.as_ref().and_then(|pending| pending.name.clone()))
+            .unwrap_or_else(|| fingerprint.clone());
+        let incoming = incoming.unwrap_or_else(DirectionPolicy::allow_all);
+        let outgoing = outgoing.unwrap_or_else(DirectionPolicy::allow_all);
+        {
+            let mut store = self.devices.write().expect("lock");
+            store.put(Device {
+                fingerprint: fingerprint.clone(),
+                name: name.clone(),
+                incoming,
+                outgoing,
+                source: DeviceSource::Manual,
+            });
+        }
+        self.refresh_maps();
+        // Only set up the reverse direction when it is actually allowed; the
+        // peer connection then creates the link instead of it appearing
+        // unconditionally.
+        if outgoing.grants_anything() {
+            self.pending_reverse.insert(
+                fingerprint.clone(),
+                (name, position.unwrap_or(Position::Left)),
+            );
+        }
+        log::info!(
+            "approved device {fingerprint}: incoming [{}], outgoing [{}]",
+            incoming.capabilities.summary(),
+            outgoing.capabilities.summary()
+        );
+        self.save_config();
+        self.broadcast_devices();
+        self.broadcast_pending();
     }
 
     fn enumerate(&mut self) {
@@ -734,9 +1324,20 @@ impl Service {
     /// Add an address (IP or CIDR) to the allowlist.
     fn trust_address(&mut self, entry: String) {
         let entry = entry.trim().to_string();
-        if crate::trusted::TrustedNet::parse(&entry).is_none() {
+        let Some(net) = crate::trusted::TrustedNet::parse(&entry) else {
             log::warn!("ignoring invalid trusted address `{entry}`");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "invalid trusted address: {entry}"
+            )));
             return;
+        };
+        if net.is_broad() {
+            log::warn!(
+                "trusted address `{entry}` is very broad: every certificate in it                  will be authorized without a prompt"
+            );
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "warning: trusted address {entry} is very broad"
+            )));
         }
         if self.trusted_ips.iter().any(|e| e == &entry) {
             return;
@@ -765,24 +1366,44 @@ impl Service {
         *self.trusted_nets.write().expect("lock") = nets;
     }
 
-    /// Trust any device that connects during the next `seconds`.
+    /// Trust one new device for the next `seconds`.
     fn start_pairing(&mut self, seconds: u64) {
         let seconds = seconds.clamp(5, 600);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
         *self.pairing_until.write().expect("lock") = Some(deadline);
+        // Opening the window twice must not let the older timer close the new
+        // window early: each timer checks the generation it was started with.
+        let generation = self.pairing_generation.get().wrapping_add(1);
+        self.pairing_generation.set(generation);
         log::info!("pairing mode open for {seconds}s");
         self.notify_frontend(FrontendEvent::PairingActive(true));
 
         let pairing = self.pairing_until.clone();
+        let generation_cell = self.pairing_generation.clone();
         let tx = self.discovery_tx.clone();
         spawn_local(async move {
             tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            if generation_cell.get() != generation {
+                return;
+            }
             let still_open = pairing.write().expect("lock").take().is_some();
             if still_open {
                 log::info!("pairing mode closed");
                 let _ = tx.send(DiscoveryEvent::Pairing(false));
             }
         });
+    }
+
+    /// Close the pairing window (single device accepted, user/CLI request or
+    /// timeout) and notify the frontend.
+    fn end_pairing(&mut self) {
+        let was_open = self.pairing_until.write().expect("lock").take().is_some();
+        self.pairing_generation
+            .set(self.pairing_generation.get().wrapping_add(1));
+        if was_open {
+            log::info!("pairing mode closed");
+        }
+        self.notify_frontend(FrontendEvent::PairingActive(false));
     }
 
     /// Kick off a background scan of the local subnets.
@@ -812,6 +1433,9 @@ impl Service {
     fn handle_discovery_event(&mut self, event: Option<DiscoveryEvent>) {
         match event {
             Some(DiscoveryEvent::Scan(mut devices)) => {
+                for device in &devices {
+                    self.apply_discovered_hostname(device);
+                }
                 for device in &mut devices {
                     device.configured = self.client_with_ip(device.ip).is_some();
                 }
@@ -858,22 +1482,83 @@ impl Service {
         self.notify_frontend(FrontendEvent::NetworkScan(devices));
     }
 
+    /// Best human-readable name for a connecting peer: prefer its discovered
+    /// network hostname, then any non-generic description stored for its key
+    /// fingerprint, falling back to its IP address string.
+    fn peer_display_name(&self, ip: IpAddr, fingerprint: &str) -> String {
+        if let Some(host) = self
+            .discovered
+            .get(&ip)
+            .and_then(|d| d.hostname.as_deref())
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            return host.to_string();
+        }
+        if let Some(desc) = self
+            .authorized_keys
+            .read()
+            .ok()
+            .and_then(|keys| keys.get(fingerprint).cloned())
+        {
+            let trimmed = desc.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with("trusted ") {
+                return trimmed.to_string();
+            }
+        }
+        ip.to_string()
+    }
+
+    /// If a discovered device reports a real hostname and we have a configured
+    /// client for that IP whose hostname is still blank or just the IP string,
+    /// upgrade the client's hostname in-place so the UI shows the computer name.
+    fn apply_discovered_hostname(&mut self, device: &DiscoveredDevice) {
+        let Some(hostname) = device.hostname.as_deref() else {
+            return;
+        };
+        if let Some(handle) = self.client_with_ip(device.ip) {
+            if self
+                .client_manager
+                .upgrade_hostname_from_discovery(handle, hostname)
+            {
+                self.broadcast_client(handle);
+                self.save_config();
+            }
+        }
+    }
+
     /// Create and activate a client entry for a peer that was just authorized.
     ///
     /// The peer address comes from the accepted connection, so the user never
     /// has to type it. An existing entry for the same address is reused
     /// instead of creating a duplicate.
-    fn add_reverse_client(&mut self, name: String, ip: IpAddr, position: Position) {
-        // An empty name means "use the address": the peer's hostname is not
-        // known before the connection is authenticated.
+    fn add_reverse_client(
+        &mut self,
+        name: String,
+        ip: IpAddr,
+        position: Position,
+        fingerprint: Option<String>,
+    ) {
+        // An empty name means "use the discovered hostname or address": the
+        // peer's hostname might be known via LAN discovery beacons.
         let name = if name.trim().is_empty() {
-            ip.to_string()
+            self.discovered
+                .get(&ip)
+                .and_then(|d| d.hostname.clone())
+                .filter(|h| !h.trim().is_empty())
+                .unwrap_or_else(|| ip.to_string())
         } else {
             name
         };
         if let Some(handle) = self.client_with_ip(ip) {
             log::info!("reverse client for {ip} already exists (id {handle})");
+            let _ = self
+                .client_manager
+                .upgrade_hostname_from_discovery(handle, &name);
             self.update_pos(handle, position);
+            if fingerprint.is_some() {
+                self.client_manager.set_fingerprint(handle, fingerprint);
+            }
             self.set_client_active(handle, true);
             self.save_config();
             return;
@@ -883,6 +1568,7 @@ impl Service {
         self.client_manager.set_hostname(handle, Some(name.clone()));
         self.client_manager.set_fix_ips(handle, vec![ip]);
         self.client_manager.set_pos(handle, position);
+        self.client_manager.set_fingerprint(handle, fingerprint);
         log::info!("adding client {handle} for authorized device {name} ({ip}, {position})");
         let (config, state) = self.client_manager.get_state(handle).expect("client state");
         self.notify_frontend(FrontendEvent::Created(handle, config, state));
@@ -891,11 +1577,7 @@ impl Service {
     }
 
     fn client_with_ip(&self, ip: IpAddr) -> Option<ClientHandle> {
-        self.client_manager
-            .get_client_states()
-            .into_iter()
-            .find(|(_, _, state)| state.ips.contains(&ip))
-            .map(|(handle, _, _)| handle)
+        self.client_manager.find_by_ip(ip)
     }
 
     fn add_client(&mut self) {
@@ -925,6 +1607,24 @@ impl Service {
     fn activate_client(&mut self, handle: ClientHandle) {
         log::debug!("activating client {handle}");
 
+        // Outgoing direction gate: controlling the peer is only possible when
+        // the outgoing policy grants at least pointer or keyboard. Clients
+        // without a known fingerprint keep the legacy permissive behavior.
+        let outgoing_caps = match self.client_manager.fingerprint(handle) {
+            Some(fingerprint) => {
+                let policy = self.devices.read().expect("lock").outgoing(&fingerprint);
+                if !policy.grants_anything() {
+                    self.notify_frontend(FrontendEvent::Error(
+                        "outgoing control is not allowed for this device".to_string(),
+                    ));
+                    log::warn!("not activating client {handle}: outgoing direction disabled");
+                    return;
+                }
+                policy.capabilities
+            }
+            None => Capabilities::ALL,
+        };
+
         /* resolve dns on activate */
         self.resolve(handle);
 
@@ -943,6 +1643,7 @@ impl Service {
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
             self.capture.create(handle, pos, CaptureType::Default);
+            self.capture.set_outgoing_caps(handle, outgoing_caps);
             self.capture.set_sensitivity(
                 handle,
                 self.client_manager.get_sensitivity(handle) as f64 / 100.0,
@@ -963,6 +1664,7 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
+        self.learned_fingerprints.remove(&handle);
         if self
             .client_manager
             .remove_client(handle)
