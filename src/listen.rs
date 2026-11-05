@@ -91,13 +91,28 @@ type VerifyPeerCertificateFn = Arc<
         + Sync,
 >;
 
+/// An open pairing window: devices accepted while it lasts get exactly these
+/// permissions, and the window is consumed by the first accepted device.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PairingWindow {
+    pub until: std::time::Instant,
+    pub incoming: DirectionPolicy,
+    pub outgoing: DirectionPolicy,
+}
+
+impl PairingWindow {
+    pub(crate) fn is_open(&self) -> bool {
+        std::time::Instant::now() < self.until
+    }
+}
+
 impl LanMouseListener {
     pub(crate) async fn new(
         port: u16,
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         trusted_nets: Arc<RwLock<Vec<AddressRule>>>,
-        pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
+        pairing_until: Arc<RwLock<Option<PairingWindow>>>,
         denied: Arc<RwLock<HashSet<String>>>,
         devices: Arc<RwLock<DeviceStore>>,
     ) -> Result<Self, ListenerCreationError> {
@@ -193,7 +208,10 @@ impl LanMouseListener {
                                                         incoming,
                                                         outgoing,
                                                     ),
-                                                    AutoSource::Pairing => {
+                                                    AutoSource::Pairing {
+                                                        incoming,
+                                                        outgoing,
+                                                    } => {
                                                         // Single use: the
                                                         // window allows exactly
                                                         // one new device.
@@ -203,8 +221,8 @@ impl LanMouseListener {
                                                             .take();
                                                         (
                                                             format!("paired {}", addr.ip()),
-                                                            DirectionPolicy::allow_all(),
-                                                            DirectionPolicy::allow_all(),
+                                                            incoming,
+                                                            outgoing,
                                                         )
                                                     }
                                                 };
@@ -221,7 +239,7 @@ impl LanMouseListener {
                                                         fingerprint: fingerprint.clone(),
                                                         from_pairing: matches!(
                                                             source,
-                                                            AutoSource::Pairing
+                                                            AutoSource::Pairing { .. }
                                                         ),
                                                         incoming,
                                                         outgoing,
@@ -380,8 +398,12 @@ enum AutoSource {
         incoming: DirectionPolicy,
         outgoing: DirectionPolicy,
     },
-    /// The user opened the pairing window, which accepts one new device.
-    Pairing,
+    /// The user opened the pairing window, which accepts one new device with
+    /// the permissions configured for the window.
+    Pairing {
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    },
 }
 
 /// Build the certificate verifier for a single incoming connection.
@@ -394,7 +416,7 @@ enum AutoSource {
 fn per_connection_verify(
     authorized: Arc<RwLock<HashMap<String, String>>>,
     trusted: Arc<RwLock<Vec<AddressRule>>>,
-    pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
+    pairing_until: Arc<RwLock<Option<PairingWindow>>>,
     denied: Arc<RwLock<HashSet<String>>>,
     addr: SocketAddr,
     recorded: Arc<Mutex<Option<String>>>,
@@ -424,9 +446,14 @@ fn per_connection_verify(
             let pairing = pairing_until
                 .read()
                 .expect("lock")
-                .is_some_and(|deadline| std::time::Instant::now() < deadline);
-            if pairing {
-                *auto_source.lock().expect("lock") = Some(AutoSource::Pairing);
+                .as_ref()
+                .filter(|window| window.is_open())
+                .copied();
+            if let Some(window) = pairing {
+                *auto_source.lock().expect("lock") = Some(AutoSource::Pairing {
+                    incoming: window.incoming,
+                    outgoing: window.outgoing,
+                });
                 return Ok(());
             }
 

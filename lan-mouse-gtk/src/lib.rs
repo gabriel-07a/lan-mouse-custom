@@ -377,6 +377,17 @@ fn build_ui(app: &Application) {
                         // Structured view of the same list; the GUI shows the
                         // legacy address strings until the rule editor lands.
                     }
+                    FrontendEvent::PairingReview(devices) => {
+                        let names = devices
+                            .iter()
+                            .map(|device| device.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        window.show_toast(&format!(
+                            "Pairing finished: {} device(s) adopted ({names})",
+                            devices.len()
+                        ));
+                    }
                     FrontendEvent::PairingActive(active) => {
                         window.set_pairing_active(active);
                         if active {

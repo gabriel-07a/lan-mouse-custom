@@ -8,7 +8,7 @@ use crate::{
     discovery,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
-    listen::{LanMouseListener, ListenerCreationError},
+    listen::{LanMouseListener, ListenerCreationError, PairingWindow},
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -108,8 +108,12 @@ pub struct Service {
     /// address rules that may connect without a prompt, carrying permissions;
     /// shared with the listener so policy changes apply to new handshakes
     trusted_nets: Arc<RwLock<Vec<crate::trusted::AddressRule>>>,
-    /// while this is in the future, any connecting device is authorized
-    pairing_until: Arc<RwLock<Option<std::time::Instant>>>,
+    /// open pairing window: the first device accepted inside it gets its
+    /// configured permissions
+    pairing_until: Arc<RwLock<Option<PairingWindow>>>,
+    /// fingerprints adopted during the current/previous pairing window, for
+    /// the post-pairing review
+    pairing_adopted: Vec<String>,
     /// certificate used for explicit Lan Mouse probes
     cert: webrtc_dtls::crypto::Certificate,
     /// (outgoing) client information
@@ -167,7 +171,7 @@ impl Service {
         let authorized_keys = Arc::new(RwLock::new(Self::authorized_map(&devices)));
         let denied_keys: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(denied_fingerprints));
         let trusted_nets = Arc::new(RwLock::new(config.address_rules()));
-        let pairing_until: Arc<RwLock<Option<std::time::Instant>>> = Default::default();
+        let pairing_until: Arc<RwLock<Option<PairingWindow>>> = Default::default();
         // listener + connection
         let listener = LanMouseListener::new(
             config.port(),
@@ -254,6 +258,7 @@ impl Service {
             discovery_cancel: CancellationToken::new(),
             trusted_nets,
             pairing_until,
+            pairing_adopted: Default::default(),
             cert: cert.clone(),
             public_key_fingerprint,
             client_manager,
@@ -511,7 +516,16 @@ impl Service {
                 self.untrust_address(&entry);
                 self.save_config();
             }
-            FrontendRequest::StartPairing(seconds) => self.start_pairing(seconds),
+            FrontendRequest::StartPairing(seconds) => self.start_pairing(
+                seconds,
+                DirectionPolicy::allow_all(),
+                DirectionPolicy::allow_all(),
+            ),
+            FrontendRequest::StartPairingScoped {
+                seconds,
+                incoming,
+                outgoing,
+            } => self.start_pairing(seconds, incoming, outgoing),
         }
     }
 
@@ -684,8 +698,9 @@ impl Service {
                 // after the handshake succeeded; persist it here so the next
                 // connection matches by certificate instead of by address.
                 if from_pairing {
-                    // The pairing window is single use: close it as soon as a
-                    // device was accepted through it.
+                    // Track the adopted device for the post-pairing review,
+                    // then close the single-use window.
+                    self.pairing_adopted.push(fingerprint.clone());
                     self.end_pairing();
                 }
                 let name = self.peer_display_name(addr.ip(), &fingerprint);
@@ -858,7 +873,8 @@ impl Service {
             .pairing_until
             .read()
             .expect("lock")
-            .is_some_and(|deadline| std::time::Instant::now() < deadline);
+            .as_ref()
+            .is_some_and(PairingWindow::is_open);
         self.notify_frontend(FrontendEvent::PairingActive(pairing_active));
         self.broadcast_devices();
         self.broadcast_pending();
@@ -1440,16 +1456,31 @@ impl Service {
         self.broadcast_address_rules();
     }
 
-    /// Trust one new device for the next `seconds`.
-    fn start_pairing(&mut self, seconds: u64) {
+    /// Trust one new device for the next `seconds`, granting `incoming` and
+    /// `outgoing` to whatever device is accepted.
+    fn start_pairing(
+        &mut self,
+        seconds: u64,
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    ) {
         let seconds = seconds.clamp(5, 600);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
-        *self.pairing_until.write().expect("lock") = Some(deadline);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        *self.pairing_until.write().expect("lock") = Some(PairingWindow {
+            until,
+            incoming,
+            outgoing,
+        });
+        self.pairing_adopted.clear();
         // Opening the window twice must not let the older timer close the new
         // window early: each timer checks the generation it was started with.
         let generation = self.pairing_generation.get().wrapping_add(1);
         self.pairing_generation.set(generation);
-        log::info!("pairing mode open for {seconds}s");
+        log::info!(
+            "pairing mode open for {seconds}s (incoming [{}], outgoing [{}])",
+            incoming.capabilities.summary(),
+            outgoing.capabilities.summary()
+        );
         self.notify_frontend(FrontendEvent::PairingActive(true));
 
         let pairing = self.pairing_until.clone();
@@ -1460,7 +1491,11 @@ impl Service {
             if generation_cell.get() != generation {
                 return;
             }
-            let still_open = pairing.write().expect("lock").take().is_some();
+            let still_open = pairing
+                .write()
+                .expect("lock")
+                .take()
+                .is_some_and(|window| window.is_open());
             if still_open {
                 log::info!("pairing mode closed");
                 let _ = tx.send(DiscoveryEvent::Pairing(false));
@@ -1469,13 +1504,36 @@ impl Service {
     }
 
     /// Close the pairing window (single device accepted, user/CLI request or
-    /// timeout) and notify the frontend.
+    /// timeout), emit the review of what was adopted and notify the frontend.
     fn end_pairing(&mut self) {
-        let was_open = self.pairing_until.write().expect("lock").take().is_some();
+        let was_open = self
+            .pairing_until
+            .write()
+            .expect("lock")
+            .take()
+            .is_some_and(|window| window.is_open());
         self.pairing_generation
             .set(self.pairing_generation.get().wrapping_add(1));
         if was_open {
             log::info!("pairing mode closed");
+        }
+        if !self.pairing_adopted.is_empty() {
+            let adopted = std::mem::take(&mut self.pairing_adopted);
+            let review = self
+                .device_snapshot()
+                .into_iter()
+                .filter(|device| adopted.contains(&device.fingerprint))
+                .collect::<Vec<_>>();
+            log::info!(
+                "pairing review: {} device(s) adopted ({})",
+                review.len(),
+                review
+                    .iter()
+                    .map(|device| device.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            self.notify_frontend(FrontendEvent::PairingReview(review));
         }
         self.notify_frontend(FrontendEvent::PairingActive(false));
     }
@@ -1534,7 +1592,11 @@ impl Service {
                 self.notify_frontend(FrontendEvent::ProbeResult { ip, lan_mouse });
             }
             Some(DiscoveryEvent::Pairing(active)) => {
-                self.notify_frontend(FrontendEvent::PairingActive(active));
+                if active {
+                    self.notify_frontend(FrontendEvent::PairingActive(true));
+                } else {
+                    self.end_pairing();
+                }
             }
             None => {}
         }

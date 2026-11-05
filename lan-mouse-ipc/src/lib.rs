@@ -466,6 +466,8 @@ pub enum FrontendEvent {
     Devices(Vec<DeviceView>),
     /// full snapshot of unauthorized connection requests
     PendingRequests(Vec<PendingView>),
+    /// devices adopted during the pairing window that just closed, for review
+    PairingReview(Vec<DeviceView>),
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -695,6 +697,12 @@ pub enum FrontendRequest {
     UntrustAddress(String),
     /// accept any device that connects during the next `seconds`
     StartPairing(u64),
+    /// accept one device during the next `seconds`, granting these permissions
+    StartPairingScoped {
+        seconds: u64,
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

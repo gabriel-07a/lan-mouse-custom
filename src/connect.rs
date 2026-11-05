@@ -1387,8 +1387,12 @@ mod tests {
 
                 let authorized: Arc<RwLock<HashMap<String, String>>> =
                     Arc::new(RwLock::new(HashMap::new()));
-                let pairing: Arc<RwLock<Option<Instant>>> =
-                    Arc::new(RwLock::new(Some(Instant::now() + Duration::from_secs(60))));
+                let pairing: Arc<RwLock<Option<crate::listen::PairingWindow>>> =
+                    Arc::new(RwLock::new(Some(crate::listen::PairingWindow {
+                        until: Instant::now() + Duration::from_secs(60),
+                        incoming: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                        outgoing: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                    })));
                 let mut listener = LanMouseListener::new(
                     port,
                     listener_cert,
@@ -1987,7 +1991,11 @@ mod tests {
                     Arc::new(RwLock::new(vec![crate::trusted::AddressRule::legacy(
                         crate::trusted::TrustedNet::parse("127.0.0.1").expect("cidr"),
                     )])),
-                    Arc::new(RwLock::new(Some(Instant::now() + Duration::from_secs(60)))),
+                    Arc::new(RwLock::new(Some(crate::listen::PairingWindow {
+                        until: Instant::now() + Duration::from_secs(60),
+                        incoming: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                        outgoing: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                    }))),
                     denied,
                     Default::default(),
                 )
@@ -2014,8 +2022,12 @@ mod tests {
                 let listener_cert = unique_cert("pairing-once-listener");
                 let first_cert = unique_cert("pairing-first");
                 let second_cert = unique_cert("pairing-second");
-                let pairing: Arc<RwLock<Option<Instant>>> =
-                    Arc::new(RwLock::new(Some(Instant::now() + Duration::from_secs(60))));
+                let pairing: Arc<RwLock<Option<crate::listen::PairingWindow>>> =
+                    Arc::new(RwLock::new(Some(crate::listen::PairingWindow {
+                        until: Instant::now() + Duration::from_secs(60),
+                        incoming: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                        outgoing: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                    })));
                 let mut listener = LanMouseListener::new(
                     port,
                     listener_cert,
@@ -2289,6 +2301,82 @@ mod tests {
                     .expect("timed out waiting for the auto authorization");
                 assert_eq!(granted_in, incoming, "rule incoming policy is reported");
                 assert_eq!(granted_out, outgoing, "rule outgoing policy is reported");
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// The pairing window grants exactly the permissions configured when it
+    /// was opened, reported to the service through AutoAuthorized.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scoped_pairing_grants_only_the_configured_capabilities() {
+        use lan_mouse_ipc::{Capabilities, DirectionPolicy};
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("scoped-pairing-listener");
+                let client_cert = unique_cert("scoped-pairing-client");
+                let incoming = DirectionPolicy {
+                    allowed: true,
+                    capabilities: Capabilities::CLIPBOARD,
+                };
+                let outgoing = DirectionPolicy::deny();
+                let pairing = Arc::new(RwLock::new(Some(crate::listen::PairingWindow {
+                    until: Instant::now() + Duration::from_secs(60),
+                    incoming,
+                    outgoing,
+                })));
+                let mut listener = LanMouseListener::new(
+                    port,
+                    listener_cert,
+                    Arc::new(RwLock::new(HashMap::new())),
+                    Arc::new(RwLock::new(Vec::new())),
+                    pairing.clone(),
+                    Default::default(),
+                    Default::default(),
+                )
+                .await
+                .expect("listener");
+
+                let (manager, handle) = client_manager_for(port);
+                let conn = LanMouseConnection::new(client_cert, manager, 2000);
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 4,
+                    },
+                    handle,
+                )
+                .await
+                .expect("pairing accepts the peer");
+
+                let (granted_in, granted_out, from_pairing) =
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            match listener.next().await {
+                                Some(ListenEvent::AutoAuthorized {
+                                    incoming,
+                                    outgoing,
+                                    from_pairing,
+                                    ..
+                                }) => break (incoming, outgoing, from_pairing),
+                                Some(_) => continue,
+                                None => panic!("listener closed"),
+                            }
+                        }
+                    })
+                    .await
+                    .expect("timed out waiting for the pairing authorization");
+                assert!(from_pairing);
+                assert_eq!(granted_in, incoming);
+                assert_eq!(granted_out, outgoing);
+                assert!(
+                    pairing.read().expect("lock").is_none(),
+                    "the single-use pairing window closes after the accept"
+                );
 
                 listener.terminate().await;
             })

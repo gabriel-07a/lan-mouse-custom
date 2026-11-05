@@ -80,10 +80,16 @@ enum CliSubcommand {
     Trusted,
     /// remove an address from the allowlist
     Untrust { address: String },
-    /// accept any device that connects in the next seconds (default 60)
+    /// accept one device in the next seconds, granting the given permissions
     Pair {
         #[arg(long, default_value = "60")]
         seconds: u64,
+        /// permissions the paired device gets here
+        #[arg(long, default_value = "all")]
+        incoming: String,
+        /// permissions this machine gets on the paired device
+        #[arg(long, default_value = "all")]
+        outgoing: String,
     },
     /// change hostname
     SetHost {
@@ -375,11 +381,23 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 }
             }
         }
-        CliSubcommand::Pair { seconds } => {
-            tx.request(FrontendRequest::StartPairing(seconds)).await?;
+        CliSubcommand::Pair {
+            seconds,
+            incoming,
+            outgoing,
+        } => {
+            let incoming = parse_policy(&incoming)?;
+            let outgoing = parse_policy(&outgoing)?;
+            tx.request(FrontendRequest::StartPairingScoped {
+                seconds,
+                incoming,
+                outgoing,
+            })
+            .await?;
             println!(
-                "pairing mode open for {seconds}s: any device that connects is authorized \
-                 and gets a client entry for the reverse direction"
+                "pairing open for {seconds}s: incoming [{}], outgoing [{}]",
+                incoming.capabilities.summary(),
+                outgoing.capabilities.summary()
             );
         }
         CliSubcommand::Untrust { address } => {

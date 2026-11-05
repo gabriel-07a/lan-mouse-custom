@@ -668,12 +668,16 @@ per-monitor scale is cached for two seconds).
 
 ### Pairing without a mouse on the other machine
 
-`lan-mouse cli pair --seconds 60` (or the *Pairing mode* button in the GUI)
-opens a window during which **one** new connecting device is authorized and
-also gets a client entry for the reverse direction. Useful when the other
-computer has no mouse to click "approve". The window is single use: it closes
-as soon as the first device is accepted. After it closes, unknown devices need
-the normal approval again; already-seen ones are matched by certificate.
+`lan-mouse cli pair --seconds 60 --incoming pointer,keyboard --outgoing none`
+(or the *Pairing mode* button in the GUI, which pairs with full access) opens a
+window during which **one** new connecting device is authorized with the
+configured permissions and, unless the outgoing direction is disabled, also
+gets a client entry for the reverse direction. Useful when the other computer
+has no mouse to click "approve". The window is single use: it closes as soon
+as the first device is accepted, and the frontend gets a **pairing review**
+listing what was adopted during the window (so it can be narrowed or revoked).
+After it closes, unknown devices need the normal approval again; already-seen
+ones are matched by certificate.
 
 Devices running this fork also announce themselves every 10 seconds with their
 certificate fingerprint, so they show up in the network table immediately and
