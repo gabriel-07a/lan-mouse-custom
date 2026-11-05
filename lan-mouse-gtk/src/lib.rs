@@ -377,6 +377,10 @@ fn build_ui(app: &Application) {
                         // Structured view of the same list; the GUI shows the
                         // legacy address strings until the rule editor lands.
                     }
+                    FrontendEvent::ConnectionHistory(_history) => {
+                        // The history view is rendered by the devices panel in
+                        // the next UI pass; the snapshot is requested on demand.
+                    }
                     FrontendEvent::PairingReview(devices) => {
                         let names = devices
                             .iter()

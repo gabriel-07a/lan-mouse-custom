@@ -506,9 +506,10 @@ clique de descoberta.
 
 > Estado (fase 2): `address_rules` com capacidades implementadas (config, migração de
 > `trusted_ips`, listener/service/CLI/eventos `AddressRules`; políticas chegadas ao
-> `AutoAuthorized`) e pairing escopado com review (`StartPairingScoped`, janela carrega
-> `incoming`/`outgoing`, evento `PairingReview` ao fechar). Próximo: auditoria/histórico,
-> mensagens de auth no protocolo e SAS.
+> `AutoAuthorized`); pairing escopado com review (`StartPairingScoped`, janela carrega
+> `incoming`/`outgoing`, evento `PairingReview`); auditoria persistida em JSONL com
+> rotação, `history` na CLI, `ConnectionHistory` no IPC e caminho/contagem no `doctor`.
+> Próximo: mensagens de auth no protocolo (compat legada) e SAS no fluxo de aprovação.
 
 Aceite: MITM no primeiro pareamento detectado por SAS; peer antigo conecta sob política legada
 marcada na UI; regra de endereço com `incoming=["clipboard"]` só entrega clipboard.

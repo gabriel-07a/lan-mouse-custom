@@ -1,4 +1,5 @@
 use crate::{
+    audit::{AuditLog, AuditRecord},
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
     config::{Config, ConfigClient},
@@ -14,7 +15,7 @@ use futures::StreamExt;
 use lan_mouse_ipc::{
     AddressRuleView, AsyncFrontendListener, Capabilities, ClientHandle, ClipboardStatus,
     DeviceView, Diagnostics, DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest,
-    IpcError, IpcListenerCreationError, PendingView, Position, Status,
+    HistoryEntry, IpcError, IpcListenerCreationError, PendingView, Position, Status,
 };
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION};
 use local_channel::mpsc::{Receiver, Sender};
@@ -80,6 +81,8 @@ pub struct Service {
     resolver: DnsResolver,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
+    /// append-only audit log for grants, revokes, pairing and sessions
+    audit: AuditLog,
     /// known devices, their policies and pending requests (shared with the listener)
     devices: Arc<RwLock<DeviceStore>>,
     /// authorized public key sha256 fingerprints (derived from `devices`)
@@ -244,6 +247,7 @@ impl Service {
             emulation,
             frontend_listener,
             resolver,
+            audit: AuditLog::new(AuditLog::default_path()),
             devices,
             authorized_keys,
             denied_keys,
@@ -332,6 +336,13 @@ impl Service {
                                 // Learning an outgoing peer must not grant it
                                 // inbound control: incoming stays denied until
                                 // the user authorizes the device.
+                                self.audit.event(
+                                    "cert_learned",
+                                    Some(&fingerprint),
+                                    Some(&name),
+                                    None,
+                                    Some("source=tofu"),
+                                );
                                 self.ensure_device(
                                     &fingerprint,
                                     name,
@@ -512,6 +523,7 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::ListAddressRules => self.broadcast_address_rules(),
+            FrontendRequest::ListHistory { limit } => self.broadcast_history(limit),
             FrontendRequest::UntrustAddress(entry) => {
                 self.untrust_address(&entry);
                 self.save_config();
@@ -711,6 +723,17 @@ impl Service {
                 };
                 self.ensure_device(&fingerprint, name.clone(), source, incoming, outgoing);
                 self.refresh_maps();
+                self.audit.event(
+                    "grant_created",
+                    Some(&fingerprint),
+                    Some(&name),
+                    Some(&addr.to_string()),
+                    Some(if from_pairing {
+                        "source=pairing"
+                    } else {
+                        "source=address_rule"
+                    }),
+                );
                 log::info!("auto-authorized {addr} ({fingerprint})");
                 if self
                     .devices
@@ -1137,6 +1160,11 @@ impl Service {
             self.notify_frontend(FrontendEvent::Error(format!("invalid fingerprint: {fp}")));
             return;
         };
+        let audit_name = if desc.trim().is_empty() {
+            fingerprint.clone()
+        } else {
+            desc.clone()
+        };
         {
             let mut store = self.devices.write().expect("lock");
             match store.device_mut(&fingerprint) {
@@ -1153,11 +1181,18 @@ impl Service {
                     } else {
                         desc
                     };
-                    store.put(Device::new(fingerprint, name));
+                    store.put(Device::new(fingerprint.clone(), name));
                 }
             }
         }
         self.refresh_maps();
+        self.audit.event(
+            "grant_created",
+            Some(&fingerprint),
+            Some(&audit_name),
+            None,
+            Some("source=manual"),
+        );
         self.broadcast_devices();
     }
 
@@ -1204,6 +1239,19 @@ impl Service {
             outgoing.capabilities.summary()
         );
         self.refresh_maps();
+        self.audit.event(
+            "grant_updated",
+            Some(&fingerprint),
+            self.devices.read().expect("lock").name_of(&fingerprint),
+            None,
+            Some(&format!(
+                "incoming={} [{}] outgoing={} [{}]",
+                incoming.allowed,
+                incoming.capabilities.summary(),
+                outgoing.allowed,
+                outgoing.capabilities.summary()
+            )),
+        );
         if !incoming.allowed {
             self.disconnect_fingerprint(&fingerprint);
         }
@@ -1263,6 +1311,17 @@ impl Service {
         if let Some(handle) = self.client_manager.find_by_fingerprint(&fingerprint) {
             self.deactivate_client(handle);
         }
+        self.audit.event(
+            "revoke",
+            Some(&fingerprint),
+            None,
+            None,
+            Some(if disconnect {
+                "reason=user disconnect=true"
+            } else {
+                "reason=user"
+            }),
+        );
         self.save_config();
         self.broadcast_devices();
         self.broadcast_pending();
@@ -1294,6 +1353,19 @@ impl Service {
                 .write()
                 .expect("lock")
                 .deny(fingerprint.clone());
+            self.audit.event(
+                "deny",
+                Some(&fingerprint),
+                pending
+                    .as_ref()
+                    .and_then(|pending| pending.name.clone())
+                    .as_deref(),
+                pending
+                    .as_ref()
+                    .map(|pending| pending.addr.to_string())
+                    .as_deref(),
+                Some("source=manual"),
+            );
             self.refresh_maps();
             // Denying a device also ends any live session and stops the
             // outgoing link instead of leaving it active.
@@ -1314,6 +1386,20 @@ impl Service {
             .unwrap_or_else(|| fingerprint.clone());
         let incoming = incoming.unwrap_or_else(DirectionPolicy::allow_all);
         let outgoing = outgoing.unwrap_or_else(DirectionPolicy::allow_all);
+        self.audit.event(
+            "grant_created",
+            Some(&fingerprint),
+            Some(&name),
+            pending
+                .as_ref()
+                .map(|pending| pending.addr.to_string())
+                .as_deref(),
+            Some(&format!(
+                "source=manual incoming=[{}] outgoing=[{}]",
+                incoming.capabilities.summary(),
+                outgoing.capabilities.summary()
+            )),
+        );
         {
             let mut store = self.devices.write().expect("lock");
             store.put(Device {
@@ -1381,6 +1467,19 @@ impl Service {
         self.notify_frontend(FrontendEvent::AddressRules(self.address_rule_views()));
     }
 
+    /// Emit the most recent persisted audit entries, newest first.
+    fn broadcast_history(&mut self, limit: u32) {
+        let limit = limit.clamp(1, 500) as usize;
+        let history = self
+            .audit
+            .recent(limit)
+            .into_iter()
+            .map(history_entry_from_record)
+            .collect::<Vec<_>>();
+        self.notify_frontend(FrontendEvent::ConnectionHistory(history));
+        self.broadcast_pending();
+    }
+
     /// Add an address rule (IP or CIDR) with explicit permissions.
     ///
     /// A device adopted through the rule gets exactly these permissions; the
@@ -1417,6 +1516,17 @@ impl Service {
         }
         let rules = self.trusted_nets.read().expect("lock").clone();
         self.config.set_address_rules(rules);
+        self.audit.event(
+            "address_rule_added",
+            None,
+            None,
+            Some(&address),
+            Some(&format!(
+                "incoming=[{}] outgoing=[{}]",
+                incoming.capabilities.summary(),
+                outgoing.capabilities.summary()
+            )),
+        );
         log::info!(
             "address rule added: {address} (in [{}], out [{}])",
             incoming.capabilities.summary(),
@@ -1452,6 +1562,8 @@ impl Service {
         }
         let rules = self.trusted_nets.read().expect("lock").clone();
         self.config.set_address_rules(rules);
+        self.audit
+            .event("address_rule_removed", None, None, Some(entry), None);
         log::info!("address rule removed: {entry}");
         self.broadcast_address_rules();
     }
@@ -1476,6 +1588,17 @@ impl Service {
         // window early: each timer checks the generation it was started with.
         let generation = self.pairing_generation.get().wrapping_add(1);
         self.pairing_generation.set(generation);
+        self.audit.event(
+            "pairing_open",
+            None,
+            None,
+            None,
+            Some(&format!(
+                "seconds={seconds} incoming=[{}] outgoing=[{}]",
+                incoming.capabilities.summary(),
+                outgoing.capabilities.summary()
+            )),
+        );
         log::info!(
             "pairing mode open for {seconds}s (incoming [{}], outgoing [{}])",
             incoming.capabilities.summary(),
@@ -1524,6 +1647,21 @@ impl Service {
                 .into_iter()
                 .filter(|device| adopted.contains(&device.fingerprint))
                 .collect::<Vec<_>>();
+            self.audit.event(
+                "pairing_close",
+                None,
+                None,
+                None,
+                Some(&format!(
+                    "adopted={} ({})",
+                    review.len(),
+                    review
+                        .iter()
+                        .map(|device| device.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            );
             log::info!(
                 "pairing review: {} device(s) adopted ({})",
                 review.len(),
@@ -1908,5 +2046,17 @@ impl std::fmt::Display for HookKind {
             HookKind::Enter => f.write_str("enter"),
             HookKind::Leave => f.write_str("leave"),
         }
+    }
+}
+
+/// Convert a persisted audit record into the IPC history entry.
+fn history_entry_from_record(record: AuditRecord) -> HistoryEntry {
+    HistoryEntry {
+        ts: record.ts,
+        event: record.event,
+        fingerprint: record.fingerprint,
+        name: record.name,
+        addr: record.addr,
+        detail: record.detail,
     }
 }

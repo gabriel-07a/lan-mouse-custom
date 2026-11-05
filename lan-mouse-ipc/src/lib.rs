@@ -375,6 +375,23 @@ pub struct DeviceView {
     pub source: String,
 }
 
+/// One persisted audit event, newest first in history snapshots.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// unix timestamp in seconds
+    pub ts: u64,
+    /// machine readable event name (`grant_created`, `revoke`, ...)
+    pub event: String,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub addr: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
 /// An address range that auto-authorizes connecting devices with fixed
 /// permissions.
 ///
@@ -468,6 +485,8 @@ pub enum FrontendEvent {
     PendingRequests(Vec<PendingView>),
     /// devices adopted during the pairing window that just closed, for review
     PairingReview(Vec<DeviceView>),
+    /// recent audit events, newest first
+    ConnectionHistory(Vec<HistoryEntry>),
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -693,6 +712,8 @@ pub enum FrontendRequest {
     },
     /// request the structured address-rule list
     ListAddressRules,
+    /// request the most recent audit entries
+    ListHistory { limit: u32 },
     /// remove an address from the allowlist
     UntrustAddress(String),
     /// accept any device that connects during the next `seconds`
@@ -1156,6 +1177,21 @@ mod ipc_tests {
             attempts: 3,
         };
         assert_eq!(json_roundtrip(pending.clone()), pending);
+    }
+
+    #[test]
+    fn history_entries_and_requests_roundtrip() {
+        let entry = HistoryEntry {
+            ts: 1_790_000_000,
+            event: "grant_created".into(),
+            fingerprint: Some("aa:bb".into()),
+            name: Some("laptop".into()),
+            addr: Some("10.0.0.2:4242".into()),
+            detail: Some("source=manual incoming=[pointer]".into()),
+        };
+        assert_eq!(json_roundtrip(entry.clone()), entry);
+        let request = FrontendRequest::ListHistory { limit: 25 };
+        assert_eq!(json_roundtrip(request.clone()), request);
     }
 
     #[test]

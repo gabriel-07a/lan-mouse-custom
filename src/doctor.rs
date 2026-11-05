@@ -64,6 +64,10 @@ struct Report {
     clipboard_consent: bool,
     local_fingerprint: String,
     authorized_fingerprints: Vec<String>,
+    /// where the append-only audit log lives
+    audit_log: String,
+    /// number of audit entries read as a cheap health signal
+    recent_audit_events: usize,
     clients: Vec<ClientReport>,
     warnings: Vec<String>,
 }
@@ -162,6 +166,10 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         emulation_probe = Some(probe_emulation(&config).await);
     }
 
+    let audit = crate::audit::AuditLog::new(crate::audit::AuditLog::default_path());
+    let audit_log = audit.path().display().to_string();
+    let recent_audit_events = audit.recent(20).len();
+
     let report = Report {
         version: env!("CARGO_PKG_VERSION").to_string(),
         commit: String::from_utf8_lossy(&crate::config::local_commit()).to_string(),
@@ -180,6 +188,8 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         clipboard_consent,
         local_fingerprint,
         authorized_fingerprints,
+        audit_log,
+        recent_audit_events,
         clients,
         warnings,
     };
@@ -193,6 +203,10 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
     println!("  version:         {}", report.version);
     println!("  commit:          {}", report.commit);
     println!("  config:          {}", report.config_path);
+    println!(
+        "  audit log:       {} ({} recent event(s))",
+        report.audit_log, report.recent_audit_events
+    );
     println!(
         "  service running: {}",
         if report.service_running { "yes" } else { "no" }

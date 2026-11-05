@@ -537,6 +537,22 @@ device still appears in the device list with the rule's permissions and can be
 narrowed or revoked per device; `trusted_ips` from older configs is migrated to
 full-access rules so existing setups keep working.
 
+### Audit log
+
+Every permission change is appended to a JSON-lines audit log at
+`$XDG_STATE_HOME/lan-mouse/audit.jsonl` (`%LOCALAPPDATA%\lan-mouse\audit.jsonl`
+on Windows, `~/Library/Logs/lan-mouse/audit.jsonl` on macOS), rotated at 5 MB
+to `audit.jsonl.1`. It records grants (`grant_created`, `grant_updated`),
+`revoke`, `deny`, pairing windows and adopted devices, address-rule changes and
+TUF certificate pinning, with fingerprint, name, address and a short detail
+(source, capabilities, reason). The log never contains input or clipboard
+contents.
+
+```sh
+lan-mouse cli history --limit 20   # recent events, newest first
+lan-mouse doctor                  # prints the audit path and a recent count
+```
+
 ## Two-way (mutual) operation
 
 Lan Mouse has **no fixed server/client role**: every instance listens for

@@ -78,6 +78,11 @@ enum CliSubcommand {
     },
     /// list the address rules and their permissions
     Trusted,
+    /// list recent audit events (grants, revokes, pairing, certificate pinning)
+    History {
+        #[arg(long, default_value = "50")]
+        limit: u32,
+    },
     /// remove an address from the allowlist
     Untrust { address: String },
     /// accept one device in the next seconds, granting the given permissions
@@ -523,6 +528,39 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::Rename { fingerprint, name } => {
             tx.request(FrontendRequest::RenameDevice { fingerprint, name })
                 .await?;
+        }
+        CliSubcommand::History { limit } => {
+            tx.request(FrontendRequest::ListHistory { limit }).await?;
+            while let Some(e) = rx.next().await {
+                if let FrontendEvent::ConnectionHistory(history) = e? {
+                    if history.is_empty() {
+                        println!("no audit events recorded yet");
+                    }
+                    for entry in history {
+                        println!(
+                            "{} {}{}{}{}",
+                            entry.ts,
+                            entry.event,
+                            entry
+                                .name
+                                .as_deref()
+                                .map(|name| format!(" name={name}"))
+                                .unwrap_or_default(),
+                            entry
+                                .fingerprint
+                                .as_deref()
+                                .map(|fp| format!(" fp={fp}"))
+                                .unwrap_or_default(),
+                            entry
+                                .detail
+                                .as_deref()
+                                .map(|detail| format!(" {detail}"))
+                                .unwrap_or_default()
+                        );
+                    }
+                    break;
+                }
+            }
         }
         CliSubcommand::SetFingerprint { id, fingerprint } => {
             tx.request(FrontendRequest::UpdateFingerprint(id, fingerprint.clone()))
