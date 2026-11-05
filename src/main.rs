@@ -50,6 +50,13 @@ enum LanMouseError {
 }
 
 fn main() {
+    // Must happen before the first window is created: the input backends rely
+    // on physical pixel coordinates and per-monitor DPI queries, and GDK (when
+    // the GUI starts) detects the awareness we set here instead of setting its
+    // own. Daemon and CLI modes never open a GDK display, so without this they
+    // would stay DPI-unaware and could not tell the displays' scale apart.
+    enable_per_monitor_dpi_awareness();
+
     // A GUI executable has no console; when the binary is invoked from a
     // terminal, reattach to the parent's console so `--help`/`cli` output is
     // still visible.
@@ -151,6 +158,26 @@ fn start_service() -> Result<Child, io::Error> {
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     command.spawn()
+}
+
+/// Sets the process DPI awareness to per-monitor v2 on Windows.
+///
+/// GDK does the same when it opens a display, but `lan-mouse --daemon` and the
+/// CLI commands never do. `GetDpiForMonitor` reports the real scale only for a
+/// per-monitor aware process, and the input backends need it to convert
+/// between physical pixels and the logical motion carried on the wire.
+fn enable_per_monitor_dpi_awareness() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        // Fails with ERROR_ACCESS_DENIED when the process is already aware
+        // (manifest, compatibility settings or a previous call); harmless.
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
 }
 
 /// Reattach to the parent console when started from a shell.

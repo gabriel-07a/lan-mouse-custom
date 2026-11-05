@@ -24,6 +24,9 @@ mod macos;
 #[cfg(layer_shell)]
 mod layer_shell;
 
+#[cfg(not(windows))]
+#[path = "windows/display_util.rs"]
+mod display_util;
 #[cfg(windows)]
 mod windows;
 

@@ -91,6 +91,18 @@ jobs:
           choco install nsis -y --no-progress
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           & "C:\Program Files (x86)\NSIS\makensis.exe" /DAPPVERSION=$version installer\windows\lan-mouse-custom.nsi
+      - name: Smoke test silent installer and doctor probe
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\lan-mouse-custom-setup-x86_64.exe" -ArgumentList "/S" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Installer failed with exit code $($p.ExitCode)" }
+          $exe = "C:\Program Files\Lan Mouse\lan-mouse.exe"
+          if (-not (Test-Path $exe)) { throw "Installed binary missing at $exe" }
+          $json = & $exe doctor --probe --json | ConvertFrom-Json
+          if ($json.capture_probe.backend -ne "windows") { throw "Unexpected capture probe: $($json.capture_probe | ConvertTo-Json)" }
+          if ($json.emulation_probe.backend -ne "windows") { throw "Unexpected emulation probe: $($json.emulation_probe | ConvertTo-Json)" }
+          $u = Start-Process -FilePath "C:\Program Files\Lan Mouse\uninstall.exe" -ArgumentList "/S" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($u.ExitCode)" }
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

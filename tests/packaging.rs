@@ -131,4 +131,23 @@ fn release_workflow_builds_both_platforms() {
     // MSYS2 ships prebuilt GTK; gvsbuild needs a specific Visual Studio.
     assert!(workflow.contains("msys2/setup-msys2"));
     assert!(workflow.contains("msystem: UCRT64"));
+    assert!(workflow.contains("doctor --probe --json"));
+}
+
+#[test]
+fn ci_workflow_tests_windows_generations_with_msys2() {
+    let workflow = read(".github/workflows/rust.yml");
+    assert!(workflow.contains("windows-2022"));
+    assert!(workflow.contains("windows-2025"));
+    assert!(workflow.contains("msys2/setup-msys2"));
+    assert!(workflow.contains("msystem: UCRT64"));
+}
+
+#[test]
+fn vm_test_lab_script_is_present_and_supports_win10_and_win11() {
+    assert!(exists("scripts/vm-test-lab.sh"), "vm-test-lab.sh");
+    let script = read("scripts/vm-test-lab.sh");
+    assert!(script.contains("windows-10.conf"));
+    assert!(script.contains("windows-11.conf"));
+    assert!(script.contains("trusted_ips"));
 }

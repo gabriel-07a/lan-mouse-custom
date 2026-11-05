@@ -8,13 +8,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
-use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
-    EnumDisplayDevicesW, EnumDisplaySettingsW,
+    EnumDisplayDevicesW, EnumDisplaySettingsW, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -118,6 +119,10 @@ thread_local! {
     static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+    /// physical pixels per logical pixel on the entry monitor (see
+    /// [`monitor_scale`]); the wire carries logical pixels so peers with a
+    /// different display scale move the cursor at the same logical speed.
+    static DPI_SCALE: Cell<f64> = const { Cell::new(1.0) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
@@ -305,6 +310,9 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
     ENTRY_POINT.replace(entry_point);
+    // Motion is forwarded in logical (96 DPI) pixels; remember the scale of
+    // the monitor the cursor is pinned to. See `monitor_scale`.
+    DPI_SCALE.replace(unsafe { monitor_scale(entry_point) });
     // Pin the real cursor to the entry point. Windows may have moved it past
     // the edge (DPI scaling, multiple displays); every later delta is measured
     // against ENTRY_POINT, so a mismatch would offset the whole session.
@@ -437,6 +445,33 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
     }
 }
 
+/// Physical pixels per logical (96 DPI) pixel on the monitor containing
+/// `point`.
+///
+/// `GetDpiForMonitor` reports the real scale only for a per-monitor DPI aware
+/// process; `main` sets that up on Windows, so this matches the physical
+/// coordinates delivered by the low level hook.
+unsafe fn monitor_scale(point: (i32, i32)) -> f64 {
+    let monitor = unsafe {
+        MonitorFromPoint(
+            POINT {
+                x: point.0,
+                y: point.1,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+    let mut dpi_x = 96u32;
+    let mut dpi_y = 96u32;
+    if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_ok()
+        && dpi_x >= 96
+    {
+        f64::from(dpi_x) / 96.0
+    } else {
+        1.0
+    }
+}
+
 fn update_clients(request: ClientUpdate) {
     match request {
         ClientUpdate::Create(pos) => {
@@ -538,7 +573,11 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             if dx == 0 && dy == 0 {
                 return None;
             }
-            let (dx, dy) = (dx as f64, dy as f64);
+            // Low level hooks report physical pixels; the wire carries logical
+            // pixels so receivers with a different display scale do not move
+            // the pointer faster or slower than this machine would.
+            let scale = DPI_SCALE.get().max(0.1);
+            let (dx, dy) = (dx as f64 / scale, dy as f64 / scale);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }
         WPARAM(p) if p == WM_MOUSEWHEEL as usize => Some(PointerEvent::AxisDiscrete120 {

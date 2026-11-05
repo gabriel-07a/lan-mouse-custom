@@ -99,3 +99,17 @@ The handoff is coordinated with a serial number: the side that captures sends
 peer answers with `Ack(serial)`. The receiver deduplicates retransmissions and
 releases its own capture exactly once. `Leave` returns control.
 
+## Multi-OS Testing Strategy
+Testing combinations across Linux, Windows 10, and Windows 11 uses three layers:
+1. **Cross-platform geometry & protocol tests (`cargo test --workspace`):**
+   - `input-emulation/src/absolute.rs`: virtual desktop bounding box, clamping, `0..=65535` normalization, and DPI logical/physical conversion.
+   - `input-capture/src/windows/display_util.rs`: multi-monitor barrier crossing and origin clamping.
+   - `src/connect.rs`: full end-to-end loopback tests (`Capture` + `DummyInputCapture` → DTLS → `LanMouseListener` → `Emulation` + `ClipboardFrame`).
+2. **Real Windows kernel & session CI (`.github/workflows/rust.yml` and `release.yml`):**
+   - Runs on both `windows-2022` (Windows 10 / Server 2022 kernel) and `windows-2025` (Windows 11 24H2 / Server 2025 kernel) using MSYS2 `UCRT64`.
+   - `tests/windows_input.rs` exercises real `SendInput`, `GetCursorPos`, `WH_MOUSE_LL`, and `WH_KEYBOARD_LL` hooks on the runner's desktop session.
+   - `release.yml` runs a silent install (`/S`) of the NSIS installer, verifies `lan-mouse.exe doctor --probe --json` reports `windows` for both capture and emulation, and runs the silent uninstaller.
+3. **Local KVM/QEMU lab (`scripts/vm-test-lab.sh`):**
+   - Generates `quickemu`/QEMU configurations for Windows 10 and Windows 11 (with virtual TPM 2.0, Secure Boot, and QXL multi-head virtual monitors for mixed-DPI testing) plus pre-paired `config.toml` files using `trusted_ips`.
+
+

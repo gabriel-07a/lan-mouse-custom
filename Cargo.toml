@@ -82,6 +82,7 @@ libc = "0.2.148"
 windows = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    "Win32_UI_HiDpi",
 ] }
 
 [features]
