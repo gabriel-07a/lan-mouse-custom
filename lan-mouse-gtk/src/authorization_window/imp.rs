@@ -110,16 +110,16 @@ impl AuthorizationWindow {
         self.fingerprint.set_text(fingerprint);
     }
 
-    pub(super) fn set_peer(&self, addr: std::net::SocketAddr, hostname: Option<&str>) {
-        match hostname.map(str::trim).filter(|h| !h.is_empty()) {
-            Some(host) => self.peer.set_text(&format!(
-                "Device \"{host}\" ({}) wants to connect.",
-                addr.ip()
-            )),
-            None => self
-                .peer
-                .set_text(&format!("Device at {} wants to connect.", addr.ip())),
-        }
+    pub(super) fn set_peer(&self, addr: std::net::SocketAddr, hostname: Option<&str>, sas: &str) {
+        let peer = match hostname.map(str::trim).filter(|h| !h.is_empty()) {
+            Some(host) => format!("Device \"{host}\" ({}) wants to connect.", addr.ip()),
+            None => format!("Device at {} wants to connect.", addr.ip()),
+        };
+        self.peer.set_text(&if sas.is_empty() {
+            peer
+        } else {
+            format!("{peer}\nVerification code: {sas} — compare it with the other machine.")
+        });
     }
 }
 

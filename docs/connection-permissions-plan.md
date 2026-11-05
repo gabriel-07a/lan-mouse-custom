@@ -504,12 +504,16 @@ caps; eventos `AuthRequest/AuthResponse/AuthRevoke` + capability `PERMISSIONS`; 
 histórico persistido e tela de auditoria; `doctor`/`status --json`; remover auto-`TrustAddress` no
 clique de descoberta.
 
-> Estado (fase 2): `address_rules` com capacidades implementadas (config, migração de
-> `trusted_ips`, listener/service/CLI/eventos `AddressRules`; políticas chegadas ao
-> `AutoAuthorized`); pairing escopado com review (`StartPairingScoped`, janela carrega
-> `incoming`/`outgoing`, evento `PairingReview`); auditoria persistida em JSONL com
-> rotação, `history` na CLI, `ConnectionHistory` no IPC e caminho/contagem no `doctor`.
-> Próximo: mensagens de auth no protocolo (compat legada) e SAS no fluxo de aprovação.
+> Estado (fase 2): `address_rules` com capacidades (config, migração de `trusted_ips`,
+> listener/service/CLI/eventos `AddressRules`); pairing escopado com review
+> (`StartPairingScoped`, janela com `incoming`/`outgoing`, evento `PairingReview`);
+> auditoria persistida em JSONL com rotação, `history` na CLI, `ConnectionHistory` no IPC
+> e caminho/contagem no `doctor`; negociação de permissões no protocolo
+> (`AuthRequest`/`AuthResponse`/`AuthRevoke`, capability `PERMISSIONS` com gating de
+> peers legados, grants do peer no `ClientState`); SAS de 6 dígitos no diálogo/pending e
+> detecção de troca de certificado (`cert_changed`, evento `CertificateChanged`).
+> Fase 2 concluída; próximo: fase 3 (sessões/--once, clipboard read/write, rate-limit,
+> quiosque, export/import, IPC auth e ACL de chave).
 
 Aceite: MITM no primeiro pareamento detectado por SAS; peer antigo conecta sob política legada
 marcada na UI; regra de endereço com `incoming=["clipboard"]` só entrega clipboard.

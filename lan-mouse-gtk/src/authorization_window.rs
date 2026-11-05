@@ -15,10 +15,11 @@ impl AuthorizationWindow {
         addr: std::net::SocketAddr,
         hostname: Option<&str>,
         fingerprint: &str,
+        sas: &str,
     ) -> Self {
         let window: Self = Object::builder().build();
         window.imp().set_fingerprint(fingerprint);
-        window.imp().set_peer(addr, hostname);
+        window.imp().set_peer(addr, hostname, sas);
         window
     }
 }

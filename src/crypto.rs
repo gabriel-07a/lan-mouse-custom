@@ -34,6 +34,26 @@ pub fn certificate_fingerprint(cert: &Certificate) -> String {
     generate_fingerprint(certificate)
 }
 
+/// Short authentication string for a pair of devices.
+///
+/// Six decimal digits derived from both fingerprints in a stable,
+/// order-independent way, so two machines that know each other's
+/// fingerprint display the same code and a substituted certificate produces a
+/// different one. It is a comparison aid, not a replacement for an
+/// authenticated exchange.
+pub fn sas_code(local_fingerprint: &str, peer_fingerprint: &str) -> String {
+    let mut pair = [local_fingerprint, peer_fingerprint];
+    pair.sort_unstable();
+    let mut hash = Sha256::new();
+    hash.update(b"lan-mouse-sas-v1");
+    hash.update(pair[0].as_bytes());
+    hash.update(b"\0");
+    hash.update(pair[1].as_bytes());
+    let digest = hash.finalize();
+    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{value:06}")
+}
+
 /// Canonicalise a user-supplied SHA-256 fingerprint.
 ///
 /// Accepts the same fingerprint with or without separators, in upper or lower
@@ -145,6 +165,21 @@ mod tests {
         let a = generate_key_and_cert(&unique_path("a")).expect("cert a");
         let b = generate_key_and_cert(&unique_path("b")).expect("cert b");
         assert_ne!(certificate_fingerprint(&a), certificate_fingerprint(&b));
+    }
+
+    #[test]
+    fn sas_is_stable_and_order_independent() {
+        let a = "aa:bb:cc";
+        let b = "dd:ee:ff";
+        let code = sas_code(a, b);
+        assert_eq!(code, sas_code(b, a), "both sides must show the same code");
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_ascii_digit()), "got {code}");
+        assert_ne!(
+            code,
+            sas_code(a, "11:22:33"),
+            "a substituted certificate changes the code"
+        );
     }
 
     #[test]

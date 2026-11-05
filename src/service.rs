@@ -191,6 +191,7 @@ impl Service {
             client_manager.clone(),
             config.connect_grace_ms(),
         );
+        conn.set_device_store(devices.clone());
         let clipboard_sender = conn.sender();
         let clipboard_from_connection = conn.take_clipboard_rx();
         let conn_state_rx = conn.take_state_rx().expect("connection state receiver");
@@ -207,7 +208,12 @@ impl Service {
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let (clipboard_from_listener_tx, clipboard_from_listener_rx) =
             local_channel::mpsc::channel();
-        let emulation = Emulation::new(emulation_backend, listener, clipboard_from_listener_tx);
+        let emulation = Emulation::new(
+            emulation_backend,
+            listener,
+            clipboard_from_listener_tx,
+            Some(devices.clone()),
+        );
         let clipboard_enabled_initial = config.clipboard_enabled();
         let clipboard_enabled = Rc::new(Cell::new(clipboard_enabled_initial));
         let clipboard_limits = Rc::new(Cell::new(config.clipboard_limits()));
@@ -632,10 +638,52 @@ impl Service {
                 // CLI or after a GUI restart) instead of showing a one-shot
                 // dialog.
                 let name = self.peer_display_name(addr.ip(), &fingerprint);
+                let sas = crypto::sas_code(&self.public_key_fingerprint, &fingerprint);
+
+                // A certificate change looks like a new device at an address
+                // that used to have another certificate, or a new fingerprint
+                // reusing the display name of a known device.
+                let previous_fingerprint = self
+                    .client_with_ip(addr.ip())
+                    .and_then(|handle| self.client_manager.fingerprint(handle))
+                    .filter(|previous| previous != &fingerprint)
+                    .or_else(|| {
+                        let trimmed = name.trim();
+                        if trimmed.is_empty() || trimmed.parse::<IpAddr>().is_ok() {
+                            return None;
+                        }
+                        self.devices
+                            .read()
+                            .expect("lock")
+                            .devices()
+                            .find(|device| {
+                                device.fingerprint != fingerprint
+                                    && device.name.eq_ignore_ascii_case(trimmed)
+                            })
+                            .map(|device| device.fingerprint.clone())
+                    });
+                if let Some(previous) = &previous_fingerprint {
+                    self.audit.event(
+                        "cert_changed",
+                        Some(&fingerprint),
+                        Some(&name),
+                        Some(&addr.to_string()),
+                        Some(&format!("previous={previous}")),
+                    );
+                    self.notify_frontend(FrontendEvent::CertificateChanged {
+                        old_fingerprint: previous.clone(),
+                        new_fingerprint: fingerprint.clone(),
+                        name: name.clone(),
+                        addr,
+                        sas: sas.clone(),
+                    });
+                }
+
                 let is_new = self.devices.write().expect("lock").pending_upsert(
                     &fingerprint,
                     addr,
                     Some(name.clone()),
+                    previous_fingerprint.clone(),
                 );
                 if is_new {
                     log::info!("connection request from {addr} ({fingerprint})");
@@ -643,6 +691,8 @@ impl Service {
                 self.notify_frontend(FrontendEvent::ConnectionAttempt {
                     addr,
                     fingerprint: fingerprint.clone(),
+                    sas,
+                    previous_fingerprint,
                 });
                 self.broadcast_pending();
             }
@@ -798,6 +848,44 @@ impl Service {
                     self.broadcast_client(handle);
                 }
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
+            }
+            EmulationEvent::PeerPermissions {
+                addr,
+                fingerprint,
+                incoming_caps,
+                outgoing_caps,
+            } => {
+                self.audit.event(
+                    "peer_permissions",
+                    Some(&fingerprint),
+                    None,
+                    Some(&addr.to_string()),
+                    Some(&format!(
+                        "peer_incoming={incoming_caps:#x} peer_outgoing={outgoing_caps:#x}"
+                    )),
+                );
+                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                    self.client_manager.set_peer_permissions(
+                        handle,
+                        Some(incoming_caps),
+                        Some(outgoing_caps),
+                    );
+                    self.broadcast_client(handle);
+                }
+            }
+            EmulationEvent::PeerAuthRevoked { addr, reason } => {
+                self.audit.event(
+                    "peer_auth_revoked",
+                    None,
+                    None,
+                    Some(&addr.to_string()),
+                    Some(&format!("reason={reason}")),
+                );
+                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                    self.client_manager
+                        .set_peer_permissions(handle, Some(0), Some(0));
+                    self.broadcast_client(handle);
+                }
             }
             EmulationEvent::PeerHello {
                 addr,
@@ -1090,7 +1178,10 @@ impl Service {
     }
 
     fn broadcast_pending(&mut self) {
-        let pending: Vec<PendingView> = self.devices.write().expect("lock").pending_views();
+        let mut pending: Vec<PendingView> = self.devices.write().expect("lock").pending_views();
+        for view in pending.iter_mut() {
+            view.sas = crypto::sas_code(&self.public_key_fingerprint, &view.fingerprint);
+        }
         self.notify_frontend(FrontendEvent::PendingRequests(pending));
     }
 

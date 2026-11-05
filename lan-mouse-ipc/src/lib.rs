@@ -231,6 +231,15 @@ pub struct ClientState {
     /// address of an active incoming connection from this peer, if any
     #[serde(default)]
     pub incoming_addr: Option<SocketAddr>,
+    /// capabilities the peer advertised it grants to this machine
+    /// (`incoming` on the peer side); only present on peers that speak the
+    /// permission negotiation extension
+    #[serde(default)]
+    pub peer_incoming_caps: Option<u8>,
+    /// capabilities the peer expects to use on this machine (`outgoing` on
+    /// the peer side)
+    #[serde(default)]
+    pub peer_outgoing_caps: Option<u8>,
 }
 
 /// Bitset of input capabilities granted in one direction.
@@ -417,6 +426,13 @@ pub struct PendingView {
     pub addr: SocketAddr,
     /// name reported by discovery, when known
     pub name: Option<String>,
+    /// six-digit comparison code derived from both fingerprints
+    #[serde(default)]
+    pub sas: String,
+    /// fingerprint previously known for the same address/name, when this
+    /// request looks like a certificate change
+    #[serde(default)]
+    pub previous_fingerprint: Option<String>,
     /// unix timestamp (seconds) of the first/last attempt
     pub first_seen: u64,
     pub last_seen: u64,
@@ -526,6 +542,22 @@ pub enum FrontendEvent {
     ConnectionAttempt {
         addr: SocketAddr,
         fingerprint: String,
+        /// six-digit code to compare with the other machine
+        #[serde(default)]
+        sas: String,
+        /// set when the same address previously presented another certificate
+        #[serde(default)]
+        previous_fingerprint: Option<String>,
+    },
+    /// a known device showed up with a different certificate than before
+    CertificateChanged {
+        old_fingerprint: String,
+        new_fingerprint: String,
+        name: String,
+        addr: SocketAddr,
+        /// six-digit comparison code for the new certificate
+        #[serde(default)]
+        sas: String,
     },
     /// runtime diagnostics (backends, protocol version, …)
     Diagnostics(Diagnostics),
@@ -861,6 +893,8 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
                 51234,
             )),
+            peer_incoming_caps: Some(0b101),
+            peer_outgoing_caps: Some(0b011),
         };
         let decoded = json_roundtrip(state);
         assert_eq!(decoded.rtt_ms, Some(12));
@@ -899,6 +933,15 @@ mod tests {
         json_roundtrip(FrontendEvent::ConnectionAttempt {
             addr: "192.168.1.5:4242".parse().unwrap(),
             fingerprint: "aa:bb".into(),
+            sas: "123456".into(),
+            previous_fingerprint: Some("cc:dd".into()),
+        });
+        json_roundtrip(FrontendEvent::CertificateChanged {
+            old_fingerprint: "cc:dd".into(),
+            new_fingerprint: "aa:bb".into(),
+            name: "laptop".into(),
+            addr: "192.168.1.5:4242".parse().unwrap(),
+            sas: "123456".into(),
         });
         json_roundtrip(FrontendEvent::Diagnostics(Diagnostics {
             capture_backend: Some("libei".into()),
@@ -1172,6 +1215,8 @@ mod ipc_tests {
             fingerprint: "cc:dd".into(),
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 4242),
             name: Some("desktop".into()),
+            sas: "654321".into(),
+            previous_fingerprint: Some("ee:ff".into()),
             first_seen: 1,
             last_seen: 2,
             attempts: 3,

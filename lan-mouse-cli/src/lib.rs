@@ -473,7 +473,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     }
                     for request in pending {
                         println!(
-                            "{:<26} from {}{} ({} attempt(s))",
+                            "{:<26} from {}{} ({} attempt(s)) code={}{}",
                             request.fingerprint,
                             request.addr,
                             request
@@ -481,7 +481,16 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                                 .as_deref()
                                 .map(|name| format!(" as {name}"))
                                 .unwrap_or_default(),
-                            request.attempts
+                            request.attempts,
+                            request.sas,
+                            request
+                                .previous_fingerprint
+                                .as_deref()
+                                .map(|old| format!(
+                                    " WARNING: certificate changed (was {})",
+                                    old.chars().take(23).collect::<String>()
+                                ))
+                                .unwrap_or_default()
                         );
                     }
                     break;

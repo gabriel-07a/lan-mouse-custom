@@ -1242,8 +1242,9 @@ impl Window {
             let fingerprint = request.fingerprint.clone();
             let addr = request.addr;
             let hostname = request.name.clone();
+            let sas = request.sas.clone();
             review.connect_clicked(move |_| {
-                parent.show_authorization_window(addr, hostname.as_deref(), &fingerprint);
+                parent.show_authorization_window(addr, hostname.as_deref(), &fingerprint, &sas);
             });
 
             row.add_suffix(&deny);
@@ -1551,7 +1552,12 @@ impl Window {
     }
 
     /// Open the authorization dialog for an incoming connection attempt.
-    pub(super) fn request_authorization(&self, addr: std::net::SocketAddr, fingerprint: &str) {
+    pub(super) fn request_authorization(
+        &self,
+        addr: std::net::SocketAddr,
+        fingerprint: &str,
+        sas: &str,
+    ) {
         // The discovery table usually knows the host name of the peer.
         let known_hostname = self
             .imp()
@@ -1560,7 +1566,7 @@ impl Window {
             .iter()
             .find(|d| d.ip == addr.ip())
             .and_then(|d| d.hostname.clone());
-        self.show_authorization_window(addr, known_hostname.as_deref(), fingerprint);
+        self.show_authorization_window(addr, known_hostname.as_deref(), fingerprint, sas);
     }
 
     /// Open (or replace) the authorization dialog.
@@ -1574,11 +1580,12 @@ impl Window {
         addr: std::net::SocketAddr,
         hostname: Option<&str>,
         fingerprint: &str,
+        sas: &str,
     ) {
         if let Some(w) = self.imp().authorization_window.borrow_mut().take() {
             w.close();
         }
-        let window = AuthorizationWindow::new(addr, hostname, fingerprint);
+        let window = AuthorizationWindow::new(addr, hostname, fingerprint, sas);
         window.set_transient_for(Some(self));
         let peer_name = hostname
             .map(str::trim)

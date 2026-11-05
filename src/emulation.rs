@@ -1,4 +1,5 @@
 use crate::config::local_commit;
+use crate::devices::DeviceStore;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCommand, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
@@ -11,6 +12,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     rc::Rc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -83,6 +85,16 @@ pub(crate) enum EmulationEvent {
         proto_version: u8,
         capabilities: u32,
     },
+    /// A peer announced the permissions it grants to this machine
+    /// (incoming_caps) and expects to use here (outgoing_caps).
+    PeerPermissions {
+        addr: SocketAddr,
+        fingerprint: String,
+        incoming_caps: u8,
+        outgoing_caps: u8,
+    },
+    /// A peer revoked the permission grants of its session.
+    PeerAuthRevoked { addr: SocketAddr, reason: u8 },
 }
 
 enum EmulationRequest {
@@ -99,6 +111,7 @@ impl Emulation {
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
         clipboard_tx: Sender<(std::net::SocketAddr, ClipboardFrame)>,
+        devices: Option<Arc<RwLock<DeviceStore>>>,
     ) -> Self {
         let selected_backend: Rc<Cell<Option<input_emulation::Backend>>> = Default::default();
         let emulation_proxy = EmulationProxy::new(backend, selected_backend.clone());
@@ -112,6 +125,8 @@ impl Emulation {
             event_tx,
             clipboard_tx,
             reply_rx,
+            devices,
+            fingerprints: Default::default(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -212,6 +227,10 @@ struct ListenTask {
     event_tx: Sender<EmulationEvent>,
     clipboard_tx: Sender<(std::net::SocketAddr, ClipboardFrame)>,
     reply_rx: Receiver<ListenerCommand>,
+    /// device policies used to answer permission negotiations
+    devices: Option<Arc<RwLock<DeviceStore>>>,
+    /// peer fingerprint per live connection, used for permission events
+    fingerprints: HashMap<SocketAddr, String>,
 }
 
 impl ListenTask {
@@ -247,6 +266,52 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::AuthRequest {
+                                session_id,
+                                incoming_caps,
+                                outgoing_caps,
+                            } => {
+                                let fingerprint = self
+                                    .fingerprints
+                                    .get(&addr)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let (incoming, outgoing) = match (&self.devices, fingerprint.as_str()) {
+                                    (Some(devices), fingerprint) if !fingerprint.is_empty() => {
+                                        let store = devices.read().expect("lock");
+                                        (store.incoming(fingerprint), store.outgoing(fingerprint))
+                                    }
+                                    _ => (
+                                        lan_mouse_ipc::DirectionPolicy::allow_all(),
+                                        lan_mouse_ipc::DirectionPolicy::allow_all(),
+                                    ),
+                                };
+                                self.listener
+                                    .reply(
+                                        addr,
+                                        ProtoEvent::AuthResponse {
+                                            session_id,
+                                            incoming_caps: incoming.capabilities.0,
+                                            outgoing_caps: outgoing.capabilities.0,
+                                        },
+                                    )
+                                    .await;
+                                self.event_tx
+                                    .send(EmulationEvent::PeerPermissions {
+                                        addr,
+                                        fingerprint,
+                                        incoming_caps,
+                                        outgoing_caps,
+                                    })
+                                    .ok()
+                                    .unwrap_or_default();
+                            }
+                            ProtoEvent::AuthRevoke { reason, .. } => {
+                                self.event_tx
+                                    .send(EmulationEvent::PeerAuthRevoked { addr, reason })
+                                    .ok()
+                                    .unwrap_or_default();
+                            }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong {
                                 alive: self.emulation_proxy.emulation_active.get(),
                                 // Advertise what we understand so the peer
@@ -291,6 +356,7 @@ impl ListenTask {
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
                         // A fresh connection from this address starts a new
                         // serial space; never dedupe against the old one.
+                        self.fingerprints.insert(addr, fingerprint.clone());
                         last_enter.clear(addr);
                         last_response.insert(addr, Instant::now());
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).ok().unwrap_or_default();
@@ -314,6 +380,7 @@ impl ListenTask {
                             .unwrap_or_default();
                     }
                     Some(ListenEvent::Closed { addr }) => {
+                        self.fingerprints.remove(&addr);
                         if last_response.remove(&addr).is_some() {
                             self.emulation_proxy.remove(addr);
                             last_enter.clear(addr);

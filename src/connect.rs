@@ -1,6 +1,7 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use crate::crypto;
+use crate::devices::DeviceStore;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
     MAX_EVENT_SIZE, ProtoEvent,
@@ -14,7 +15,7 @@ use std::{
     io,
     net::SocketAddr,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -93,6 +94,11 @@ struct ConnCtx {
     /// `Ping` with capabilities: older releases close the connection when
     /// they receive an event id they do not know.
     hello_sent: Rc<RefCell<HashSet<SocketAddr>>>,
+    /// device policies used to compute the permission grants announced to
+    /// peers; `None` disables the permission negotiation (tests, legacy paths)
+    devices: Option<Arc<RwLock<DeviceStore>>>,
+    /// permission session id per peer address, stable for a connection
+    auth_sessions: Rc<RefCell<HashMap<SocketAddr, u128>>>,
     /// how long a single `send` blocks waiting for a connection
     grace: Duration,
 }
@@ -263,6 +269,8 @@ impl LanMouseConnection {
             ping_response: Default::default(),
             ping_sent: Default::default(),
             hello_sent: Default::default(),
+            devices: None,
+            auth_sessions: Default::default(),
             grace: Duration::from_millis(connect_grace_ms),
         };
         Self {
@@ -276,6 +284,16 @@ impl LanMouseConnection {
     /// Cloneable send half, used by the clipboard sync task.
     pub(crate) fn sender(&self) -> ConnectionSender {
         self.sender.clone()
+    }
+
+    /// Enable permission negotiation: the store is used to compute what this
+    /// machine grants the peer, and the result is announced once the peer
+    /// advertises the `PERMISSIONS` capability.
+    ///
+    /// Must be called before cloning the connection (the send half is cloned
+    /// by the clipboard/capture tasks right after construction).
+    pub(crate) fn set_device_store(&mut self, devices: Arc<RwLock<DeviceStore>>) {
+        self.sender.ctx.devices = Some(devices);
     }
 
     /// Hand the clipboard frame receiver to the clipboard task. The input
@@ -489,6 +507,9 @@ async fn connect(
         // (DHCP reuse, ARP/DNS spoofing, wrong machine) would receive our
         // keyboard, mouse and clipboard without any warning.
         Some(expected) => {
+            // Self-signed peers cannot pass the standard chain verification,
+            // so skip it and pin the certificate with our own callback.
+            config.insecure_skip_verify = true;
             config.verify_peer_certificate = Some(Arc::new(
                 move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
                     let Some(cert) = certs.first() else {
@@ -744,6 +765,49 @@ async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
     }
 }
 
+/// Stable per-connection session id used for permission updates.
+fn auth_session(ctx: &ConnCtx, addr: SocketAddr) -> u128 {
+    *ctx.auth_sessions
+        .borrow_mut()
+        .entry(addr)
+        .or_insert_with(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default();
+            nanos ^ ((addr.port() as u128) << 96) ^ (std::process::id() as u128)
+        })
+}
+
+/// Announce the local permission grants to the peer.
+///
+/// Only called after the peer advertised [`capabilities::PERMISSIONS`]:
+/// legacy peers close the connection on an unknown event id.
+async fn send_auth_request(ctx: &ConnCtx, handle: ClientHandle, addr: SocketAddr, conn: &ArcConn) {
+    let Some(devices) = &ctx.devices else {
+        return;
+    };
+    let (incoming, outgoing) = match ctx.client_manager.fingerprint(handle) {
+        Some(fingerprint) => {
+            let store = devices.read().expect("lock");
+            (store.incoming(&fingerprint), store.outgoing(&fingerprint))
+        }
+        None => (
+            lan_mouse_ipc::DirectionPolicy::allow_all(),
+            lan_mouse_ipc::DirectionPolicy::allow_all(),
+        ),
+    };
+    let event = ProtoEvent::AuthRequest {
+        session_id: auth_session(ctx, addr),
+        incoming_caps: incoming.capabilities.0,
+        outgoing_caps: outgoing.capabilities.0,
+    };
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+    if let Err(e) = conn.send(&buf[..len]).await {
+        log::debug!("failed to announce permissions to {addr}: {e}");
+    }
+}
+
 /// Send our build `Hello` once per connection, as soon as the peer proved it
 /// can decode events added by this fork.
 async fn send_hello_once(ctx: &ConnCtx, addr: SocketAddr, conn: &ArcConn) {
@@ -799,6 +863,9 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
                             ctx.client_manager
                                 .set_peer_capabilities(handle, capabilities);
                             send_hello_once(&ctx, addr, &conn).await;
+                            if capabilities & lan_mouse_proto::capabilities::PERMISSIONS != 0 {
+                                send_auth_request(&ctx, handle, addr, &conn).await;
+                            }
                         }
                         ctx.notify_state_changed(handle);
                     }
@@ -815,6 +882,26 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
                         );
                         ctx.notify_state_changed(handle);
                     }
+                    ProtoEvent::AuthResponse {
+                        incoming_caps,
+                        outgoing_caps,
+                        ..
+                    } => {
+                        ctx.client_manager.set_peer_permissions(
+                            handle,
+                            Some(incoming_caps),
+                            Some(outgoing_caps),
+                        );
+                        ctx.notify_state_changed(handle);
+                    }
+                    ProtoEvent::AuthRevoke { reason, .. } => {
+                        log::debug!("peer {addr} revoked permission grants (reason {reason})");
+                        ctx.client_manager
+                            .set_peer_permissions(handle, Some(0), Some(0));
+                        ctx.notify_state_changed(handle);
+                    }
+                    // The listener is the responder for permission requests.
+                    ProtoEvent::AuthRequest { .. } => {}
                     event => ctx.tx.send((handle, event)).ok().unwrap_or_default(),
                 }
             }
@@ -1253,6 +1340,7 @@ mod tests {
                     Some(input_emulation::Backend::Dummy),
                     listener,
                     clipboard_tx,
+                    None,
                 );
 
                 let (manager, handle) = client_manager_for(port);
@@ -1590,6 +1678,7 @@ mod tests {
                     Some(input_emulation::Backend::Dummy),
                     listener,
                     clipboard_tx,
+                    None,
                 );
                 let client = raw_dtls_client(port, client_cert).await;
 
@@ -1659,6 +1748,7 @@ mod tests {
                     Some(input_emulation::Backend::Dummy),
                     listener,
                     clipboard_tx,
+                    None,
                 );
 
                 let client = raw_dtls_client(port, client_cert).await;
@@ -1761,6 +1851,7 @@ mod tests {
                     Some(input_emulation::Backend::Dummy),
                     listener_b,
                     clipboard_b_tx,
+                    None,
                 );
 
                 // Peer A: ClientManager + LanMouseConnection + Capture (DummyInputCapture emits on Position::Left)
@@ -2379,6 +2470,123 @@ mod tests {
                 );
 
                 listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// Two peers that advertise `PERMISSIONS` exchange their grants: the
+    /// listener replies to our AuthRequest with its local policy and reports
+    /// the peer's grant upward, while we record the listener's grant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn permission_negotiation_exchanges_grants() {
+        use crate::devices::{Device, DeviceSource, DeviceStore};
+        use lan_mouse_ipc::{Capabilities, DirectionPolicy};
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("auth-listener");
+                let client_cert = unique_cert("auth-client");
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+                let listener_fp = crypto::certificate_fingerprint(&listener_cert);
+
+                let mut listener_store = DeviceStore::default();
+                listener_store.put(Device {
+                    fingerprint: client_fp.clone(),
+                    name: "client".into(),
+                    incoming: DirectionPolicy {
+                        allowed: true,
+                        capabilities: Capabilities::KEYBOARD,
+                    },
+                    outgoing: DirectionPolicy {
+                        allowed: true,
+                        capabilities: Capabilities::CLIPBOARD,
+                    },
+                    source: DeviceSource::Manual,
+                });
+                let listener_devices = Arc::new(RwLock::new(listener_store));
+
+                let listener =
+                    listener_with_authorized(port, listener_cert, vec![client_fp.clone()]).await;
+                let (clipboard_tx, _clipboard_rx) = local_channel::mpsc::channel();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    listener,
+                    clipboard_tx,
+                    Some(listener_devices),
+                );
+
+                let (manager, handle) = client_manager_for(port);
+                manager.set_fingerprint(handle, Some(listener_fp.clone()));
+                let mut client_store = DeviceStore::default();
+                client_store.put(Device {
+                    fingerprint: listener_fp,
+                    name: "listener".into(),
+                    incoming: DirectionPolicy {
+                        allowed: true,
+                        capabilities: Capabilities::POINTER,
+                    },
+                    outgoing: DirectionPolicy {
+                        allowed: true,
+                        capabilities: Capabilities::KEYBOARD,
+                    },
+                    source: DeviceSource::Manual,
+                });
+                let conn = LanMouseConnection::new(client_cert, manager.clone(), 2000);
+                let mut conn = conn;
+                conn.set_device_store(Arc::new(RwLock::new(client_store)));
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 9,
+                    },
+                    handle,
+                )
+                .await
+                .expect("connect");
+
+                // We receive the listener's grant: incoming = KEYBOARD (2),
+                // outgoing = CLIPBOARD (4).
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut granted = None;
+                while Instant::now() < deadline && granted.is_none() {
+                    if let Some((_, state)) = manager.get_state(handle) {
+                        if state.peer_incoming_caps.is_some() {
+                            granted = Some((state.peer_incoming_caps, state.peer_outgoing_caps));
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                assert_eq!(
+                    granted,
+                    Some((
+                        Some(Capabilities::KEYBOARD.0),
+                        Some(Capabilities::CLIPBOARD.0)
+                    )),
+                    "the listener grant must be recorded on the client"
+                );
+
+                // The listener reports our grant upward: incoming = POINTER (1),
+                // outgoing = KEYBOARD (2).
+                let event = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match emulation.event().await {
+                            EmulationEvent::PeerPermissions {
+                                incoming_caps,
+                                outgoing_caps,
+                                fingerprint,
+                                ..
+                            } => break (incoming_caps, outgoing_caps, fingerprint),
+                            _ => continue,
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for the peer permissions event");
+                assert_eq!(event.0, Capabilities::POINTER.0);
+                assert_eq!(event.1, Capabilities::KEYBOARD.0);
+                assert_eq!(event.2, client_fp);
             })
             .await;
     }

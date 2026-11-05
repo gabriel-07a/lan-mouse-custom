@@ -366,8 +366,31 @@ fn build_ui(app: &Application) {
                     FrontendEvent::EmulationStatus(s) => window.set_emulation(s.into()),
                     FrontendEvent::AuthorizedUpdated(keys) => window.set_authorized_keys(keys),
                     FrontendEvent::PublicKeyFingerprint(fp) => window.set_pk_fp(&fp),
-                    FrontendEvent::ConnectionAttempt { addr, fingerprint } => {
-                        window.request_authorization(addr, &fingerprint);
+                    FrontendEvent::ConnectionAttempt {
+                        addr,
+                        fingerprint,
+                        sas,
+                        previous_fingerprint,
+                    } => {
+                        if previous_fingerprint.is_some() {
+                            window.show_toast(
+                                "Warning: this device presented a different certificate than before",
+                            );
+                        }
+                        window.request_authorization(addr, &fingerprint, &sas);
+                    }
+                    FrontendEvent::CertificateChanged {
+                        name,
+                        sas,
+                        old_fingerprint,
+                        new_fingerprint,
+                        ..
+                    } => {
+                        window.show_toast(&format!(
+                            "Certificate changed for {name}: {} -> {} (code {sas})",
+                            old_fingerprint.chars().take(11).collect::<String>(),
+                            new_fingerprint.chars().take(11).collect::<String>(),
+                        ));
                     }
                     FrontendEvent::NetworkScan(devices) => window.update_network(devices),
                     FrontendEvent::TrustedAddresses(addresses) => {

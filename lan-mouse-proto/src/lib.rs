@@ -38,10 +38,17 @@ pub mod capabilities {
     /// Legacy peers cannot decode those frames, so nothing must be offered
     /// to them.
     pub const CLIPBOARD: u32 = 1 << 4;
+    /// The peer understands the permission negotiation events
+    /// ([`super::ProtoEvent::AuthRequest`], [`super::ProtoEvent::AuthResponse`]
+    /// and [`super::ProtoEvent::AuthRevoke`]). Legacy peers close the
+    /// connection on an unknown event id, so these must only be sent when the
+    /// peer advertised this bit.
+    pub const PERMISSIONS: u32 = 1 << 5;
 }
 
 /// Features this build can use when the peer also advertises them.
-pub const CAPABILITIES: u32 = capabilities::ENTER_ACK | capabilities::CLIPBOARD;
+pub const CAPABILITIES: u32 =
+    capabilities::ENTER_ACK | capabilities::CLIPBOARD | capabilities::PERMISSIONS;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -125,6 +132,28 @@ pub enum ProtoEvent {
         proto_version: u8,
         capabilities: u32,
     },
+    /// Announces or updates the permissions this side grants to the peer and
+    /// expects from it. Only sent when the peer advertises
+    /// [`capabilities::PERMISSIONS`]. Idempotent: a new request replaces the
+    /// previous grants for that session.
+    AuthRequest {
+        /// per-connection identifier so stale updates can be ignored
+        session_id: u128,
+        /// capabilities this side grants the peer in the incoming direction
+        incoming_caps: u8,
+        /// capabilities this side expects/uses in the outgoing direction
+        outgoing_caps: u8,
+    },
+    /// Reciprocal grant, sent in reply to [`ProtoEvent::AuthRequest`].
+    AuthResponse {
+        session_id: u128,
+        incoming_caps: u8,
+        outgoing_caps: u8,
+    },
+    /// Tears down the permission grants of a session (device revoked, link
+    /// released). `reason` is a small enum: 0 = revoked, 1 = released,
+    /// 2 = policy changed to deny.
+    AuthRevoke { session_id: u128, reason: u8 },
 }
 
 impl Display for ProtoEvent {
@@ -157,6 +186,25 @@ impl Display for ProtoEvent {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s}, v{proto_version}, caps={capabilities:#x})")
             }
+            ProtoEvent::AuthRequest {
+                session_id,
+                incoming_caps,
+                outgoing_caps,
+            } => write!(
+                f,
+                "AuthRequest(session={session_id:#x}, in={incoming_caps:#x}, out={outgoing_caps:#x})"
+            ),
+            ProtoEvent::AuthResponse {
+                session_id,
+                incoming_caps,
+                outgoing_caps,
+            } => write!(
+                f,
+                "AuthResponse(session={session_id:#x}, in={incoming_caps:#x}, out={outgoing_caps:#x})"
+            ),
+            ProtoEvent::AuthRevoke { session_id, reason } => {
+                write!(f, "AuthRevoke(session={session_id:#x}, reason={reason})")
+            }
         }
     }
 }
@@ -176,6 +224,11 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    // Ids 12-15 are reserved for clipboard frames; new protocol events start
+    // at 16 so the clipboard detection in the read loops keeps working.
+    AuthRequest = 16,
+    AuthResponse = 17,
+    AuthRevoke = 18,
 }
 
 impl ProtoEvent {
@@ -199,6 +252,9 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
+            ProtoEvent::AuthRequest { .. } => EventType::AuthRequest,
+            ProtoEvent::AuthResponse { .. } => EventType::AuthResponse,
+            ProtoEvent::AuthRevoke { .. } => EventType::AuthRevoke,
         }
     }
 }
@@ -297,6 +353,20 @@ impl TryFrom<&[u8]> for ProtoEvent {
                     capabilities,
                 })
             }
+            EventType::AuthRequest => Ok(Self::AuthRequest {
+                session_id: decode_u128(&mut buf)?,
+                incoming_caps: decode_u8(&mut buf)?,
+                outgoing_caps: decode_u8(&mut buf)?,
+            }),
+            EventType::AuthResponse => Ok(Self::AuthResponse {
+                session_id: decode_u128(&mut buf)?,
+                incoming_caps: decode_u8(&mut buf)?,
+                outgoing_caps: decode_u8(&mut buf)?,
+            }),
+            EventType::AuthRevoke => Ok(Self::AuthRevoke {
+                session_id: decode_u128(&mut buf)?,
+                reason: decode_u8(&mut buf)?,
+            }),
         }
     }
 }
@@ -383,6 +453,28 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_u8(buf, len, proto_version);
                     encode_u32(buf, len, capabilities);
                 }
+                ProtoEvent::AuthRequest {
+                    session_id,
+                    incoming_caps,
+                    outgoing_caps,
+                } => {
+                    encode_u128(buf, len, session_id);
+                    encode_u8(buf, len, incoming_caps);
+                    encode_u8(buf, len, outgoing_caps);
+                }
+                ProtoEvent::AuthResponse {
+                    session_id,
+                    incoming_caps,
+                    outgoing_caps,
+                } => {
+                    encode_u128(buf, len, session_id);
+                    encode_u8(buf, len, incoming_caps);
+                    encode_u8(buf, len, outgoing_caps);
+                }
+                ProtoEvent::AuthRevoke { session_id, reason } => {
+                    encode_u128(buf, len, session_id);
+                    encode_u8(buf, len, reason);
+                }
             }
         }
         (buf, len)
@@ -404,6 +496,7 @@ macro_rules! decode_impl {
 }
 
 decode_impl!(u8);
+decode_impl!(u128);
 decode_impl!(u32);
 decode_impl!(i32);
 decode_impl!(f64);
@@ -424,6 +517,7 @@ macro_rules! encode_impl {
 }
 
 encode_impl!(u8);
+encode_impl!(u128);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
@@ -490,6 +584,20 @@ mod tests {
                 commit: *b"abcdefgh",
                 proto_version: PROTO_VERSION,
                 capabilities: CAPABILITIES,
+            },
+            ProtoEvent::AuthRequest {
+                session_id: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+                incoming_caps: 0b101,
+                outgoing_caps: 0b011,
+            },
+            ProtoEvent::AuthResponse {
+                session_id: 7,
+                incoming_caps: 0,
+                outgoing_caps: 0xff,
+            },
+            ProtoEvent::AuthRevoke {
+                session_id: u128::MAX,
+                reason: 2,
             },
         ]
     }
@@ -740,6 +848,10 @@ mod extra_tests {
         assert_eq!(EventType::Leave as u8, 9);
         assert_eq!(EventType::Ack as u8, 10);
         assert_eq!(EventType::Hello as u8, 11);
+        // Clipboard frames reserve 12-15; new events must start at 16.
+        assert_eq!(EventType::AuthRequest as u8, 16);
+        assert_eq!(EventType::AuthResponse as u8, 17);
+        assert_eq!(EventType::AuthRevoke as u8, 18);
     }
 
     #[test]
@@ -779,6 +891,7 @@ mod extra_tests {
             capabilities::KEYMAP_V1,
             capabilities::ENTER_ACK,
             capabilities::CLIPBOARD,
+            capabilities::PERMISSIONS,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");

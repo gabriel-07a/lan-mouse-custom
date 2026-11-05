@@ -243,6 +243,19 @@ impl ClientManager {
         }
     }
 
+    /// Record the capabilities the peer grants us / expects from us.
+    pub(crate) fn set_peer_permissions(
+        &self,
+        handle: ClientHandle,
+        incoming_caps: Option<u8>,
+        outgoing_caps: Option<u8>,
+    ) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.peer_incoming_caps = incoming_caps;
+            state.peer_outgoing_caps = outgoing_caps;
+        }
+    }
+
     /// update the port of the client
     pub(crate) fn set_port(&self, handle: ClientHandle, port: u16) {
         match self.clients.borrow_mut().get_mut(handle as usize) {

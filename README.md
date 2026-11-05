@@ -537,6 +537,22 @@ device still appears in the device list with the rule's permissions and can be
 narrowed or revoked per device; `trusted_ips` from older configs is migrated to
 full-access rules so existing setups keep working.
 
+### Permission negotiation and verification code
+
+Peers from this fork advertise a `PERMISSIONS` capability and exchange
+`AuthRequest`/`AuthResponse` messages once connected, so each side learns the
+capabilities the other grants it (shown in the client state) without changing
+the enforcement model: grants are always enforced locally. Legacy peers never
+receive these events (they would close the connection on an unknown id), so
+interoperability is preserved.
+
+When a new device asks for approval, the dialog/CLI shows a **six-digit
+verification code** derived from both certificate fingerprints. Two machines
+that know each other's fingerprint display the same code; compare it out of
+band (screenshot, chat) before approving. If a known device later shows up with
+a **different certificate** for the same address or name, the frontend warns
+about the change, the request is flagged and the event is audited.
+
 ### Audit log
 
 Every permission change is appended to a JSON-lines audit log at

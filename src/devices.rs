@@ -87,6 +87,8 @@ pub(crate) struct PendingDevice {
     pub fingerprint: String,
     pub addr: SocketAddr,
     pub name: Option<String>,
+    /// previous certificate seen for the same address/name, if any
+    pub previous_fingerprint: Option<String>,
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
     pub attempts: u32,
@@ -98,6 +100,8 @@ impl PendingDevice {
             fingerprint: self.fingerprint.clone(),
             addr: self.addr,
             name: self.name.clone(),
+            sas: String::new(),
+            previous_fingerprint: self.previous_fingerprint.clone(),
             first_seen: unix_secs(self.first_seen),
             last_seen: unix_secs(self.last_seen),
             attempts: self.attempts,
@@ -259,6 +263,7 @@ impl DeviceStore {
         fingerprint: &str,
         addr: SocketAddr,
         name: Option<String>,
+        previous_fingerprint: Option<String>,
     ) -> bool {
         let now = SystemTime::now();
         match self.pending.get_mut(fingerprint) {
@@ -269,6 +274,9 @@ impl DeviceStore {
                 }
                 pending.last_seen = now;
                 pending.attempts = pending.attempts.saturating_add(1);
+                if previous_fingerprint.is_some() {
+                    pending.previous_fingerprint = previous_fingerprint;
+                }
                 false
             }
             None => {
@@ -278,6 +286,7 @@ impl DeviceStore {
                         fingerprint: fingerprint.to_string(),
                         addr,
                         name,
+                        previous_fingerprint,
                         first_seen: now,
                         last_seen: now,
                         attempts: 1,
@@ -385,8 +394,8 @@ mod tests {
     #[test]
     fn pending_requests_are_counted_and_pruned() {
         let mut store = DeviceStore::default();
-        assert!(store.pending_upsert(&fp(1), addr(4000), Some("peer".into())));
-        assert!(!store.pending_upsert(&fp(1), addr(4001), None));
+        assert!(store.pending_upsert(&fp(1), addr(4000), Some("peer".into()), None));
+        assert!(!store.pending_upsert(&fp(1), addr(4001), None, None));
         let pending = store.pending(&fp(1)).expect("pending");
         assert_eq!(pending.attempts, 2);
         assert_eq!(pending.addr, addr(4001));
