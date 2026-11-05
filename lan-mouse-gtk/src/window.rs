@@ -583,8 +583,8 @@ impl Window {
             return;
         };
 
-        /* activation state */
-        row.set_active(state.active);
+        /* activation state (drives the derived row state: badge, spinner, action) */
+        client_object.set_active(state.active);
 
         /* dns state */
         client_object.set_resolving(state.resolving);

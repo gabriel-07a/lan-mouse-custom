@@ -75,6 +75,33 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+## Connection State Shown by the Frontend
+
+The client row (`lan-mouse-gtk/src/client_row.rs`) derives its status badge,
+spinner, action button and subtitle from the two link properties published by
+the service:
+
+- `active_addr`: an outgoing DTLS handshake completed (certificate verified or
+  pinned). This is the only evidence of an outgoing link.
+- `incoming_addr`: an incoming DTLS session was accepted; it does not prove the
+  peer entered this screen or sends input.
+- `alive`: the peer's "input emulation enabled" flag from its last `Pong`. It
+  is also set optimistically after the handshake, so it is **not** a liveness
+  signal and never triggers a "reconnecting" state.
+
+Derived states: `Disconnected` (off, no incoming session), `Connecting…`
+(enabled, no link yet; the subtitle only says "no answer yet" instead of
+guessing firewall/DNS/approval), `Connected` (outgoing link; amber with
+"emulation disabled on the other PC" when `alive` is false),
+`Connected (bidirectional)` (both links) and `Peer connected` (incoming session
+only; input is applied only after the peer enters this screen). The row offers
+a single action per state (Connect / Cancel / Disconnect / Also connect).
+
+Freshness of the last heartbeat (last `Pong`), explicit failure reasons and a
+`remote_entered` flag need new optional fields in the IPC. The audit, the
+remaining gaps and the recommended `ConnectionPhase` are documented in
+[docs/client-connection-state.md](docs/client-connection-state.md).
+
 ## Clipboard
 The clipboard is a separate subsystem (crate `input-clipboard`). A snapshot is
 a set of canonical formats (`text/plain;charset=utf-8`, `text/html`,

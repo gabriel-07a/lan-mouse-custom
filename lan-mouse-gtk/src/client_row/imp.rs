@@ -5,7 +5,7 @@ use adw::{ActionRow, ComboRow, prelude::*};
 use glib::{Binding, subclass::InitializingObject};
 use gtk::glib::subclass::Signal;
 use gtk::glib::{SignalHandlerId, clone};
-use gtk::{Button, CompositeTemplate, Entry, Label, Switch, glib};
+use gtk::{Button, CompositeTemplate, Entry, Label, glib};
 use lan_mouse_ipc::Position;
 use std::sync::OnceLock;
 
@@ -15,9 +15,9 @@ use crate::client_object::ClientObject;
 #[template(resource = "/de/feschber/LanMouse/client_row.ui")]
 pub struct ClientRow {
     #[template_child]
-    pub enable_switch: TemplateChild<gtk::Switch>,
-    #[template_child]
     pub status_badge: TemplateChild<Label>,
+    #[template_child]
+    pub connect_spinner: TemplateChild<gtk::Spinner>,
     #[template_child]
     pub connect_button: TemplateChild<Button>,
     #[template_child]
@@ -41,7 +41,6 @@ pub struct ClientRow {
     hostname_change_handler: RefCell<Option<SignalHandlerId>>,
     port_change_handler: RefCell<Option<SignalHandlerId>>,
     position_change_handler: RefCell<Option<SignalHandlerId>>,
-    set_state_handler: RefCell<Option<SignalHandlerId>>,
     pub client_object: RefCell<Option<ClientObject>>,
 }
 
@@ -110,17 +109,6 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.position_change_handler.replace(Some(handler));
-        let handler = self.enable_switch.connect_state_set(clone!(
-            #[weak(rename_to = row)]
-            self,
-            #[upgrade_or]
-            glib::Propagation::Proceed,
-            move |switch, state| {
-                row.handle_activate_switch(state, switch);
-                glib::Propagation::Proceed
-            }
-        ));
-        self.set_state_handler.replace(Some(handler));
     }
 
     fn signals() -> &'static [glib::subclass::Signal] {
@@ -152,21 +140,27 @@ impl ObjectImpl for ClientRow {
 #[gtk::template_callbacks]
 impl ClientRow {
     #[template_callback]
-    fn handle_activate_switch(&self, state: bool, _switch: &Switch) -> bool {
-        self.obj().emit_by_name::<()>("request-activate", &[&state]);
-        true // dont run default handler
+    fn handle_toggle_connect(&self, _button: &Button) {
+        // The button label and meaning are derived from the current state
+        // (`super::row_action`); recompute them here so the click always
+        // matches what the row shows.
+        let Some(activate) = self
+            .current_action()
+            .map(super::RowAction::wants_activation)
+        else {
+            return;
+        };
+        self.obj()
+            .emit_by_name::<()>("request-activate", &[&activate]);
     }
 
-    #[template_callback]
-    fn handle_toggle_connect(&self, _button: &Button) {
-        let currently_active = self
-            .client_object
-            .borrow()
-            .as_ref()
-            .map(|co| co.property::<bool>("active"))
-            .unwrap_or(false);
-        let next = !currently_active;
-        self.obj().emit_by_name::<()>("request-activate", &[&next]);
+    /// The single action currently shown by the connect button.
+    fn current_action(&self) -> Option<super::RowAction> {
+        let client_object = self.client_object.borrow();
+        let client_object = client_object.as_ref()?;
+        let state = super::client_connection_state(client_object);
+        let active = client_object.property::<bool>("active");
+        Some(super::row_action(state, active))
     }
 
     #[template_callback]
@@ -244,18 +238,6 @@ impl ClientRow {
             .expect("client object")
             .set_position(pos.to_string());
         self.position.unblock_signal(handler);
-    }
-
-    pub(super) fn set_active(&self, active: bool) {
-        let handler = self.set_state_handler.borrow();
-        let handler = handler.as_ref().expect("signal handler");
-        self.enable_switch.block_signal(handler);
-        self.client_object
-            .borrow_mut()
-            .as_mut()
-            .expect("client object")
-            .set_active(active);
-        self.enable_switch.unblock_signal(handler);
     }
 
     pub(super) fn set_dns_state(&self, resolved: bool) {

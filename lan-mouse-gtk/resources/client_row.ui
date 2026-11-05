@@ -2,12 +2,14 @@
 <interface>
 	<template class="ClientRow" parent="AdwExpanderRow">
 		<property name="title">hostname</property>
-		<!-- enabled -->
-		<child type="prefix">
-			<object class="GtkSwitch" id="enable_switch">
+		<child type="suffix">
+			<object class="GtkSpinner" id="connect_spinner">
 				<property name="valign">center</property>
-				<property name="halign">end</property>
-				<property name="tooltip-text" translatable="yes">Enable or disable connection</property>
+				<property name="visible">false</property>
+				<property name="spinning">false</property>
+				<style>
+					<class name="status-spinner"/>
+				</style>
 			</object>
 		</child>
 		<child type="suffix">
@@ -25,7 +27,7 @@
 				<signal name="clicked" handler="handle_toggle_connect" swapped="true"/>
 				<property name="label" translatable="yes">Connect</property>
 				<property name="valign">center</property>
-				<property name="tooltip-text" translatable="yes">Connect or disconnect this device</property>
+				<property name="tooltip-text" translatable="yes">Enable this device and try to connect to it</property>
 				<style>
 					<class name="suggested-action"/>
 				</style>

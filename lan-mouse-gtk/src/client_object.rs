@@ -66,7 +66,10 @@ pub struct ClientData {
     pub peer_commit: Option<String>,
     /// 0 means unknown
     pub rtt_ms: u32,
-    /// the peer answered its last liveness check
+    /// the peer reports its input emulation as enabled (last Pong payload);
+    /// it is also set optimistically right after the handshake and is **not**
+    /// a liveness signal: the outgoing link can be established while the
+    /// peer's emulation is off
     pub alive: bool,
     /// address of the established connection, if any
     pub active_addr: Option<String>,
