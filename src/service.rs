@@ -87,8 +87,6 @@ pub struct Service {
     devices: Arc<RwLock<DeviceStore>>,
     /// authorized public key sha256 fingerprints (derived from `devices`)
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
-    /// revoked fingerprints that must never be authorized again
-    denied_keys: Arc<RwLock<HashSet<String>>>,
     /// generation counter for the pairing window; stale timers compare it so
     /// opening the window twice cannot close the new window early
     pairing_generation: Rc<Cell<u64>>,
@@ -163,16 +161,10 @@ impl Service {
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
-        let denied_fingerprints = config
-            .denied_fingerprints()
-            .into_iter()
-            .filter_map(|fp| crypto::normalize_fingerprint(&fp))
-            .collect::<HashSet<_>>();
         let mut device_store = DeviceStore::default();
-        device_store.seed(config.devices(), denied_fingerprints.iter().cloned());
+        device_store.seed(config.devices(), config.denied_devices());
         let devices = Arc::new(RwLock::new(device_store));
         let authorized_keys = Arc::new(RwLock::new(Self::authorized_map(&devices)));
-        let denied_keys: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(denied_fingerprints));
         let trusted_nets = Arc::new(RwLock::new(config.address_rules()));
         let pairing_until: Arc<RwLock<Option<PairingWindow>>> = Default::default();
         // listener + connection
@@ -182,7 +174,6 @@ impl Service {
             authorized_keys.clone(),
             trusted_nets.clone(),
             pairing_until.clone(),
-            denied_keys.clone(),
             devices.clone(),
         )
         .await?;
@@ -256,7 +247,6 @@ impl Service {
             audit: AuditLog::new(AuditLog::default_path()),
             devices,
             authorized_keys,
-            denied_keys,
             pairing_generation: Default::default(),
             learned_fingerprints: Default::default(),
             pending_reverse: Default::default(),
@@ -530,6 +520,16 @@ impl Service {
             }
             FrontendRequest::ListAddressRules => self.broadcast_address_rules(),
             FrontendRequest::ListHistory { limit } => self.broadcast_history(limit),
+            FrontendRequest::DenyDevice {
+                fingerprint,
+                expires_in,
+            } => self.deny_device(fingerprint, expires_in),
+            FrontendRequest::GrantSession {
+                fingerprint,
+                name,
+                position,
+                incoming,
+            } => self.grant_session(fingerprint, name, position, incoming),
             FrontendRequest::UntrustAddress(entry) => {
                 self.untrust_address(&entry);
                 self.save_config();
@@ -570,14 +570,14 @@ impl Service {
             .devices
             .read()
             .expect("lock")
-            .devices()
+            .persistent_devices()
             .cloned()
             .collect::<Vec<_>>();
         self.config.set_devices(devices);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
         self.config
-            .set_denied_fingerprints(self.devices.read().expect("lock").denied());
+            .set_denied_devices(self.devices.read().expect("lock").denied());
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
         }
@@ -602,13 +602,7 @@ impl Service {
         // Rebuild the device store from disk. Policies edited by hand in the
         // config file take effect immediately.
         let mut store = DeviceStore::default();
-        store.seed(
-            self.config.devices(),
-            self.config
-                .denied_fingerprints()
-                .into_iter()
-                .filter_map(|fp| crypto::normalize_fingerprint(&fp)),
-        );
+        store.seed(self.config.devices(), self.config.denied_devices());
         *self.devices.write().expect("lock") = store;
         *self.trusted_nets.write().expect("lock") = self.config.address_rules();
         self.refresh_maps();
@@ -720,6 +714,7 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
+                self.expire_session_grants(addr);
                 let _ = self.clipboard_peer_events.send(addr);
                 if let Some(handle) = self.client_with_ip(addr.ip()) {
                     if self.client_manager.incoming_addr(handle).is_some() {
@@ -1111,14 +1106,6 @@ impl Service {
     fn refresh_maps(&mut self) {
         let authorized = Self::authorized_map(&self.devices);
         *self.authorized_keys.write().expect("lock") = authorized.clone();
-        let denied = self
-            .devices
-            .read()
-            .expect("lock")
-            .denied()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        *self.denied_keys.write().expect("lock") = denied;
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(authorized));
     }
 
@@ -1417,6 +1404,131 @@ impl Service {
         self.broadcast_devices();
         self.broadcast_pending();
         log::info!("revoked device {fingerprint}");
+    }
+
+    /// Deny a device for `expires_in` seconds (`None` = permanent).
+    fn deny_device(&mut self, fp: String, expires_in: Option<u64>) {
+        let Some(fingerprint) = crypto::normalize_fingerprint(&fp) else {
+            self.notify_frontend(FrontendEvent::Error(format!("invalid fingerprint: {fp}")));
+            return;
+        };
+        let expires = expires_in.map(|seconds| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_add(seconds)
+        });
+        self.devices.write().expect("lock").deny_until(
+            fingerprint.clone(),
+            expires,
+            Some("user".to_string()),
+        );
+        self.refresh_maps();
+        self.disconnect_fingerprint(&fingerprint);
+        if let Some(handle) = self.client_manager.find_by_fingerprint(&fingerprint) {
+            self.deactivate_client(handle);
+        }
+        self.audit.event(
+            "deny",
+            Some(&fingerprint),
+            None,
+            None,
+            Some(&match expires {
+                Some(expires) => format!("reason=user expires={expires}"),
+                None => "reason=user".to_string(),
+            }),
+        );
+        self.save_config();
+        self.broadcast_devices();
+        self.broadcast_pending();
+        log::info!("denied device {fingerprint} (expires={expires:?})");
+    }
+
+    /// Grant a device for the current session only.
+    ///
+    /// The record is never persisted and is removed as soon as the peer
+    /// disconnects, so the user is asked again next time.
+    fn grant_session(
+        &mut self,
+        fp: String,
+        name: Option<String>,
+        position: Option<Position>,
+        incoming: DirectionPolicy,
+    ) {
+        let Some(fingerprint) = crypto::normalize_fingerprint(&fp) else {
+            self.notify_frontend(FrontendEvent::Error(format!("invalid fingerprint: {fp}")));
+            return;
+        };
+        let pending = self
+            .devices
+            .write()
+            .expect("lock")
+            .pending_remove(&fingerprint);
+        let name = name
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| pending.as_ref().and_then(|pending| pending.name.clone()))
+            .unwrap_or_else(|| fingerprint.clone());
+        self.devices.write().expect("lock").put_ephemeral(Device {
+            fingerprint: fingerprint.clone(),
+            name: name.clone(),
+            incoming,
+            // A session grant never configures outgoing control.
+            outgoing: DirectionPolicy::deny(),
+            source: DeviceSource::Manual,
+        });
+        self.refresh_maps();
+        self.audit.event(
+            "session_grant",
+            Some(&fingerprint),
+            Some(&name),
+            pending
+                .as_ref()
+                .map(|pending| pending.addr.to_string())
+                .as_deref(),
+            Some(&format!(
+                "incoming=[{}] outgoing=none",
+                incoming.capabilities.summary()
+            )),
+        );
+        let _ = position;
+        // Session grants are not persisted, so save only rewrites the
+        // persistent part of the config.
+        self.save_config();
+        self.broadcast_devices();
+        self.broadcast_pending();
+        log::info!("granted session access to {fingerprint} ({name})");
+    }
+
+    /// Drop session-only grants whose peer disconnected.
+    fn expire_session_grants(&mut self, addr: SocketAddr) {
+        let fingerprint = self
+            .incoming_conn_info
+            .values()
+            .find(|incoming| incoming.addr == addr)
+            .map(|incoming| incoming.fingerprint.clone());
+        let Some(fingerprint) = fingerprint else {
+            return;
+        };
+        let removed = self
+            .devices
+            .write()
+            .expect("lock")
+            .remove_ephemeral(&fingerprint);
+        if !removed {
+            return;
+        }
+        log::info!("session grant for {fingerprint} expired (peer disconnected)");
+        self.audit.event(
+            "session_grant_expired",
+            Some(&fingerprint),
+            None,
+            Some(&addr.to_string()),
+            Some("reason=disconnected"),
+        );
+        self.refresh_maps();
+        self.save_config();
+        self.broadcast_devices();
     }
 
     fn respond_pending(

@@ -6,7 +6,7 @@ use lan_mouse_proto::{
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
@@ -113,7 +113,6 @@ impl LanMouseListener {
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         trusted_nets: Arc<RwLock<Vec<AddressRule>>>,
         pairing_until: Arc<RwLock<Option<PairingWindow>>>,
-        denied: Arc<RwLock<HashSet<String>>>,
         devices: Arc<RwLock<DeviceStore>>,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
@@ -137,7 +136,6 @@ impl LanMouseListener {
             let authorized = authorized_keys.clone();
             let trusted = trusted_nets.clone();
             let pairing = pairing_until.clone();
-            let denied = denied.clone();
             let devices = devices.clone();
             spawn_local(async move {
                 // Bound the number of half-open handshakes so stray UDP
@@ -156,7 +154,6 @@ impl LanMouseListener {
                                 let authorized = authorized.clone();
                                 let trusted = trusted.clone();
                                 let pairing = pairing.clone();
-                                let denied = denied.clone();
                                 let devices = devices.clone();
                                 let conns = conns_clone.clone();
                                 let cfg = cfg.clone();
@@ -170,7 +167,7 @@ impl LanMouseListener {
                                         authorized.clone(),
                                         trusted,
                                         pairing.clone(),
-                                        denied.clone(),
+                                        devices.clone(),
                                         addr,
                                         recorded.clone(),
                                         auto_source.clone(),
@@ -417,7 +414,7 @@ fn per_connection_verify(
     authorized: Arc<RwLock<HashMap<String, String>>>,
     trusted: Arc<RwLock<Vec<AddressRule>>>,
     pairing_until: Arc<RwLock<Option<PairingWindow>>>,
-    denied: Arc<RwLock<HashSet<String>>>,
+    devices: Arc<RwLock<DeviceStore>>,
     addr: SocketAddr,
     recorded: Arc<Mutex<Option<String>>>,
     auto_source: Arc<Mutex<Option<AutoSource>>>,
@@ -432,7 +429,9 @@ fn per_connection_verify(
 
             // A revoked device must stay revoked: the deny list wins over the
             // authorized map, the address allowlist and an open pairing window.
-            if denied.read().expect("lock").contains(&fingerprint) {
+            // The check goes through the device store so an expiring deny stops
+            // blocking as soon as its deadline passes.
+            if devices.read().expect("lock").is_denied(&fingerprint) {
                 log::warn!("rejecting revoked device {fingerprint} from {addr}");
                 return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
             }

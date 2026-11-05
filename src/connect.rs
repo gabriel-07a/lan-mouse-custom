@@ -1078,7 +1078,6 @@ mod tests {
             Arc::new(RwLock::new(Vec::new())),
             Default::default(),
             Default::default(),
-            Default::default(),
         )
         .await
         .expect("listener")
@@ -1410,7 +1409,6 @@ mod tests {
                     trusted,
                     Default::default(),
                     Default::default(),
-                    Default::default(),
                 )
                 .await
                 .expect("listener");
@@ -1487,7 +1485,6 @@ mod tests {
                     authorized.clone(),
                     Arc::new(RwLock::new(Vec::new())),
                     pairing,
-                    Default::default(),
                     Default::default(),
                 )
                 .await
@@ -2074,7 +2071,9 @@ mod tests {
                     client_fp.clone(),
                     "peer".to_string(),
                 )])));
-                let denied = Arc::new(RwLock::new(HashSet::from([client_fp])));
+                let mut deny_store = crate::devices::DeviceStore::default();
+                deny_store.deny_until(client_fp, None, Some("test".to_string()));
+                let denied = Arc::new(RwLock::new(deny_store));
                 let mut listener = LanMouseListener::new(
                     port,
                     listener_cert,
@@ -2088,7 +2087,6 @@ mod tests {
                         outgoing: lan_mouse_ipc::DirectionPolicy::allow_all(),
                     }))),
                     denied,
-                    Default::default(),
                 )
                 .await
                 .expect("listener");
@@ -2125,7 +2123,6 @@ mod tests {
                     Arc::new(RwLock::new(HashMap::new())),
                     Arc::new(RwLock::new(Vec::new())),
                     pairing.clone(),
-                    Default::default(),
                     Default::default(),
                 )
                 .await
@@ -2249,7 +2246,6 @@ mod tests {
                     )]))),
                     Arc::new(RwLock::new(Vec::new())),
                     Default::default(),
-                    Default::default(),
                     devices,
                 )
                 .await
@@ -2359,7 +2355,6 @@ mod tests {
                     Arc::new(RwLock::new(vec![rule])),
                     Default::default(),
                     Default::default(),
-                    Default::default(),
                 )
                 .await
                 .expect("listener");
@@ -2426,7 +2421,6 @@ mod tests {
                     Arc::new(RwLock::new(HashMap::new())),
                     Arc::new(RwLock::new(Vec::new())),
                     pairing.clone(),
-                    Default::default(),
                     Default::default(),
                 )
                 .await

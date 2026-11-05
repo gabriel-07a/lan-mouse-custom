@@ -129,11 +129,17 @@ enum CliSubcommand {
         /// what this machine may do there (pointer,keyboard,clipboard | none | all)
         #[arg(long, default_value = "all")]
         outgoing: String,
+        /// grant only for the current session; dropped when the peer disconnects
+        #[arg(long)]
+        once: bool,
     },
-    /// deny a pending device permanently (revoked devices are never asked again)
+    /// deny a device (permanently by default, or for a limited time)
     Deny {
         /// SHA-256 fingerprint of the device
         fingerprint: String,
+        /// duration until the deny expires (`1h`, `30m`, `10s`) or `forever`
+        #[arg(long, default_value = "forever")]
+        r#for: String,
     },
     /// revoke a device: closes live sessions and denies the fingerprint
     Revoke {
@@ -189,6 +195,32 @@ enum ClipboardAction {
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
     execute(args.command).await?;
     Ok(())
+}
+
+/// Parse a deny duration (`forever`, `10s`, `30m`, `2h`, `1d`).
+fn parse_duration(spec: &str) -> Result<Option<u64>, CliError> {
+    let spec = spec.trim().to_ascii_lowercase();
+    if matches!(spec.as_str(), "forever" | "permanent" | "none" | "") {
+        return Ok(None);
+    }
+    let (number, unit) = spec.split_at(spec.len().saturating_sub(1));
+    let value: u64 = number.parse().map_err(|_| {
+        CliError::InvalidArgument(format!(
+            "invalid duration: {spec} (use 30m, 2h, 1d or forever)"
+        ))
+    })?;
+    let seconds = match unit {
+        "s" => value,
+        "m" => value * 60,
+        "h" => value * 60 * 60,
+        "d" => value * 24 * 60 * 60,
+        _ => {
+            return Err(CliError::InvalidArgument(format!(
+                "invalid duration: {spec} (use 30m, 2h, 1d or forever)"
+            )));
+        }
+    };
+    Ok(Some(seconds.max(1)))
 }
 
 /// Parse `pointer,keyboard,clipboard`, `all` or `none` into a policy.
@@ -503,29 +535,50 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             position,
             incoming,
             outgoing,
+            once,
         } => {
             let incoming = parse_policy(&incoming)?;
-            let outgoing = parse_policy(&outgoing)?;
-            tx.request(FrontendRequest::RespondPending {
-                fingerprint,
-                accept: true,
-                name,
-                position: Some(position),
-                incoming: Some(incoming),
-                outgoing: Some(outgoing),
-            })
-            .await?;
+            if once {
+                tx.request(FrontendRequest::GrantSession {
+                    fingerprint: fingerprint.clone(),
+                    name,
+                    position: Some(position),
+                    incoming,
+                })
+                .await?;
+                println!(
+                    "granted session access to {fingerprint}: incoming [{}] (dropped on disconnect)",
+                    incoming.capabilities.summary()
+                );
+            } else {
+                let outgoing = parse_policy(&outgoing)?;
+                tx.request(FrontendRequest::RespondPending {
+                    fingerprint: fingerprint.clone(),
+                    accept: true,
+                    name,
+                    position: Some(position),
+                    incoming: Some(incoming),
+                    outgoing: Some(outgoing),
+                })
+                .await?;
+                println!(
+                    "allowed {fingerprint}: incoming [{}], outgoing [{}]",
+                    incoming.capabilities.summary(),
+                    outgoing.capabilities.summary()
+                );
+            }
         }
-        CliSubcommand::Deny { fingerprint } => {
-            tx.request(FrontendRequest::RespondPending {
-                fingerprint,
-                accept: false,
-                name: None,
-                position: None,
-                incoming: None,
-                outgoing: None,
+        CliSubcommand::Deny { fingerprint, r#for } => {
+            let expires_in = parse_duration(&r#for)?;
+            tx.request(FrontendRequest::DenyDevice {
+                fingerprint: fingerprint.clone(),
+                expires_in,
             })
             .await?;
+            match expires_in {
+                Some(seconds) => println!("denied {fingerprint} for {seconds}s"),
+                None => println!("denied {fingerprint} permanently"),
+            }
         }
         CliSubcommand::Revoke { fingerprint } => {
             tx.request(FrontendRequest::RevokeDevice {

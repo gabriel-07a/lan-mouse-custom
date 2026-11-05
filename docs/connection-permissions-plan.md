@@ -512,8 +512,13 @@ clique de descoberta.
 > (`AuthRequest`/`AuthResponse`/`AuthRevoke`, capability `PERMISSIONS` com gating de
 > peers legados, grants do peer no `ClientState`); SAS de 6 dígitos no diálogo/pending e
 > detecção de troca de certificado (`cert_changed`, evento `CertificateChanged`).
-> Fase 2 concluída; próximo: fase 3 (sessões/--once, clipboard read/write, rate-limit,
-> quiosque, export/import, IPC auth e ACL de chave).
+> Fase 2 concluída.
+>
+> Fase 3 em andamento: **3.1 implementada** — deny com expiração (`DenyDevice { expires_in }`,
+> `deny --for 1h`, checagem de deny com expiração no listener via DeviceStore) e grants de sessão
+> (`GrantSession`/`allow --once`: `put_ephemeral`, nunca persistido, expirado no disconnect com
+> auditoria `session_grant`/`session_grant_expired`). Próximo: clipboard read/write separados
+> (3.2), rate-limit/limites (3.3) e 3.4 (quiosque, import/export, IPC auth, ACL Windows).
 
 Aceite: MITM no primeiro pareamento detectado por SAS; peer antigo conecta sob política legada
 marcada na UI; regra de endereço com `incoming=["clipboard"]` só entrega clipboard.

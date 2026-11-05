@@ -748,6 +748,20 @@ pub enum FrontendRequest {
     ListHistory { limit: u32 },
     /// remove an address from the allowlist
     UntrustAddress(String),
+    /// deny a device, optionally only for a limited time
+    DenyDevice {
+        fingerprint: String,
+        /// seconds until the deny expires; `None` means permanent
+        expires_in: Option<u64>,
+    },
+    /// grant a device for the current session only; the grant is dropped when
+    /// the peer disconnects
+    GrantSession {
+        fingerprint: String,
+        name: Option<String>,
+        position: Option<Position>,
+        incoming: DirectionPolicy,
+    },
     /// accept any device that connects during the next `seconds`
     StartPairing(u64),
     /// accept one device during the next `seconds`, granting these permissions
@@ -1290,6 +1304,19 @@ mod ipc_tests {
                 position: Some(Position::Bottom),
                 incoming: Some(DirectionPolicy::allow_all()),
                 outgoing: Some(DirectionPolicy::deny()),
+            },
+            FrontendRequest::DenyDevice {
+                fingerprint: "cc".into(),
+                expires_in: Some(3600),
+            },
+            FrontendRequest::GrantSession {
+                fingerprint: "dd".into(),
+                name: Some("visitor".into()),
+                position: Some(Position::Left),
+                incoming: DirectionPolicy {
+                    allowed: true,
+                    capabilities: Capabilities::KEYBOARD,
+                },
             },
         ];
         for request in requests {

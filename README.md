@@ -477,10 +477,16 @@ lan-mouse cli devices                  # name, fingerprint, position, caps, stat
 lan-mouse cli pending                 # devices waiting for approval
 lan-mouse cli allow <fingerprint> --name windows11 --position right \
     --incoming pointer,keyboard,clipboard --outgoing pointer,keyboard
-lan-mouse cli deny <fingerprint>      # deny permanently (deny list)
+lan-mouse cli deny <fingerprint> [--for 1h]  # deny permanently or for a while
+lan-mouse cli allow <fingerprint> --incoming keyboard --once  # session grant
 lan-mouse cli revoke <fingerprint>    # close sessions + deny
 lan-mouse cli rename <fingerprint> "desk pc"
 ```
+
+`--once` grants access only for the current session: the record is never
+written to the config and is revoked as soon as the peer disconnects, so the
+device is asked again next time. `deny --for 1h` (or `30m`, `2d`) makes a
+temporary revocation that stops blocking when it expires.
 
 `--incoming`/`--outgoing` accept `pointer,keyboard,clipboard`, `all` or `none`;
 `none` disables that direction. Policies are stored per device in the config:

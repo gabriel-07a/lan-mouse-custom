@@ -80,8 +80,8 @@ struct ConfigToml {
     devices: Option<Vec<TomlDevice>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     /// fingerprints that must never connect again (survives pairing and
-    /// address rules), written when a device is revoked
-    denied_fingerprints: Option<Vec<String>>,
+    /// address rules), written when a device is revoked; entries may expire
+    denied_fingerprints: Option<Vec<TomlDenied>>,
     /// address ranges that may connect without an authorization prompt,
     /// with the permissions granted to devices adopted through them
     address_rules: Option<Vec<TomlAddressRule>>,
@@ -192,6 +192,62 @@ impl From<Device> for TomlDevice {
             incoming: Some(device.incoming.into()),
             outgoing: Some(device.outgoing.into()),
             source: Some(device.source.as_str().to_string()),
+        }
+    }
+}
+
+/// A revoked fingerprint on disk.
+///
+/// The old format was a plain string list; both shapes are accepted so
+/// existing configs keep working, and permanent entries are still written as
+/// plain strings for older binaries.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+enum TomlDenied {
+    Plain(String),
+    Detailed {
+        fingerprint: String,
+        #[serde(default)]
+        expires: Option<u64>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+impl TomlDenied {
+    fn into_record(self) -> Option<crate::devices::DeniedRecord> {
+        let (fingerprint, expires, reason) = match self {
+            Self::Plain(fingerprint) => (fingerprint, None, None),
+            Self::Detailed {
+                fingerprint,
+                expires,
+                reason,
+            } => (fingerprint, expires, reason),
+        };
+        match crate::crypto::normalize_fingerprint(&fingerprint) {
+            Some(fingerprint) => Some(crate::devices::DeniedRecord::until(
+                fingerprint,
+                expires,
+                reason,
+            )),
+            None => {
+                log::warn!("ignoring malformed denied fingerprint: {fingerprint}");
+                None
+            }
+        }
+    }
+}
+
+impl From<crate::devices::DeniedRecord> for TomlDenied {
+    fn from(record: crate::devices::DeniedRecord) -> Self {
+        if record.expires.is_none() && record.reason.is_none() {
+            Self::Plain(record.fingerprint)
+        } else {
+            Self::Detailed {
+                fingerprint: record.fingerprint,
+                expires: record.expires,
+                reason: record.reason,
+            }
         }
     }
 }
@@ -766,13 +822,15 @@ impl Config {
             Some(devices.into_iter().map(TomlDevice::from).collect());
     }
 
-    /// fingerprints that were revoked and must not be authorized again by
-    /// pairing or by an address rule
-    pub fn denied_fingerprints(&self) -> Vec<String> {
+    /// Revoked fingerprints with their optional expiry.
+    pub(crate) fn denied_devices(&self) -> Vec<crate::devices::DeniedRecord> {
         self.config_toml
             .as_ref()
-            .and_then(|c| c.denied_fingerprints.clone())
+            .and_then(|config| config.denied_fingerprints.clone())
             .unwrap_or_default()
+            .into_iter()
+            .filter_map(TomlDenied::into_record)
+            .collect()
     }
 
     /// Auto-authorizing address rules with their permission policies.
@@ -936,14 +994,18 @@ impl Config {
     }
 
     /// set the revoked fingerprint list
-    pub fn set_denied_fingerprints(&mut self, fingerprints: Vec<String>) {
+    pub(crate) fn set_denied_devices(&mut self, denied: Vec<crate::devices::DeniedRecord>) {
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
         self.config_toml
             .as_mut()
             .expect("config")
-            .denied_fingerprints = (!fingerprints.is_empty()).then_some(fingerprints);
+            .denied_fingerprints = if denied.is_empty() {
+            None
+        } else {
+            Some(denied.into_iter().map(TomlDenied::from).collect())
+        };
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
@@ -1183,13 +1245,31 @@ mod tests {
 
     #[test]
     fn denied_fingerprints_parse_and_serialize() {
+        // Legacy shape: plain fingerprint strings.
         let config = parse("denied_fingerprints = [\"aa\", \"bb\"]\n");
-        assert_eq!(
-            config.denied_fingerprints,
-            Some(vec!["aa".to_string(), "bb".to_string()])
-        );
+        let denied = config.denied_fingerprints.clone().expect("denied entries");
+        assert_eq!(denied.len(), 2);
+        assert!(matches!(&denied[0], TomlDenied::Plain(_)));
         let serialized = toml_edit::ser::to_string_pretty(&config).expect("serialize");
         assert!(serialized.contains("denied_fingerprints"));
+
+        // New shape: entries with expiry and reason.
+        let config = parse(
+            "[[denied_fingerprints]]\nfingerprint = \"cc\"\nexpires = 1900000000\nreason = \"kiosk\"\n",
+        );
+        let denied = config.denied_fingerprints.clone().expect("denied entries");
+        match &denied[0] {
+            TomlDenied::Detailed {
+                fingerprint,
+                expires,
+                reason,
+            } => {
+                assert_eq!(fingerprint, "cc");
+                assert_eq!(*expires, Some(1_900_000_000));
+                assert_eq!(reason.as_deref(), Some("kiosk"));
+            }
+            TomlDenied::Plain(_) => panic!("expected detailed entry"),
+        }
     }
 
     #[test]
