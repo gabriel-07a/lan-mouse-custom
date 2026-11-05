@@ -17,7 +17,7 @@ use windows::Win32::{
     Foundation::POINT,
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext},
-        WindowsAndMessaging::GetCursorPos,
+        WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, GetCursorInfo, GetCursorPos},
     },
 };
 
@@ -26,6 +26,29 @@ fn cursor_pos() -> Option<(i32, i32)> {
     unsafe { GetCursorPos(&mut pt) }
         .is_ok()
         .then_some((pt.x, pt.y))
+}
+
+/// Whether Windows currently draws the mouse cursor (across the desktop).
+fn cursor_showing() -> Option<bool> {
+    let mut info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetCursorInfo(&mut info) }.ok()?;
+    Some(info.flags.0 & CURSOR_SHOWING.0 != 0)
+}
+
+async fn wait_cursor_showing(expect_shown: bool, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if cursor_showing() == Some(expect_shown) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -59,6 +82,7 @@ async fn windows_backends_initialize_and_move_cursor_and_trigger_barrier() {
 
             // If an interactive desktop with cursor access is available, verify
             // that SendInput moves the cursor and crosses the left barrier.
+            let cursor_was_showing = cursor_showing() == Some(true);
             if let Some(initial) = cursor_pos() {
                 // Move slightly toward the center first so we have a known starting movement.
                 emulation
@@ -94,6 +118,16 @@ async fn windows_backends_initialize_and_move_cursor_and_trigger_barrier() {
                 if let Ok(Some(Ok((handle, event)))) = begin {
                     assert_eq!(handle, 0, "expected Left barrier (handle 0)");
                     assert_eq!(event, CaptureEvent::Begin);
+
+                    // While this machine drives the peer, the local pointer
+                    // must disappear (1x1 topmost overlay under the pinned
+                    // cursor).
+                    if cursor_was_showing {
+                        assert!(
+                            wait_cursor_showing(false, Duration::from_secs(1)).await,
+                            "local pointer must be hidden while the peer is controlled"
+                        );
+                    }
 
                     // While capture is active, inject a key press + release and verify the hook captures it.
                     let key_a = scancode::Linux::KeyA as u32;
@@ -151,6 +185,26 @@ async fn windows_backends_initialize_and_move_cursor_and_trigger_barrier() {
             }
 
             capture.release().await.expect("release capture");
+
+            // The overlay is hidden on release; nudge the pointer so Windows
+            // recomputes the cursor shape for the window now under it.
+            if cursor_was_showing {
+                let _ = emulation
+                    .consume(
+                        Event::Pointer(PointerEvent::Motion {
+                            time: 0,
+                            dx: 2.0,
+                            dy: 2.0,
+                        }),
+                        0,
+                    )
+                    .await;
+                assert!(
+                    wait_cursor_showing(true, Duration::from_secs(1)).await,
+                    "local pointer must be restored after the capture is released"
+                );
+            }
+
             capture.terminate().await.expect("terminate capture");
             emulation.terminate().await;
         })

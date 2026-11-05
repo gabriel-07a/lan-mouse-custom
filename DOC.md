@@ -122,6 +122,31 @@ level mouse hook:
   out-of-bounds detector and re-pins the cursor every event so its deltas are
   per-event rather than cumulative.
 
+## Local cursor visibility
+
+While a machine is driving a peer, its own pointer is hidden so the cursor
+visually "moves" to the other screen instead of staying parked on the edge.
+
+- **Windows**: a 1x1 topmost tool window (`WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+  WS_EX_NOACTIVATE`) is created once, hidden, by the hook thread. On capture it
+  is positioned under the pinned entry point, shown, and its `WM_SETCURSOR`
+  handler calls `SetCursor(NULL)` and returns `TRUE`, which removes the pointer
+  for as long as it stays over that window. On release the window is hidden;
+  the next `WM_SETCURSOR` restores the normal cursor. A real window rather than
+  `ShowCursor(FALSE)` is used because the display counter is global and an
+  unbalanced call (crash, kill) can leave the cursor hidden system-wide, while
+  the overlay is owned by the capture thread and disappears with the process.
+- **macOS**: `CGDisplay::hide_cursor` / `show_cursor` around Grab/Release
+  already.
+- **Wayland wlroots/layer-shell**: the pointer cursor is set to `NULL` on
+  grab; restoring it after release is compositor-dependent and should be
+  validated on Sway/Hyprland. GNOME/Wayland (libei) has no API to hide the
+  compositor-owned cursor, so it remains visible there.
+- **X11**: the capture backend is not implemented in this fork.
+
+The local cursor is only hidden on the *sending* side; the receiving machine
+always keeps the visible pointer, since that is what the user is controlling.
+
 ## Symmetric roles
 Every instance runs both a listener and an outgoing connection, so *server* and
 *client* above only describe who initiates a given DTLS session — not a fixed
@@ -140,7 +165,7 @@ Testing combinations across Linux, Windows 10, and Windows 11 uses three layers:
    - `src/connect.rs`: full end-to-end loopback tests (`Capture` + `DummyInputCapture` → DTLS → `LanMouseListener` → `Emulation` + `ClipboardFrame`).
 2. **Real Windows kernel & session CI (`.github/workflows/rust.yml` and `release.yml`):**
    - Runs on both `windows-2022` (Windows 10 / Server 2022 kernel) and `windows-2025` (Windows 11 24H2 / Server 2025 kernel) using MSYS2 `UCRT64`.
-   - `tests/windows_input.rs` exercises real `SendInput`, `GetCursorPos`, `WH_MOUSE_LL`, and `WH_KEYBOARD_LL` hooks on the runner's desktop session.
+   - `tests/windows_input.rs` exercises real `SendInput`, `GetCursorPos`, `WH_MOUSE_LL`, and `WH_KEYBOARD_LL` hooks on the runner's desktop session, and checks that the local pointer is hidden while a capture is active and restored after release (`GetCursorInfo`).
    - `release.yml` runs a silent install (`/S`) of the NSIS installer, verifies `lan-mouse.exe doctor --probe --json` reports `windows` for both capture and emulation, and runs the silent uninstaller.
 3. **Local KVM/QEMU lab (`scripts/vm-test-lab.sh`):**
    - Generates `quickemu`/QEMU configurations for Windows 10 and Windows 11 (with virtual TPM 2.0, Secure Boot, and QXL multi-head virtual monitors for mixed-DPI testing) plus pre-paired `config.toml` files using `trusted_ips`.

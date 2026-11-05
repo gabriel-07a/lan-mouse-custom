@@ -69,6 +69,13 @@ Most current desktop environments and operating systems are fully supported, thi
 > crossing. If a pointer still sticks at an edge, run with `LAN_MOUSE_LOG_LEVEL=debug` and check
 > for the `ENTERED @ ...` line: without it the edge is not being treated as a barrier (usually
 > a missing client at that position or a display layout where that edge is not the outer one).
+>
+> - **Local cursor while sending**: the pointer of the machine that currently controls a peer
+> is hidden, so the cursor appears to "move" to the other screen instead of sitting parked at
+> the edge. Windows, macOS and wlroots/layer-shell backends support this; on GNOME/Wayland the
+> pointer is compositor-owned (libei has no hide API), so it stays visible there. The cursor is
+> restored on every release/Leave/disconnect path, and a crash cannot leave it hidden (the
+> Windows overlay window is destroyed with the process).
 
 For more detailed information about os support see [Detailed OS Support](#detailed-os-support)
 

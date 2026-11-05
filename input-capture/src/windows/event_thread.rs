@@ -22,14 +22,16 @@ use windows::Win32::UI::Input::{
     RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos, GetMessageW, HOOKPROC, HWND_MESSAGE,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WINDOW_STYLE, WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
-    WNDPROC,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos, GetMessageW, HOOKPROC, HWND_MESSAGE, HWND_TOPMOST,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLMHF_INJECTED, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT,
+    PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SetCursor, SetCursorPos, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -130,6 +132,94 @@ fn try_send_event(
     EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
 }
 
+fn hidden_pointer_hwnd() -> Option<HWND> {
+    match HIDDEN_POINTER_WINDOW.get() {
+        0 => None,
+        raw => Some(HWND(raw as *mut core::ffi::c_void)),
+    }
+}
+
+/// Window procedure for the hidden-pointer overlay.
+///
+/// The overlay is a 1x1 topmost window positioned exactly under the pinned
+/// pointer. Returning `TRUE` from `WM_SETCURSOR` after `SetCursor(NULL)`
+/// removes the cursor for as long as the pointer stays over that window, which
+/// is precisely the duration of the capture.
+unsafe extern "system" fn hidden_pointer_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_SETCURSOR => {
+            unsafe {
+                SetCursor(None);
+            }
+            LRESULT(1)
+        }
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Park the overlay on `point` and show it, hiding the local pointer.
+fn show_hidden_pointer(point: (i32, i32)) {
+    let Some(hwnd) = hidden_pointer_hwnd() else {
+        return;
+    };
+    let positioned = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            point.0,
+            point.1,
+            1,
+            1,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    };
+    if let Err(e) = positioned {
+        if !HIDDEN_POINTER_WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!("could not position the local cursor overlay: {e}");
+        }
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // Showing a window under a stationary cursor does not reliably send
+        // WM_SETCURSOR; remove the cursor explicitly and let the window
+        // procedure keep it removed for the rest of the capture.
+        SetCursor(None);
+    }
+    if !HIDDEN_POINTER_SHOWN.replace(true) {
+        log::debug!("local pointer hidden while the peer is controlled");
+    }
+}
+
+/// Hide the overlay, restoring the normal cursor.
+fn hide_hidden_pointer() {
+    let Some(hwnd) = hidden_pointer_hwnd() else {
+        return;
+    };
+    if HIDDEN_POINTER_SHOWN.replace(false) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        log::debug!("local pointer restored");
+    }
+}
+
+fn destroy_hidden_pointer() {
+    hide_hidden_pointer();
+    if let Some(hwnd) = hidden_pointer_hwnd() {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        HIDDEN_POINTER_WINDOW.set(0);
+    }
+}
+
 thread_local! {
     /// all configured clients
     static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
@@ -154,7 +244,15 @@ thread_local! {
     /// a remote peer is currently driving this machine; local barrier
     /// detection must stay quiet to avoid a hand-off ping-pong
     static REMOTE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// 1x1 topmost window used to hide the local pointer while capturing.
+    /// 0 means "not created" (raw pointer value of the HWND).
+    static HIDDEN_POINTER_WINDOW: Cell<isize> = const { Cell::new(0) };
+    /// whether the hidden-pointer overlay is currently shown
+    static HIDDEN_POINTER_SHOWN: Cell<bool> = const { Cell::new(false) };
 }
+
+/// Log a failure to set up the local pointer overlay only once.
+static HIDDEN_POINTER_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn get_msg() -> Option<MSG> {
     unsafe {
@@ -275,6 +373,44 @@ fn start_routine(
         return;
     };
 
+    // 1x1 topmost window that hides the local pointer while a capture is
+    // active. The pointer is pinned to the entry point, so this window sits
+    // exactly under the hotspot and its WM_SETCURSOR handler removes the
+    // cursor. A real window (unlike ShowCursor's global counter) is owned by
+    // this thread: it is destroyed with the process, so a crash cannot leave
+    // the cursor hidden forever.
+    let hidden_pointer_class = WNDCLASSW {
+        lpfnWndProc: Some(hidden_pointer_proc),
+        hInstance: instance,
+        lpszClassName: w!("lan-mouse-hidden-pointer"),
+        ..Default::default()
+    };
+    if unsafe { RegisterClassW(&hidden_pointer_class) } == 0 {
+        // The class may already exist when the capture backend is recreated
+        // (e.g. after an error). Creating the window can still succeed.
+        log::debug!("local cursor overlay class was already registered");
+    }
+    let hidden = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("lan-mouse-hidden-pointer"),
+            w!("lan-mouse-hidden-pointer"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(instance),
+            None,
+        )
+    };
+    match hidden {
+        Ok(hidden) => HIDDEN_POINTER_WINDOW.set(hidden.0 as isize),
+        Err(e) => log::warn!("could not create the local cursor overlay: {e}"),
+    }
+
     // Relative motion via raw input is immune to pointer clamping and DPI
     // virtualisation: at the desktop edge Windows stops the *cursor* but
     // still reports the movement that pushed against it. This is what makes
@@ -329,6 +465,10 @@ fn start_routine(
             }
         }
     }
+
+    // The overlay must never survive the capture thread: a stale window (or
+    // a hidden cursor) could otherwise outlive the capture.
+    destroy_hidden_pointer();
 }
 
 fn release_active_client() {
@@ -339,6 +479,7 @@ fn release_active_client() {
         LAST_RELEASE.replace(Some(Instant::now()));
     }
     PREV_POS.replace(None);
+    hide_hidden_pointer();
 }
 
 /// Enter the client registered at `pos`.
@@ -360,6 +501,10 @@ fn activate(pos: Position, at: (i32, i32)) {
     // that peers with another scale can consume at the same logical speed.
     DPI_SCALE.replace(unsafe { monitor_scale(entry_point) });
     PREV_POS.replace(Some(entry_point));
+    // Show the overlay under the pinned pointer *before* moving the cursor:
+    // the resulting WM_SETCURSOR is delivered to the overlay and removes the
+    // local cursor for the duration of the capture.
+    show_hidden_pointer(entry_point);
     unsafe {
         let _ = SetCursorPos(entry_point.0, entry_point.1);
     }
@@ -577,6 +722,13 @@ unsafe extern "system" fn window_proc(
         WM_DISPLAYCHANGE => {
             log::debug!("display resolution changed");
             DISPLAY_RESOLUTION_GENERATION.fetch_add(1, Ordering::Release);
+            if ACTIVE_CLIENT.get().is_some() {
+                // Keep the cursor hidden: the entry point may still be valid
+                // (resolution change on another monitor) but repositioning is
+                // cheap and keeps the overlay under the pinned pointer.
+                let (entry_x, entry_y) = ENTRY_POINT.get();
+                show_hidden_pointer((entry_x, entry_y));
+            }
             LRESULT(0)
         }
         WM_INPUT => {

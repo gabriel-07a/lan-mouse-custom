@@ -483,6 +483,13 @@ impl State {
             None => return,
         };
 
+        // NOTE: `grab` hides the cursor with `wl_pointer.set_cursor(None)`.
+        // Restoring the compositor's default cursor on release has no
+        // dedicated Wayland request; whether the pointer reappears when the
+        // lock/interactivity is dropped is compositor-dependent and still
+        // needs validation on Sway/Hyprland. Do not add a speculative cursor
+        // theme dependency here without that check.
+
         // ungrab surface
         window
             .layer_surface
