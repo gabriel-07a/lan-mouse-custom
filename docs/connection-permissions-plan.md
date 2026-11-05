@@ -520,8 +520,15 @@ clique de descoberta.
 > com fallback permissivo para fingerprints desconhecidos);
 > **3.3 implementada** — rate-limit por IP (20/min), limite de handshakes em voo (32), teto de
 > conexões vivas (128) e poda de rejeições/pendências antigas.
-> Próximo: 3.4 (modo quiosque, import/export de política, autenticação do IPC local, ACL da chave
-> no Windows) e fechamento.
+> **3.4 implementada** — modo quiosque (`accept_incoming = false`, rejeitado no callback de
+> certificado), backup/transferência de política (`export-policy`/`import-policy`, validação
+> atômica, auditoria), autenticação do IPC local por `SO_PEERCRED` no Unix (limitação do loopback
+> TCP no Windows documentada) e ACL da chave privada best-effort no Windows via `icacls`.
+>
+> **Fases 2 e 3 concluídas.** Pendências conhecidas (documentadas, fora do escopo aprovado): SAS
+> mútuo com troca de nonce (o código atual é determinístico e exibido dos dois lados quando as
+> fingerprints são conhecidas), autenticação do IPC no Windows (requer named pipe/token) e a
+> revisão visual da UI de auditoria/histórico.
 
 Aceite: MITM no primeiro pareamento detectado por SAS; peer antigo conecta sob política legada
 marcada na UI; regra de endereço com `incoming=["clipboard"]` só entrega clipboard.

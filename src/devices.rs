@@ -14,6 +14,7 @@
 //! control one machine while not being controllable in return.
 
 use lan_mouse_ipc::{DirectionPolicy, PendingView};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -151,6 +152,47 @@ impl DeniedRecord {
         self.expires
             .is_some_and(|expires| unix_secs(SystemTime::now()) >= expires)
     }
+}
+
+/// Portable permission policy: devices, address rules and revoked identities.
+///
+/// This is what `export-policy` writes and `import-policy` reads. It contains
+/// no addresses of configured links and no session state, so it can be copied
+/// between machines.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PolicyBundle {
+    #[serde(default)]
+    pub devices: Vec<PolicyDevice>,
+    #[serde(default)]
+    pub address_rules: Vec<PolicyAddressRule>,
+    #[serde(default)]
+    pub denied: Vec<PolicyDenied>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PolicyDevice {
+    pub fingerprint: String,
+    pub name: String,
+    pub incoming: DirectionPolicy,
+    pub outgoing: DirectionPolicy,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PolicyAddressRule {
+    pub address: String,
+    pub incoming: DirectionPolicy,
+    pub outgoing: DirectionPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PolicyDenied {
+    pub fingerprint: String,
+    #[serde(default)]
+    pub expires: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// In-memory store for devices, revoked fingerprints and pending requests.
@@ -403,6 +445,120 @@ impl DeviceStore {
         });
     }
 
+    /// Serialize the persistent part of the policy for `export-policy`.
+    pub(crate) fn export_bundle(
+        &self,
+        address_rules: &[crate::trusted::AddressRule],
+    ) -> PolicyBundle {
+        PolicyBundle {
+            devices: self
+                .persistent_devices()
+                .map(|device| PolicyDevice {
+                    fingerprint: device.fingerprint.clone(),
+                    name: device.name.clone(),
+                    incoming: device.incoming,
+                    outgoing: device.outgoing,
+                    source: Some(device.source.as_str().to_string()),
+                })
+                .collect(),
+            address_rules: address_rules
+                .iter()
+                .map(|rule| PolicyAddressRule {
+                    address: rule.net.to_string(),
+                    incoming: rule.incoming,
+                    outgoing: rule.outgoing,
+                })
+                .collect(),
+            denied: self
+                .denied()
+                .into_iter()
+                .map(|record| PolicyDenied {
+                    fingerprint: record.fingerprint,
+                    expires: record.expires,
+                    reason: record.reason,
+                })
+                .collect(),
+        }
+    }
+
+    /// Replace the policy with an imported bundle.
+    ///
+    /// Everything is validated before anything is applied, so a malformed
+    /// file leaves the running policy untouched. Session grants are kept.
+    pub(crate) fn import_bundle(
+        &mut self,
+        bundle: &PolicyBundle,
+        address_rules: &mut Vec<crate::trusted::AddressRule>,
+    ) -> Result<(), String> {
+        let mut devices = Vec::with_capacity(bundle.devices.len());
+        for device in &bundle.devices {
+            let Some(fingerprint) = crate::crypto::normalize_fingerprint(&device.fingerprint)
+            else {
+                return Err(format!(
+                    "invalid device fingerprint: {}",
+                    device.fingerprint
+                ));
+            };
+            devices.push(Device {
+                fingerprint,
+                name: device.name.clone(),
+                incoming: device.incoming,
+                outgoing: device.outgoing,
+                source: device
+                    .source
+                    .as_deref()
+                    .map(DeviceSource::parse)
+                    .unwrap_or_default(),
+            });
+        }
+        let mut rules = Vec::with_capacity(bundle.address_rules.len());
+        for rule in &bundle.address_rules {
+            let Some(net) = crate::trusted::TrustedNet::parse(&rule.address) else {
+                return Err(format!("invalid address rule: {}", rule.address));
+            };
+            rules.push(crate::trusted::AddressRule::new(
+                net,
+                rule.incoming,
+                rule.outgoing,
+            ));
+        }
+        let mut denied = Vec::with_capacity(bundle.denied.len());
+        for record in &bundle.denied {
+            let Some(fingerprint) = crate::crypto::normalize_fingerprint(&record.fingerprint)
+            else {
+                return Err(format!(
+                    "invalid denied fingerprint: {}",
+                    record.fingerprint
+                ));
+            };
+            denied.push(DeniedRecord::until(
+                fingerprint,
+                record.expires,
+                record.reason.clone(),
+            ));
+        }
+
+        // Validation passed: apply atomically from the caller's point of view.
+        let ephemeral = self.ephemeral.clone();
+        self.devices.clear();
+        self.denied.clear();
+        for device in devices {
+            self.devices.insert(device.fingerprint.clone(), device);
+        }
+        for record in denied {
+            if !record.is_expired() {
+                self.denied.insert(record.fingerprint.clone(), record);
+            }
+        }
+        self.ephemeral = ephemeral;
+        for fingerprint in self.denied.keys() {
+            self.devices.remove(fingerprint);
+            self.ephemeral.remove(fingerprint);
+        }
+        *address_rules = rules;
+        Ok(())
+    }
+
     pub(crate) fn pending_views(&mut self) -> Vec<PendingView> {
         self.prune_pending();
         let mut pending = self.pending.values().collect::<Vec<_>>();
@@ -544,6 +700,57 @@ mod tests {
         assert!(store.remove_ephemeral(&fp(1)));
         assert!(!store.is_known(&fp(1)));
         assert!(!store.remove_ephemeral(&fp(1)), "already gone");
+    }
+
+    #[test]
+    fn policy_bundle_roundtrips_through_json() {
+        let mut store = DeviceStore::default();
+        store.put(Device {
+            fingerprint: fp(1),
+            name: "laptop".into(),
+            incoming: DirectionPolicy::allow_all(),
+            outgoing: DirectionPolicy::deny(),
+            source: DeviceSource::Manual,
+        });
+        store.deny_until(fp(2), Some(unix_secs(SystemTime::now()) + 60), None);
+        let rules = vec![crate::trusted::AddressRule::new(
+            crate::trusted::TrustedNet::parse("10.0.0.0/24").expect("cidr"),
+            DirectionPolicy::allow_all(),
+            DirectionPolicy::deny(),
+        )];
+        let bundle = store.export_bundle(&rules);
+        let json = serde_json::to_string(&bundle).expect("serialize");
+        let decoded: PolicyBundle = serde_json::from_str(&json).expect("decode");
+
+        let mut imported = DeviceStore::default();
+        let mut imported_rules = Vec::new();
+        imported
+            .import_bundle(&decoded, &mut imported_rules)
+            .expect("import");
+        assert!(imported.is_known(&fp(1)));
+        assert_eq!(imported.outgoing(&fp(1)), DirectionPolicy::deny());
+        assert!(imported.is_denied(&fp(2)));
+        assert_eq!(imported_rules.len(), 1);
+        assert_eq!(imported_rules[0].net.to_string(), "10.0.0.0/24");
+    }
+
+    #[test]
+    fn invalid_policy_is_rejected_without_changing_the_store() {
+        let mut store = DeviceStore::default();
+        store.put(Device::new(fp(1), "keep".into()));
+        let mut rules = Vec::new();
+        let invalid = PolicyBundle {
+            devices: vec![PolicyDevice {
+                fingerprint: "not-a-fingerprint".into(),
+                name: "bad".into(),
+                incoming: DirectionPolicy::allow_all(),
+                outgoing: DirectionPolicy::deny(),
+                source: None,
+            }],
+            ..Default::default()
+        };
+        assert!(store.import_bundle(&invalid, &mut rules).is_err());
+        assert!(store.is_known(&fp(1)), "existing policy is untouched");
     }
 
     #[test]

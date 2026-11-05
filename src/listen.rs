@@ -158,6 +158,7 @@ impl LanMouseListener {
         trusted_nets: Arc<RwLock<Vec<AddressRule>>>,
         pairing_until: Arc<RwLock<Option<PairingWindow>>>,
         devices: Arc<RwLock<DeviceStore>>,
+        accept_incoming: Arc<RwLock<bool>>,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, mut request_port_change_rx) = channel();
@@ -181,6 +182,7 @@ impl LanMouseListener {
             let trusted = trusted_nets.clone();
             let pairing = pairing_until.clone();
             let devices = devices.clone();
+            let accept_incoming = accept_incoming.clone();
             spawn_local(async move {
                 // Bound the number of half-open handshakes so stray UDP
                 // traffic cannot spawn unbounded tasks.
@@ -222,6 +224,7 @@ impl LanMouseListener {
                                 let trusted = trusted.clone();
                                 let pairing = pairing.clone();
                                 let devices = devices.clone();
+                                let accept_incoming = accept_incoming.clone();
                                 let conns = conns_clone.clone();
                                 let cfg = cfg.clone();
                                 spawn_local(async move {
@@ -235,6 +238,7 @@ impl LanMouseListener {
                                         trusted,
                                         pairing.clone(),
                                         devices.clone(),
+                                        accept_incoming.clone(),
                                         addr,
                                         recorded.clone(),
                                         auto_source.clone(),
@@ -477,17 +481,27 @@ enum AutoSource {
 /// state: auto-authorization is recorded here but persisted by the accept
 /// task after the handshake succeeds, so an aborted handshake cannot leave an
 /// orphaned pin.
+#[allow(clippy::too_many_arguments)]
 fn per_connection_verify(
     authorized: Arc<RwLock<HashMap<String, String>>>,
     trusted: Arc<RwLock<Vec<AddressRule>>>,
     pairing_until: Arc<RwLock<Option<PairingWindow>>>,
     devices: Arc<RwLock<DeviceStore>>,
+    accept_incoming: Arc<RwLock<bool>>,
     addr: SocketAddr,
     recorded: Arc<Mutex<Option<String>>>,
     auto_source: Arc<Mutex<Option<AutoSource>>>,
 ) -> VerifyPeerCertificateFn {
     Arc::new(
         move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
+            // Kiosk mode: no incoming control at all. Rejecting in the
+            // certificate callback covers authorized devices, address rules
+            // and the pairing window alike, and the peer only sees a
+            // handshake failure.
+            if !*accept_incoming.read().expect("lock") {
+                log::debug!("rejecting incoming connection from {addr}: kiosk mode");
+                return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+            }
             let Some(cert) = certs.first() else {
                 return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
             };

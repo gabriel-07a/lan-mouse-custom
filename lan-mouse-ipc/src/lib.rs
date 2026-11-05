@@ -528,6 +528,8 @@ pub enum FrontendEvent {
     PairingReview(Vec<DeviceView>),
     /// recent audit events, newest first
     ConnectionHistory(Vec<HistoryEntry>),
+    /// serialized permission policy (JSON) produced by `ExportPolicy`
+    PolicyExport { json: String },
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -771,6 +773,10 @@ pub enum FrontendRequest {
     ListAddressRules,
     /// request the most recent audit entries
     ListHistory { limit: u32 },
+    /// serialize devices, address rules and revocations (JSON)
+    ExportPolicy,
+    /// replace the permission policy from a JSON bundle
+    ImportPolicy { json: String },
     /// remove an address from the allowlist
     UntrustAddress(String),
     /// deny a device, optionally only for a limited time
@@ -1297,6 +1303,16 @@ mod ipc_tests {
             attempts: 3,
         };
         assert_eq!(json_roundtrip(pending.clone()), pending);
+    }
+
+    #[test]
+    fn policy_export_and_import_roundtrip() {
+        json_roundtrip(FrontendEvent::PolicyExport { json: "{}".into() });
+        json_roundtrip(FrontendRequest::ExportPolicy);
+        let request = FrontendRequest::ImportPolicy {
+            json: "{\"devices\":[]}".into(),
+        };
+        assert_eq!(json_roundtrip(request.clone()), request);
     }
 
     #[test]

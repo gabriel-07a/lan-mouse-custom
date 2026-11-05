@@ -490,6 +490,7 @@ mod tests {
                     Arc::new(RwLock::new(Vec::new())),
                     Default::default(),
                     Default::default(),
+                    Arc::new(RwLock::new(true)),
                 )
                 .await
                 .expect("listener");

@@ -131,6 +131,18 @@ impl Drop for AsyncFrontendListener {
     }
 }
 
+/// Whether the IPC client runs as the same user as the service.
+#[cfg(unix)]
+fn peer_is_same_user(stream: &UnixStream) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) => cred.uid() == unsafe { libc::geteuid() },
+        Err(e) => {
+            log::warn!("could not read IPC peer credentials: {e}");
+            false
+        }
+    }
+}
+
 impl Stream for AsyncFrontendListener {
     type Item = Result<FrontendRequest, IpcError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -140,6 +152,16 @@ impl Stream for AsyncFrontendListener {
         }
         let mut sync = false;
         while let Poll::Ready(Ok((stream, _))) = self.listener.poll_accept(cx) {
+            // On Unix the local socket lives in $XDG_RUNTIME_DIR, but the
+            // permission check is enforced explicitly so another local user
+            // can never drive this service (which can grant control over the
+            // machine). Windows uses a loopback TCP socket, which cannot carry
+            // peer credentials; that limitation is documented in the README.
+            #[cfg(unix)]
+            if !peer_is_same_user(&stream) {
+                log::warn!("rejecting IPC connection from a different user");
+                continue;
+            }
             let (rx, tx) = tokio::io::split(stream);
             let buf_reader = BufReader::new(rx);
             let lines = buf_reader.lines();

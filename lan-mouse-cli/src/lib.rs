@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 
-use std::{net::IpAddr, time::Duration};
+use std::{net::IpAddr, path::PathBuf, time::Duration};
 use thiserror::Error;
 
 use lan_mouse_ipc::{
@@ -18,6 +18,8 @@ pub enum CliError {
     Ipc(#[from] IpcError),
     #[error("{0}")]
     InvalidArgument(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -148,6 +150,10 @@ enum CliSubcommand {
     },
     /// rename a known device
     Rename { fingerprint: String, name: String },
+    /// export the permission policy (devices, address rules, denials) as JSON
+    ExportPolicy { file: PathBuf },
+    /// import a permission policy from a JSON file
+    ImportPolicy { file: PathBuf },
     /// pin the expected certificate fingerprint of a client
     SetFingerprint {
         id: ClientHandle,
@@ -623,6 +629,21 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     break;
                 }
             }
+        }
+        CliSubcommand::ExportPolicy { file } => {
+            tx.request(FrontendRequest::ExportPolicy).await?;
+            while let Some(e) = rx.next().await {
+                if let FrontendEvent::PolicyExport { json } = e? {
+                    std::fs::write(&file, json)?;
+                    println!("policy exported to {}", file.display());
+                    break;
+                }
+            }
+        }
+        CliSubcommand::ImportPolicy { file } => {
+            let json = std::fs::read_to_string(&file)?;
+            tx.request(FrontendRequest::ImportPolicy { json }).await?;
+            println!("policy imported from {}", file.display());
         }
         CliSubcommand::SetFingerprint { id, fingerprint } => {
             tx.request(FrontendRequest::UpdateFingerprint(id, fingerprint.clone()))

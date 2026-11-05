@@ -87,6 +87,35 @@ pub fn load_certificate(path: &Path) -> Result<Certificate, Error> {
     Ok(Certificate::from_pem(pem.as_str())?)
 }
 
+/// Best-effort ACL hardening for the private key on Windows.
+///
+/// `std` cannot set ACLs, so this shells out to `icacls` (present on every
+/// supported Windows release): inheritance is removed and the current user
+/// gets read-only access, mirroring the `0400` mode used on Unix. A failure
+/// is logged but never prevents the service from starting.
+#[cfg(windows)]
+fn restrict_windows_key_acl(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    let Ok(user) = std::env::var("USERNAME") else {
+        log::warn!("could not determine the current user; key ACL not restricted");
+        return;
+    };
+    let result = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:R"))
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .status();
+    match result {
+        Ok(status) if status.success() => {
+            log::debug!("restricted private key ACL to {user}:R");
+        }
+        Ok(status) => log::warn!("icacls failed for {path:?} ({status})"),
+        Err(e) => log::warn!("could not run icacls for {path:?}: {e}"),
+    }
+}
+
 pub(crate) fn load_or_generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
     if path.exists() && path.is_file() {
         Ok(load_certificate(path)?)
@@ -107,9 +136,22 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
         perm.set_mode(0o400); /* r-- --- --- */
         f.set_permissions(perm)?;
     }
-    /* FIXME windows permissions */
+    // On Windows the handle is reopened after creation so the ACL can be
+    // applied before the PEM bytes are written; on Unix the create handle is
+    // used directly.
+    #[cfg(windows)]
+    let f = {
+        drop(f);
+        File::options().append(true).open(path)?
+    };
+
     let mut writer = BufWriter::new(f);
     writer.write_all(serialized.as_bytes())?;
+    drop(writer);
+
+    #[cfg(windows)]
+    restrict_windows_key_acl(path);
+
     Ok(cert)
 }
 

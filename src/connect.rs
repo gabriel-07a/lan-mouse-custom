@@ -1078,6 +1078,7 @@ mod tests {
             Arc::new(RwLock::new(Vec::new())),
             Default::default(),
             Default::default(),
+            Arc::new(RwLock::new(true)),
         )
         .await
         .expect("listener")
@@ -1409,6 +1410,7 @@ mod tests {
                     trusted,
                     Default::default(),
                     Default::default(),
+                    Arc::new(RwLock::new(true)),
                 )
                 .await
                 .expect("listener");
@@ -1486,6 +1488,7 @@ mod tests {
                     Arc::new(RwLock::new(Vec::new())),
                     pairing,
                     Default::default(),
+                    Arc::new(RwLock::new(true)),
                 )
                 .await
                 .expect("listener");
@@ -2087,6 +2090,7 @@ mod tests {
                         outgoing: lan_mouse_ipc::DirectionPolicy::allow_all(),
                     }))),
                     denied,
+                    Arc::new(RwLock::new(true)),
                 )
                 .await
                 .expect("listener");
@@ -2124,6 +2128,7 @@ mod tests {
                     Arc::new(RwLock::new(Vec::new())),
                     pairing.clone(),
                     Default::default(),
+                    Arc::new(RwLock::new(true)),
                 )
                 .await
                 .expect("listener");
@@ -2247,6 +2252,7 @@ mod tests {
                     Arc::new(RwLock::new(Vec::new())),
                     Default::default(),
                     devices,
+                    Arc::new(RwLock::new(true)),
                 )
                 .await
                 .expect("listener");
@@ -2355,6 +2361,7 @@ mod tests {
                     Arc::new(RwLock::new(vec![rule])),
                     Default::default(),
                     Default::default(),
+                    Arc::new(RwLock::new(true)),
                 )
                 .await
                 .expect("listener");
@@ -2422,6 +2429,7 @@ mod tests {
                     Arc::new(RwLock::new(Vec::new())),
                     pairing.clone(),
                     Default::default(),
+                    Arc::new(RwLock::new(true)),
                 )
                 .await
                 .expect("listener");

@@ -5,7 +5,7 @@ use crate::{
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
-    devices::{Device, DeviceSource, DeviceStore},
+    devices::{Device, DeviceSource, DeviceStore, PolicyBundle},
     discovery,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
@@ -109,6 +109,9 @@ pub struct Service {
     /// address rules that may connect without a prompt, carrying permissions;
     /// shared with the listener so policy changes apply to new handshakes
     trusted_nets: Arc<RwLock<Vec<crate::trusted::AddressRule>>>,
+    /// whether incoming connections are accepted (kiosk mode shares this with
+    /// the listener)
+    accept_incoming: Arc<RwLock<bool>>,
     /// open pairing window: the first device accepted inside it gets its
     /// configured permissions
     pairing_until: Arc<RwLock<Option<PairingWindow>>>,
@@ -167,6 +170,7 @@ impl Service {
         let authorized_keys = Arc::new(RwLock::new(Self::authorized_map(&devices)));
         let trusted_nets = Arc::new(RwLock::new(config.address_rules()));
         let pairing_until: Arc<RwLock<Option<PairingWindow>>> = Default::default();
+        let accept_incoming = Arc::new(RwLock::new(config.accept_incoming()));
         // listener + connection
         let listener = LanMouseListener::new(
             config.port(),
@@ -175,6 +179,7 @@ impl Service {
             trusted_nets.clone(),
             pairing_until.clone(),
             devices.clone(),
+            accept_incoming.clone(),
         )
         .await?;
         let mut conn = LanMouseConnection::new(
@@ -258,6 +263,7 @@ impl Service {
             discovered: Default::default(),
             discovery_cancel: CancellationToken::new(),
             trusted_nets,
+            accept_incoming,
             pairing_until,
             pairing_adopted: Default::default(),
             cert: cert.clone(),
@@ -521,6 +527,8 @@ impl Service {
             }
             FrontendRequest::ListAddressRules => self.broadcast_address_rules(),
             FrontendRequest::ListHistory { limit } => self.broadcast_history(limit),
+            FrontendRequest::ExportPolicy => self.export_policy(),
+            FrontendRequest::ImportPolicy { json } => self.import_policy(json),
             FrontendRequest::DenyDevice {
                 fingerprint,
                 expires_in,
@@ -606,6 +614,7 @@ impl Service {
         store.seed(self.config.devices(), self.config.denied_devices());
         *self.devices.write().expect("lock") = store;
         *self.trusted_nets.write().expect("lock") = self.config.address_rules();
+        *self.accept_incoming.write().expect("lock") = self.config.accept_incoming();
         self.refresh_maps();
         for handle in self.client_manager.active_clients() {
             if let Some(fingerprint) = self.client_manager.fingerprint(handle) {
@@ -1669,6 +1678,66 @@ impl Service {
             self.trusted_address_strings(),
         ));
         self.notify_frontend(FrontendEvent::AddressRules(self.address_rule_views()));
+    }
+
+    /// Serialize the persistent permission policy for backup/transfer.
+    fn export_policy(&mut self) {
+        let rules = self.trusted_nets.read().expect("lock").clone();
+        let bundle = self.devices.read().expect("lock").export_bundle(&rules);
+        match serde_json::to_string_pretty(&bundle) {
+            Ok(json) => {
+                self.audit.event("policy_exported", None, None, None, None);
+                self.notify_frontend(FrontendEvent::PolicyExport { json });
+            }
+            Err(e) => self.notify_frontend(FrontendEvent::Error(format!(
+                "could not serialize policy: {e}"
+            ))),
+        }
+    }
+
+    /// Replace the permission policy from a JSON bundle.
+    fn import_policy(&mut self, json: String) {
+        let bundle: PolicyBundle = match serde_json::from_str(&json) {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                self.notify_frontend(FrontendEvent::Error(format!("invalid policy file: {e}")));
+                return;
+            }
+        };
+        let mut rules = self.trusted_nets.read().expect("lock").clone();
+        let result = self
+            .devices
+            .write()
+            .expect("lock")
+            .import_bundle(&bundle, &mut rules);
+        match result {
+            Ok(()) => {
+                *self.trusted_nets.write().expect("lock") = rules;
+                self.refresh_maps();
+                self.audit.event(
+                    "policy_imported",
+                    None,
+                    None,
+                    None,
+                    Some(&format!(
+                        "devices={} rules={} denied={}",
+                        bundle.devices.len(),
+                        bundle.address_rules.len(),
+                        bundle.denied.len()
+                    )),
+                );
+                self.save_config();
+                self.broadcast_devices();
+                self.broadcast_address_rules();
+                log::info!(
+                    "imported policy: {} device(s), {} rule(s), {} denied",
+                    bundle.devices.len(),
+                    bundle.address_rules.len(),
+                    bundle.denied.len()
+                );
+            }
+            Err(e) => self.notify_frontend(FrontendEvent::Error(format!("invalid policy: {e}"))),
+        }
     }
 
     /// Emit the most recent persisted audit entries, newest first.

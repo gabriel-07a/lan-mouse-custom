@@ -562,6 +562,42 @@ band (screenshot, chat) before approving. If a known device later shows up with
 a **different certificate** for the same address or name, the frontend warns
 about the change, the request is flagged and the event is audited.
 
+### Kiosk mode
+
+Set `accept_incoming = false` to make this machine control-only: outgoing
+links and clipboard sends keep working, but every incoming handshake is
+rejected in the certificate callback, so authorized devices, address rules and
+an open pairing window cannot connect either.
+
+```toml
+accept_incoming = false
+```
+
+### Policy backup and transfer
+
+`export-policy` writes the persistent permission policy (devices, address
+rules and revocations, without link addresses or session state) as JSON;
+`import-policy` validates the whole file first and only then replaces the
+policy, so a malformed file changes nothing.
+
+```sh
+lan-mouse cli export-policy permits.json
+lan-mouse cli import-policy permits.json
+```
+
+Import and export are audited (`policy_exported`/`policy_imported`).
+
+### Local IPC security
+
+On Unix the frontend socket is protected twice: it lives in
+`$XDG_RUNTIME_DIR` (0700) and the listener verifies the peer UID through
+`SO_PEERCRED`, rejecting IPC clients running as another user. On Windows the
+frontend uses a loopback TCP socket, which cannot carry peer credentials; any
+local process that can connect to `127.0.0.1:5252` can talk to the service, so
+do not run untrusted software in the same session. The private key file gets
+`0400` permissions on Unix and a best-effort `icacls` restriction to the
+current user on Windows (`RW` removed for everyone else).
+
 ### Connection limits
 
 The listener bounds abuse from the LAN even before a certificate is accepted:

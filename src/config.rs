@@ -87,6 +87,9 @@ struct ConfigToml {
     address_rules: Option<Vec<TomlAddressRule>>,
     /// legacy full-access address allowlist (still written for older peers)
     trusted_ips: Option<Vec<String>>,
+    /// refuse incoming connections entirely (kiosk mode); outgoing links keep
+    /// working
+    accept_incoming: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, Eq, PartialEq)]
@@ -885,6 +888,17 @@ impl Config {
         self.args
             .emulation_backend
             .or(self.config_toml.as_ref().and_then(|c| c.emulation_backend))
+    }
+
+    /// Whether incoming connections/control are accepted at all.
+    ///
+    /// `false` is the kiosk mode: this machine can still drive the peers it is
+    /// configured for, but nobody can connect to it or control it.
+    pub fn accept_incoming(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.accept_incoming)
+            .unwrap_or(true)
     }
 
     /// the port to use (initially)
