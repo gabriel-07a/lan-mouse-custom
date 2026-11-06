@@ -1,3 +1,5 @@
+#![cfg_attr(windows, allow(dead_code))]
+
 //! Shared definition of the system tray menu.
 //!
 //! Both the Windows (`Shell_NotifyIconW`) and the Linux

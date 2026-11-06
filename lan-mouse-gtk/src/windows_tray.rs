@@ -1,3 +1,5 @@
+#![allow(clippy::manual_dangling_ptr)]
+
 //! System tray for Windows (notification area).
 //!
 //! A message-only window receives the tray callbacks; its queue is drained
@@ -143,7 +145,7 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }
 
