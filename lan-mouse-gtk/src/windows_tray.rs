@@ -107,12 +107,12 @@ fn try_setup(window: &Window) -> Result<(), Box<dyn std::error::Error>> {
         // Drain the tray window's queue from the GTK main loop. `PeekMessageW`
         // never blocks; `GetMessageW` would freeze the whole UI.
         glib::timeout_add_local(Duration::from_millis(50), move || {
-            unsafe {
-                let mut msg = MSG::default();
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
+            // Already inside the `unsafe` block opened for the whole setup
+            // (the Win32 calls in this closure are unsafe too).
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
             glib::ControlFlow::Continue
         });
