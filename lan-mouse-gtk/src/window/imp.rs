@@ -60,6 +60,8 @@ pub struct Window {
     #[template_child]
     pub hostname_label: TemplateChild<Label>,
     #[template_child]
+    pub local_addresses_row: TemplateChild<ActionRow>,
+    #[template_child]
     pub toast_overlay: TemplateChild<ToastOverlay>,
     #[template_child]
     pub capture_emulation_group: TemplateChild<PreferencesGroup>,
@@ -205,6 +207,36 @@ impl Window {
     }
 
     #[template_callback]
+    fn handle_copy_local_ips(&self, button: &Button) {
+        let addresses = crate::local_addresses::local_addresses();
+        let text = crate::local_addresses::copy_text(&addresses);
+        if text.is_empty() {
+            self.obj().show_toast("No local IP address to copy");
+            return;
+        }
+        if let Some(display) = gdk::Display::default() {
+            display.clipboard().set_text(&text);
+            button.set_icon_name("emblem-ok-symbolic");
+            button.set_css_classes(&["success"]);
+            glib::spawn_future_local(clone!(
+                #[weak]
+                button,
+                async move {
+                    glib::timeout_future_seconds(1).await;
+                    button.set_icon_name("edit-copy-symbolic");
+                    button.set_css_classes(&[]);
+                }
+            ));
+        }
+    }
+
+    #[template_callback]
+    fn handle_refresh_local_ips(&self, _: &Button) {
+        self.refresh_local_addresses();
+        self.obj().show_toast("Local IP addresses refreshed");
+    }
+
+    #[template_callback]
     fn handle_port_changed(&self, _entry: &Entry) {
         self.port_edit_apply.set_visible(true);
         self.port_edit_cancel.set_visible(true);
@@ -277,6 +309,33 @@ impl Window {
         }
         self.port_edit_apply.set_visible(false);
         self.port_edit_cancel.set_visible(false);
+        self.refresh_local_addresses();
+    }
+
+    /// Re-enumerate this machine's addresses and update the "This Computer"
+    /// row. Called on startup, when the listening port changes and by the
+    /// refresh button (Wi-Fi/VPN changes are picked up without a restart).
+    pub(super) fn refresh_local_addresses(&self) {
+        let addresses = crate::local_addresses::local_addresses();
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|name| name.into_string().ok())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "This computer".to_string());
+        self.local_addresses_row.set_title(&hostname);
+        let mut subtitle = crate::local_addresses::subtitle(&addresses);
+        if !addresses.is_empty() {
+            // The peer needs both values; keep the port one line below the
+            // addresses even though it is also editable under General.
+            subtitle.push_str(&format!("\nPort: {}", self.port.get()));
+        }
+        self.local_addresses_row.set_subtitle(&subtitle);
+        self.local_addresses_row.set_tooltip_text(Some(&format!(
+            "{}Port: {} (editable under General).",
+            crate::local_addresses::tooltip(&addresses),
+            self.port.get()
+        )));
     }
 }
 

@@ -1645,3 +1645,30 @@ impl Window {
         self.imp().authorization_window.replace(Some(window));
     }
 }
+
+#[cfg(test)]
+mod ui_template_smoke {
+    use adw::prelude::*;
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    use gtk::glib;
+
+    /// Builds the composite template once to catch unknown properties/ids.
+    /// GTK needs an initialized display; skip silently in headless CI.
+    #[test]
+    fn window_template_instantiates() {
+        if gtk::init().is_err() {
+            eprintln!("skipping: no GTK display");
+            return;
+        }
+        gtk::gio::resources_register_include!("lan-mouse.gresource").expect("test gresource");
+        let window = glib::Object::builder::<super::Window>().build();
+        let subtitle = window.imp().local_addresses_row.subtitle();
+        assert!(
+            subtitle
+                .as_deref()
+                .is_some_and(|subtitle| !subtitle.is_empty()),
+            "local addresses row must have a subtitle"
+        );
+        drop(window);
+    }
+}

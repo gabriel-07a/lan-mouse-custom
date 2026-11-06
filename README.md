@@ -342,7 +342,10 @@ the gtk frontend (see conditional compilation).
 By default the gtk frontend will open when running `lan-mouse`.
 
 To connect a device you want to control, simply click the `Add` button and enter the hostname
-of the device.
+of the device. The **This Computer** section at the top of the window lists the local IPv4/IPv6
+addresses of the current machine (plus the listening port) and has a button to copy them, so you
+can enter one on the other computer without opening a terminal. Use the refresh button after
+connecting to another network; the row also updates when the port changes.
 
 On the *remote* device, authorize your *local* device for incoming traffic using the `Authorize` button
 under the "Incoming Connections" section.

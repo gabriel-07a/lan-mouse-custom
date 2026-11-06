@@ -49,6 +49,36 @@
                     <property name="orientation">vertical</property>
                     <property name="spacing">12</property>
                     <child>
+                      <object class="AdwPreferencesGroup" id="local_addresses_group">
+                        <property name="title" translatable="yes">This Computer</property>
+                        <property name="description" translatable="yes">Addresses the other computer can use to reach this machine. Copy one into the “Add device” dialog there.</property>
+                        <child>
+                          <object class="AdwActionRow" id="local_addresses_row">
+                            <property name="title">This computer</property>
+                            <property name="subtitle" translatable="yes">Looking up local IP addresses…</property>
+                            <property name="subtitle-lines">4</property>
+                            <property name="icon-name">network-wired-symbolic</property>
+                            <child>
+                              <object class="GtkButton" id="copy-local-ips-button">
+                                <signal name="clicked" handler="handle_copy_local_ips" swapped="true"/>
+                                <property name="icon-name">edit-copy-symbolic</property>
+                                <property name="valign">center</property>
+                                <property name="tooltip-text" translatable="yes">Copy all local IP addresses</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="refresh-local-ips-button">
+                                <signal name="clicked" handler="handle_refresh_local_ips" swapped="true"/>
+                                <property name="icon-name">view-refresh-symbolic</property>
+                                <property name="valign">center</property>
+                                <property name="tooltip-text" translatable="yes">Refresh the local IP addresses</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
                       <object class="AdwPreferencesGroup">
                         <property name="title" translatable="yes">Connected &amp;amp; Paired Devices</property>
                         <property name="description" translatable="yes">Devices paired with this computer (both outgoing and incoming connections).</property>

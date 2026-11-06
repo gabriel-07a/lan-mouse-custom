@@ -6,6 +6,7 @@ mod key_object;
 mod key_row;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod linux_tray;
+mod local_addresses;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
 #[cfg(target_os = "macos")]
