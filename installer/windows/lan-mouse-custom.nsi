@@ -235,8 +235,13 @@ Section "Lan Mouse" SEC_MAIN
   ; Inbound UDP for the DTLS listener, so the peer can reach this device
   ; without a manual firewall prompt. Remove a stale rule first: upgrades
   ; would otherwise accumulate duplicate rules pointing at old paths.
+  ; Public is included deliberately: Windows often marks a Wi-Fi LAN as a
+  ; "Public" network, and a private/domain-only rule silently drops the peer's
+  ; handshake (the UI then shows "connecting/waiting" on the other side with no
+  ; authorization prompt ever appearing here). The rule is program-scoped, so
+  ; it only opens this executable's inbound UDP.
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="Lan Mouse"'
-  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Lan Mouse" dir=in action=allow program="$INSTDIR\${EXENAME}" enable=yes profile=private,domain'
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Lan Mouse" dir=in action=allow program="$INSTDIR\${EXENAME}" enable=yes profile=private,domain,public'
 SectionEnd
 
 ; Checked by default: a KVM is only useful if it is running.
