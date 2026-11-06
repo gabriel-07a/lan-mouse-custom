@@ -111,10 +111,10 @@ fn restrict_windows_key_acl(path: &Path) {
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output();
     match result {
-        Ok(status) if status.success() => {
+        Ok(output) if output.status.success() => {
             log::debug!("restricted private key ACL to {user}:R");
         }
-        Ok(status) => log::warn!("icacls failed for {path:?} ({status})"),
+        Ok(output) => log::warn!("icacls failed for {path:?} ({})", output.status),
         Err(e) => log::warn!("could not run icacls for {path:?}: {e}"),
     }
 }
