@@ -50,6 +50,7 @@ struct ClientReport {
 /// Which portal a restore token belongs to.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 enum PortalTokenKind {
     /// `org.freedesktop.portal.InputCapture` (outgoing input capture)
     InputCapture,

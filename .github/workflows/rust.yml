@@ -120,6 +120,12 @@ jobs:
             grep -E 'warning:|error(\[|:)' clippy.log | head -15
             echo "--- clippy log tail ---"
             tail -n 25 clippy.log
+            echo "--- toolchain ---"
+            command -v cargo rustc clippy-driver cargo-clippy x86_64-w64-mingw32-gcc link.exe 2>&1 || true
+            cargo --version 2>&1 || true
+            rustc --version --verbose 2>&1 || true
+            echo "--- linker context ---"
+            grep -B8 -A25 'link.exe' clippy.log 2>&1 || true
           } | while IFS= read -r line; do
             echo "::error::${line}"
           done
@@ -138,6 +144,12 @@ jobs:
             grep -E 'warning:|error(\[|:)' clippy.log | head -15
             echo "--- clippy log tail ---"
             tail -n 25 clippy.log
+            echo "--- toolchain ---"
+            command -v cargo rustc clippy-driver cargo-clippy x86_64-w64-mingw32-gcc link.exe 2>&1 || true
+            cargo --version 2>&1 || true
+            rustc --version --verbose 2>&1 || true
+            echo "--- linker context ---"
+            grep -B8 -A25 'link.exe' clippy.log 2>&1 || true
           } | while IFS= read -r line; do
             echo "::error::${line}"
           done

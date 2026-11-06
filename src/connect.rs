@@ -981,7 +981,9 @@ mod tests {
     use futures::StreamExt;
     use lan_mouse_ipc::Position as IpcPosition;
     use lan_mouse_proto::Position as ProtoPosition;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    #[cfg(target_os = "linux")]
+    use std::net::Ipv6Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::{Arc, RwLock};
     use tokio::task::LocalSet;
