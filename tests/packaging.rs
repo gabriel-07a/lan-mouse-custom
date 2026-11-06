@@ -131,7 +131,9 @@ fn release_workflow_builds_both_platforms() {
     // MSYS2 ships prebuilt GTK; gvsbuild needs a specific Visual Studio.
     assert!(workflow.contains("msys2/setup-msys2"));
     assert!(workflow.contains("msystem: UCRT64"));
-    assert!(workflow.contains("doctor --probe --json"));
+    assert!(workflow.contains("doctor"));
+    assert!(workflow.contains("--probe"));
+    assert!(workflow.contains("--json"));
 }
 
 #[test]

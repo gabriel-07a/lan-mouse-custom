@@ -100,13 +100,16 @@ fn restrict_windows_key_acl(path: &Path) {
         log::warn!("could not determine the current user; key ACL not restricted");
         return;
     };
+    // Capture stdout/stderr: icacls prints "processed file: ..." on success,
+    // which would otherwise pollute the JSON output of `doctor --json` and
+    // the release smoke test's ConvertFrom-Json.
     let result = std::process::Command::new("icacls")
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
         .arg(format!("{user}:R"))
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .status();
+        .output();
     match result {
         Ok(status) if status.success() => {
             log::debug!("restricted private key ACL to {user}:R");
