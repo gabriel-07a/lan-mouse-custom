@@ -94,10 +94,43 @@ jobs:
       - name: Smoke test silent installer and doctor probe
         shell: pwsh
         run: |
+          # Regression guard for the reported bug: installing a release over an
+          # older build must NOT resurrect the old PCs/certificates/permissions.
+          # Seed stale per-user data and assert the silent installer moves it to
+          # a timestamped backup (reversible clean install; silent default).
+          $userData = Join-Path $env:LOCALAPPDATA "lan-mouse"
+          $roamingData = Join-Path $env:APPDATA "lan-mouse"
+          $unrelated = Join-Path $env:LOCALAPPDATA "lan-mouse-unrelated-keep.txt"
+          New-Item -ItemType Directory -Force -Path $userData, $roamingData | Out-Null
+          Set-Content -Path (Join-Path $userData "config.toml") -Value "# stale config from an older build"
+          Set-Content -Path (Join-Path $userData "lan-mouse.pem") -Value "stale certificate"
+          Set-Content -Path (Join-Path $roamingData "config.toml") -Value "# stale roaming config"
+          Set-Content -Path $unrelated -Value "must survive the clean install"
           $p = Start-Process -FilePath ".\lan-mouse-custom-setup-x86_64.exe" -ArgumentList "/S" -Wait -PassThru
           if ($p.ExitCode -ne 0) {
             echo "::error::installer exit code $($p.ExitCode)"
             throw "Installer failed with exit code $($p.ExitCode)"
+          }
+          if (Test-Path (Join-Path $userData "config.toml")) {
+            echo "::error::installer did not clean the stale configuration in $userData"
+            throw "Installer kept the stale user configuration in place"
+          }
+          $localBackups = @(Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)
+          if ($localBackups.Count -eq 0) {
+            echo "::error::installer did not create a lan-mouse.bak-* backup"
+            throw "Installer did not create a reversible backup"
+          }
+          if (-not (Get-ChildItem -Path $localBackups[0].FullName -Filter "config.toml" -ErrorAction SilentlyContinue)) {
+            echo "::error::backup $($localBackups[0].FullName) does not contain the stale config.toml"
+            throw "Installer backup is missing the stale configuration"
+          }
+          if (Test-Path (Join-Path $roamingData "config.toml")) {
+            echo "::error::installer did not back up the stale roaming configuration in $roamingData"
+            throw "Installer kept the stale roaming configuration in place"
+          }
+          if (-not (Test-Path $unrelated)) {
+            echo "::error::installer deleted an unrelated file: $unrelated"
+            throw "Installer must not delete unrelated files"
           }
           $exe = "C:\Program Files\Lan Mouse\lan-mouse.exe"
           if (-not (Test-Path $exe)) {
@@ -141,6 +174,34 @@ jobs:
             echo "::error::uninstaller exit code $($u.ExitCode)"
             throw "Uninstaller failed with exit code $($u.ExitCode)"
           }
+          # The silent uninstaller moves the per-user data to a backup
+          # (recreated above by the doctor run); /KEEPUSERDATA keeps it in
+          # place and /PURGEUSERDATA deletes it.
+          if (Test-Path $userData) {
+            echo "::error::uninstaller left the user data directory $userData"
+            throw "Uninstaller left the user data directory in place"
+          }
+          if (Test-Path $roamingData) {
+            echo "::error::uninstaller left the roaming data directory $roamingData"
+            throw "Uninstaller left the roaming data directory in place"
+          }
+          $postUninstallBackups = @(Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)
+          if ($postUninstallBackups.Count -lt 2) {
+            echo "::error::expected backups from install and uninstall, found $($postUninstallBackups.Count)"
+            throw "Uninstaller did not keep the user data reversible"
+          }
+          if (-not (Test-Path $unrelated)) {
+            echo "::error::uninstaller deleted an unrelated file: $unrelated"
+            throw "Uninstaller must not delete unrelated files"
+          }
+          # The runner is disposable, but clean the backups we seeded anyway.
+          foreach ($backup in @(Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)) {
+            Remove-Item -Recurse -Force $backup.FullName
+          }
+          foreach ($backup in @(Get-ChildItem -Path $env:APPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)) {
+            Remove-Item -Recurse -Force $backup.FullName
+          }
+          Remove-Item -Force $unrelated -ErrorAction SilentlyContinue
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

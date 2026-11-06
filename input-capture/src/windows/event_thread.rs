@@ -71,13 +71,16 @@ impl EventThread {
         self.signal(RequestType::Release);
     }
 
-    /// Tell the hook thread that a remote peer is currently controlling this
-    /// machine. Barrier detection stays disabled while this is true: the
-    /// remote side's injected pointer motion otherwise looks like the local
-    /// user crossing an edge, which makes the two machines hand control back
-    /// and forth ("ping-pong") at the shared border.
-    pub(crate) fn set_remote_active(&self, active: bool) {
-        self.client_update(ClientUpdate::RemoteActive(active));
+    /// Tell the hook thread which edge a remote peer entered through and is
+    /// currently controlling this machine from.
+    ///
+    /// Injected pointer motion must not look like the local user crossing an
+    /// edge, otherwise the two machines hand control back and forth
+    /// ("ping-pong") at the shared border. The one exception is the edge the
+    /// peer entered through: a crossing there is the return hand-off and must
+    /// release the peer's capture so the cursor can come back.
+    pub(crate) fn set_remote_peer(&self, peer: Option<Position>) {
+        self.client_update(ClientUpdate::RemotePeer(peer));
     }
 
     pub(crate) fn create(&self, pos: Position) {
@@ -136,7 +139,7 @@ enum RequestType {
 enum ClientUpdate {
     Create(Position),
     Destroy(Position),
-    RemoteActive(bool),
+    RemotePeer(Option<Position>),
 }
 
 fn try_send_event(
@@ -255,9 +258,10 @@ thread_local! {
     static RAW_INPUT_OK: Cell<bool> = const { Cell::new(false) };
     /// time of the last capture release, used for the re-entry cooldown
     static LAST_RELEASE: Cell<Option<Instant>> = const { Cell::new(None) };
-    /// a remote peer is currently driving this machine; local barrier
-    /// detection must stay quiet to avoid a hand-off ping-pong
-    static REMOTE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// edge a remote peer entered through while it drives this machine
+    /// (`None` = no peer is driving us); local barrier detection must stay
+    /// quiet except at that edge, where a crossing is the return hand-off
+    static REMOTE_PEER: Cell<Option<Position>> = const { Cell::new(None) };
     /// 1x1 topmost window used to hide the local pointer while capturing.
     /// 0 means "not created" (raw pointer value of the HWND).
     static HIDDEN_POINTER_WINDOW: Cell<isize> = const { Cell::new(0) };
@@ -534,13 +538,23 @@ fn activate(pos: Position, at: (i32, i32)) {
 }
 
 /// Whether a local barrier crossing may start a capture right now.
+///
+/// The remote-active state is handled per edge by [`edge_activation_allowed`]:
+/// the cooldown here only prevents an immediate bounce-back after a release.
 fn may_activate() -> bool {
-    if REMOTE_ACTIVE.get() {
-        return false;
-    }
     LAST_RELEASE
         .get()
         .is_none_or(|released| released.elapsed() >= RELEASE_COOLDOWN)
+}
+
+/// Whether a crossing at `entered` may start a capture while a remote peer is
+/// driving this machine.
+///
+/// Only the edge the peer entered through qualifies: pushing the injected
+/// pointer back out that edge is the return hand-off. Any other edge would
+/// reflect the injected motion back to the peer (feedback loop).
+fn edge_activation_allowed(remote_peer: Option<Position>, entered: Position) -> bool {
+    remote_peer.is_none_or(|remote| remote == entered)
 }
 
 /// Barrier detection from raw mouse movement while the pointer is clamped to
@@ -553,10 +567,12 @@ unsafe fn try_activate_by_raw(dx: i32, dy: i32) {
     if !may_activate() {
         return;
     }
+    let remote_peer = REMOTE_PEER.get();
     // The remote peer's injected motion is visible to raw input as well (and
-    // reaches here before the service can flip `REMOTE_ACTIVE`); never treat
-    // it as a local barrier crossing.
-    if input_event::injection::is_recent(REMOTE_GRACE_MS) {
+    // reaches here before the service can flip the remote state); never treat
+    // it as a local barrier crossing — except at the edge the peer entered
+    // through, where it is the return hand-off and the peer must be released.
+    if remote_peer.is_none() && input_event::injection::is_recent(REMOTE_GRACE_MS) {
         return;
     }
     let mut cursor = POINT::default();
@@ -570,6 +586,9 @@ unsafe fn try_activate_by_raw(dx: i32, dy: i32) {
     let Some(pos) = entered else {
         return;
     };
+    if !edge_activation_allowed(remote_peer, pos) {
+        return;
+    }
     if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
         return;
     }
@@ -582,13 +601,16 @@ unsafe fn try_activate_by_legacy(lparam: LPARAM) {
     if !may_activate() {
         return;
     }
-    if input_event::injection::is_recent(REMOTE_GRACE_MS) {
+    let remote_peer = REMOTE_PEER.get();
+    if remote_peer.is_none() && input_event::injection::is_recent(REMOTE_GRACE_MS) {
         return;
     }
     let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
-    if mouse_low_level.flags & LLMHF_INJECTED != 0 {
+    if mouse_low_level.flags & LLMHF_INJECTED != 0 && remote_peer.is_none() {
         // Injected movement (e.g. another tool, or the remote peer when this
         // machine is also configured to send) must not start a local capture.
+        // While a peer is driving us it is the return motion and is allowed at
+        // the edge it entered through (checked below).
         return;
     }
     let curr_pos = (mouse_low_level.pt.x, mouse_low_level.pt.y);
@@ -601,6 +623,9 @@ unsafe fn try_activate_by_legacy(lparam: LPARAM) {
     let Some(pos) = entered else {
         return;
     };
+    if !edge_activation_allowed(remote_peer, pos) {
+        return;
+    }
     if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
         return;
     }
@@ -847,9 +872,21 @@ fn update_clients(request: ClientUpdate) {
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
         }
-        ClientUpdate::RemoteActive(active) => {
-            REMOTE_ACTIVE.set(active);
-            log::debug!("remote peer control active: {active}");
+        ClientUpdate::RemotePeer(peer) => {
+            REMOTE_PEER.set(peer);
+            match peer {
+                Some(pos) => {
+                    // A peer taking over must never leave a local capture (and
+                    // a hidden cursor) behind, and the post-release cooldown
+                    // must not swallow the return crossing through `pos`.
+                    if ACTIVE_CLIENT.get().is_some() {
+                        release_active_client();
+                    }
+                    LAST_RELEASE.replace(None);
+                    log::debug!("remote peer control active from {pos:?}");
+                }
+                None => log::debug!("remote peer control inactive"),
+            }
         }
     }
 }
@@ -963,5 +1000,29 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             log::warn!("unknown mouse event: {w:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Position;
+
+    #[test]
+    fn the_remote_entry_edge_is_the_only_allowed_crossing() {
+        assert!(edge_activation_allowed(None, Position::Left));
+        assert!(edge_activation_allowed(None, Position::Bottom));
+        assert!(edge_activation_allowed(
+            Some(Position::Left),
+            Position::Left
+        ));
+        assert!(!edge_activation_allowed(
+            Some(Position::Left),
+            Position::Right
+        ));
+        assert!(!edge_activation_allowed(
+            Some(Position::Top),
+            Position::Bottom
+        ));
     }
 }

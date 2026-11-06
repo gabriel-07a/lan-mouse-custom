@@ -38,8 +38,8 @@ impl Capture for WindowsInputCapture {
         Ok(())
     }
 
-    fn set_remote_active(&mut self, active: bool) {
-        self.event_thread.set_remote_active(active);
+    fn set_remote_peer(&mut self, peer: Option<Position>) {
+        self.event_thread.set_remote_peer(peer);
     }
 }
 

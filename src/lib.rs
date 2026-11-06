@@ -14,5 +14,6 @@ pub mod doctor;
 mod emulation;
 pub mod emulation_test;
 mod listen;
+mod reset;
 pub mod service;
 pub mod trusted;

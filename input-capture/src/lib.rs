@@ -176,9 +176,10 @@ impl InputCapture {
         self.capture.release().await
     }
 
-    /// Tell the backend that a remote peer is currently driving this machine.
-    pub fn set_remote_active(&mut self, active: bool) {
-        self.capture.set_remote_active(active);
+    /// Tell the backend which edge a remote peer entered through and is
+    /// currently driving this machine from (`None` = no peer is driving us).
+    pub fn set_remote_peer(&mut self, peer: Option<Position>) {
+        self.capture.set_remote_peer(peer);
     }
 
     /// Drain and return every key the capture has forwarded as
@@ -322,13 +323,15 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
 
-    /// Tell the backend that a remote peer is currently driving this machine.
+    /// Tell the backend which edge a remote peer entered through and is
+    /// currently driving this machine from (`None` = no peer is driving us).
     ///
     /// Backends whose local edge detection can observe injected input (Windows
-    /// raw input / low level hooks) must not start a local capture while this
-    /// is true, otherwise the two machines hand control back and forth at the
-    /// shared border.
-    fn set_remote_active(&mut self, _active: bool) {}
+    /// raw input / low level hooks) must not start a local capture from that
+    /// input, otherwise the two machines hand control back and forth at the
+    /// shared border. The exception is the edge the peer entered through: a
+    /// crossing there is the return hand-off and must still be reported.
+    fn set_remote_peer(&mut self, _peer: Option<Position>) {}
 }
 
 async fn create_backend(

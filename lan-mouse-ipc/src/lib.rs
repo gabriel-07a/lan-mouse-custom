@@ -201,6 +201,20 @@ pub struct ClientState {
     /// smoothed round-trip time to the peer in milliseconds, if known
     #[serde(default)]
     pub rtt_ms: Option<u32>,
+    /// Unix timestamp in milliseconds of the **last `Pong` received on the
+    /// current outgoing link**, or `None` while no round-trip has been proven
+    /// yet (fresh handshake, peer that never answers, or a service build that
+    /// predates this field).
+    ///
+    /// This is the only field that is direct evidence of a working round-trip:
+    /// `active_addr` only proves that the DTLS handshake completed and `alive`
+    /// is the peer's emulation flag (set optimistically at the handshake). The
+    /// frontend must not claim "connected" from `active_addr` alone; it derives
+    /// freshness from this timestamp when it is available and falls back to the
+    /// cadence of `FrontendEvent::State` updates otherwise. Cleared when the
+    /// link goes down (disconnect/deactivate).
+    #[serde(default)]
+    pub last_pong_at: Option<u64>,
     /// ips from dns
     pub dns_ips: Vec<IpAddr>,
     /// all ip addresses associated with a particular client
@@ -926,6 +940,7 @@ mod tests {
             )),
             alive: true,
             rtt_ms: Some(12),
+            last_pong_at: Some(1_700_000_000_123),
             dns_ips: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3))],
             ips: HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]),
             has_pressed_keys: true,
@@ -943,6 +958,7 @@ mod tests {
         };
         let decoded = json_roundtrip(state);
         assert_eq!(decoded.rtt_ms, Some(12));
+        assert_eq!(decoded.last_pong_at, Some(1_700_000_000_123));
         assert_eq!(decoded.peer_proto_version, 1);
         assert_eq!(decoded.peer_capabilities, 0b101);
     }
@@ -962,6 +978,9 @@ mod tests {
         });
         let state: ClientState = serde_json::from_value(legacy).expect("legacy state");
         assert_eq!(state.rtt_ms, None);
+        // A service predating the round-trip timestamp must not make the
+        // frontend claim liveness: the field defaults to "unknown".
+        assert_eq!(state.last_pong_at, None);
         assert_eq!(state.peer_proto_version, 0);
         assert_eq!(state.peer_capabilities, 0);
     }

@@ -2,7 +2,7 @@ use crate::config::local_commit;
 use crate::devices::DeviceStore;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCommand, ListenerCreationError};
 use futures::StreamExt;
-use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
+use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, PointerEdge};
 use input_event::Event;
 use lan_mouse_proto::clipboard::ClipboardFrame;
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION, Position, ProtoEvent};
@@ -17,6 +17,7 @@ use std::{
 };
 use tokio::{
     select,
+    sync::mpsc::UnboundedReceiver,
     task::{JoinHandle, spawn_local},
 };
 
@@ -72,6 +73,17 @@ pub(crate) enum EmulationEvent {
     EmulationEnabled,
     /// capture should be released
     ReleaseNotify,
+    /// The remote pointer was pushed past one of our screen edges, detected by
+    /// the emulation backend that injects the peer's input. The peer must
+    /// release its capture so the cursor can come back (return hand-off).
+    EdgeReturn(lan_mouse_ipc::Position),
+    /// The peer driving this machine released its capture (`Leave`). Its
+    /// incoming capture zones can be dropped and, once no session is left, the
+    /// local capture may resume.
+    PeerLeft {
+        addr: SocketAddr,
+        fingerprint: String,
+    },
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -104,6 +116,14 @@ enum EmulationRequest {
     Disconnect(SocketAddr),
     ChangePort(u16),
     Terminate,
+}
+
+/// Backends without edge-return support drop the notifier sender, closing the
+/// channel. The emulation loop must not poll `recv()` once that happens: a
+/// closed unbounded receiver returns `Ready(None)` immediately forever and
+/// would spin a CPU core at 100% (Linux/macOS/Dummy backends).
+fn edge_return_notifier_active(rx: &UnboundedReceiver<PointerEdge>) -> bool {
+    !rx.is_closed()
 }
 
 impl Emulation {
@@ -264,6 +284,19 @@ impl ListenTask {
                             ProtoEvent::Leave(_) => {
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                // The peer is no longer driving this machine.
+                                // Without this the service kept the incoming
+                                // capture zone (and on Windows the remote-active
+                                // suppression) latched until the socket dropped.
+                                let fingerprint = self
+                                    .fingerprints
+                                    .get(&addr)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                self.event_tx
+                                    .send(EmulationEvent::PeerLeft { addr, fingerprint })
+                                    .ok()
+                                    .unwrap_or_default();
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
                             ProtoEvent::AuthRequest {
@@ -572,6 +605,14 @@ impl EmulationTask {
         };
         self.selected_backend.set(Some(emulation.backend()));
 
+        // The emulation backend that injects the peer's input is the component
+        // that can see the remote pointer being pushed past a screen edge on
+        // platforms where the capture backend cannot (absolute Windows
+        // injection, injected motion that does not trigger compositor
+        // barriers). It reports the hand-off request through this channel.
+        let (edge_return_tx, mut edge_return_rx) = tokio::sync::mpsc::unbounded_channel();
+        emulation.set_edge_return_notifier(edge_return_tx);
+
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(
             self.event_tx.clone(),
@@ -585,7 +626,9 @@ impl EmulationTask {
             return Err(e);
         }
 
-        let res = self.do_emulation_session(&mut emulation).await;
+        let res = self
+            .do_emulation_session(&mut emulation, &mut edge_return_rx)
+            .await;
         // FIXME replace with async drop when stabilized
         emulation.terminate().await;
         res
@@ -607,9 +650,26 @@ impl EmulationTask {
     async fn do_emulation_session(
         &mut self,
         emulation: &mut InputEmulation,
+        edge_return_rx: &mut UnboundedReceiver<PointerEdge>,
     ) -> Result<(), InputEmulationError> {
         loop {
             tokio::select! {
+                // Backends without edge-return support drop the notifier in
+                // the default `set_edge_return_notifier` implementation, so
+                // the channel is already closed for them. Without this guard
+                // `recv()` would return `Ready(None)` forever and spin a CPU
+                // core at 100% (Linux/macOS/Dummy backends).
+                edge = edge_return_rx.recv(), if edge_return_notifier_active(edge_return_rx) => {
+                    if let Some(edge) = edge {
+                        log::debug!("emulation observed a return hand-off through {edge:?}");
+                        self.event_tx
+                            .send(EmulationEvent::EdgeReturn(edge_to_ipc_pos(edge)))
+                            .ok()
+                            .unwrap_or_default();
+                    } else {
+                        log::debug!("edge-return notifier closed; hand-off disabled");
+                    }
+                },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
                         let handle = match self.handles.get(&addr) {
@@ -634,6 +694,15 @@ impl EmulationTask {
                 },
             }
         }
+    }
+}
+
+fn edge_to_ipc_pos(edge: PointerEdge) -> lan_mouse_ipc::Position {
+    match edge {
+        PointerEdge::Left => lan_mouse_ipc::Position::Left,
+        PointerEdge::Right => lan_mouse_ipc::Position::Right,
+        PointerEdge::Top => lan_mouse_ipc::Position::Top,
+        PointerEdge::Bottom => lan_mouse_ipc::Position::Bottom,
     }
 }
 
@@ -731,5 +800,40 @@ mod enter_deduper_tests {
         assert!(deduper.is_duplicate(addr(1), 5));
         deduper.clear(addr(1));
         assert!(!deduper.is_duplicate(addr(1), 5));
+    }
+}
+
+#[cfg(test)]
+mod edge_return_guard_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_edge_return_channel_is_disabled() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PointerEdge>();
+        assert!(edge_return_notifier_active(&rx));
+        drop(tx);
+        assert!(!edge_return_notifier_active(&rx));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_edge_return_arm_does_not_busy_loop() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PointerEdge>();
+        drop(tx);
+        let mut arm_polls = 0usize;
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                tokio::select! {
+                    edge = rx.recv(), if edge_return_notifier_active(&rx) => {
+                        arm_polls += 1;
+                        let _ = edge;
+                    }
+                    _ = tokio::task::yield_now() => break,
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "the loop should yield, not spin");
+        assert_eq!(arm_polls, 0, "a closed notifier must be disabled");
     }
 }

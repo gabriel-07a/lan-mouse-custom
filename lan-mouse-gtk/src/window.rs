@@ -1,6 +1,7 @@
 mod imp;
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -22,7 +23,13 @@ use crate::{
 };
 
 use self::imp::DeviceControls;
-use super::{client_object::ClientObject, client_row::ClientRow};
+use super::{
+    client_object::ClientObject,
+    client_row::{
+        ClientRow, LinkProof, RowConnectionState, link_proof_from_age, row_connection_state,
+        sorted_ips, sticky_endpoint,
+    },
+};
 
 /// Capabilities in the exact order their checkboxes are rendered.
 const CAPABILITIES: [Capabilities; 3] = [
@@ -62,6 +69,144 @@ fn policy_from_mask(mask: u32) -> DirectionPolicy {
     }
 }
 
+/// A reply younger than this proves that the outgoing link still works.
+///
+/// The service pings in rounds of ~2 s and closes a link that stopped
+/// answering after two missed rounds; 6 s is conservative and absorbs
+/// scheduler jitter without flickering the badge on a single lost packet.
+const LINK_FRESH_WINDOW: Duration = Duration::from_secs(6);
+
+/// A new endpoint must persist this long before replacing the one shown in the
+/// subtitle. Prevents IPv4/IPv6 alternation when the service reports a
+/// different source address per packet.
+const ENDPOINT_STICKY_WINDOW: Duration = Duration::from_secs(3);
+
+/// Recompute the freshness-dependent parts of every row on this cadence, so a
+/// row whose peer goes silent stops claiming "Connected" even when the service
+/// stops sending events. 1 s keeps the "no reply for Ns" counter honest.
+const STATUS_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Milliseconds since the Unix epoch, matching the clock the service uses for
+/// [`lan_mouse_ipc::ClientState::last_pong_at`].
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
+/// Set a GTK object property only when its value differs.
+///
+/// The status tick refreshes every row once per second; unconditionally
+/// writing the properties would emit `notify` every time, and the hostname /
+/// port entries are bound to those properties (a `set_text` while the user is
+/// typing moves the cursor). Comparing first keeps the tick silent when
+/// nothing changed.
+fn set_if_changed<T>(object: &ClientObject, property: &str, value: T) -> bool
+where
+    T: PartialEq + Into<glib::Value> + for<'b> glib::value::FromValue<'b> + 'static,
+{
+    if object.property::<T>(property) == value {
+        return false;
+    }
+    object.set_property(property, value);
+    true
+}
+
+/// One logical peer rendered as a single stable row.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PeerSummary {
+    pub hostname: Option<String>,
+    pub port: u16,
+    pub position: Position,
+    pub sensitivity: u16,
+    pub active: bool,
+    pub alive: bool,
+    pub active_addr: Option<String>,
+    pub incoming_addr: Option<String>,
+    pub rtt_ms: u32,
+    pub peer_commit: Option<String>,
+    pub ips: Vec<String>,
+    pub resolving: bool,
+}
+
+/// Identity of the logical peer a configured client belongs to.
+///
+/// Only the certificate fingerprint is authoritative: two configured clients
+/// with the same fingerprint are the same device (the service bug that creates
+/// one entry per address family). Hostnames/IPs are deliberately not used as
+/// identity because distinct machines can share them in a misconfigured setup,
+/// and merging those rows would hide a real device.
+pub(crate) fn peer_identity(config: &ClientConfig) -> Option<String> {
+    config
+        .fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// Merge the configured clients that belong to one logical peer into the single
+/// summary its row shows.
+///
+/// The row must stay stable while the service has duplicate entries for one
+/// peer (one per address family): `active` is the OR of the members, and the
+/// link fields come from a member with a proven link, preferring one that
+/// already has a measured round-trip. Iteration order is the configuration
+/// order, so the choice does not flap between updates.
+pub(crate) fn merge_peer_states(members: &[(ClientConfig, ClientState)]) -> Option<PeerSummary> {
+    let (first_config, _) = members.first()?;
+    let link_index = members
+        .iter()
+        .position(|(_, state)| state.active_addr.is_some() && state.rtt_ms.is_some())
+        .or_else(|| {
+            members
+                .iter()
+                .position(|(_, state)| state.active_addr.is_some())
+        })
+        .unwrap_or(0);
+    let (link_config, link_state) = &members[link_index];
+    let hostname = members.iter().find_map(|(config, _)| {
+        config
+            .hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|hostname| !hostname.is_empty())
+            .map(str::to_string)
+    });
+    let incoming_addr = members
+        .iter()
+        .find_map(|(_, state)| state.incoming_addr.map(|addr| addr.to_string()));
+    let ips = members
+        .iter()
+        .flat_map(|(_, state)| state.ips.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect();
+    Some(PeerSummary {
+        hostname,
+        port: link_config.port,
+        position: link_config.pos,
+        sensitivity: first_config.sensitivity,
+        active: members.iter().any(|(_, state)| state.active),
+        alive: link_state.alive,
+        active_addr: link_state.active_addr.map(|addr| addr.to_string()),
+        incoming_addr,
+        rtt_ms: members
+            .iter()
+            .filter_map(|(_, state)| state.rtt_ms)
+            .max()
+            .unwrap_or(0),
+        peer_commit: members
+            .iter()
+            .find_map(|(_, state)| state.peer_commit)
+            .and_then(|commit| crate::client_object::peer_commit_to_string(Some(commit))),
+        ips,
+        resolving: members.iter().any(|(_, state)| state.resolving),
+    })
+}
+
 /// Short form of a SHA-256 fingerprint for row titles.
 ///
 /// The identity stays the full fingerprint (stored in `DeviceView`); the title
@@ -98,7 +243,12 @@ fn device_subtitle(device: &DeviceView) -> String {
         "{state} · {} · controls me: {incoming} · I control it: {outgoing}",
         device.position
     );
-    if let Some(address) = device.addresses.first() {
+    // `DeviceView::addresses` is filled from a `HashSet` in config/service
+    // order; sort it so the "Devices" row cannot alternate between IPv4 and
+    // IPv6 on every snapshot.
+    let mut addresses = device.addresses.clone();
+    addresses.sort();
+    if let Some(address) = addresses.first() {
         subtitle.push_str(&format!(" · {address}:{}", device.port));
     }
     subtitle
@@ -209,6 +359,10 @@ impl Window {
             .imp()
             .clipboard_row
             .replace(Some((clipboard_row, clipboard_switch)));
+        // Freshness of the round-trip decays with time; refresh the rows even
+        // when the service sends no further events, otherwise a silent peer
+        // would keep showing "Connected" forever.
+        window.install_status_tick();
         window
     }
 
@@ -315,10 +469,7 @@ impl Window {
                                     let hostname = Some(hostname).filter(|s| !s.is_empty());
                                     /* changed in response to FrontendEvent
                                      * -> do not request additional update */
-                                    window.request(FrontendRequest::UpdateHostname(
-                                        client.handle(),
-                                        hostname,
-                                    ));
+                                    window.request_peer_hostname(client.handle(), hostname);
                                 }
                             }
                         ),
@@ -331,10 +482,7 @@ impl Window {
                             window,
                             move |row: ClientRow, port: u32| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
-                                    window.request(FrontendRequest::UpdatePort(
-                                        client.handle(),
-                                        port as u16,
-                                    ));
+                                    window.request_peer_port(client.handle(), port as u16);
                                 }
                             }
                         ),
@@ -351,10 +499,7 @@ impl Window {
                                         "request: {} client",
                                         if active { "activating" } else { "deactivating" }
                                     );
-                                    window.request(FrontendRequest::Activate(
-                                        client.handle(),
-                                        active,
-                                    ));
+                                    window.request_peer_activate(client.handle(), active);
                                 }
                             }
                         ),
@@ -367,7 +512,7 @@ impl Window {
                             window,
                             move |row: ClientRow| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
-                                    window.request(FrontendRequest::Delete(client.handle()));
+                                    window.request_peer_delete(client.handle());
                                 }
                             }
                         ),
@@ -380,9 +525,7 @@ impl Window {
                             window,
                             move |row: ClientRow| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
-                                    window.request(FrontendRequest::ResolveDns(
-                                        client.get_data().handle,
-                                    ));
+                                    window.request_peer_dns(client.get_data().handle);
                                 }
                             }
                         ),
@@ -395,10 +538,10 @@ impl Window {
                             window,
                             move |row: ClientRow, percent: u32| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
-                                    window.request(FrontendRequest::UpdateSensitivity(
+                                    window.request_peer_sensitivity(
                                         client.handle(),
                                         percent.min(u16::MAX as u32) as u16,
-                                    ));
+                                    );
                                 }
                             }
                         ),
@@ -417,10 +560,7 @@ impl Window {
                                         2 => Position::Top,
                                         _ => Position::Bottom,
                                     };
-                                    window.request(FrontendRequest::UpdatePosition(
-                                        client.handle(),
-                                        position,
-                                    ));
+                                    window.request_peer_position(client.handle(), position);
                                 }
                             }
                         ),
@@ -456,6 +596,379 @@ impl Window {
         });
     }
 
+    // ------------------------------------------------------------------
+    // Logical peers: round-trip freshness and duplicate aggregation
+    // ------------------------------------------------------------------
+
+    /// The visible (primary) handle of the logical peer `handle` belongs to.
+    fn peer_primary_of(&self, handle: ClientHandle) -> ClientHandle {
+        *self
+            .imp()
+            .peer_primary
+            .borrow()
+            .get(&handle)
+            .unwrap_or(&handle)
+    }
+
+    /// All configured clients that belong to the same logical peer as `handle`.
+    fn peer_members(&self, handle: ClientHandle) -> Vec<ClientHandle> {
+        let primary = self.peer_primary_of(handle);
+        let groups = self.imp().peer_groups.borrow();
+        for members in groups.values() {
+            if members.contains(&primary) {
+                return members.clone();
+            }
+        }
+        vec![primary]
+    }
+
+    /// Hide/show the row that belongs to a configured client. Rows are created
+    /// by the list factory, so the widget is looked up by index; duplicate
+    /// clients stay in the model but their row is hidden.
+    fn set_client_row_visible(&self, handle: ClientHandle, visible: bool) {
+        let Some(idx) = self.client_idx(handle) else {
+            return;
+        };
+        if let Some(row) = self.imp().client_list.row_at_index(idx as i32) {
+            row.set_visible(visible);
+        }
+    }
+
+    /// Register `handle` in the peer group of its fingerprint and return the
+    /// primary (visible) handle of that peer.
+    ///
+    /// Also removes the handle from a group it used to belong to (a peer whose
+    /// certificate was replaced is a different identity); a promoted surviving
+    /// member is re-rendered so it does not keep a stale primary.
+    fn register_peer_identity(&self, handle: ClientHandle, config: &ClientConfig) -> ClientHandle {
+        let Some(identity) = peer_identity(config) else {
+            return self.peer_primary_of(handle);
+        };
+        let mut promoted = None;
+        let primary = {
+            let mut groups = self.imp().peer_groups.borrow_mut();
+            // Drop the handle from any other identity group (e.g. after a
+            // certificate change/revocation re-added it under a new pin).
+            let stale_identities = groups
+                .iter()
+                .filter(|(key, members)| {
+                    key.as_str() != identity.as_str() && members.contains(&handle)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for stale in stale_identities {
+                if let Some(members) = groups.get_mut(&stale) {
+                    let was_primary = members.first() == Some(&handle);
+                    members.retain(|member| *member != handle);
+                    if was_primary {
+                        promoted = members.first().copied();
+                    }
+                    if members.is_empty() {
+                        groups.remove(&stale);
+                    }
+                }
+            }
+            let members = groups.entry(identity).or_default();
+            if !members.contains(&handle) {
+                members.push(handle);
+            }
+            members[0]
+        };
+        {
+            let mut primary_map = self.imp().peer_primary.borrow_mut();
+            primary_map.retain(|member, primary| *member != handle && *primary != handle);
+            if primary != handle {
+                primary_map.insert(handle, primary);
+            }
+        }
+        if let Some(promoted) = promoted {
+            // Remaining members of the old group now belong to the promoted
+            // primary; re-point their mappings so later updates aggregate into
+            // the promoted row.
+            {
+                let groups = self.imp().peer_groups.borrow();
+                if let Some(members) = groups.values().find(|members| members.contains(&promoted)) {
+                    let mut primary_map = self.imp().peer_primary.borrow_mut();
+                    for member in members.iter().copied() {
+                        if member == promoted {
+                            primary_map.remove(&member);
+                        } else {
+                            primary_map.insert(member, promoted);
+                        }
+                    }
+                }
+            }
+            self.set_client_row_visible(promoted, true);
+            self.refresh_peer(promoted);
+        }
+        primary
+    }
+
+    /// Store the latest config of a client. Returns `true` when an already
+    /// known client's config changed (a local edit or a fingerprint learned
+    /// later), which lets the next state update be ignored as round-trip
+    /// evidence.
+    fn note_config(&self, handle: ClientHandle, config: &ClientConfig) -> bool {
+        let mut states = self.imp().peer_states.borrow_mut();
+        match states.get_mut(&handle) {
+            Some((known, _)) => {
+                let changed = known != config;
+                *known = config.clone();
+                changed
+            }
+            None => {
+                states.insert(handle, (config.clone(), ClientState::default()));
+                false
+            }
+        }
+    }
+
+    fn note_state(&self, handle: ClientHandle, state: &ClientState) {
+        {
+            let mut states = self.imp().peer_states.borrow_mut();
+            match states.get_mut(&handle) {
+                Some((_, known)) => *known = state.clone(),
+                None => {
+                    states.insert(handle, (ClientConfig::default(), state.clone()));
+                }
+            }
+        }
+        // A `State` event triggered by a local config edit is not a reply from
+        // the peer; do not count it as round-trip evidence.
+        let local_edit = self.imp().local_config_changes.borrow_mut().remove(&handle);
+
+        // Per-link round-trip bookkeeping (fallback for service builds that do
+        // not expose `last_pong_at` yet).
+        let addr = state.active_addr.map(|addr| addr.to_string());
+        let mut links = self.imp().link_ui.borrow_mut();
+        let link = links.entry(handle).or_default();
+        if link.addr != addr {
+            let previous_addr = link.addr.take();
+            link.addr = addr.clone();
+            link.updates = 0;
+            link.last_reply = None;
+            link.candidate_addr = None;
+            // The debounced endpoint is kept only while the service keeps
+            // reporting a link: a genuine loss or a fresh connection starts
+            // from the new address instead of showing the old one for the
+            // sticky window.
+            if previous_addr.is_none() || addr.is_none() {
+                link.shown_addr = None;
+            }
+        }
+        if link.addr.is_some() && !local_edit {
+            link.updates = link.updates.saturating_add(1);
+            // The first State for a fresh address is the handshake
+            // notification itself. Any later update while the link is up means
+            // the service produced another event (a Pong or a reply to it).
+            if link.updates >= 2 {
+                link.last_reply = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Round-trip evidence for one configured client.
+    fn link_proof(&self, handle: ClientHandle) -> LinkProof {
+        // Prefer the explicit service timestamp when the running service
+        // provides it (see docs/audit-connected-truth.md for the service-side
+        // patch). It is exact: it is written only on a received Pong.
+        let last_pong_at = self
+            .imp()
+            .peer_states
+            .borrow()
+            .get(&handle)
+            .and_then(|(_, state)| state.last_pong_at);
+        if let Some(last_pong_at) = last_pong_at {
+            let age = Duration::from_millis(unix_ms_now().saturating_sub(last_pong_at));
+            return link_proof_from_age(age, LINK_FRESH_WINDOW);
+        }
+        // Fallback for service builds without `last_pong_at`: count State
+        // updates (one per Pong) and their age.
+        let links = self.imp().link_ui.borrow();
+        let Some(link) = links.get(&handle) else {
+            return LinkProof::Pending;
+        };
+        if link.updates < 2 {
+            return LinkProof::Pending;
+        }
+        match link.last_reply {
+            Some(instant) => link_proof_from_age(instant.elapsed(), LINK_FRESH_WINDOW),
+            None => LinkProof::Pending,
+        }
+    }
+
+    /// Best round-trip evidence across all configured clients of one peer.
+    fn merged_proof(&self, primary: ClientHandle) -> LinkProof {
+        self.peer_members(primary)
+            .into_iter()
+            .fold(LinkProof::Pending, |best, handle| {
+                best.best(self.link_proof(handle))
+            })
+    }
+
+    /// Debounce the endpoint shown in the subtitle so a service that reports a
+    /// different source address per packet cannot make the row alternate
+    /// between IPv4 and IPv6.
+    fn stable_endpoint(&self, primary: ClientHandle, raw: Option<String>) -> Option<String> {
+        let mut links = self.imp().link_ui.borrow_mut();
+        let link = links.entry(primary).or_default();
+        sticky_endpoint(
+            &mut link.shown_addr,
+            &mut link.candidate_addr,
+            raw,
+            Instant::now(),
+            ENDPOINT_STICKY_WINDOW,
+        )
+    }
+
+    /// Recompute the visible row of one logical peer from all its members,
+    /// including the round-trip proof.
+    ///
+    /// Properties are only written when they changed, and the row is only
+    /// re-rendered when the state changed or when the visible text depends on
+    /// the current time (`Reconnecting` shows the seconds since the last
+    /// reply). This keeps the periodic tick silent for healthy rows.
+    fn refresh_peer(&self, primary: ClientHandle) {
+        let members = self.peer_members(primary);
+        let pairs = {
+            let states = self.imp().peer_states.borrow();
+            members
+                .iter()
+                .filter_map(|handle| states.get(handle).cloned())
+                .collect::<Vec<_>>()
+        };
+        let Some(summary) = merge_peer_states(&pairs) else {
+            return;
+        };
+        let Some(client_object) = self.client_object_for_handle(primary) else {
+            return;
+        };
+        let Some(row) = self.row_for_handle(primary) else {
+            return;
+        };
+        let proof = self.merged_proof(primary);
+        let state = row_connection_state(
+            summary.active,
+            summary.alive,
+            summary.active_addr.is_some(),
+            summary.incoming_addr.is_some(),
+            proof,
+        );
+        let display_addr = self.stable_endpoint(primary, summary.active_addr.clone());
+        let mut changed = false;
+        changed |= set_if_changed(&client_object, "hostname", summary.hostname);
+        changed |= set_if_changed(&client_object, "port", u32::from(summary.port));
+        changed |= set_if_changed(&client_object, "position", summary.position.to_string());
+        changed |= set_if_changed(
+            &client_object,
+            "sensitivity",
+            u32::from(summary.sensitivity),
+        );
+        changed |= set_if_changed(&client_object, "active", summary.active);
+        changed |= set_if_changed(&client_object, "alive", summary.alive);
+        changed |= set_if_changed(&client_object, "active-addr", display_addr);
+        changed |= set_if_changed(&client_object, "incoming-addr", summary.incoming_addr);
+        changed |= set_if_changed(&client_object, "rtt-ms", summary.rtt_ms);
+        changed |= set_if_changed(&client_object, "peer-commit", summary.peer_commit);
+        changed |= set_if_changed(&client_object, "ips", sorted_ips(&summary.ips));
+        changed |= set_if_changed(&client_object, "resolving", summary.resolving);
+        self.update_dns_state(primary, !summary.ips.is_empty());
+
+        let previous_state = self
+            .imp()
+            .link_ui
+            .borrow()
+            .get(&primary)
+            .and_then(|link| link.last_state);
+        let needs_refresh =
+            changed || previous_state != Some(state) || state == RowConnectionState::Reconnecting;
+        if needs_refresh {
+            row.refresh_status_with_proof(proof);
+        }
+        if let Some(link) = self.imp().link_ui.borrow_mut().get_mut(&primary) {
+            link.last_state = Some(state);
+        }
+    }
+
+    /// Periodic refresh: recompute every visible peer row so freshness decays
+    /// even when no event arrives (the only way a silent peer's row can stop
+    /// claiming to be connected).
+    fn refresh_link_ages(&self) {
+        let handles = self
+            .imp()
+            .peer_states
+            .borrow()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut primaries: Vec<ClientHandle> = Vec::new();
+        for handle in handles {
+            let primary = self.peer_primary_of(handle);
+            if !primaries.contains(&primary) {
+                primaries.push(primary);
+            }
+        }
+        for primary in primaries {
+            self.refresh_peer(primary);
+        }
+    }
+
+    fn install_status_tick(&self) {
+        let weak = self.downgrade();
+        let source = glib::timeout_add_local(STATUS_TICK_INTERVAL, move || {
+            let Some(window) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            window.refresh_link_ages();
+            glib::ControlFlow::Continue
+        });
+        self.imp().status_tick.replace(Some(source));
+    }
+
+    // ---- request fan-out: an action on one row applies to the whole peer ----
+
+    fn request_peer_activate(&self, handle: ClientHandle, active: bool) {
+        for member in self.peer_members(handle) {
+            self.request(FrontendRequest::Activate(member, active));
+        }
+    }
+
+    fn request_peer_delete(&self, handle: ClientHandle) {
+        for member in self.peer_members(handle) {
+            self.request(FrontendRequest::Delete(member));
+        }
+    }
+
+    fn request_peer_hostname(&self, handle: ClientHandle, hostname: Option<String>) {
+        for member in self.peer_members(handle) {
+            self.request(FrontendRequest::UpdateHostname(member, hostname.clone()));
+        }
+    }
+
+    fn request_peer_port(&self, handle: ClientHandle, port: u16) {
+        for member in self.peer_members(handle) {
+            self.request(FrontendRequest::UpdatePort(member, port));
+        }
+    }
+
+    fn request_peer_position(&self, handle: ClientHandle, position: Position) {
+        for member in self.peer_members(handle) {
+            self.request(FrontendRequest::UpdatePosition(member, position));
+        }
+    }
+
+    fn request_peer_sensitivity(&self, handle: ClientHandle, sensitivity: u16) {
+        for member in self.peer_members(handle) {
+            self.request(FrontendRequest::UpdateSensitivity(member, sensitivity));
+        }
+    }
+
+    fn request_peer_dns(&self, handle: ClientHandle) {
+        for member in self.peer_members(handle) {
+            self.request(FrontendRequest::ResolveDns(member));
+        }
+    }
+
     fn create_client_row(&self, client_object: &ClientObject) -> ClientRow {
         let row = ClientRow::new(client_object);
         row.bind(client_object);
@@ -474,10 +987,10 @@ impl Window {
         client: ClientConfig,
         state: ClientState,
     ) {
-        let client = ClientObject::new(handle, client, state.clone());
-        self.clients().append(&client);
-        self.update_placeholder_visibility();
-        self.update_dns_state(handle, !state.ips.is_empty());
+        let client_object = ClientObject::new(handle, client.clone(), state.clone());
+        self.clients().append(&client_object);
+        self.note_state(handle, &state);
+        let _ = self.note_config(handle, &client);
 
         // A client created by the "add device" dialog carries its address and
         // side; apply them as soon as the service reports the handle.
@@ -520,6 +1033,14 @@ impl Window {
             self.request(FrontendRequest::Activate(handle, true));
             self.show_toast("Request sent — approve it on the other device");
         }
+
+        // One logical peer -> one visible row. Duplicate configured clients for
+        // the same certificate fingerprint are kept in the model (so their
+        // state can be read/aggregated and deleted) but their row is hidden.
+        let primary = self.register_peer_identity(handle, &client);
+        self.set_client_row_visible(handle, primary == handle);
+        self.update_placeholder_visibility();
+        self.refresh_peer(primary);
     }
 
     pub(super) fn update_client_list(
@@ -554,65 +1075,70 @@ impl Window {
             log::warn!("could not find client with handle {handle}");
             return;
         };
+        let identity = self
+            .imp()
+            .peer_states
+            .borrow()
+            .get(&handle)
+            .and_then(|(config, _)| peer_identity(config));
 
         self.clients().remove(idx as u32);
+        self.imp().peer_states.borrow_mut().remove(&handle);
+        self.imp().link_ui.borrow_mut().remove(&handle);
+
+        // Drop the handle from its peer group; if it was the visible row of a
+        // group, promote a surviving duplicate so the peer stays on screen.
+        let mut promoted = None;
+        if let Some(identity) = identity {
+            let mut groups = self.imp().peer_groups.borrow_mut();
+            let mut primary_map = self.imp().peer_primary.borrow_mut();
+            let mut empty = None;
+            if let Some(members) = groups.get_mut(&identity) {
+                members.retain(|member| *member != handle);
+                if members.is_empty() {
+                    empty = Some(identity.clone());
+                } else {
+                    let new_primary = members[0];
+                    promoted = Some(new_primary);
+                    for member in members.iter().copied() {
+                        if member == new_primary {
+                            primary_map.remove(&member);
+                        } else {
+                            primary_map.insert(member, new_primary);
+                        }
+                    }
+                }
+            }
+            if let Some(empty) = empty {
+                groups.remove(&empty);
+            }
+            primary_map.remove(&handle);
+        }
+
+        if let Some(promoted) = promoted {
+            self.set_client_row_visible(promoted, true);
+            self.refresh_peer(promoted);
+        }
         if self.clients().n_items() == 0 {
             self.update_placeholder_visibility();
         }
     }
 
     pub(super) fn update_client_config(&self, handle: ClientHandle, client: ClientConfig) {
-        let Some(row) = self.row_for_handle(handle) else {
-            log::warn!("could not find row for handle {handle}");
-            return;
-        };
-        row.set_hostname(client.hostname);
-        row.set_port(client.port);
-        row.set_position(client.pos);
-        row.set_sensitivity(client.sensitivity);
-        row.refresh_status();
+        if self.note_config(handle, &client) {
+            self.imp().local_config_changes.borrow_mut().insert(handle);
+        }
+        // The fingerprint can be learned after creation (TOFU/authorization):
+        // re-register so two entries for the same peer end up as one row.
+        let primary = self.register_peer_identity(handle, &client);
+        self.set_client_row_visible(handle, primary == handle);
+        self.refresh_peer(primary);
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {
-        let Some(row) = self.row_for_handle(handle) else {
-            log::warn!("could not find row for handle {handle}");
-            return;
-        };
-        let Some(client_object) = self.client_object_for_handle(handle) else {
-            log::warn!("could not find row for handle {handle}");
-            return;
-        };
-
-        /* activation state (drives the derived row state: badge, spinner, action) */
-        client_object.set_active(state.active);
-
-        /* dns state */
-        client_object.set_resolving(state.resolving);
-
-        self.update_dns_state(handle, !state.ips.is_empty());
-        let ips = state
-            .ips
-            .into_iter()
-            .map(|ip| ip.to_string())
-            .collect::<Vec<_>>();
-        client_object.set_ips(ips);
-
-        /* peer build version (drives the version-match indicator) */
-        client_object.set_property(
-            "peer-commit",
-            crate::client_object::peer_commit_to_string(state.peer_commit),
-        );
-        client_object.set_property("rtt-ms", state.rtt_ms.unwrap_or(0));
-        client_object.set_property("alive", state.alive);
-        client_object.set_property(
-            "active-addr",
-            state.active_addr.map(|addr| addr.to_string()),
-        );
-        client_object.set_property(
-            "incoming-addr",
-            state.incoming_addr.map(|addr| addr.to_string()),
-        );
-        row.refresh_status();
+        self.note_state(handle, &state);
+        let primary = self.peer_primary_of(handle);
+        self.refresh_peer(primary);
     }
 
     fn client_object_for_handle(&self, handle: ClientHandle) -> Option<ClientObject> {
@@ -816,7 +1342,16 @@ impl Window {
         }
         self.imp().device_controls.borrow_mut().clear();
 
-        let devices = self.imp().devices.borrow().clone();
+        let mut devices = self.imp().devices.borrow().clone();
+        // Defensive: one row per device identity, ordered by name so a
+        // reordered snapshot cannot shuffle the list under the user's cursor.
+        devices.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.fingerprint.cmp(&b.fingerprint))
+        });
+        devices.dedup_by(|a, b| a.fingerprint.eq_ignore_ascii_case(&b.fingerprint));
         if devices.is_empty() {
             group.set_visible(false);
             return;
@@ -1673,5 +2208,166 @@ mod ui_template_smoke {
             "local addresses row must have a subtitle"
         );
         drop(window);
+    }
+}
+
+#[cfg(test)]
+mod peer_merge_tests {
+    use super::*;
+
+    fn config(hostname: Option<&str>, fingerprint: Option<&str>) -> ClientConfig {
+        ClientConfig {
+            hostname: hostname.map(str::to_string),
+            fingerprint: fingerprint.map(str::to_string),
+            port: 4242,
+            ..Default::default()
+        }
+    }
+
+    fn state(
+        active: bool,
+        alive: bool,
+        active_addr: Option<&str>,
+        incoming_addr: Option<&str>,
+        rtt_ms: Option<u32>,
+        ips: &[&str],
+    ) -> ClientState {
+        ClientState {
+            active,
+            alive,
+            active_addr: active_addr.map(|addr| addr.parse().expect("address")),
+            incoming_addr: incoming_addr.map(|addr| addr.parse().expect("address")),
+            rtt_ms,
+            ips: ips
+                .iter()
+                .map(|ip| ip.parse().expect("ip"))
+                .collect::<std::collections::HashSet<_>>(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn peer_identity_requires_a_fingerprint() {
+        assert_eq!(
+            peer_identity(&config(Some("predator"), Some("AA:BB:CC:DD"))),
+            Some("aa:bb:cc:dd".to_string())
+        );
+        // A hostname is not an identity: two different machines can share one.
+        assert_eq!(peer_identity(&config(Some("predator"), None)), None);
+        assert_eq!(peer_identity(&config(None, Some("  "))), None);
+    }
+
+    #[test]
+    fn single_member_summary_is_a_passthrough() {
+        let members = [(
+            config(Some("predator"), Some("aa:bb")),
+            state(
+                true,
+                true,
+                Some("192.168.166.197:4242"),
+                None,
+                Some(7),
+                &["192.168.166.197"],
+            ),
+        )];
+        let summary = merge_peer_states(&members).expect("summary");
+        assert_eq!(summary.hostname.as_deref(), Some("predator"));
+        assert!(summary.active);
+        assert!(summary.alive);
+        assert_eq!(summary.port, 4242);
+        assert_eq!(summary.active_addr.as_deref(), Some("192.168.166.197:4242"));
+        assert_eq!(summary.incoming_addr, None);
+        assert_eq!(summary.rtt_ms, 7);
+        assert_eq!(summary.ips, vec!["192.168.166.197".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_entries_of_one_peer_are_merged_into_one_row() {
+        // Regression for the reported "two connected devices for the same
+        // peer": one configured client per address family, same fingerprint.
+        let members = [
+            (
+                config(Some("predator"), Some("aa:bb")),
+                state(
+                    true,
+                    true,
+                    Some("192.168.166.197:4242"),
+                    None,
+                    Some(4),
+                    &["192.168.166.197"],
+                ),
+            ),
+            (
+                config(Some("predator"), Some("aa:bb")),
+                state(
+                    false,
+                    false,
+                    Some("[2804:2b24:0:6::1]:4242"),
+                    Some("[2804:2b24:0:6::1]:50000"),
+                    None,
+                    &["2804:2b24:0:6::1"],
+                ),
+            ),
+        ];
+        let summary = merge_peer_states(&members).expect("summary");
+        // OR of the members: the peer is enabled even if only one entry is.
+        assert!(summary.active);
+        // Link data comes from the member with a proven round-trip, so the
+        // summary does not flap between the two links.
+        assert_eq!(summary.active_addr.as_deref(), Some("192.168.166.197:4242"));
+        assert_eq!(summary.rtt_ms, 4);
+        assert!(summary.alive);
+        assert_eq!(
+            summary.incoming_addr.as_deref(),
+            Some("[2804:2b24:0:6::1]:50000")
+        );
+        // Union of both address lists, stable IPv4-first order.
+        assert_eq!(
+            summary.ips,
+            vec![
+                "192.168.166.197".to_string(),
+                "2804:2b24:0:6::1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_prefers_the_member_with_a_measured_round_trip() {
+        let members = [
+            (
+                config(Some("predator"), Some("aa:bb")),
+                state(
+                    true,
+                    true,
+                    Some("192.168.166.197:4242"),
+                    None,
+                    None,
+                    &["192.168.166.197"],
+                ),
+            ),
+            (
+                config(Some("predator"), Some("aa:bb")),
+                state(
+                    true,
+                    false,
+                    Some("[2804:2b24:0:6::1]:4242"),
+                    None,
+                    Some(9),
+                    &["2804:2b24:0:6::1"],
+                ),
+            ),
+        ];
+        let summary = merge_peer_states(&members).expect("summary");
+        assert_eq!(
+            summary.active_addr.as_deref(),
+            Some("[2804:2b24:0:6::1]:4242")
+        );
+        assert_eq!(summary.rtt_ms, 9);
+        assert!(!summary.alive);
+    }
+
+    #[test]
+    fn merge_without_members_is_none() {
+        assert_eq!(merge_peer_states(&[]), None);
     }
 }

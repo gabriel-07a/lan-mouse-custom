@@ -34,6 +34,26 @@ mod subpixel;
 
 pub type EmulationHandle = u64;
 
+/// Screen edge the remote pointer was pushed across while a peer drives this
+/// machine.
+///
+/// The backend that injects the remote input is often the only component that
+/// can observe the pointer being pushed past a screen edge: Windows injects
+/// absolute positions (which the raw-input barrier detector ignores) and the
+/// GNOME/libei capture portal does not reliably report barriers for injected
+/// motion. Reporting the edge lets the service ask the peer to release its
+/// capture — that is what hands the cursor back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PointerEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Channel used by a backend to report [`PointerEdge`] return requests.
+pub type EdgeReturnNotifier = tokio::sync::mpsc::UnboundedSender<PointerEdge>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
     #[cfg(wlroots)]
@@ -106,6 +126,15 @@ impl InputEmulation {
     /// The backend that was actually selected.
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// Install the notifier used by backends that can detect the remote
+    /// pointer being pushed past a screen edge (see [`PointerEdge`]).
+    ///
+    /// Backends that cannot detect it never call the notifier; the capture
+    /// backend's barrier detection remains the only return path there.
+    pub fn set_edge_return_notifier(&mut self, notifier: EdgeReturnNotifier) {
+        self.emulation.set_edge_return_notifier(notifier);
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
@@ -246,6 +275,10 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+
+    /// Backends that can observe the injected pointer at a screen edge report
+    /// it here so the service can hand control back to the peer.
+    fn set_edge_return_notifier(&mut self, _notifier: EdgeReturnNotifier) {}
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use lan_mouse_proto::{
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
+    cell::RefCell,
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     rc::Rc,
@@ -13,10 +14,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{
-    sync::Mutex as AsyncMutex,
-    task::{JoinHandle, spawn_local},
-};
+use tokio::task::{JoinHandle, spawn_local};
 use webrtc_dtls::{
     config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
     conn::DTLSConn,
@@ -37,6 +35,145 @@ pub enum ListenerCreationError {
 }
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
+
+/// Accepted incoming transports, keyed by the *logical* address the rest of
+/// the program knows the peer by (see [`SessionMeta::logical_addr`]).
+type ConnMap = Rc<RefCell<HashMap<SocketAddr, ArcConn>>>;
+
+/// Bookkeeping for one accepted peer identity (certificate fingerprint).
+///
+/// Identity is the fingerprint, never the address: the same peer may reach us
+/// over IPv4 or IPv6 (and with a new source port on every reconnect). Keeping
+/// the address the peer was first accepted on stable means:
+/// - the service keeps one client/incoming entry per peer instead of one per
+///   address family;
+/// - the UI does not alternate between `192.168.x.x` and `2804:...`;
+/// - session state (pressed keys, capture zone) is not torn down just because
+///   the peer switched families.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionMeta {
+    /// Address used by the service and by replies (`reply`/`reply_raw`).
+    logical_addr: SocketAddr,
+    /// Monotonic id of the current transport for this identity; a stale
+    /// `read_loop` must not remove or close the connection that replaced it.
+    generation: u64,
+}
+
+type SessionMap = Rc<RefCell<HashMap<String, SessionMeta>>>;
+
+/// Everything a live incoming transport needs while its `read_loop` runs.
+///
+/// Grouped in a struct because these values travel together for the whole
+/// session: the transport, its identity/generation in the session table, the
+/// event channel and the permission maps consulted per event. Nine positional
+/// arguments were unreadable and tripped `clippy::too_many_arguments`.
+struct ReadLoopCtx {
+    conns: ConnMap,
+    sessions: SessionMap,
+    generation: u64,
+    fingerprint: String,
+    logical_addr: SocketAddr,
+    conn: ArcConn,
+    dtls_tx: Sender<ListenEvent>,
+    devices: Arc<RwLock<DeviceStore>>,
+    authorized: Arc<RwLock<HashMap<String, String>>>,
+}
+
+/// What the accept task must do with a freshly authenticated connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AcceptPlan {
+    /// Address the service is told about (or already knows).
+    logical_addr: SocketAddr,
+    /// `true` when this fingerprint already had a live session; the new
+    /// transport replaces the old one under the same logical address, so no
+    /// `Accept`/`Connected` event is emitted again.
+    replacement: bool,
+}
+
+/// Decide how a newly authenticated incoming connection maps to a peer
+/// identity and update the session table accordingly.
+///
+/// Split out from the async accept task so the identity/dedupe rules are unit
+/// testable. Must be called without awaiting (it is a single synchronous
+/// step on the single-threaded runtime, which keeps concurrent handshakes from
+/// both enrolling).
+fn plan_accept(
+    sessions: &mut HashMap<String, SessionMeta>,
+    fingerprint: &str,
+    addr: SocketAddr,
+    generation: u64,
+) -> AcceptPlan {
+    match sessions.get(fingerprint) {
+        Some(existing) => {
+            let logical_addr = existing.logical_addr;
+            sessions.insert(
+                fingerprint.to_string(),
+                SessionMeta {
+                    logical_addr,
+                    generation,
+                },
+            );
+            AcceptPlan {
+                logical_addr,
+                replacement: true,
+            }
+        }
+        None => {
+            sessions.insert(
+                fingerprint.to_string(),
+                SessionMeta {
+                    logical_addr: addr,
+                    generation,
+                },
+            );
+            AcceptPlan {
+                logical_addr: addr,
+                replacement: false,
+            }
+        }
+    }
+}
+
+/// Whether `fingerprint`'s current transport is still `generation`.
+fn session_is_current(
+    sessions: &HashMap<String, SessionMeta>,
+    fingerprint: &str,
+    generation: u64,
+) -> bool {
+    sessions
+        .get(fingerprint)
+        .is_some_and(|meta| meta.generation == generation)
+}
+
+/// Remove the session/transport for `fingerprint` if it is still `generation`.
+///
+/// Returns `true` when the caller is responsible for emitting
+/// [`ListenEvent::Closed`]. Stale transports (already replaced) return `false`
+/// and must stay silent, otherwise the service would tear down the live
+/// session of the address family that replaced them.
+fn finish_session(
+    conns: &ConnMap,
+    sessions: &SessionMap,
+    fingerprint: &str,
+    logical_addr: SocketAddr,
+    generation: u64,
+    conn: &ArcConn,
+) -> bool {
+    if !session_is_current(&sessions.borrow(), fingerprint, generation) {
+        return false;
+    }
+    sessions.borrow_mut().remove(fingerprint);
+    let mut conns = conns.borrow_mut();
+    // Only remove the transport if it is still this one; a replacement may
+    // have been installed under the same logical address.
+    let ours = conns
+        .get(&logical_addr)
+        .is_some_and(|current| Arc::ptr_eq(current, conn));
+    if ours {
+        conns.remove(&logical_addr);
+    }
+    ours
+}
 
 /// Commands sent from other tasks to the listener task.
 pub(crate) enum ListenerCommand {
@@ -124,7 +261,10 @@ pub(crate) struct LanMouseListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
     listen_task: JoinHandle<()>,
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    /// The single live transport per logical peer address.
+    conns: ConnMap,
+    /// Accepted peer identities (certificate fingerprints).
+    sessions: SessionMap,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
 }
@@ -172,10 +312,16 @@ impl LanMouseListener {
 
         let mut listener = bind_listener(port).await?;
 
-        let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
-            Rc::new(AsyncMutex::new(Vec::new()));
+        let conns: ConnMap = Default::default();
+        let sessions: SessionMap = Default::default();
+        // Monotonic transport id shared by the accept task and every
+        // `read_loop`, replacing the old "first matching address wins"
+        // bookkeeping.
+        let transport_generation = Rc::new(std::cell::Cell::new(0u64));
 
         let conns_clone = conns.clone();
+        let sessions_clone = sessions.clone();
+        let generation_clone = transport_generation.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let authorized = authorized_keys.clone();
@@ -208,7 +354,7 @@ impl LanMouseListener {
                                     let _ = conn.close().await;
                                     continue;
                                 }
-                                if conns_clone.lock().await.len() >= MAX_LIVE_CONNECTIONS {
+                                if conns_clone.borrow().len() >= MAX_LIVE_CONNECTIONS {
                                     log::warn!(
                                         "too many live connections, dropping handshake from {addr}"
                                     );
@@ -226,6 +372,8 @@ impl LanMouseListener {
                                 let devices = devices.clone();
                                 let accept_incoming = accept_incoming.clone();
                                 let conns = conns_clone.clone();
+                                let sessions = sessions_clone.clone();
+                                let generation = generation_clone.clone();
                                 let cfg = cfg.clone();
                                 spawn_local(async move {
                                     let _permit = permit;
@@ -248,8 +396,6 @@ impl LanMouseListener {
                                     match DTLSConn::new(conn, cfg, false, None).await {
                                         Ok(dtls) => {
                                             let dtls = Arc::new(dtls);
-                                            log::info!("dtls client connected, ip: {addr}");
-                                            conns.lock().await.push((addr, dtls.clone()));
                                             let fingerprint = dtls
                                                 .connection_state()
                                                 .await
@@ -257,76 +403,119 @@ impl LanMouseListener {
                                                 .first()
                                                 .map(|cert| crypto::generate_fingerprint(cert))
                                                 .unwrap_or_default();
-                                            // Auto-authorization (allowlisted
-                                            // address or pairing window) is
-                                            // only persisted once the
-                                            // handshake actually succeeded, so
-                                            // a failed/aborted handshake
-                                            // cannot leave an orphaned pin.
-                                            if let Some(source) =
-                                                auto_source.lock().expect("lock").take()
-                                            {
-                                                let (description, incoming, outgoing) = match source
+                                            let transport_id = generation.get().wrapping_add(1);
+                                            generation.set(transport_id);
+                                            let generation = transport_id;
+                                            // Identity is the certificate fingerprint, not
+                                            // the address. Enrol/replace synchronously so
+                                            // two concurrent handshakes of the same peer
+                                            // cannot both create a logical session.
+                                            let plan = {
+                                                let mut sessions = sessions.borrow_mut();
+                                                plan_accept(
+                                                    &mut sessions,
+                                                    &fingerprint,
+                                                    addr,
+                                                    generation,
+                                                )
+                                            };
+                                            let logical_addr = plan.logical_addr;
+                                            let replaced = conns
+                                                .borrow_mut()
+                                                .insert(logical_addr, dtls.clone());
+                                            if let Some(old) = replaced {
+                                                // Deduplication: the logical session
+                                                // stays, only the transport is replaced.
+                                                let _ = old.close().await;
+                                            }
+                                            if plan.replacement {
+                                                log::info!(
+                                                    "peer {fingerprint} reconnected from {addr}; \
+                                                     keeping logical address {logical_addr}"
+                                                );
+                                            } else {
+                                                log::info!(
+                                                    "dtls client connected, ip: {addr} ({fingerprint})"
+                                                );
+                                                // Auto-authorization (allowlisted
+                                                // address or pairing window) is
+                                                // only persisted once the
+                                                // handshake actually succeeded, so
+                                                // a failed/aborted handshake
+                                                // cannot leave an orphaned pin.
+                                                if let Some(source) =
+                                                    auto_source.lock().expect("lock").take()
                                                 {
-                                                    AutoSource::TrustedAddress {
-                                                        incoming,
-                                                        outgoing,
-                                                    } => (
-                                                        format!("trusted {}", addr.ip()),
-                                                        incoming,
-                                                        outgoing,
-                                                    ),
-                                                    AutoSource::Pairing {
-                                                        incoming,
-                                                        outgoing,
-                                                    } => {
-                                                        // Single use: the
-                                                        // window allows exactly
-                                                        // one new device.
-                                                        let _ = pairing
-                                                            .write()
-                                                            .expect("lock")
-                                                            .take();
-                                                        (
-                                                            format!("paired {}", addr.ip()),
+                                                    let (description, incoming, outgoing) =
+                                                        match source {
+                                                            AutoSource::TrustedAddress {
+                                                                incoming,
+                                                                outgoing,
+                                                            } => (
+                                                                format!(
+                                                                    "trusted {}",
+                                                                    logical_addr.ip()
+                                                                ),
+                                                                incoming,
+                                                                outgoing,
+                                                            ),
+                                                            AutoSource::Pairing {
+                                                                incoming,
+                                                                outgoing,
+                                                            } => {
+                                                                // Single use: the
+                                                                // window allows exactly
+                                                                // one new device.
+                                                                let _ = pairing
+                                                                    .write()
+                                                                    .expect("lock")
+                                                                    .take();
+                                                                (
+                                                                    format!(
+                                                                        "paired {}",
+                                                                        logical_addr.ip()
+                                                                    ),
+                                                                    incoming,
+                                                                    outgoing,
+                                                                )
+                                                            }
+                                                        };
+                                                    authorized
+                                                        .write()
+                                                        .expect("lock")
+                                                        .insert(fingerprint.clone(), description);
+                                                    log::info!(
+                                                        "auto-authorized {logical_addr} ({fingerprint})"
+                                                    );
+                                                    let _ = listen_tx.send(
+                                                        ListenEvent::AutoAuthorized {
+                                                            addr: logical_addr,
+                                                            fingerprint: fingerprint.clone(),
+                                                            from_pairing: matches!(
+                                                                source,
+                                                                AutoSource::Pairing { .. }
+                                                            ),
                                                             incoming,
                                                             outgoing,
-                                                        )
-                                                    }
-                                                };
-                                                authorized
-                                                    .write()
-                                                    .expect("lock")
-                                                    .insert(fingerprint.clone(), description);
-                                                log::info!(
-                                                    "auto-authorized {addr} ({fingerprint})"
-                                                );
-                                                let _ = listen_tx.send(
-                                                    ListenEvent::AutoAuthorized {
-                                                        addr,
-                                                        fingerprint: fingerprint.clone(),
-                                                        from_pairing: matches!(
-                                                            source,
-                                                            AutoSource::Pairing { .. }
-                                                        ),
-                                                        incoming,
-                                                        outgoing,
-                                                    },
-                                                );
+                                                        },
+                                                    );
+                                                }
+                                                let _ = listen_tx.send(ListenEvent::Accept {
+                                                    addr: logical_addr,
+                                                    fingerprint: fingerprint.clone(),
+                                                });
                                             }
-                                            let _ = listen_tx.send(ListenEvent::Accept {
-                                                addr,
-                                                fingerprint: fingerprint.clone(),
-                                            });
-                                            spawn_local(read_loop(
+                                            spawn_local(read_loop(ReadLoopCtx {
                                                 conns,
-                                                addr,
+                                                sessions,
+                                                generation,
                                                 fingerprint,
-                                                dtls,
-                                                listen_tx,
+                                                logical_addr,
+                                                conn: dtls,
+                                                dtls_tx: listen_tx,
                                                 devices,
                                                 authorized,
-                                            ));
+                                            }));
                                         }
                                         Err(e) => {
                                             if matches!(
@@ -366,6 +555,7 @@ impl LanMouseListener {
 
         Ok(Self {
             conns,
+            sessions,
             listen_rx,
             listen_tx,
             listen_task,
@@ -384,8 +574,9 @@ impl LanMouseListener {
 
     pub(crate) async fn terminate(&mut self) {
         self.listen_task.abort();
-        let conns = self.conns.lock().await;
-        for (_, conn) in conns.iter() {
+        let conns = self.conns.borrow().values().cloned().collect::<Vec<_>>();
+        self.sessions.borrow_mut().clear();
+        for conn in conns {
             let _ = conn.close().await;
         }
         self.listen_tx.close();
@@ -398,12 +589,14 @@ impl LanMouseListener {
     }
 
     /// Send an already encoded frame (clipboard acks and chunks).
+    ///
+    /// The address identifies the logical session (one transport per accepted
+    /// peer identity); a reconnect may have replaced the underlying transport
+    /// while keeping the same logical address.
     pub(crate) async fn reply_raw(&self, addr: SocketAddr, bytes: &[u8]) {
-        let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                let _ = conn.send(bytes).await;
-            }
+        let conn = self.conns.borrow().get(&addr).cloned();
+        if let Some(conn) = conn {
+            let _ = conn.send(bytes).await;
         }
     }
 
@@ -411,38 +604,26 @@ impl LanMouseListener {
     ///
     /// Used when a device is revoked while it is still connected: removing the
     /// fingerprint alone would leave the live DTLS session able to inject
-    /// input until it drops on its own.
+    /// input until it drops on its own. The session is removed before the
+    /// transport closes so the `read_loop` does not report a second close.
     pub(crate) async fn disconnect(&self, addr: SocketAddr) {
-        let conn = {
-            let mut conns = self.conns.lock().await;
-            conns
-                .iter()
-                .position(|(a, _)| *a == addr)
-                .map(|index| conns.remove(index).1)
-        };
+        let conn = self.conns.borrow_mut().remove(&addr);
+        self.sessions
+            .borrow_mut()
+            .retain(|_, meta| meta.logical_addr != addr);
         if let Some(conn) = conn {
             log::info!("closing incoming connection from {addr}");
             let _ = conn.close().await;
+            let _ = self.listen_tx.send(ListenEvent::Closed { addr });
         }
     }
 
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
-        if let Some(conn) = self
-            .conns
-            .lock()
-            .await
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .map(|(_, c)| c.clone())
-        {
-            let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-            let certs = conn.connection_state().await.peer_certificates;
-            let cert = certs.first()?;
-            let fingerprint = crypto::generate_fingerprint(cert);
-            Some(fingerprint)
-        } else {
-            None
-        }
+        let conn = self.conns.borrow().get(&addr).cloned()?;
+        let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
+        let certs = conn.connection_state().await.peer_certificates;
+        let cert = certs.first()?;
+        Some(crypto::generate_fingerprint(cert))
     }
 }
 
@@ -597,23 +778,35 @@ fn normalize_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-async fn read_loop(
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
-    addr: SocketAddr,
-    fingerprint: String,
-    conn: ArcConn,
-    dtls_tx: Sender<ListenEvent>,
-    devices: Arc<RwLock<DeviceStore>>,
-    authorized: Arc<RwLock<HashMap<String, String>>>,
-) -> Result<(), Error> {
+async fn read_loop(ctx: ReadLoopCtx) -> Result<(), Error> {
+    let ReadLoopCtx {
+        conns,
+        sessions,
+        generation,
+        fingerprint,
+        logical_addr,
+        conn,
+        dtls_tx,
+        devices,
+        authorized,
+    } = ctx;
     let mut b = [0u8; MAX_CLIPBOARD_FRAME];
     let mut blocked = 0u64;
+    let addr = logical_addr;
 
     loop {
+        if !session_is_current(&sessions.borrow(), &fingerprint, generation) {
+            // A newer transport replaced this one; it owns the logical
+            // session now. Exit without emitting `Closed`.
+            return Ok(());
+        }
         let n = match conn.recv(&mut b).await {
             Ok(n) => n,
             Err(_) => break,
         };
+        if !session_is_current(&sessions.borrow(), &fingerprint, generation) {
+            return Ok(());
+        }
         if n > 0 && is_clipboard_frame(b[0]) {
             let clipboard_policy = incoming_policy(&devices, &authorized, &fingerprint);
             if !(clipboard_policy.allowed && clipboard_policy.capabilities.allows_clipboard_write())
@@ -668,11 +861,16 @@ async fn read_loop(
         }
     }
     log::info!("dtls client disconnected {addr:?}");
-    let mut conns = conns.lock().await;
-    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
-        conns.remove(index);
+    if finish_session(
+        &conns,
+        &sessions,
+        &fingerprint,
+        logical_addr,
+        generation,
+        &conn,
+    ) {
+        let _ = dtls_tx.send(ListenEvent::Closed { addr });
     }
-    let _ = dtls_tx.send(ListenEvent::Closed { addr });
     Ok(())
 }
 
@@ -764,5 +962,89 @@ mod limiter_tests {
         assert!(limiter.allow(ip(1)));
         limiter.prune();
         assert!(limiter.attempts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn addr(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse().expect("ip"), port)
+    }
+
+    #[test]
+    fn first_connection_enrols_with_its_own_address() {
+        let mut sessions = HashMap::new();
+        let v4 = addr("192.168.1.5", 1000);
+        let plan = plan_accept(&mut sessions, "fingerprint", v4, 1);
+        assert_eq!(
+            plan,
+            AcceptPlan {
+                logical_addr: v4,
+                replacement: false,
+            }
+        );
+        assert!(session_is_current(&sessions, "fingerprint", 1));
+    }
+
+    #[test]
+    fn same_fingerprint_from_another_family_keeps_the_logical_address() {
+        let mut sessions = HashMap::new();
+        let v4 = addr("192.168.1.5", 1000);
+        let v6 = addr("fd00::5", 2000);
+
+        let first = plan_accept(&mut sessions, "fingerprint", v4, 1);
+        assert!(!first.replacement);
+
+        // The peer dialed us again over IPv6 (or reconnected from a new source
+        // port). Identity is the certificate: this must be a replacement, not
+        // a second device, and the address must not flip.
+        let second = plan_accept(&mut sessions, "fingerprint", v6, 2);
+        assert_eq!(
+            second,
+            AcceptPlan {
+                logical_addr: v4,
+                replacement: true,
+            }
+        );
+        assert!(
+            !session_is_current(&sessions, "fingerprint", 1),
+            "the stale transport must not be able to remove or report the new one"
+        );
+        assert!(session_is_current(&sessions, "fingerprint", 2));
+    }
+
+    #[test]
+    fn reconnecting_from_the_same_family_replaces_the_old_transport() {
+        let mut sessions = HashMap::new();
+        let first = addr("192.168.1.5", 1000);
+        let second = addr("192.168.1.5", 4000);
+        let _ = plan_accept(&mut sessions, "fingerprint", first, 1);
+        let plan = plan_accept(&mut sessions, "fingerprint", second, 2);
+        assert_eq!(
+            plan.logical_addr, first,
+            "the service-facing address stays stable across reconnects"
+        );
+        assert!(plan.replacement);
+    }
+
+    #[test]
+    fn different_fingerprints_stay_separate_devices() {
+        let mut sessions = HashMap::new();
+        let a = addr("192.168.1.5", 1000);
+        let b = addr("192.168.1.6", 1000);
+        let first = plan_accept(&mut sessions, "fp-a", a, 1);
+        let second = plan_accept(&mut sessions, "fp-b", b, 2);
+        assert!(!first.replacement);
+        assert!(!second.replacement);
+        assert_eq!(second.logical_addr, b);
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn unknown_fingerprint_is_never_current() {
+        let sessions = HashMap::new();
+        assert!(!session_is_current(&sessions, "missing", 1));
     }
 }

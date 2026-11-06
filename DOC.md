@@ -184,6 +184,61 @@ The handoff is coordinated with a serial number: the side that captures sends
 peer answers with `Ack(serial)`. The receiver deduplicates retransmissions and
 releases its own capture exactly once. `Leave` returns control.
 
+## Persistent State and Clean Install
+
+Everything Lan Mouse persists for one user lives in a directory literally
+called `lan-mouse`; there is no database and no registry-based device state.
+Clients, `[[devices]]` (per-direction policies and capabilities),
+`[[address_rules]]`, `authorized_fingerprints` and `[[denied]]` are all inside
+`config.toml`. Pending approval requests and the pairing window are in-memory
+only and disappear on restart.
+
+| OS | Config, identity and audit | Extra runtime state |
+| --- | --- | --- |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/lan-mouse/` (`config.toml`, `lan-mouse.pem`), `${XDG_STATE_HOME:-~/.local/state}/lan-mouse/` (`audit.jsonl`) | portal consent tokens in the state directory (`input-capture.token`, `remote-desktop.token`, `clipboard.token`), migrated from the legacy `${XDG_CACHE_HOME:-~/.cache}/lan-mouse/` |
+| Windows | `%LOCALAPPDATA%\lan-mouse\` (`config.toml`, `lan-mouse.pem`, `audit.jsonl`) | installation itself: `%PROGRAMFILES64%\Lan Mouse`, shortcuts, `HKLM` keys, firewall rule `Lan Mouse` |
+| macOS | `~/.config/lan-mouse/`, `~/Library/Logs/lan-mouse/audit.jsonl` | Accessibility / Input Monitoring TCC grants (OS-managed, not resettable by the app) |
+
+**Upgrade vs fresh install.** Package upgrades intentionally keep the user's
+configuration. A *fresh* install must not resurrect devices from an older
+build. Cleaning is **reversible by default**: the app-owned directories are
+renamed to a sibling `lan-mouse.bak-<timestamp>` (atomic same-directory
+rename), so the next start sees a pristine config while the old devices,
+certificate and audit log are preserved in the backup and can be restored by
+renaming it back. Permanent deletion requires an explicit `--purge` /
+`/PURGEUSERDATA`.
+
+- **Windows installer** (`installer/windows/lan-mouse-custom.nsi`): stops the
+  GUI and the daemon it spawned (`taskkill /T /F`), detects leftovers in
+  `%LOCALAPPDATA%\lan-mouse` / `%APPDATA%\lan-mouse` and asks before cleaning
+  them (interactive default: move to `lan-mouse.bak-<yyyyMMdd-HHmmss>`).
+  Silent installs clean by default; `/KEEPUSERDATA` preserves the
+  configuration, `/CLEANUSERDATA` forces a clean install and
+  `/PURGEUSERDATA` deletes the old data permanently instead of backing it up.
+  The previous `$INSTDIR` is wiped before extraction so stale binaries cannot
+  mix with the new build. The uninstaller moves the same user-data directories
+  to a backup (silent: yes, `/KEEPUSERDATA` keeps them in place,
+  `/PURGEUSERDATA` deletes them).
+- **`lan-mouse --reset-config [--dry-run] [--purge]`** (`src/reset.rs`,
+  handled in `src/config.rs` before `Config::new` creates anything): moves the
+  config, state, legacy cache and macOS audit directories of the current user
+  to timestamped `lan-mouse.bak-<unix timestamp>` siblings (`--purge` deletes
+  them instead). It refuses to run while the service is running, only touches
+  paths whose final component is exactly `lan-mouse`, does not follow symlinks,
+  prints every path and never touches custom `--config` / `--cert-path`
+  locations.
+- **Linux `.deb`**: maintainer scripts never modify home directories (dpkg runs
+  as root and cannot know which users ran the app). `postrm purge` prints the
+  per-user paths and how to reset; `scripts/install-clean.sh`
+  (`--dry-run`/`--yes`/`--purge`) is the scripted equivalent for Linux and
+  macOS and also defaults to a reversible backup.
+- **macOS**: move the directories above (or run the reset flag); TCC grants
+  are managed by the OS and only reset in System Settings / with `tccutil`.
+
+See [docs/audit-fresh-install.md](docs/audit-fresh-install.md) for the exact
+path table, the fresh-install/upgrade/uninstall matrix and the remaining risks
+(multi-user machines, elevated installs, custom paths, portal tokens, TCC).
+
 ## Multi-OS Testing Strategy
 Testing combinations across Linux, Windows 10, and Windows 11 uses three layers:
 1. **Cross-platform geometry & protocol tests (`cargo test --workspace`):**

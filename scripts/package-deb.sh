@@ -96,5 +96,37 @@ exit 0
 PRERM
 chmod 755 "$stage/DEBIAN/prerm"
 
+# Per-user data (devices, permissions, certificate, audit log, portal consent
+# tokens) is NEVER touched by a maintainer script: dpkg runs as root, cannot
+# know which users ran Lan Mouse and must not modify home directories behind
+# the user's back. Upgrades therefore keep the configuration on purpose, even
+# on `apt purge`. The postrm only explains how to reset it explicitly:
+#   lan-mouse --reset-config          (moves it to a reversible .bak backup;
+#                                      add --purge to delete permanently)
+#   scripts/install-clean.sh --yes    (from the source tree, also macOS)
+cat > "$stage/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+if [ "$1" = "purge" ]; then
+    printf '%s\n' \
+        "lan-mouse: per-user configuration was kept (this is intentional):" \
+        "  ~/.config/lan-mouse        devices, permissions, certificate" \
+        "  ~/.local/state/lan-mouse   audit log and portal consent tokens" \
+        "  ~/.cache/lan-mouse         portal tokens from older builds" \
+        "Run 'lan-mouse --reset-config' before uninstalling to move that data" \
+        "to a reversible 'lan-mouse.bak-<timestamp>' backup ('--purge' deletes" \
+        "it permanently), or delete the directories manually for a clean state." >&2
+fi
+# Refresh the desktop/icon caches after the package files are gone.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+fi
+exit 0
+POSTRM
+chmod 755 "$stage/DEBIAN/postrm"
+
 dpkg-deb --root-owner-group --build "$stage" "$out"
 echo "built $out"

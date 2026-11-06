@@ -10,7 +10,7 @@ use lan_mouse_proto::{
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
@@ -19,11 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::{
-    net::UdpSocket,
-    sync::watch,
-    task::{JoinSet, spawn_local},
-};
+use tokio::{net::UdpSocket, sync::watch, task::spawn_local};
 use webrtc_dtls::{
     config::{Config, ExtendedMasterSecretType},
     conn::DTLSConn,
@@ -47,9 +43,9 @@ pub(crate) enum LanMouseConnectionError {
     Timeout,
 }
 
-/// Per-address DTLS handshake budget. Addresses are dialed in parallel, so
-/// the total time to establish a connection stays close to this value even
-/// when a client has several (possibly stale) IPs configured.
+/// Per-address DTLS handshake budget. Addresses are dialed one after the
+/// other (see [`dial_order`]), so a dead preferred address delays the switch to
+/// the failover address by at most this budget.
 const ADDRESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Backoff for the background reconnect loop while a client stays active.
@@ -57,8 +53,22 @@ const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
-type ConnMap = Rc<RefCell<HashMap<SocketAddr, ArcConn>>>;
-type FastConnMap = Rc<RefCell<HashMap<ClientHandle, ArcConn>>>;
+
+/// One established transport for a configured client.
+///
+/// A client (one logical peer, identified by its config entry and, once
+/// learned, its certificate fingerprint) owns **at most one** of these. The
+/// generation makes every task that belongs to a transport able to tell
+/// whether it is still the current one: a stale ping/receive loop must never
+/// write connection state for a transport that was already replaced.
+#[derive(Clone)]
+struct ActiveConnection {
+    /// Monotonic id of this transport; changes on every (re)connect.
+    generation: u64,
+    /// The peer address this transport was established to.
+    addr: SocketAddr,
+    conn: ArcConn,
+}
 
 /// Shared state of the outgoing connection layer.
 ///
@@ -69,10 +79,10 @@ type FastConnMap = Rc<RefCell<HashMap<ClientHandle, ArcConn>>>;
 struct ConnCtx {
     cert: Certificate,
     client_manager: ClientManager,
-    /// connections keyed by peer address (source of truth)
-    conns: ConnMap,
-    /// connections keyed by client handle (hot-path cache)
-    fast_conns: FastConnMap,
+    /// the single live transport per client (source of truth)
+    active: Rc<RefCell<HashMap<ClientHandle, ActiveConnection>>>,
+    /// source of monotonic [`ActiveConnection::generation`] ids
+    generation: Rc<Cell<u64>>,
     /// handles with a connect attempt in flight
     connecting: Rc<RefCell<HashSet<ClientHandle>>>,
     /// handles with a background reconnect loop running
@@ -129,7 +139,7 @@ impl ConnCtx {
     /// Start a background connect attempt, unless one is already running or
     /// the client is already connected.
     fn start_connecting(&self, handle: ClientHandle) {
-        if self.client_manager.active_addr(handle).is_some() {
+        if self.active(handle).is_some() {
             return;
         }
         if !self.connecting.borrow_mut().insert(handle) {
@@ -159,7 +169,7 @@ impl ConnCtx {
                 if !ctx.client_manager.is_active(handle) {
                     break;
                 }
-                if ctx.client_manager.active_addr(handle).is_some() {
+                if ctx.active(handle).is_some() {
                     break;
                 }
                 ctx.start_connecting(handle);
@@ -169,40 +179,78 @@ impl ConnCtx {
         });
     }
 
-    fn fast_conn(&self, handle: ClientHandle, addr: SocketAddr) -> Option<ArcConn> {
-        if let Some(conn) = self.fast_conns.borrow().get(&handle).cloned() {
-            return Some(conn);
-        }
-        let conn = self.conns.borrow().get(&addr).cloned()?;
-        self.fast_conns.borrow_mut().insert(handle, conn.clone());
-        Some(conn)
+    /// The live transport of `handle`, if any.
+    fn active(&self, handle: ClientHandle) -> Option<ActiveConnection> {
+        self.active.borrow().get(&handle).cloned()
     }
 
-    fn disconnect(&self, handle: ClientHandle, addr: SocketAddr) {
-        log::warn!("client ({handle}) @ {addr} connection closed");
-        self.conns.borrow_mut().remove(&addr);
-        self.fast_conns.borrow_mut().remove(&handle);
+    /// Whether `generation` is still the live transport of `handle`.
+    fn is_current(&self, handle: ClientHandle, generation: u64) -> bool {
+        self.active
+            .borrow()
+            .get(&handle)
+            .is_some_and(|active| active.generation == generation)
+    }
+
+    fn next_generation(&self) -> u64 {
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
+        generation
+    }
+
+    /// Install a new transport, returning the one it replaced (if any).
+    fn install(&self, handle: ClientHandle, active: ActiveConnection) -> Option<ActiveConnection> {
+        self.active.borrow_mut().insert(handle, active)
+    }
+
+    /// Remove the live transport only if it is still `generation`.
+    fn take_if_current(&self, handle: ClientHandle, generation: u64) -> Option<ActiveConnection> {
+        let mut active = self.active.borrow_mut();
+        match active.get(&handle) {
+            Some(current) if current.generation == generation => active.remove(&handle),
+            _ => None,
+        }
+    }
+
+    /// Tear down the transport of `handle` if it is still `generation`.
+    ///
+    /// The state is cleared before the transport is closed so a replacement
+    /// connection can be installed while the close is still in flight. A
+    /// stale generation is a no-op: that is what keeps an old ping/receive
+    /// loop from fighting with the current transport over `active_addr`.
+    async fn disconnect(&self, handle: ClientHandle, generation: u64) {
+        let Some(active) = self.take_if_current(handle, generation) else {
+            return;
+        };
+        log::warn!("client ({handle}) @ {} connection closed", active.addr);
         self.client_manager.set_active_addr(handle, None);
         self.client_manager.set_alive(handle, false);
         self.client_manager.set_peer_hello(handle, None, 0, 0);
         self.client_manager.set_rtt_ms(handle, None);
-        self.ping_sent.borrow_mut().remove(&addr);
-        self.ping_response.borrow_mut().remove(&addr);
+        // No transport means no round-trip proof: the frontend must not keep
+        // showing "Connected" based on a Pong from the closed link.
+        self.client_manager.set_last_pong_at(handle, None);
+        self.ping_sent.borrow_mut().remove(&active.addr);
+        self.ping_response.borrow_mut().remove(&active.addr);
+        // A reconnect may legitimately reuse the same ip:port (stateful NAT,
+        // fast socket rebinding), so per-address bookkeeping must not outlive
+        // the transport it belongs to.
+        self.hello_sent.borrow_mut().remove(&active.addr);
+        self.auth_sessions.borrow_mut().remove(&active.addr);
         self.notify_connected(handle, false);
+        let _ = active.conn.close().await;
         self.schedule_reconnect(handle);
     }
 
-    /// Resolve a usable connection for `handle`, waiting up to `remaining`
+    /// Resolve the live connection for `handle`, waiting up to `remaining`
     /// for a connection attempt that is already (or will be) in flight.
     async fn conn_for(
         &self,
         handle: ClientHandle,
         remaining: Duration,
-    ) -> Result<(SocketAddr, ArcConn), LanMouseConnectionError> {
-        if let Some(addr) = self.client_manager.active_addr(handle) {
-            if let Some(conn) = self.fast_conn(handle, addr) {
-                return Ok((addr, conn));
-            }
+    ) -> Result<ActiveConnection, LanMouseConnectionError> {
+        if let Some(active) = self.active(handle) {
+            return Ok(active);
         }
 
         self.start_connecting(handle);
@@ -219,14 +267,8 @@ impl ConnCtx {
             .await;
         }
 
-        let addr = self
-            .client_manager
-            .active_addr(handle)
-            .ok_or(LanMouseConnectionError::NotConnected)?;
-        let conn = self
-            .fast_conn(handle, addr)
-            .ok_or(LanMouseConnectionError::NotConnected)?;
-        Ok((addr, conn))
+        self.active(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)
     }
 }
 
@@ -258,8 +300,8 @@ impl LanMouseConnection {
         let ctx = ConnCtx {
             cert,
             client_manager,
-            conns: Default::default(),
-            fast_conns: Default::default(),
+            active: Default::default(),
+            generation: Default::default(),
             connecting: Default::default(),
             reconnecting: Default::default(),
             waiters: Default::default(),
@@ -407,20 +449,20 @@ impl ConnectionSender {
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let (addr, conn) = self.ctx.conn_for(handle, remaining).await?;
+            let active = self.ctx.conn_for(handle, remaining).await?;
 
             if require_alive && !self.ctx.client_manager.alive(handle) {
                 return Err(LanMouseConnectionError::TargetEmulationDisabled);
             }
 
-            match conn.send(buf).await {
+            match active.conn.send(buf).await {
                 Ok(_) => {
-                    log::trace!("{} bytes >->->->->- {addr}", buf.len());
+                    log::trace!("{} bytes >->->->->- {}", buf.len(), active.addr);
                     return Ok(());
                 }
                 Err(e) => {
                     log::warn!("client {handle} failed to send: {e}");
-                    self.ctx.disconnect(handle, addr);
+                    self.ctx.disconnect(handle, active.generation).await;
                     // One transparent retry lets a transient send error be
                     // absorbed without releasing the capture. The retry path
                     // still has to complete before the caller's grace expires.
@@ -464,6 +506,18 @@ pub(crate) fn configure_low_latency_udp(socket: &UdpSocket) {
     }
     #[cfg(not(unix))]
     let _ = socket;
+}
+
+/// Current wall-clock time in Unix milliseconds.
+///
+/// `last_pong_at` is a frontend-facing timestamp (not a monotonic `Instant`):
+/// the GUI compares it with the system clock, and it must survive being read
+/// out of the IPC state snapshot.
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 /// Fingerprint of the certificate presented by an outgoing connection.
@@ -541,37 +595,80 @@ async fn connect(
     }
 }
 
-async fn connect_any(
-    addrs: &[SocketAddr],
+/// Address family preference for clients that have never connected.
+///
+/// IPv4 is tried first because it works on every home/office LAN without
+/// router advertisements or an IPv6 firewall exception, and it is what most
+/// peers actually use. IPv6 is still tried (and is the only option on
+/// IPv6-only networks) — only after IPv4 failed. The order is deliberately
+/// static so the same client does not flip families between reconnects.
+fn family_rank(addr: &SocketAddr) -> u8 {
+    match addr {
+        SocketAddr::V4(_) => 0,
+        SocketAddr::V6(_) => 1,
+    }
+}
+
+/// Order the candidate addresses of a client for one connection attempt.
+///
+/// Preference, highest first:
+/// 1. the address that established the previous session (remembered per
+///    client by [`ClientManager::record_working_addr`]) — this keeps a
+///    reconnect on the family/address that actually works instead of
+///    flip-flopping between the A and AAAA records;
+/// 2. IPv4;
+/// 3. IPv6.
+///
+/// The result is deduplicated and deterministic, so a multi-address client
+/// never dials the same endpoint twice in one attempt.
+fn dial_order(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    preferred: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let preferred_ip = preferred.map(|addr| addr.ip());
+    let mut addrs = addrs.into_iter().collect::<Vec<_>>();
+    addrs.sort_by_key(|addr| {
+        (
+            u8::from(Some(addr.ip()) != preferred_ip),
+            family_rank(addr),
+            *addr,
+        )
+    });
+    addrs.dedup();
+    addrs
+}
+
+/// Try the candidate addresses one at a time, in [`dial_order`] order, and
+/// return the first successful handshake.
+///
+/// Deliberately **not** happy-eyeballs: racing IPv4 and IPv6 opens a session
+/// per family on the peer, which then has to pick one and may show the same
+/// device twice. One attempt = at most one session, and the ordering above
+/// keeps the chosen address stable. Sequential failover is slower in the worst
+/// case (one [`ADDRESS_TIMEOUT`] per dead address), which is the documented
+/// trade-off for a stable logical link.
+async fn connect_first(
+    addrs: impl IntoIterator<Item = SocketAddr>,
     cert: Certificate,
     timeout: Duration,
     expected_fingerprint: Option<String>,
 ) -> Result<(ArcConn, SocketAddr), LanMouseConnectionError> {
-    if addrs.is_empty() {
-        return Err(LanMouseConnectionError::NotConnected);
-    }
-    let mut joinset = JoinSet::new();
-    for &addr in addrs {
-        joinset.spawn_local(connect(
-            addr,
-            cert.clone(),
-            timeout,
-            expected_fingerprint.clone(),
-        ));
-    }
-    while let Some(result) = joinset.join_next().await {
-        match result {
-            Ok(Ok(conn)) => {
-                // Stop the other in-flight attempts: the first successful
-                // handshake wins (happy-eyeballs style).
-                joinset.abort_all();
-                return Ok(conn);
+    let mut last_error = LanMouseConnectionError::NotConnected;
+    let mut attempted = 0usize;
+    for addr in addrs {
+        attempted += 1;
+        match connect(addr, cert.clone(), timeout, expected_fingerprint.clone()).await {
+            Ok(connected) => return Ok(connected),
+            Err((addr, e)) => {
+                log::warn!("failed to connect to {addr}: `{e}`");
+                last_error = e;
             }
-            Ok(Err((addr, e))) => log::warn!("failed to connect to {addr}: `{e}`"),
-            Err(e) => log::warn!("connection attempt task failed: {e}"),
         }
     }
-    Err(LanMouseConnectionError::NotConnected)
+    if attempted == 0 {
+        return Err(LanMouseConnectionError::NotConnected);
+    }
+    Err(last_error)
 }
 
 async fn connect_to_handle(
@@ -581,7 +678,7 @@ async fn connect_to_handle(
     log::info!("client {handle} connecting ...");
 
     let result = async {
-        if ctx.client_manager.active_addr(handle).is_some() {
+        if ctx.active(handle).is_some() {
             return Ok(());
         }
 
@@ -590,15 +687,25 @@ async fn connect_to_handle(
             .get_ips(handle)
             .ok_or(LanMouseConnectionError::NotConnected)?;
         let port = ctx.client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
-        let addrs = ips
-            .into_iter()
-            .map(|a| SocketAddr::new(a, port))
-            .collect::<Vec<_>>();
+        let preferred = ctx
+            .client_manager
+            .preferred_addr(handle)
+            .filter(|preferred| ips.contains(&preferred.ip()));
+        if preferred.is_none() {
+            // The remembered address is no longer part of the client's address
+            // set (DNS change, new DHCP lease, edited config): forget it so the
+            // failover starts from the documented family preference again.
+            ctx.client_manager.clear_preferred_addr(handle);
+        }
+        let addrs = dial_order(
+            ips.into_iter().map(|ip| SocketAddr::new(ip, port)),
+            preferred,
+        );
 
-        log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
+        log::info!("client ({handle}) connecting ... (ordered addresses: {addrs:?})");
         let expected = ctx.client_manager.fingerprint(handle);
         let (conn, addr) =
-            connect_any(&addrs, ctx.cert.clone(), ADDRESS_TIMEOUT, expected.clone()).await?;
+            connect_first(addrs, ctx.cert.clone(), ADDRESS_TIMEOUT, expected.clone()).await?;
         log::info!("client ({handle}) connected @ {addr}");
 
         // Trust on first use: pin the certificate the peer actually presented
@@ -614,21 +721,43 @@ async fn connect_to_handle(
             }
         }
 
+        // Defensive: `connecting` already serializes attempts for one handle,
+        // but a duplicate transport must never be installed.
+        if let Some(existing) = ctx.active(handle) {
+            log::warn!(
+                "client {handle}: duplicate connection to {addr} (current: {}), closing it",
+                existing.addr
+            );
+            let _ = conn.close().await;
+            return Ok(());
+        }
+
+        let generation = ctx.next_generation();
+        let active = ActiveConnection {
+            generation,
+            addr,
+            conn,
+        };
+        if let Some(previous) = ctx.install(handle, active.clone()) {
+            // Unreachable with the guard above, but closing the old transport
+            // is what makes "one logical peer = one connection" hold even if
+            // that guard ever regresses.
+            let _ = previous.conn.close().await;
+        }
         ctx.client_manager.set_active_addr(handle, Some(addr));
+        ctx.client_manager.record_working_addr(handle, addr);
         // The handshake succeeded. Treat the peer as available until a
         // `Pong(false)` or a timeout says otherwise: waiting for the first
         // Pong would otherwise make `send` fail right after connecting.
         ctx.client_manager.set_alive(handle, true);
-        ctx.conns.borrow_mut().insert(addr, conn.clone());
-        ctx.fast_conns.borrow_mut().insert(handle, conn.clone());
         ctx.notify_connected(handle, true);
 
         // The version handshake is deferred until the peer answers a `Ping`
         // with capabilities: releases predating `Hello` disconnect on an
         // unknown event id, which would silently make this connection
         // write-only.
-        spawn_local(ping_pong(ctx.clone(), addr, conn.clone()));
-        spawn_local(receive_loop(ctx.clone(), handle, addr, conn));
+        spawn_local(ping_pong(ctx.clone(), handle, active.clone()));
+        spawn_local(receive_loop(ctx.clone(), handle, active));
         Ok(())
     }
     .await;
@@ -709,23 +838,37 @@ impl PingWatchdog {
     }
 }
 
-async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
+/// Send keepalive `Ping`s on one transport and close it when the peer stops
+/// answering.
+///
+/// Tied to [`ActiveConnection::generation`]: once a replacement transport is
+/// installed, this loop exits quietly instead of touching the client state
+/// (which was the source of the IPv4/IPv6 flapping when two transports for the
+/// same peer existed).
+async fn ping_pong(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnection) {
     let mut watchdog = PingWatchdog::default();
+    let addr = active.addr;
     loop {
+        if !ctx.is_current(handle, active.generation) {
+            return;
+        }
         let (buf, len) = ProtoEvent::Ping.into();
 
         // send 4 pings, at least one must be answered
         for _ in 0..4 {
+            if !ctx.is_current(handle, active.generation) {
+                return;
+            }
             // Keep the timestamp of the first unanswered ping of the round so
             // the RTT is not reset by the following three probes.
             ctx.ping_sent
                 .borrow_mut()
                 .entry(addr)
                 .or_insert_with(Instant::now);
-            if let Err(e) = conn.send(&buf[..len]).await {
+            if let Err(e) = active.conn.send(&buf[..len]).await {
                 if watchdog.on_send_error() == PingVerdict::Close {
                     log::warn!("{addr}: too many send errors, closing connection");
-                    let _ = conn.close().await;
+                    ctx.disconnect(handle, active.generation).await;
                     return;
                 }
                 log::warn!("{addr}: send error `{e}` ({})", watchdog.send_failures);
@@ -739,6 +882,9 @@ async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
+        if !ctx.is_current(handle, active.generation) {
+            return;
+        }
         let answered = ctx.ping_response.borrow_mut().remove(&addr);
         if watchdog.on_round(answered) == PingVerdict::Close {
             if watchdog.ever_answered {
@@ -746,7 +892,7 @@ async fn ping_pong(ctx: ConnCtx, addr: SocketAddr, conn: ArcConn) {
             } else {
                 log::warn!("{addr} never answered a ping, closing connection");
             }
-            let _ = conn.close().await;
+            ctx.disconnect(handle, active.generation).await;
             return;
         }
         if !answered {
@@ -826,13 +972,22 @@ async fn send_hello_once(ctx: &ConnCtx, addr: SocketAddr, conn: &ArcConn) {
     }
 }
 
-async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn: ArcConn) {
+async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnection) {
+    let addr = active.addr;
     let mut buf = [0u8; MAX_CLIPBOARD_FRAME];
     loop {
-        let n = match conn.recv(&mut buf).await {
+        if !ctx.is_current(handle, active.generation) {
+            return;
+        }
+        let n = match active.conn.recv(&mut buf).await {
             Ok(n) => n,
             Err(_) => break,
         };
+        // A replacement transport may have been installed while this one was
+        // blocked in `recv`; never let stale data touch the client state.
+        if !ctx.is_current(handle, active.generation) {
+            return;
+        }
         if n > 0 && is_clipboard_frame(buf[0]) {
             match ClipboardFrame::decode(&buf[..n]) {
                 Ok(frame) => ctx
@@ -852,8 +1007,15 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
                         alive,
                         capabilities,
                     } => {
-                        ctx.client_manager.set_active_addr(handle, Some(addr));
+                        // `active_addr` is owned by the connect path and is
+                        // set exactly once per transport. A `Pong` must never
+                        // rewrite it: with two transports for the same peer
+                        // (legacy happy-eyeballs dialing) this made the UI
+                        // subtitle alternate between the IPv4 and the IPv6
+                        // address every ping round.
                         ctx.client_manager.set_alive(handle, alive);
+                        ctx.client_manager
+                            .set_last_pong_at(handle, Some(unix_ms_now()));
                         ctx.ping_response.borrow_mut().insert(addr);
                         if let Some(sent) = ctx.ping_sent.borrow_mut().remove(&addr) {
                             let rtt = sent.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -862,9 +1024,9 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
                         if let Some(capabilities) = capabilities {
                             ctx.client_manager
                                 .set_peer_capabilities(handle, capabilities);
-                            send_hello_once(&ctx, addr, &conn).await;
+                            send_hello_once(&ctx, addr, &active.conn).await;
                             if capabilities & lan_mouse_proto::capabilities::PERMISSIONS != 0 {
-                                send_auth_request(&ctx, handle, addr, &conn).await;
+                                send_auth_request(&ctx, handle, addr, &active.conn).await;
                             }
                         }
                         ctx.notify_state_changed(handle);
@@ -913,7 +1075,7 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, addr: SocketAddr, conn
         }
     }
     log::warn!("recv error");
-    ctx.disconnect(handle, addr);
+    ctx.disconnect(handle, active.generation).await;
 }
 
 #[cfg(test)]
@@ -973,6 +1135,54 @@ mod tests {
         watchdog.on_send_ok();
         assert_eq!(watchdog.send_failures, 0);
     }
+
+    fn sa(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse().expect("ip"), port)
+    }
+
+    #[test]
+    fn dial_order_prefers_ipv4_before_ipv6() {
+        let v6 = sa("fd00::1", 4242);
+        let v4 = sa("192.168.1.1", 4242);
+        assert_eq!(dial_order([v6, v4], None), vec![v4, v6]);
+    }
+
+    #[test]
+    fn dial_order_keeps_the_remembered_address_first() {
+        let v4a = sa("192.168.1.1", 4242);
+        let v4b = sa("10.0.0.1", 4242);
+        let v6 = sa("fd00::1", 4242);
+        // The address that worked last is tried first even when it is IPv6;
+        // the other answers stay as failover.
+        assert_eq!(dial_order([v4a, v4b, v6], Some(v6)), vec![v6, v4b, v4a]);
+    }
+
+    #[test]
+    fn dial_order_is_deterministic_and_deduplicated() {
+        let a = sa("10.0.0.2", 4242);
+        let b = sa("10.0.0.1", 4242);
+        assert_eq!(dial_order([a, b, a], None), vec![b, a]);
+    }
+
+    #[test]
+    fn dial_order_keeps_ipv6_only_clients_working() {
+        let v6a = sa("fd00::2", 4242);
+        let v6b = sa("fd00::1", 4242);
+        assert_eq!(dial_order([v6a, v6b], None), vec![v6b, v6a]);
+    }
+
+    #[test]
+    fn dial_order_ignores_a_preference_outside_the_candidate_set() {
+        let v4 = sa("192.168.1.10", 4242);
+        let v6 = sa("fd00::10", 4242);
+        // The remembered address changed (DHCP): fall back to the documented
+        // family preference without dropping the IPv6 failover.
+        assert_eq!(
+            dial_order([v6, v4], Some(sa("192.168.1.99", 4242))),
+            vec![v4, v6]
+        );
+    }
+
     use crate::client::ClientManager;
     use crate::config::ConfigClient;
     use crate::crypto;
@@ -1235,6 +1445,83 @@ mod tests {
                     matches!(event, ProtoEvent::Enter { serial: 99, .. })
                 })
                 .await;
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// One client configured with both an A and an AAAA record must dial
+    /// exactly one of them: racing both used to leave a second, half-adopted
+    /// session on the peer (two devices / alternating address in the UI).
+    #[tokio::test(flavor = "current_thread")]
+    async fn dual_stack_client_opens_a_single_session() {
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            return;
+        }
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("dual-listener");
+                let client_cert = unique_cert("dual-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let mut listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+
+                let manager = ClientManager::default();
+                let handle = manager.add_with_config(ConfigClient {
+                    ips: HashSet::from([
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    ]),
+                    hostname: None,
+                    port,
+                    pos: IpcPosition::Right,
+                    active: true,
+                    enter_hook: None,
+                    leave_hook: None,
+                    sensitivity: 100,
+                    fingerprint: None,
+                });
+                let conn = LanMouseConnection::new(client_cert, manager.clone(), 2000);
+                conn.send(
+                    ProtoEvent::Enter {
+                        pos: ProtoPosition::Right,
+                        serial: 1,
+                    },
+                    handle,
+                )
+                .await
+                .expect("dual stack connect");
+
+                let accepted = tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        match listener.next().await {
+                            Some(ListenEvent::Accept { addr, .. }) => break addr,
+                            Some(_) => continue,
+                            None => panic!("listener closed before accepting"),
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for accept");
+
+                // The second family must not dial (and leave a duplicate
+                // session): nothing else may be accepted for this fingerprint.
+                let quiet_until = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < quiet_until {
+                    match tokio::time::timeout(Duration::from_millis(100), listener.next()).await {
+                        Ok(Some(ListenEvent::Accept { addr, .. })) => {
+                            panic!("duplicate session accepted from {addr} (first {accepted})")
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {}
+                    }
+                }
+                assert!(
+                    manager.active_addr(handle).is_some(),
+                    "the IPv4 attempt must have established the connection"
+                );
                 listener.terminate().await;
             })
             .await;
@@ -2211,6 +2498,100 @@ mod tests {
                 listener.disconnect(peer).await;
                 let _ = conn;
 
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// The same peer (certificate) connecting again — over the other address
+    /// family, or after a network flap that left the old transport half-open —
+    /// must replace the transport instead of becoming a second device with a
+    /// second address.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_with_same_certificate_replaces_the_session() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("dedupe-listener");
+                let client_cert = unique_cert("dedupe-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let mut listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+
+                // Keep the first transport alive on purpose: the replacement
+                // must close it, not depend on the test dropping it.
+                let first = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    raw_dtls_client(port, client_cert.clone()),
+                )
+                .await
+                .expect("timed out waiting for the first handshake");
+                let logical = tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        match listener.next().await {
+                            Some(ListenEvent::Accept { addr, .. }) => break addr,
+                            Some(_) => continue,
+                            None => panic!("listener closed before accepting"),
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for the first accept");
+
+                // Second transport from the same identity (new source port,
+                // as if the peer switched address family or reconnected after
+                // a lost link).
+                let second = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    raw_dtls_client(port, client_cert),
+                )
+                .await
+                .expect("timed out waiting for the replacement handshake");
+
+                // The replacement transport serves the same logical session:
+                // events from it arrive under the address the service already
+                // knows (no family flip). Event-driven with a generous deadline
+                // on purpose: a fixed sleep here made the test sensitive to a
+                // loaded CI runner, and the Enter is re-sent if a loopback
+                // datagram is dropped.
+                let enter = ProtoEvent::Enter {
+                    pos: ProtoPosition::Right,
+                    serial: 5,
+                };
+                raw_send(&second, enter).await;
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let msg_addr = loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !remaining.is_zero(),
+                        "timed out waiting for the enter from the replaced transport"
+                    );
+                    match tokio::time::timeout(
+                        remaining.min(Duration::from_millis(250)),
+                        listener.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(ListenEvent::Msg {
+                            event: ProtoEvent::Enter { serial: 5, .. },
+                            addr,
+                        })) => break addr,
+                        Ok(Some(ListenEvent::Accept { addr, .. })) => {
+                            panic!("the same peer was accepted twice (second at {addr})")
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => panic!("listener closed while waiting for the enter"),
+                        // No event within the tick: the datagram may have been
+                        // dropped, retransmit like the real capture does.
+                        Err(_) => raw_send(&second, enter).await,
+                    }
+                };
+                assert_eq!(
+                    msg_addr, logical,
+                    "logical address must stay stable across transport replacement"
+                );
+
+                let _ = first;
                 listener.terminate().await;
             })
             .await;

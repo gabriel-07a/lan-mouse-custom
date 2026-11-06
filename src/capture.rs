@@ -76,9 +76,9 @@ enum CaptureRequest {
     SetSensitivity(CaptureHandle, f64),
     /// replace the capabilities this machine may use on the client
     SetOutgoingCaps(CaptureHandle, lan_mouse_ipc::Capabilities),
-    /// a remote peer started/stopped driving this machine; suppress local
-    /// barrier detection while it is in control
-    SetRemoteActive(bool),
+    /// edge a remote peer entered through while it drives this machine;
+    /// `None` means no peer is driving us
+    SetRemotePeer(Option<lan_mouse_ipc::Position>),
 }
 
 impl Capture {
@@ -103,7 +103,7 @@ impl Capture {
             conn,
             enter: EnterState::default(),
             sensitivity: Default::default(),
-            remote_active: false,
+            remote_peer: None,
             grace: Duration::from_millis(connect_grace_ms),
             disconnected_since: None,
             event_tx,
@@ -209,11 +209,10 @@ impl Capture {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
 
-    /// A remote peer started/stopped driving this machine.
-    pub(crate) fn set_remote_active(&self, active: bool) {
-        let _ = self
-            .request_tx
-            .send(CaptureRequest::SetRemoteActive(active));
+    /// A remote peer started driving this machine from `peer`'s edge, or
+    /// stopped driving it (`None`).
+    pub(crate) fn set_remote_peer(&self, peer: Option<lan_mouse_ipc::Position>) {
+        let _ = self.request_tx.send(CaptureRequest::SetRemotePeer(peer));
     }
 }
 
@@ -320,9 +319,9 @@ struct CaptureTask {
     sensitivity: HashMap<CaptureHandle, f64>,
     /// capabilities allowed in the outgoing direction, per client
     outgoing_caps: HashMap<CaptureHandle, lan_mouse_ipc::Capabilities>,
-    /// true while a remote peer is driving this machine (Windows raw input
-    /// otherwise mistakes the injected motion for a local barrier crossing)
-    remote_active: bool,
+    /// edge a remote peer entered through while it drives this machine
+    /// (`None` = no peer is driving us)
+    remote_peer: Option<lan_mouse_ipc::Position>,
     /// how long a failed motion send may stay down before the capture is
     /// released, matching `connect_grace_ms`
     grace: Duration,
@@ -388,8 +387,8 @@ impl CaptureTask {
                         CaptureRequest::SetOutgoingCaps(handle, caps) => {
                             self.outgoing_caps.insert(handle, caps);
                         }
-                        CaptureRequest::SetRemoteActive(active) => {
-                            self.remote_active = active;
+                        CaptureRequest::SetRemotePeer(peer) => {
+                            self.remote_peer = peer;
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -404,7 +403,7 @@ impl CaptureTask {
             r = InputCapture::new(self.backend) => r?,
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
-        capture.set_remote_active(self.remote_active);
+        capture.set_remote_peer(self.remote_peer.map(to_capture_pos));
         self.selected_backend.set(Some(capture.backend()));
 
         let _capture_guard = DropGuard::new(
@@ -549,9 +548,9 @@ impl CaptureTask {
                     CaptureRequest::SetOutgoingCaps(h, caps) => {
                         self.outgoing_caps.insert(h, caps);
                     }
-                    CaptureRequest::SetRemoteActive(active) => {
-                        self.remote_active = active;
-                        capture.set_remote_active(active);
+                    CaptureRequest::SetRemotePeer(peer) => {
+                        self.remote_peer = peer;
+                        capture.set_remote_peer(peer.map(to_capture_pos));
                     }
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
@@ -607,6 +606,29 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
+
+        // While a peer drives this machine, a barrier begin on an outgoing
+        // capture is the injected pointer being pushed back toward the peer.
+        // Only the incoming (EnterOnly) capture may act on it: it sends the
+        // `Leave` that releases the peer's grab. Starting the outgoing capture
+        // here would reflect the injected motion back to the peer and loop.
+        if is_suppressed_remote_begin(
+            self.remote_peer.map(to_capture_pos),
+            self.get_type(handle),
+            &event,
+        ) {
+            log::debug!("ignoring outgoing capture begin while a peer drives this machine");
+            // The capture backend may already have activated a capture for
+            // this begin (Windows edge activation hides the pointer and sets
+            // ACTIVE_CLIENT). Discarding the event without releasing would
+            // leave the hidden pointer/ACTIVE_CLIENT latched when the peer's
+            // Leave arrives: the next local inputs would then keep retrying
+            // Enter against a stale handle. Undo the activation here; the
+            // actual return hand-off is still driven by the emulation
+            // EdgeReturn/Leave path.
+            capture.release().await?;
+            return Ok(());
+        }
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
@@ -906,6 +928,21 @@ enum State {
     Sending,
 }
 
+/// Whether a capture event must be ignored because a remote peer is driving
+/// this machine.
+///
+/// Only the incoming [`CaptureType::EnterOnly`] capture may react to a begin in
+/// that state: it sends the `Leave` that ends the hand-off. A begin on an
+/// outgoing capture comes from the peer's injected motion and would loop the
+/// input back if it started a capture.
+fn is_suppressed_remote_begin(
+    remote_peer: Option<Position>,
+    capture_type: CaptureType,
+    event: &CaptureEvent,
+) -> bool {
+    remote_peer.is_some() && capture_type == CaptureType::Default && *event == CaptureEvent::Begin
+}
+
 fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
     match pos {
         lan_mouse_ipc::Position::Left => input_capture::Position::Left,
@@ -1033,5 +1070,40 @@ mod enter_state_tests {
         state.begin(now, TIMEOUT);
         assert_eq!(state.serial(), 2);
         assert_eq!(state.awaiting_ack(), Some(2));
+    }
+
+    #[test]
+    fn a_remote_peer_only_allows_the_incoming_capture_to_begin() {
+        let begin = CaptureEvent::Begin;
+        let motion = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        }));
+
+        // No remote peer: everything behaves as before.
+        assert!(!is_suppressed_remote_begin(
+            None,
+            CaptureType::Default,
+            &begin
+        ));
+        // Remote peer driving us: the outgoing capture must not start.
+        assert!(is_suppressed_remote_begin(
+            Some(Position::Left),
+            CaptureType::Default,
+            &begin
+        ));
+        // The incoming capture still forwards the hand-off.
+        assert!(!is_suppressed_remote_begin(
+            Some(Position::Left),
+            CaptureType::EnterOnly,
+            &begin
+        ));
+        // Input events after a begin are not affected.
+        assert!(!is_suppressed_remote_begin(
+            Some(Position::Left),
+            CaptureType::Default,
+            &motion
+        ));
     }
 }

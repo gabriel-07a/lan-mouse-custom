@@ -111,9 +111,87 @@ pub(crate) fn logical_to_physical(delta: f64, scale: f64) -> f64 {
     delta * sanitise_scale(scale)
 }
 
+/// Screen edge that an unclamped pointer target overshoots.
+///
+/// The emulation backend computes the target as `cursor + requested motion`
+/// and Windows clamps the actual pointer to the virtual desktop. When the
+/// remote peer keeps pushing outward at an edge, the unclamped target crosses
+/// it — that is the return hand-off: the peer must release its capture so the
+/// cursor can come back.
+///
+/// When both axes overflow (corner), the larger overshoot wins.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn overshoot_edge(
+    screen: &VirtualScreen,
+    requested: (i32, i32),
+) -> Option<super::PointerEdge> {
+    let (x, y) = requested;
+    let mut candidates = [
+        (
+            super::PointerEdge::Left,
+            screen.left.saturating_sub(x).max(0),
+        ),
+        (
+            super::PointerEdge::Right,
+            x.saturating_sub(screen.right()).max(0),
+        ),
+        (super::PointerEdge::Top, screen.top.saturating_sub(y).max(0)),
+        (
+            super::PointerEdge::Bottom,
+            y.saturating_sub(screen.bottom()).max(0),
+        ),
+    ];
+    candidates.sort_by_key(|&(_, overshoot)| std::cmp::Reverse(overshoot));
+    let (edge, overshoot) = candidates[0];
+    (overshoot > 0).then_some(edge)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn screen() -> VirtualScreen {
+        VirtualScreen::from_monitors(&[(0, 0, 1920, 1080)]).expect("screen")
+    }
+
+    #[test]
+    fn overshoot_detects_every_edge() {
+        assert_eq!(
+            overshoot_edge(&screen(), (-3, 500)),
+            Some(super::super::PointerEdge::Left)
+        );
+        assert_eq!(
+            overshoot_edge(&screen(), (1925, 500)),
+            Some(super::super::PointerEdge::Right)
+        );
+        assert_eq!(
+            overshoot_edge(&screen(), (500, (-2))),
+            Some(super::super::PointerEdge::Top)
+        );
+        assert_eq!(
+            overshoot_edge(&screen(), (500, 1085)),
+            Some(super::super::PointerEdge::Bottom)
+        );
+    }
+
+    #[test]
+    fn inside_targets_do_not_hand_off() {
+        assert_eq!(overshoot_edge(&screen(), (0, 0)), None);
+        assert_eq!(overshoot_edge(&screen(), (1919, 1079)), None);
+        assert_eq!(overshoot_edge(&screen(), (960, 540)), None);
+    }
+
+    #[test]
+    fn a_corner_prefers_the_larger_overshoot() {
+        assert_eq!(
+            overshoot_edge(&screen(), (-5, (-2))),
+            Some(super::super::PointerEdge::Left)
+        );
+        assert_eq!(
+            overshoot_edge(&screen(), (-1, 1090)),
+            Some(super::super::PointerEdge::Bottom)
+        );
+    }
 
     #[test]
     fn normalise_covers_the_full_range() {

@@ -143,6 +143,11 @@ Lan Mouse can be installed from the [winget community repositories](https://gith
 winget install lan-mouse
 ```
 
+The unofficial fork publishes its own installer
+(`lan-mouse-custom-setup-x86_64.exe`) in the releases of this repository.
+Its clean-install behavior is described in
+[Clean install, reset and uninstall](#clean-install-reset-and-uninstall).
+
 </details>
 
 <details>
@@ -216,6 +221,71 @@ For a detailed list of available features, checkout the [Cargo.toml](./Cargo.tom
 </details>
 
 
+
+## Clean install, reset and uninstall
+
+Lan Mouse stores everything it persists for one user (devices, permissions,
+certificates, address rules, audit log, portal consent tokens) in directories
+named `lan-mouse`. A **package upgrade keeps this data on purpose**; a **fresh
+install** must not resurrect it. The exact paths per OS are listed in
+[docs/audit-fresh-install.md](docs/audit-fresh-install.md).
+
+### Windows installer
+
+The Windows installer detects leftovers from older or portable builds in
+`%LOCALAPPDATA%\lan-mouse` and `%APPDATA%\lan-mouse`. Cleaning is
+**reversible**: the old directory is renamed to a timestamped sibling
+`lan-mouse.bak-<time>` instead of being deleted, so the next start shows no old
+PCs while the data can still be restored.
+
+* **Interactive install**: asks before cleaning (default **Yes**, so installing
+  a release starts fresh). Answer **No** to keep your devices and permissions
+  when upgrading.
+* **Silent install** (`setup.exe /S`): backs up the old configuration by
+  default. Pass `/KEEPUSERDATA` to keep it in place, `/CLEANUSERDATA` to force
+  the clean install, or `/PURGEUSERDATA` to delete it permanently.
+* **Uninstall**: stops the GUI and its daemon and moves the same two
+  directories to a backup (interactive asks, default **Yes**; silent uninstall
+  moves them too). `/KEEPUSERDATA` keeps them in place; `/PURGEUSERDATA`
+  deletes them permanently. Shortcuts, firewall rule and registry keys are
+  removed.
+
+Restore a backup by renaming it back, e.g. Explorer → rename
+`%LOCALAPPDATA%\lan-mouse.bak-<time>` to `lan-mouse`, or in PowerShell:
+
+```powershell
+Rename-Item "$env:LOCALAPPDATA\lan-mouse.bak-<time>" "lan-mouse"
+```
+
+Delete old `lan-mouse.bak-*` directories manually when you no longer need
+them. Quit Lan Mouse before installing/uninstalling manually; the installer
+stops a running instance for you (`taskkill /T /F`).
+
+### Reset (Linux, macOS and Windows)
+
+```sh
+lan-mouse --reset-config --dry-run   # show every path that would be moved
+lan-mouse --reset-config             # move them to .bak backups (reversible)
+lan-mouse --reset-config --purge     # delete them permanently
+```
+
+The default is reversible: every directory is renamed to a sibling
+`lan-mouse.bak-<unix timestamp>` (e.g. `~/.config/lan-mouse.bak-1762370000`),
+which hides the old devices from the next start. Restore it with
+`mv ~/.config/lan-mouse.bak-<timestamp> ~/.config/lan-mouse` (or use
+`--purge` if you are sure you never want the data back). The command only
+touches directories literally named `lan-mouse` (config, state, legacy
+portal-token cache, macOS audit logs), refuses to run while the service is
+running, never follows symlinks and does not touch custom `--config` /
+`--cert-path` locations. On Linux/macOS the helper script
+`scripts/install-clean.sh --dry-run` / `--yes` / `--purge` does the same when
+the binary is not installed anymore.
+
+On Debian/Ubuntu (`apt`), package upgrades and even `apt purge` keep the
+per-user data; the postrm explains the paths and the reset command. GNOME/KDE
+will ask for clipboard/input-capture/remote-desktop consent again after a
+reset. On macOS the Accessibility/Input Monitoring grants are managed by the OS
+and are **not** reset by the command.
 
 ## Development
 

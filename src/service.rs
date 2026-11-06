@@ -93,6 +93,10 @@ pub struct Service {
     /// fingerprints learned from outgoing connections (TOFU), so a change can
     /// be persisted without writing the config on every state update
     learned_fingerprints: HashMap<ClientHandle, String>,
+    /// clients the service added on its own for an incoming device. They are
+    /// merged into the user-configured client once its certificate fingerprint
+    /// is learned, so one logical peer never shows up as two devices.
+    auto_reverse_clients: HashSet<ClientHandle>,
     /// devices authorized with [`FrontendRequest::AuthorizeDevice`] whose
     /// reverse client entry must be created once their address is known
     pending_reverse: HashMap<String, (String, Position)>,
@@ -255,6 +259,7 @@ impl Service {
             authorized_keys,
             pairing_generation: Default::default(),
             learned_fingerprints: Default::default(),
+            auto_reverse_clients: Default::default(),
             pending_reverse: Default::default(),
             discovery_rx,
             discovery_tx,
@@ -354,6 +359,11 @@ impl Service {
                                     DirectionPolicy::allow_all(),
                                 );
                                 self.learned_fingerprints.insert(handle, fingerprint.clone());
+                                // The incoming session may have been adopted by
+                                // an auto-added reverse client before this
+                                // certificate was known; merge it now that the
+                                // configured client and the peer are linked.
+                                self.merge_auto_reverse_client(handle, &fingerprint);
                                 self.refresh_maps();
                                 self.save_config();
                                 self.broadcast_devices();
@@ -721,8 +731,23 @@ impl Service {
             } => {
                 // The peer is driving this machine: local barrier detection
                 // must not react to the injected pointer motion (ping-pong at
-                // the shared border).
-                self.capture.set_remote_active(true);
+                // the shared border). Knowing *which* edge the peer entered
+                // through also lets the capture side still detect the return
+                // hand-off at exactly that edge.
+                self.capture.set_remote_peer(Some(pos));
+                // Resolve the client entry before the fingerprint is moved
+                // into the session registry below.
+                let handle = self.client_for_peer(addr, &fingerprint);
+                // Defense in depth: one identity must never keep two capture
+                // zones. A transport switch (IPv4 <-> IPv6, reconnect) ends the
+                // old session before the new one is registered.
+                if let Some(stale) = self.incoming_addr_for_fingerprint(&fingerprint) {
+                    if stale != addr {
+                        if let Some(stale) = self.remove_incoming(stale) {
+                            self.notify_frontend(FrontendEvent::IncomingDisconnected(stale));
+                        }
+                    }
+                }
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
@@ -734,17 +759,14 @@ impl Service {
                 } else {
                     self.update_incoming(addr, pos, fingerprint);
                 }
-                if let Some(handle) = self.client_with_ip(addr.ip()) {
-                    if self.client_manager.incoming_addr(handle) != Some(addr) {
-                        self.client_manager.set_incoming_addr(handle, Some(addr));
-                        self.broadcast_client(handle);
-                    }
+                if let Some(handle) = handle {
+                    self.attach_incoming(handle, addr);
                 }
             }
             EmulationEvent::Disconnected { addr } => {
                 self.expire_session_grants(addr);
                 let _ = self.clipboard_peer_events.send(addr);
-                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                if let Some(handle) = self.client_for_incoming(addr) {
                     if self.client_manager.incoming_addr(handle).is_some() {
                         self.client_manager.set_incoming_addr(handle, None);
                         self.broadcast_client(handle);
@@ -754,7 +776,7 @@ impl Service {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
                 if self.incoming_conns.is_empty() {
-                    self.capture.set_remote_active(false);
+                    self.capture.set_remote_peer(None);
                 }
             }
             EmulationEvent::PortChanged(port) => match port {
@@ -775,7 +797,11 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => {
                 self.capture.release();
-                self.capture.set_remote_active(false);
+                self.capture.set_remote_peer(None);
+            }
+            EmulationEvent::EdgeReturn(pos) => self.request_return(pos),
+            EmulationEvent::PeerLeft { addr, fingerprint } => {
+                self.peer_released(addr, &fingerprint);
             }
             EmulationEvent::AutoAuthorized {
                 addr,
@@ -814,7 +840,12 @@ impl Service {
                     }),
                 );
                 log::info!("auto-authorized {addr} ({fingerprint})");
-                if self
+                if let Some(handle) = self.client_with_fingerprint(&fingerprint) {
+                    // One logical peer = one client entry. An incoming
+                    // connection must reconnect to the configured client
+                    // instead of becoming a second "reverse" device.
+                    self.attach_incoming(handle, addr);
+                } else if self
                     .devices
                     .read()
                     .expect("lock")
@@ -827,10 +858,9 @@ impl Service {
                         Position::Left,
                         Some(fingerprint.clone()),
                     );
-                }
-                if let Some(handle) = self.client_with_ip(addr.ip()) {
-                    self.client_manager.set_incoming_addr(handle, Some(addr));
-                    self.broadcast_client(handle);
+                    if let Some(handle) = self.client_with_fingerprint(&fingerprint) {
+                        self.attach_incoming(handle, addr);
+                    }
                 }
                 self.save_config();
                 self.broadcast_devices();
@@ -849,21 +879,40 @@ impl Service {
                 );
                 self.refresh_maps();
                 let outgoing = self.devices.read().expect("lock").outgoing(&fingerprint);
-                if let Some((name, position)) = self.pending_reverse.remove(&fingerprint) {
-                    let resolved_name = if name.trim().is_empty() {
-                        self.peer_display_name(addr.ip(), &fingerprint)
-                    } else {
-                        name
-                    };
-                    if outgoing.grants_anything() {
+                if let Some((name, _position)) = self.pending_reverse.remove(&fingerprint) {
+                    // The user picked a position while authorizing the device.
+                    // When the peer is already a configured client the existing
+                    // entry (and its position) is kept: changing it here was
+                    // what duplicated/deactivated the configured row.
+                    if let Some(handle) = self.client_with_fingerprint(&fingerprint) {
+                        let resolved_name = if name.trim().is_empty() {
+                            self.peer_display_name(addr.ip(), &fingerprint)
+                        } else {
+                            name
+                        };
+                        let _ = self
+                            .client_manager
+                            .upgrade_hostname_from_discovery(handle, &resolved_name);
+                        self.attach_incoming(handle, addr);
+                    } else if outgoing.grants_anything() {
+                        let resolved_name = if name.trim().is_empty() {
+                            self.peer_display_name(addr.ip(), &fingerprint)
+                        } else {
+                            name
+                        };
                         self.add_reverse_client(
                             resolved_name,
                             addr.ip(),
-                            position,
+                            _position,
                             Some(fingerprint.clone()),
                         );
+                        if let Some(handle) = self.client_with_fingerprint(&fingerprint) {
+                            self.attach_incoming(handle, addr);
+                        }
                     }
-                } else if self.client_with_ip(addr.ip()).is_none() && outgoing.grants_anything() {
+                } else if let Some(handle) = self.client_with_fingerprint(&fingerprint) {
+                    self.attach_incoming(handle, addr);
+                } else if outgoing.grants_anything() {
                     let name = self.peer_display_name(addr.ip(), &fingerprint);
                     self.add_reverse_client(
                         name,
@@ -871,10 +920,9 @@ impl Service {
                         Position::Left,
                         Some(fingerprint.clone()),
                     );
-                }
-                if let Some(handle) = self.client_with_ip(addr.ip()) {
-                    self.client_manager.set_incoming_addr(handle, Some(addr));
-                    self.broadcast_client(handle);
+                    if let Some(handle) = self.client_with_fingerprint(&fingerprint) {
+                        self.attach_incoming(handle, addr);
+                    }
                 }
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
@@ -893,7 +941,7 @@ impl Service {
                         "peer_incoming={incoming_caps:#x} peer_outgoing={outgoing_caps:#x}"
                     )),
                 );
-                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                if let Some(handle) = self.client_for_peer(addr, &fingerprint) {
                     self.client_manager.set_peer_permissions(
                         handle,
                         Some(incoming_caps),
@@ -910,7 +958,7 @@ impl Service {
                     Some(&addr.to_string()),
                     Some(&format!("reason={reason}")),
                 );
-                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                if let Some(handle) = self.client_for_incoming(addr) {
                     self.client_manager
                         .set_peer_permissions(handle, Some(0), Some(0));
                     self.broadcast_client(handle);
@@ -924,7 +972,7 @@ impl Service {
             } => {
                 // Map the peer's source addr back to its client handle
                 // and stamp the version.
-                if let Some(handle) = self.client_with_ip(addr.ip()) {
+                if let Some(handle) = self.client_for_incoming(addr) {
                     self.client_manager.set_peer_hello(
                         handle,
                         Some(commit),
@@ -1063,7 +1111,80 @@ impl Service {
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
 
+    /// Ask the peer that is driving us to release its capture because the
+    /// remote pointer was pushed past `pos` (the edge it originally entered
+    /// through). This is the return hand-off: without it the peer keeps the
+    /// local pointer grabbed on its side of the shared edge.
+    fn request_return(&mut self, pos: Position) {
+        let addrs: Vec<SocketAddr> = self
+            .incoming_conn_info
+            .values()
+            .filter(|incoming| incoming.pos == pos)
+            .map(|incoming| incoming.addr)
+            .collect();
+        if addrs.is_empty() {
+            log::debug!("return hand-off through {pos:?}, but no incoming session matches it");
+            return;
+        }
+        for addr in addrs {
+            log::info!("handing control back: remote pointer left through {pos:?} ({addr})");
+            self.emulation.send_leave_event(addr);
+        }
+    }
+
+    /// The peer released its capture (``ProtoEvent::Leave``).
+    ///
+    /// Drop its incoming capture zone(s) and clear the remote-control
+    /// suppression once no connection is driving this machine. Keeping the
+    /// zone around used to leave the local capture disabled after the first
+    /// hand-off, especially when a duplicate IPv4/IPv6 session for the same
+    /// peer was still registered.
+    fn peer_released(&mut self, addr: SocketAddr, fingerprint: &str) {
+        log::info!("peer at {addr} released its capture (return hand-off)");
+        self.remove_incoming(addr);
+        if !fingerprint.is_empty() {
+            let stale: Vec<SocketAddr> = self
+                .incoming_conn_info
+                .values()
+                .filter(|incoming| incoming.fingerprint == fingerprint)
+                .map(|incoming| incoming.addr)
+                .collect();
+            for stale_addr in stale {
+                self.remove_incoming(stale_addr);
+            }
+        }
+        if self.incoming_conns.is_empty() {
+            self.capture.set_remote_peer(None);
+        }
+    }
+
     fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
+        // One logical peer must hold at most one incoming transport. A peer
+        // that switches between IPv4 and IPv6 (or a reconnect racing the old
+        // session) used to leave two capture zones behind; the stale one kept
+        // `remote_active` latched so the local capture stayed suppressed and
+        // the cursor was trapped on the peer's screen.
+        let superseded: Vec<(ClientHandle, SocketAddr)> = self
+            .incoming_conn_info
+            .iter()
+            .filter(|(_, incoming)| {
+                incoming.addr == addr
+                    || (!fingerprint.is_empty() && incoming.fingerprint == fingerprint)
+            })
+            .map(|(handle, incoming)| (*handle, incoming.addr))
+            .collect();
+        for (handle, stale_addr) in superseded {
+            self.capture.destroy(handle);
+            self.incoming_conn_info.remove(&handle);
+            if stale_addr != addr {
+                log::info!(
+                    "replacing stale incoming transport {stale_addr} of {fingerprint} with {addr}"
+                );
+                self.incoming_conns.remove(&stale_addr);
+                self.notify_frontend(FrontendEvent::IncomingDisconnected(stale_addr));
+            }
+        }
+
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
         self.capture.create(handle, pos, CaptureType::EnterOnly);
@@ -2110,6 +2231,18 @@ impl Service {
         position: Position,
         fingerprint: Option<String>,
     ) {
+        // Identity first: the certificate is the device. An entry that is
+        // already configured for this fingerprint is reused as-is instead of
+        // creating a second row (which used to deactivate the configured one
+        // through the position collision).
+        if let Some(fingerprint) = fingerprint.as_deref() {
+            if let Some(handle) = self.client_with_fingerprint(fingerprint) {
+                log::info!("reverse client for {ip} already configured (id {handle})");
+                self.attach_incoming(handle, SocketAddr::new(ip, 0));
+                return;
+            }
+        }
+
         // An empty name means "use the discovered hostname or address": the
         // peer's hostname might be known via LAN discovery beacons.
         let name = if name.trim().is_empty() {
@@ -2121,18 +2254,27 @@ impl Service {
         } else {
             name
         };
+
+        // Legacy entries configured only by address (no certificate pinned
+        // yet) are reused, but never when they are pinned to another
+        // certificate: that would let a peer at a reused address hijack it.
         if let Some(handle) = self.client_with_ip(ip) {
-            log::info!("reverse client for {ip} already exists (id {handle})");
-            let _ = self
-                .client_manager
-                .upgrade_hostname_from_discovery(handle, &name);
-            self.update_pos(handle, position);
-            if fingerprint.is_some() {
-                self.client_manager.set_fingerprint(handle, fingerprint);
+            let compatible = reverse_client_compatible(
+                fingerprint.as_deref(),
+                self.client_manager.fingerprint(handle).as_deref(),
+            );
+            if compatible {
+                log::info!("reverse client for {ip} already exists (id {handle})");
+                let _ = self
+                    .client_manager
+                    .upgrade_hostname_from_discovery(handle, &name);
+                if fingerprint.is_some() && self.client_manager.fingerprint(handle).is_none() {
+                    self.client_manager.set_fingerprint(handle, fingerprint);
+                }
+                self.attach_incoming(handle, SocketAddr::new(ip, 0));
+                self.save_config();
+                return;
             }
-            self.set_client_active(handle, true);
-            self.save_config();
-            return;
         }
 
         let handle = self.client_manager.add_client();
@@ -2140,15 +2282,115 @@ impl Service {
         self.client_manager.set_fix_ips(handle, vec![ip]);
         self.client_manager.set_pos(handle, position);
         self.client_manager.set_fingerprint(handle, fingerprint);
+        self.auto_reverse_clients.insert(handle);
         log::info!("adding client {handle} for authorized device {name} ({ip}, {position})");
         let (config, state) = self.client_manager.get_state(handle).expect("client state");
         self.notify_frontend(FrontendEvent::Created(handle, config, state));
-        self.activate_client(handle);
+
+        // Never guess the peer's listen port: dialling DEFAULT_PORT created a
+        // phantom connection to the wrong service. Without a discovered port
+        // the entry stays inactive until the user fills in the address.
+        match self.discovered.get(&ip).and_then(|device| device.port) {
+            Some(port) => {
+                self.client_manager.set_port(handle, port);
+                self.activate_client(handle);
+            }
+            None => log::info!(
+                "reverse client {handle} created inactive: listen port of {ip} is unknown"
+            ),
+        }
         self.save_config();
     }
 
     fn client_with_ip(&self, ip: IpAddr) -> Option<ClientHandle> {
         self.client_manager.find_by_ip(ip)
+    }
+
+    /// Client that represents this certificate identity, if any.
+    fn client_with_fingerprint(&self, fingerprint: &str) -> Option<ClientHandle> {
+        self.client_manager.find_by_fingerprint(fingerprint)
+    }
+
+    /// Incoming session address already registered for this identity.
+    fn incoming_addr_for_fingerprint(&self, fingerprint: &str) -> Option<SocketAddr> {
+        self.incoming_conn_info
+            .values()
+            .find(|incoming| incoming.fingerprint == fingerprint)
+            .map(|incoming| incoming.addr)
+    }
+
+    /// Client entry whose incoming session is `addr`, if any.
+    ///
+    /// Incoming addresses are matched through the session registry first: the
+    /// peer's certificate identity and its route (IPv4/IPv6, ephemeral source
+    /// port) are different things and the route alone must not pick a client.
+    fn client_for_incoming(&self, addr: SocketAddr) -> Option<ClientHandle> {
+        self.client_manager
+            .registered_clients()
+            .into_iter()
+            .find(|handle| self.client_manager.incoming_addr(*handle) == Some(addr))
+            .or_else(|| self.client_with_ip(addr.ip()))
+    }
+
+    /// Client entry for an incoming peer, preferring the certificate identity.
+    fn client_for_peer(&self, addr: SocketAddr, fingerprint: &str) -> Option<ClientHandle> {
+        if !fingerprint.is_empty() {
+            if let Some(handle) = self.client_with_fingerprint(fingerprint) {
+                return Some(handle);
+            }
+        }
+        self.client_for_incoming(addr)
+    }
+
+    /// Register an incoming session on an existing client entry.
+    ///
+    /// Reusing the configured client is what keeps one logical peer from being
+    /// shown as two devices. Its position, port and activation state are left
+    /// untouched: an incoming connection only proves the peer is reachable.
+    fn attach_incoming(&mut self, handle: ClientHandle, addr: SocketAddr) {
+        let mut changed = false;
+        if self.client_manager.incoming_addr(handle) != Some(addr) {
+            self.client_manager.set_incoming_addr(handle, Some(addr));
+            changed = true;
+        }
+        if changed {
+            self.broadcast_client(handle);
+        }
+    }
+
+    /// Drop an auto-added reverse client once the configured client for the
+    /// same certificate learns its fingerprint (TOFU).
+    ///
+    /// A peer that connects before its outgoing link is up used to leave the
+    /// incoming session attached to an auto-created client on the default
+    /// port, while the configured client stayed deactivated by the position
+    /// collision — two rows for one peer and a stale capture zone.
+    fn merge_auto_reverse_client(&mut self, handle: ClientHandle, fingerprint: &str) {
+        let duplicates: Vec<ClientHandle> = self
+            .auto_reverse_clients
+            .iter()
+            .copied()
+            .filter(|other| *other != handle)
+            .filter(|other| self.client_manager.fingerprint(*other).as_deref() == Some(fingerprint))
+            .collect();
+        if duplicates.is_empty() {
+            return;
+        }
+        for duplicate in duplicates {
+            let incoming = self.client_manager.incoming_addr(duplicate);
+            if let Some(addr) = incoming {
+                if self.client_manager.incoming_addr(handle).is_none() {
+                    self.client_manager.set_incoming_addr(handle, Some(addr));
+                }
+            }
+            log::info!(
+                "merging auto-added reverse client {duplicate} into configured client {handle} \
+                 (same certificate {fingerprint})"
+            );
+            self.remove_client(duplicate);
+        }
+        self.broadcast_client(handle);
+        self.save_config();
     }
 
     fn add_client(&mut self) {
@@ -2206,7 +2448,21 @@ impl Service {
 
         if let Some(other) = self.client_manager.client_at(pos) {
             if other != handle {
-                self.deactivate_client(other);
+                let same_peer = matches!(
+                    (
+                        self.client_manager.fingerprint(handle),
+                        self.client_manager.fingerprint(other),
+                    ),
+                    (Some(a), Some(b)) if a == b
+                );
+                if same_peer {
+                    // Two entries of the same certificate at one position: do
+                    // not tear down the user-configured link for the service's
+                    // own duplicate.
+                    log::warn!("not deactivating {other}: it is the same peer as {handle}");
+                } else {
+                    self.deactivate_client(other);
+                }
             }
         }
 
@@ -2236,6 +2492,7 @@ impl Service {
 
     fn remove_client(&mut self, handle: ClientHandle) {
         self.learned_fingerprints.remove(&handle);
+        self.auto_reverse_clients.remove(&handle);
         if self
             .client_manager
             .remove_client(handle)
@@ -2346,6 +2603,20 @@ impl std::fmt::Display for HookKind {
     }
 }
 
+/// Whether an existing client entry may be reused for an incoming peer.
+///
+/// The certificate fingerprint is the identity. An entry with a pinned
+/// fingerprint is only compatible with the same fingerprint; an entry with no
+/// pin (legacy address-only configuration) may adopt the incoming peer, which
+/// is how the first connection pins the client.
+fn reverse_client_compatible(incoming: Option<&str>, pinned: Option<&str>) -> bool {
+    match (incoming, pinned) {
+        (_, None) => true,
+        (Some(incoming), Some(pinned)) => incoming == pinned,
+        (None, Some(_)) => false,
+    }
+}
+
 /// Convert a persisted audit record into the IPC history entry.
 fn history_entry_from_record(record: AuditRecord) -> HistoryEntry {
     HistoryEntry {
@@ -2355,5 +2626,25 @@ fn history_entry_from_record(record: AuditRecord) -> HistoryEntry {
         name: record.name,
         addr: record.addr,
         detail: record.detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reverse_client_compatible;
+
+    #[test]
+    fn an_unpinned_legacy_client_can_adopt_a_peer() {
+        // Configured by address only: the first handshake pins the identity.
+        assert!(reverse_client_compatible(Some("aa"), None));
+        assert!(reverse_client_compatible(None, None));
+    }
+
+    #[test]
+    fn a_pinned_client_only_matches_the_same_certificate() {
+        assert!(reverse_client_compatible(Some("aa"), Some("aa")));
+        assert!(!reverse_client_compatible(Some("bb"), Some("aa")));
+        // Never replace a pin with a peer that somehow lost its fingerprint.
+        assert!(!reverse_client_compatible(None, Some("aa")));
     }
 }

@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use adw::subclass::prelude::*;
 use adw::{ActionRow, PreferencesGroup, ToastOverlay, prelude::*};
@@ -10,7 +11,8 @@ use gtk::{
 };
 
 use lan_mouse_ipc::{
-    DEFAULT_PORT, DeviceView, DiscoveredDevice, FrontendRequestWriter, PendingView, Position,
+    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, DeviceView, DiscoveredDevice,
+    FrontendRequestWriter, PendingView, Position,
 };
 
 use crate::authorization_window::AuthorizationWindow;
@@ -32,6 +34,31 @@ pub struct PendingAdd {
 pub struct DeviceControls {
     pub incoming: [gtk::CheckButton; 3],
     pub outgoing: [gtk::CheckButton; 3],
+}
+
+/// GUI-side round-trip bookkeeping for one configured client.
+///
+/// The service is the source of truth for the connection, but until it exposes
+/// a `last_pong_at` timestamp the row can only prove that a reply arrived by
+/// observing `FrontendEvent::State` updates: the service broadcasts one per
+/// received `Pong` (plus a handful of related events such as `Hello` /
+/// `AuthResponse`, which are themselves answers). The first `State` after a
+/// handshake is the handshake notification itself and therefore not proof.
+#[derive(Debug, Default)]
+pub struct LinkUi {
+    /// Address of the outgoing link this bookkeeping belongs to.
+    pub addr: Option<String>,
+    /// `State` updates observed for the current address (first = handshake).
+    pub updates: u32,
+    /// When the last confirmed round-trip was observed.
+    pub last_reply: Option<Instant>,
+    /// Address currently shown in the row (debounced, see `sticky_endpoint`).
+    pub shown_addr: Option<String>,
+    /// Address waiting to replace the shown one once it is stable.
+    pub candidate_addr: Option<(String, Instant)>,
+    /// Last connection state rendered for this peer; used to avoid rewriting
+    /// the row every periodic tick when nothing changed.
+    pub last_state: Option<crate::client_row::RowConnectionState>,
 }
 
 #[derive(CompositeTemplate, Default)]
@@ -119,6 +146,22 @@ pub struct Window {
     pub pending: RefCell<Vec<PendingView>>,
     /// rows currently inside `requests_group`
     pub request_rows: RefCell<Vec<adw::ActionRow>>,
+    /// last known config and state of every client handle, including entries
+    /// that are aggregated into another row (duplicate configured clients for
+    /// the same certificate fingerprint).
+    pub peer_states: RefCell<HashMap<ClientHandle, (ClientConfig, ClientState)>>,
+    /// certificate fingerprint -> client handles of that logical peer.
+    pub peer_groups: RefCell<HashMap<String, Vec<ClientHandle>>>,
+    /// duplicate handle -> primary (visible) handle of its logical peer.
+    pub peer_primary: RefCell<HashMap<ClientHandle, ClientHandle>>,
+    /// round-trip freshness bookkeeping per handle.
+    pub link_ui: RefCell<HashMap<ClientHandle, LinkUi>>,
+    /// handles whose next `State` event was caused by a local config edit
+    /// (hostname/port/position/...): such an event must not be mistaken for a
+    /// round-trip.
+    pub local_config_changes: RefCell<HashSet<ClientHandle>>,
+    /// periodical status refresh source, tied to the window lifetime.
+    pub status_tick: RefCell<Option<glib::SourceId>>,
 }
 
 #[glib::object_subclass]

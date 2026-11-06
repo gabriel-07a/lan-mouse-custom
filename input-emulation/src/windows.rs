@@ -38,8 +38,8 @@ use windows::Win32::{
 use windows::core::BOOL;
 
 use super::{
-    Emulation, EmulationHandle,
-    absolute::{VirtualScreen, logical_to_physical},
+    EdgeReturnNotifier, Emulation, EmulationHandle, PointerEdge,
+    absolute::{VirtualScreen, logical_to_physical, overshoot_edge},
 };
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
@@ -47,6 +47,10 @@ const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 /// How long the enumerated monitor layout is trusted. Display changes are
 /// rare, and enumerating on every motion event would be wasteful.
 const SCREEN_CACHE_TTL: Duration = Duration::from_secs(2);
+/// How often the return hand-off may be requested while the remote peer keeps
+/// pushing past our screen edge. A single `Leave` can be lost over UDP, so the
+/// request is retried at this rate until the peer releases its capture.
+const EDGE_RETURN_THROTTLE: Duration = Duration::from_millis(250);
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
@@ -65,6 +69,11 @@ pub(crate) struct WindowsEmulation {
     /// `(monitor handle, physical pixels per logical pixel, checked at)` for
     /// the cursor's current monitor.
     scale_cache: Option<(isize, f64, Instant)>,
+    /// Service notifier: the remote pointer was pushed past a screen edge and
+    /// the driving peer must release its capture (return hand-off).
+    edge_return: Option<EdgeReturnNotifier>,
+    /// when the last edge-return request was sent (throttles retries)
+    last_edge_return: Option<Instant>,
 }
 
 impl WindowsEmulation {
@@ -82,6 +91,8 @@ impl WindowsEmulation {
             screen: None,
             screen_checked: None,
             scale_cache: None,
+            edge_return: None,
+            last_edge_return: None,
         })
     }
 
@@ -147,12 +158,21 @@ impl WindowsEmulation {
             return;
         }
 
-        // Clamp to the virtual desktop so the pointer cannot wrap, then
-        // normalise to the 0..=65535 range that MOUSEEVENTF_VIRTUALDESK uses.
-        let target = screen.clamp((
+        // The peer keeps pushing past one of our screen edges: that is the
+        // return hand-off. Windows only clamps the pointer, it does not tell
+        // the capturing side, so report it here and let the service ask the
+        // peer to release its capture.
+        let requested = (
             cursor.0.saturating_add(move_x),
             cursor.1.saturating_add(move_y),
-        ));
+        );
+        if let Some(edge) = overshoot_edge(&screen, requested) {
+            self.request_edge_return(edge);
+        }
+
+        // Clamp to the virtual desktop so the pointer cannot wrap, then
+        // normalise to the 0..=65535 range that MOUSEEVENTF_VIRTUALDESK uses.
+        let target = screen.clamp(requested);
         let (normalised_x, normalised_y) = screen.normalise(target);
 
         send_mouse_input(MOUSEINPUT {
@@ -264,9 +284,31 @@ impl Emulation for WindowsEmulation {
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+
+    fn set_edge_return_notifier(&mut self, notifier: EdgeReturnNotifier) {
+        self.edge_return = Some(notifier);
+    }
 }
 
 impl WindowsEmulation {
+    /// Report that the remote pointer was pushed past `edge`, throttled so a
+    /// lost `Leave` is retried until the peer releases its capture.
+    fn request_edge_return(&mut self, edge: PointerEdge) {
+        let Some(notifier) = &self.edge_return else {
+            return;
+        };
+        if self
+            .last_edge_return
+            .is_some_and(|last| last.elapsed() < EDGE_RETURN_THROTTLE)
+        {
+            return;
+        }
+        if notifier.send(edge).is_ok() {
+            self.last_edge_return = Some(Instant::now());
+            log::debug!("remote pointer pushed past the {edge:?} edge: requesting hand-off");
+        }
+    }
+
     async fn spawn_repeat_task(&mut self, key: u32) {
         // there can only be one repeating key and it's
         // always the last to be pressed

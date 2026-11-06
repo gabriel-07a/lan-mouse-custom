@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     rc::Rc,
 };
@@ -14,6 +14,13 @@ use crate::config::ConfigClient;
 #[derive(Clone, Default)]
 pub struct ClientManager {
     clients: Rc<RefCell<Slab<(ClientConfig, ClientState)>>>,
+    /// Last address that actually established a session with this client.
+    ///
+    /// Kept only in memory (deliberately not part of [`ClientState`], which is
+    /// the frontend IPC type): it is a hint for the connection layer so a
+    /// reconnect tries the address/family that worked last before falling back
+    /// to the other DNS answer, instead of racing A and AAAA on every attempt.
+    preferred: Rc<RefCell<HashMap<ClientHandle, SocketAddr>>>,
 }
 
 impl ClientManager {
@@ -90,6 +97,8 @@ impl ClientManager {
                 s.active_addr = None;
                 s.alive = false;
                 s.rtt_ms = None;
+                // No live link, therefore no round-trip proof either.
+                s.last_pong_at = None;
                 true
             }
             _ => false,
@@ -145,6 +154,9 @@ impl ClientManager {
 
     /// remove a client from the list
     pub fn remove_client(&self, client: ClientHandle) -> Option<(ClientConfig, ClientState)> {
+        // The slab reuses vacant handles, so never let a new client inherit
+        // the previous session's address preference.
+        self.preferred.borrow_mut().remove(&client);
         // remove id from occupied ids
         self.clients.borrow_mut().try_remove(client as usize)
     }
@@ -438,6 +450,18 @@ impl ClientManager {
         state.rtt_ms = smoothed;
     }
 
+    /// Timestamp (Unix ms) of the last `Pong` received on the outgoing link.
+    ///
+    /// This is the frontend's proof of a live round-trip: `alive` only reports
+    /// whether emulation is enabled on the peer and was set optimistically
+    /// right after the handshake, so it must not be used to claim "Connected".
+    /// `None` means "no round-trip observed on the current transport".
+    pub(crate) fn set_last_pong_at(&self, handle: ClientHandle, timestamp_ms: Option<u64>) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.last_pong_at = timestamp_ms;
+        }
+    }
+
     /// whether the client is currently marked active (receiving our input)
     pub(crate) fn is_active(&self, handle: ClientHandle) -> bool {
         self.clients
@@ -490,6 +514,27 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .and_then(|(_, s)| s.active_addr)
+    }
+
+    /// Remember the address whose handshake last succeeded for this client.
+    ///
+    /// Used by the connection layer to keep reconnects on the address family
+    /// that actually works (stable IPv4 or IPv6) and to use the other DNS
+    /// answer only as failover.
+    pub(crate) fn record_working_addr(&self, handle: ClientHandle, addr: SocketAddr) {
+        if self.clients.borrow().contains(handle as usize) {
+            self.preferred.borrow_mut().insert(handle, addr);
+        }
+    }
+
+    /// Address that last established a session for this client, if any.
+    pub(crate) fn preferred_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
+        self.preferred.borrow().get(&handle).copied()
+    }
+
+    /// Forget the pinned working address (e.g. after a config/hostname change).
+    pub(crate) fn clear_preferred_addr(&self, handle: ClientHandle) {
+        self.preferred.borrow_mut().remove(&handle);
     }
 
     pub(crate) fn alive(&self, handle: ClientHandle) -> bool {
@@ -725,12 +770,46 @@ mod tests {
         manager.set_active_addr(handle, Some(SocketAddr::new(ip(10), 4242)));
         manager.set_alive(handle, true);
         manager.set_rtt_ms(handle, Some(15));
+        manager.set_last_pong_at(handle, Some(1_700_000_000_123));
         assert!(manager.deactivate_client(handle));
         let (_, state) = manager.get_state(handle).expect("client");
         assert!(!state.active);
         assert_eq!(state.active_addr, None);
         assert!(!state.alive);
         assert_eq!(state.rtt_ms, None);
+        assert_eq!(
+            state.last_pong_at, None,
+            "a deactivated link carries no round-trip proof"
+        );
+    }
+
+    #[test]
+    fn last_pong_at_starts_empty_and_tracks_the_link() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+
+        // Default/legacy state: no Pong observed yet.
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert_eq!(state.last_pong_at, None);
+
+        // A Pong on the current transport records its wall-clock timestamp.
+        manager.set_last_pong_at(handle, Some(1_700_000_000_123));
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert_eq!(state.last_pong_at, Some(1_700_000_000_123));
+
+        // Losing the transport clears it: the frontend must fall back to
+        // "no proof" instead of showing a stale "Connected".
+        manager.set_last_pong_at(handle, None);
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert_eq!(state.last_pong_at, None);
+    }
+
+    #[test]
+    fn last_pong_at_ignores_unknown_handles() {
+        let manager = ClientManager::default();
+        // Must be a no-op, not a panic (same as the other setters).
+        manager.set_last_pong_at(9, Some(42));
+        assert!(manager.get_state(9).is_none());
     }
 
     #[test]
@@ -759,5 +838,48 @@ mod tests {
         let inactive = manager.add_with_config(config_client(Position::Left, false));
         assert_eq!(manager.find_by_ip(ip(10)), Some(inactive));
         assert_eq!(manager.find_by_ip(ip(99)), None);
+    }
+
+    #[test]
+    fn working_address_is_remembered_per_client() {
+        let manager = ClientManager::default();
+        let a = manager.add_client();
+        let b = manager.add_client();
+        let v4 = SocketAddr::new(ip(10), 4242);
+        let v6 = SocketAddr::new("fd00::10".parse().unwrap(), 4242);
+
+        assert_eq!(manager.preferred_addr(a), None);
+        manager.record_working_addr(a, v4);
+        manager.record_working_addr(b, v6);
+        assert_eq!(manager.preferred_addr(a), Some(v4));
+        assert_eq!(manager.preferred_addr(b), Some(v6));
+
+        // A later fallback success replaces the remembered address.
+        manager.record_working_addr(a, v6);
+        assert_eq!(manager.preferred_addr(a), Some(v6));
+
+        manager.clear_preferred_addr(a);
+        assert_eq!(manager.preferred_addr(a), None);
+    }
+
+    #[test]
+    fn working_address_does_not_leak_into_a_reused_handle() {
+        let manager = ClientManager::default();
+        let removed = manager.add_with_config(config_client(Position::Left, true));
+        manager.record_working_addr(removed, SocketAddr::new(ip(10), 4242));
+        manager.remove_client(removed);
+
+        // Slab may hand out the same handle again; the old session's address
+        // must not become the new client's preferred one.
+        let recreated = manager.add_with_config(config_client(Position::Right, true));
+        assert_eq!(manager.preferred_addr(recreated), None);
+    }
+
+    #[test]
+    fn record_working_addr_ignores_unknown_handles() {
+        let manager = ClientManager::default();
+        manager.record_working_addr(7, SocketAddr::new(ip(10), 4242));
+        assert_eq!(manager.preferred_addr(7), None);
+        assert!(manager.get_state(7).is_none());
     }
 }

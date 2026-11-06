@@ -45,7 +45,7 @@ pub fn local_commit() -> [u8; 8] {
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CERT_FILE_NAME: &str = "lan-mouse.pem";
 
-fn default_path() -> Result<PathBuf, VarError> {
+pub(crate) fn default_path() -> Result<PathBuf, VarError> {
     #[cfg(unix)]
     let default_path = {
         let xdg_config_home =
@@ -338,6 +338,21 @@ struct Args {
     #[arg(long)]
     cert_path: Option<PathBuf>,
 
+    /// move this user's stored devices, permissions, certificates, audit log
+    /// and portal consent tokens to a timestamped backup (reversible), then
+    /// exit; use --purge to delete them permanently instead
+    #[arg(long)]
+    reset_config: bool,
+
+    /// with `--reset-config`: only print the paths that would be moved/removed
+    #[arg(long, requires = "reset_config")]
+    dry_run: bool,
+
+    /// with `--reset-config`: permanently delete the data instead of moving it
+    /// to a `lan-mouse.bak-*` backup
+    #[arg(long, requires = "reset_config")]
+    purge: bool,
+
     /// subcommands
     #[command(subcommand)]
     command: Option<Command>,
@@ -606,6 +621,21 @@ const DEFAULT_CONNECT_GRACE_MS: u64 = 400;
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
+
+        // `--reset-config` must run before any filesystem setup: it must not
+        // create the config directory it is about to remove (or just cleared).
+        if args.reset_config {
+            match crate::reset::run(crate::reset::ResetOptions {
+                dry_run: args.dry_run,
+                purge: args.purge,
+            }) {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("lan-mouse: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
 
         // --config <file> overrules default location
         let config_path = args
