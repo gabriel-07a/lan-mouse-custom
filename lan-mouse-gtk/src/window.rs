@@ -1646,7 +1646,10 @@ impl Window {
     }
 }
 
-#[cfg(test)]
+// GTK window creation from a test thread is only reliable on Linux/Windows;
+// macOS requires AppKit's main thread, so the smoke test would fail the macOS
+// CI job instead of validating the template.
+#[cfg(all(test, not(target_os = "macos")))]
 mod ui_template_smoke {
     use adw::prelude::*;
     use adw::subclass::prelude::ObjectSubclassIsExt;

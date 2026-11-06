@@ -1,3 +1,5 @@
+#![cfg_attr(not(any(windows, x11)), allow(dead_code))]
+
 //! Sub-pixel accumulator for integer-only emulation backends.
 //!
 //! The wire format carries `f64` deltas. Wayland (libei/layer-shell) produces
