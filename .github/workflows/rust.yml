@@ -117,16 +117,21 @@ jobs:
           # exact failure is visible through the public checks API even
           # without repository-admin access to the raw job log.
           {
-            grep -E 'warning:|error(\[|:)' clippy.log | head -15
-            echo "--- clippy log tail ---"
-            tail -n 25 clippy.log
+            echo "--- linker context ---"
+            grep -B6 -A20 'link.exe' clippy.log 2>&1 || true
             echo "--- toolchain ---"
-            command -v cargo rustc clippy-driver cargo-clippy x86_64-w64-mingw32-gcc link.exe 2>&1 || true
+            echo "cargo=$(command -v cargo 2>&1)"
+            echo "rustc=$(command -v rustc 2>&1)"
+            echo "clippy-driver=$(command -v clippy-driver 2>&1)"
+            echo "cargo-clippy=$(command -v cargo-clippy 2>&1)"
+            echo "gcc=$(command -v x86_64-w64-mingw32-gcc 2>&1)"
+            echo "link=$(command -v link.exe 2>&1)"
+            echo "RUSTFLAGS=${RUSTFLAGS:-} CARGO_BUILD_TARGET=${CARGO_BUILD_TARGET:-}"
             cargo --version 2>&1 || true
             rustc --version --verbose 2>&1 || true
-            echo "--- linker context ---"
-            grep -B8 -A25 'link.exe' clippy.log 2>&1 || true
-          } | while IFS= read -r line; do
+            echo "--- clippy warnings ---"
+            grep -E 'warning:|error(\[|:)' clippy.log | head -10
+          } | head -30 | while IFS= read -r line; do
             echo "::error::${line}"
           done
           exit "$status"
@@ -141,16 +146,21 @@ jobs:
           cargo clippy --workspace --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
           {
-            grep -E 'warning:|error(\[|:)' clippy.log | head -15
-            echo "--- clippy log tail ---"
-            tail -n 25 clippy.log
+            echo "--- linker context ---"
+            grep -B6 -A20 'link.exe' clippy.log 2>&1 || true
             echo "--- toolchain ---"
-            command -v cargo rustc clippy-driver cargo-clippy x86_64-w64-mingw32-gcc link.exe 2>&1 || true
+            echo "cargo=$(command -v cargo 2>&1)"
+            echo "rustc=$(command -v rustc 2>&1)"
+            echo "clippy-driver=$(command -v clippy-driver 2>&1)"
+            echo "cargo-clippy=$(command -v cargo-clippy 2>&1)"
+            echo "gcc=$(command -v x86_64-w64-mingw32-gcc 2>&1)"
+            echo "link=$(command -v link.exe 2>&1)"
+            echo "RUSTFLAGS=${RUSTFLAGS:-} CARGO_BUILD_TARGET=${CARGO_BUILD_TARGET:-}"
             cargo --version 2>&1 || true
             rustc --version --verbose 2>&1 || true
-            echo "--- linker context ---"
-            grep -B8 -A25 'link.exe' clippy.log 2>&1 || true
-          } | while IFS= read -r line; do
+            echo "--- clippy warnings ---"
+            grep -E 'warning:|error(\[|:)' clippy.log | head -10
+          } | head -30 | while IFS= read -r line; do
             echo "::error::${line}"
           done
           exit "$status"

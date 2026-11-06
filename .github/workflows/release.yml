@@ -95,14 +95,52 @@ jobs:
         shell: pwsh
         run: |
           $p = Start-Process -FilePath ".\lan-mouse-custom-setup-x86_64.exe" -ArgumentList "/S" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "Installer failed with exit code $($p.ExitCode)" }
+          if ($p.ExitCode -ne 0) {
+            echo "::error::installer exit code $($p.ExitCode)"
+            throw "Installer failed with exit code $($p.ExitCode)"
+          }
           $exe = "C:\Program Files\Lan Mouse\lan-mouse.exe"
-          if (-not (Test-Path $exe)) { throw "Installed binary missing at $exe" }
-          $json = & $exe doctor --probe --json | ConvertFrom-Json
-          if ($json.capture_probe.backend -ne "windows") { throw "Unexpected capture probe: $($json.capture_probe | ConvertTo-Json)" }
-          if ($json.emulation_probe.backend -ne "windows") { throw "Unexpected emulation probe: $($json.emulation_probe | ConvertTo-Json)" }
+          if (-not (Test-Path $exe)) {
+            echo "::error::installed binary missing at $exe"
+            throw "Installed binary missing at $exe"
+          }
+          # The release binary is a GUI-subsystem executable. PowerShell's `&`
+          # piping can miss its stdout; redirect through files instead so the
+          # doctor JSON is reliably captured and failures are diagnosable.
+          $stdout = Join-Path $env:RUNNER_TEMP "lan-mouse-doctor.json"
+          $stderr = Join-Path $env:RUNNER_TEMP "lan-mouse-doctor.err"
+          $doctor = Start-Process -FilePath $exe -ArgumentList "doctor", "--probe", "--json" `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+          Write-Host "doctor exit code: $($doctor.ExitCode)"
+          Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          if ($doctor.ExitCode -ne 0) {
+            echo "::error::doctor exited with $($doctor.ExitCode)"
+            throw "doctor exited with $($doctor.ExitCode)"
+          }
+          $raw = Get-Content $stdout -Raw
+          if ([string]::IsNullOrWhiteSpace($raw)) {
+            echo "::error::doctor produced no JSON (stdout empty)"
+            throw "doctor produced no JSON"
+          }
+          try {
+            $json = $raw | ConvertFrom-Json
+          } catch {
+            echo "::error::could not parse doctor JSON: $($raw.Substring(0, [Math]::Min(300, $raw.Length)))"
+            throw "could not parse doctor JSON"
+          }
+          if ($json.capture_probe.backend -ne "windows") {
+            echo "::error::unexpected capture probe: $($json.capture_probe | ConvertTo-Json -Compress)"
+            throw "Unexpected capture probe"
+          }
+          if ($json.emulation_probe.backend -ne "windows") {
+            echo "::error::unexpected emulation probe: $($json.emulation_probe | ConvertTo-Json -Compress)"
+            throw "Unexpected emulation probe"
+          }
           $u = Start-Process -FilePath "C:\Program Files\Lan Mouse\uninstall.exe" -ArgumentList "/S" -Wait -PassThru
-          if ($u.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($u.ExitCode)" }
+          if ($u.ExitCode -ne 0) {
+            echo "::error::uninstaller exit code $($u.ExitCode)"
+            throw "Uninstaller failed with exit code $($u.ExitCode)"
+          }
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
