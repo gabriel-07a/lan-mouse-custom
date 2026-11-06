@@ -42,8 +42,14 @@ impl FakeEnv {
             .expect("clock")
             .as_nanos();
         let unique = NEXT_FAKE_ENV.fetch_add(1, Ordering::Relaxed);
-        let root = env::temp_dir().join(format!(
-            "lan-mouse-packaging-{label}-{}-{nanos}-{unique}",
+        // macOS limits AF_UNIX paths to ~104 bytes; the default temp dir on
+        // CI is /var/folders/... and plus HOME/Library/Caches/... exceeds it.
+        #[cfg(target_os = "macos")]
+        let temp_root = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let temp_root = env::temp_dir();
+        let root = temp_root.join(format!(
+            "lm-packaging-{label}-{}-{nanos}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("fake env root");

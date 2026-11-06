@@ -425,13 +425,28 @@ mod tests {
 
     #[test]
     fn only_directories_literally_named_lan_mouse_are_owned() {
-        assert!(is_owned_app_dir(Path::new("/home/user/.config/lan-mouse")));
-        assert!(is_owned_app_dir(Path::new("/tmp/lan-mouse")));
-        assert!(!is_owned_app_dir(Path::new("/home/user/.config/other")));
-        assert!(!is_owned_app_dir(Path::new("/lan-mouse")));
-        assert!(!is_owned_app_dir(Path::new("/")));
+        // Windows paths need a drive prefix to be `Path::is_absolute()`;
+        // a Unix-style "/home/..." is deliberately not owned there.
+        #[cfg(unix)]
+        let config_dir = Path::new("/home/user/.config");
+        #[cfg(windows)]
+        let config_dir = Path::new(r"C:\Users\user\AppData\Local");
+        assert!(is_owned_app_dir(&config_dir.join("lan-mouse")));
+        assert!(is_owned_app_dir(&env::temp_dir().join("lan-mouse")));
+        assert!(!is_owned_app_dir(&config_dir.join("other")));
         assert!(!is_owned_app_dir(Path::new("relative/lan-mouse")));
-        assert!(!is_owned_app_dir(Path::new("/home/lan-mouse/.config")));
+        #[cfg(unix)]
+        {
+            assert!(!is_owned_app_dir(Path::new("/lan-mouse")));
+            assert!(!is_owned_app_dir(Path::new("/")));
+            assert!(!is_owned_app_dir(Path::new("/home/lan-mouse/.config")));
+        }
+        #[cfg(windows)]
+        {
+            assert!(!is_owned_app_dir(Path::new(r"C:\lan-mouse")));
+            assert!(!is_owned_app_dir(Path::new(r"C:\")));
+            assert!(!is_owned_app_dir(Path::new(r"C:\Users\lan-mouse\.config")));
+        }
     }
 
     #[test]
