@@ -595,45 +595,20 @@ async fn connect(
     }
 }
 
-/// Address family preference for clients that have never connected.
-///
-/// IPv4 is tried first because it works on every home/office LAN without
-/// router advertisements or an IPv6 firewall exception, and it is what most
-/// peers actually use. IPv6 is still tried (and is the only option on
-/// IPv6-only networks) — only after IPv4 failed. The order is deliberately
-/// static so the same client does not flip families between reconnects.
-fn family_rank(addr: &SocketAddr) -> u8 {
-    match addr {
-        SocketAddr::V4(_) => 0,
-        SocketAddr::V6(_) => 1,
-    }
-}
-
 /// Order the candidate addresses of a client for one connection attempt.
 ///
-/// Preference, highest first:
-/// 1. the address that established the previous session (remembered per
-///    client by [`ClientManager::record_working_addr`]) — this keeps a
-///    reconnect on the family/address that actually works instead of
-///    flip-flopping between the A and AAAA records;
-/// 2. IPv4;
-/// 3. IPv6.
-///
-/// The result is deduplicated and deterministic, so a multi-address client
-/// never dials the same endpoint twice in one attempt.
+/// The address that established the previous session (remembered per client
+/// by [`ClientManager::record_working_addr`]) is tried first, then the
+/// remaining addresses numerically. The result is deduplicated and
+/// deterministic, so a multi-address client never dials the same endpoint
+/// twice in one attempt. Callers filter to IPv4 before dialing.
 fn dial_order(
     addrs: impl IntoIterator<Item = SocketAddr>,
     preferred: Option<SocketAddr>,
 ) -> Vec<SocketAddr> {
     let preferred_ip = preferred.map(|addr| addr.ip());
     let mut addrs = addrs.into_iter().collect::<Vec<_>>();
-    addrs.sort_by_key(|addr| {
-        (
-            u8::from(Some(addr.ip()) != preferred_ip),
-            family_rank(addr),
-            *addr,
-        )
-    });
+    addrs.sort_by_key(|addr| (u8::from(Some(addr.ip()) != preferred_ip), *addr));
     addrs.dedup();
     addrs
 }
@@ -641,12 +616,10 @@ fn dial_order(
 /// Try the candidate addresses one at a time, in [`dial_order`] order, and
 /// return the first successful handshake.
 ///
-/// Deliberately **not** happy-eyeballs: racing IPv4 and IPv6 opens a session
-/// per family on the peer, which then has to pick one and may show the same
-/// device twice. One attempt = at most one session, and the ordering above
-/// keeps the chosen address stable. Sequential failover is slower in the worst
-/// case (one [`ADDRESS_TIMEOUT`] per dead address), which is the documented
-/// trade-off for a stable logical link.
+/// One attempt = at most one session, and the ordering above keeps the chosen
+/// address stable. Sequential failover is slower in the worst case (one
+/// [`ADDRESS_TIMEOUT`] per dead address), which is the documented trade-off
+/// for a stable logical link.
 async fn connect_first(
     addrs: impl IntoIterator<Item = SocketAddr>,
     cert: Certificate,
@@ -694,13 +667,20 @@ async fn connect_to_handle(
         if preferred.is_none() {
             // The remembered address is no longer part of the client's address
             // set (DNS change, new DHCP lease, edited config): forget it so the
-            // failover starts from the documented family preference again.
+            // failover starts from the documented address preference again.
             ctx.client_manager.clear_preferred_addr(handle);
         }
         let addrs = dial_order(
             ips.into_iter().map(|ip| SocketAddr::new(ip, port)),
             preferred,
-        );
+        )
+        .into_iter()
+        // Lan Mouse is IPv4-only by design; see bind_listener().
+        .filter(SocketAddr::is_ipv4)
+        .collect::<Vec<_>>();
+        if addrs.is_empty() {
+            return Err(LanMouseConnectionError::NotConnected);
+        }
 
         log::info!("client ({handle}) connecting ... (ordered addresses: {addrs:?})");
         let expected = ctx.client_manager.fingerprint(handle);
@@ -1141,20 +1121,10 @@ mod tests {
     }
 
     #[test]
-    fn dial_order_prefers_ipv4_before_ipv6() {
-        let v6 = sa("fd00::1", 4242);
-        let v4 = sa("192.168.1.1", 4242);
-        assert_eq!(dial_order([v6, v4], None), vec![v4, v6]);
-    }
-
-    #[test]
     fn dial_order_keeps_the_remembered_address_first() {
         let v4a = sa("192.168.1.1", 4242);
         let v4b = sa("10.0.0.1", 4242);
-        let v6 = sa("fd00::1", 4242);
-        // The address that worked last is tried first even when it is IPv6;
-        // the other answers stay as failover.
-        assert_eq!(dial_order([v4a, v4b, v6], Some(v6)), vec![v6, v4b, v4a]);
+        assert_eq!(dial_order([v4a, v4b], Some(v4b)), vec![v4b, v4a]);
     }
 
     #[test]
@@ -1165,22 +1135,25 @@ mod tests {
     }
 
     #[test]
-    fn dial_order_keeps_ipv6_only_clients_working() {
-        let v6a = sa("fd00::2", 4242);
-        let v6b = sa("fd00::1", 4242);
-        assert_eq!(dial_order([v6a, v6b], None), vec![v6b, v6a]);
+    fn dial_order_ignores_a_preference_outside_the_candidate_set() {
+        let v4 = sa("192.168.1.10", 4242);
+        let other = sa("10.0.0.10", 4242);
+        assert_eq!(
+            dial_order([v4, other], Some(sa("192.168.1.99", 4242))),
+            vec![other, v4]
+        );
     }
 
     #[test]
-    fn dial_order_ignores_a_preference_outside_the_candidate_set() {
-        let v4 = sa("192.168.1.10", 4242);
-        let v6 = sa("fd00::10", 4242);
-        // The remembered address changed (DHCP): fall back to the documented
-        // family preference without dropping the IPv6 failover.
-        assert_eq!(
-            dial_order([v6, v4], Some(sa("192.168.1.99", 4242))),
-            vec![v4, v6]
-        );
+    fn ipv4_only_dial_filters_ipv6_candidates() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let v6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let addrs = [v4, v6]
+            .into_iter()
+            .filter(IpAddr::is_ipv4)
+            .map(|ip| SocketAddr::new(ip, 4242))
+            .collect::<Vec<_>>();
+        assert_eq!(addrs, vec![SocketAddr::new(v4, 4242)]);
     }
 
     use crate::client::ClientManager;
@@ -1191,8 +1164,6 @@ mod tests {
     use futures::StreamExt;
     use lan_mouse_ipc::Position as IpcPosition;
     use lan_mouse_proto::Position as ProtoPosition;
-    #[cfg(target_os = "linux")]
-    use std::net::Ipv6Addr;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::{Arc, RwLock};
@@ -1403,134 +1374,7 @@ mod tests {
             })
             .await;
     }
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn ipv6_loopback_works() {
-        // Skip when the host has no IPv6 loopback.
-        if std::net::UdpSocket::bind("[::1]:0").is_err() {
-            return;
-        }
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let port = free_udp_port();
-                let listener_cert = unique_cert("ipv6-listener");
-                let client_cert = unique_cert("ipv6-client");
-                let fp = crypto::certificate_fingerprint(&client_cert);
-                let mut listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
 
-                let manager = ClientManager::default();
-                let handle = manager.add_with_config(ConfigClient {
-                    ips: HashSet::from([IpAddr::V6(Ipv6Addr::LOCALHOST)]),
-                    hostname: None,
-                    port,
-                    pos: IpcPosition::Right,
-                    active: true,
-                    enter_hook: None,
-                    leave_hook: None,
-                    sensitivity: 100,
-                    fingerprint: None,
-                });
-                let conn = LanMouseConnection::new(client_cert, manager, 2000);
-                conn.send(
-                    ProtoEvent::Enter {
-                        pos: ProtoPosition::Right,
-                        serial: 99,
-                    },
-                    handle,
-                )
-                .await
-                .expect("IPv6 connect");
-                expect_event(&mut listener, |event| {
-                    matches!(event, ProtoEvent::Enter { serial: 99, .. })
-                })
-                .await;
-                listener.terminate().await;
-            })
-            .await;
-    }
-
-    /// One client configured with both an A and an AAAA record must dial
-    /// exactly one of them: racing both used to leave a second, half-adopted
-    /// session on the peer (two devices / alternating address in the UI).
-    #[tokio::test(flavor = "current_thread")]
-    async fn dual_stack_client_opens_a_single_session() {
-        if std::net::UdpSocket::bind("[::1]:0").is_err() {
-            return;
-        }
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let port = free_udp_port();
-                let listener_cert = unique_cert("dual-listener");
-                let client_cert = unique_cert("dual-client");
-                let fp = crypto::certificate_fingerprint(&client_cert);
-                let mut listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
-
-                let manager = ClientManager::default();
-                let handle = manager.add_with_config(ConfigClient {
-                    ips: HashSet::from([
-                        IpAddr::V4(Ipv4Addr::LOCALHOST),
-                        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-                    ]),
-                    hostname: None,
-                    port,
-                    pos: IpcPosition::Right,
-                    active: true,
-                    enter_hook: None,
-                    leave_hook: None,
-                    sensitivity: 100,
-                    fingerprint: None,
-                });
-                let conn = LanMouseConnection::new(client_cert, manager.clone(), 2000);
-                conn.send(
-                    ProtoEvent::Enter {
-                        pos: ProtoPosition::Right,
-                        serial: 1,
-                    },
-                    handle,
-                )
-                .await
-                .expect("dual stack connect");
-
-                let accepted = tokio::time::timeout(Duration::from_secs(15), async {
-                    loop {
-                        match listener.next().await {
-                            Some(ListenEvent::Accept { addr, .. }) => break addr,
-                            Some(_) => continue,
-                            None => panic!("listener closed before accepting"),
-                        }
-                    }
-                })
-                .await
-                .expect("timed out waiting for accept");
-
-                // The second family must not dial (and leave a duplicate
-                // session): nothing else may be accepted for this fingerprint.
-                let quiet_until = Instant::now() + Duration::from_secs(1);
-                while Instant::now() < quiet_until {
-                    match tokio::time::timeout(Duration::from_millis(100), listener.next()).await {
-                        Ok(Some(ListenEvent::Accept { addr, .. })) => {
-                            panic!("duplicate session accepted from {addr} (first {accepted})")
-                        }
-                        Ok(Some(_)) => {}
-                        Ok(None) => break,
-                        Err(_) => {}
-                    }
-                }
-                assert!(
-                    manager.active_addr(handle).is_some(),
-                    "the IPv4 attempt must have established the connection"
-                );
-                listener.terminate().await;
-            })
-            .await;
-    }
-
-    /// A peer may accept the DTLS connection and read it without ever
-    /// replying (upstream releases do exactly that when they did not
-    /// initiate the connection). Two silent ping rounds used to close such a
-    /// link every few seconds, which froze the pointer at the screen edge.
     #[tokio::test(flavor = "current_thread")]
     async fn silent_listener_keeps_the_link_alive() {
         let local = LocalSet::new();

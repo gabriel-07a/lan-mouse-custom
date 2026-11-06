@@ -193,11 +193,14 @@ impl ClientManager {
 
     fn update_ips(&self, handle: ClientHandle) {
         if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            // Lan Mouse is IPv4-only: an AAAA record must not create a
+            // second transport or show up in the UI.
             s.ips = c
                 .fix_ips
                 .iter()
                 .cloned()
                 .chain(s.dns_ips.iter().cloned())
+                .filter(IpAddr::is_ipv4)
                 .collect::<HashSet<_>>();
         }
     }

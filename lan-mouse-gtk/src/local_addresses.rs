@@ -17,21 +17,19 @@ pub(crate) struct LocalAddress {
 /// Enumerate the addresses other computers on the network can use to reach
 /// this one.
 ///
-/// Loopback, unspecified, multicast and link-local addresses are skipped:
-/// they are either not reachable from another machine or need a scope ID that
-/// cannot be typed by hand. IPv4 addresses come first so the usual LAN address
-/// is the first line shown to the user.
+/// Lan Mouse is IPv4-only: only IPv4 interfaces are enumerated. Loopback,
+/// unspecified, multicast and link-local addresses are skipped because they
+/// are not reachable from another machine.
 pub(crate) fn local_addresses() -> Vec<LocalAddress> {
     let Ok(interfaces) = if_addrs::get_if_addrs() else {
         log::warn!("could not enumerate the local network interfaces");
         return Vec::new();
     };
-    collect_addresses(interfaces.into_iter().map(|interface| {
-        let ip = match interface.addr {
-            if_addrs::IfAddr::V4(v4) => IpAddr::V4(v4.ip),
-            if_addrs::IfAddr::V6(v6) => IpAddr::V6(v6.ip),
+    collect_addresses(interfaces.into_iter().filter_map(|interface| {
+        let if_addrs::IfAddr::V4(v4) = interface.addr else {
+            return None;
         };
-        (interface.name, ip)
+        Some((interface.name, IpAddr::V4(v4.ip)))
     }))
 }
 
@@ -45,7 +43,9 @@ where
 {
     let mut addresses = interfaces
         .into_iter()
-        .filter(|(interface, ip)| is_usable(*ip) && !is_container_interface(interface))
+        .filter(|(interface, ip)| {
+            ip.is_ipv4() && is_usable(*ip) && !is_container_interface(interface)
+        })
         .map(|(interface, ip)| LocalAddress { ip, interface })
         .collect::<Vec<_>>();
 
@@ -97,24 +97,17 @@ fn is_container_interface(name: &str) -> bool {
 /// needs. Probing it with a UDP `connect` does a route lookup without sending
 /// a packet and works on Linux, Windows and macOS. When there is no default
 /// route (offline LAN, isolated switch), fall back to ranking the enumerated
-/// addresses: real interfaces before containers, IPv4 before IPv6, private
-/// before public.
+/// addresses: real interfaces before containers, private before public.
 pub(crate) fn primary_address(addresses: &[LocalAddress]) -> Option<LocalAddress> {
     choose_primary(addresses, default_route_ip())
 }
 
 fn default_route_ip() -> Option<IpAddr> {
     route_probe("8.8.8.8:80".parse().ok()?)
-        .or_else(|| route_probe("[2001:4860:4860::8888]:80".parse().ok()?))
 }
 
 fn route_probe(destination: SocketAddr) -> Option<IpAddr> {
-    let bind = if destination.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind).ok()?;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect(destination).ok()?;
     let ip = socket.local_addr().ok()?.ip();
     (!ip.is_unspecified()).then_some(ip)
@@ -210,16 +203,13 @@ mod tests {
             address("eth0", "192.168.1.10"),
             address("eth0", "169.254.10.20"),
             address("eth0", "224.0.0.1"),
-            address("eth0", "::1"),
-            address("eth0", "fe80::1"),
-            address("eth0", "2001:db8::5"),
             address("eth0", "0.0.0.0"),
         ]);
         let ips = collected
             .iter()
             .map(|address| address.ip)
             .collect::<Vec<_>>();
-        assert_eq!(ips, vec![ip("192.168.1.10"), ip("2001:db8::5")]);
+        assert_eq!(ips, vec![ip("192.168.1.10")]);
     }
 
     #[test]
@@ -240,28 +230,18 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_addresses_come_first_and_are_numerically_sorted() {
+    fn ipv4_addresses_are_numerically_sorted() {
         let collected = collect_addresses(vec![
             address("wg0", "10.0.0.5"),
             address("eth0", "192.168.1.10"),
             address("eth0", "9.0.0.1"),
-            address("eth0", "2001:db8::2"),
             address("eth0", "2001:db8::1"),
         ]);
         let ips = collected
             .iter()
             .map(|address| address.ip.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(
-            ips,
-            vec![
-                "9.0.0.1",
-                "10.0.0.5",
-                "192.168.1.10",
-                "2001:db8::1",
-                "2001:db8::2"
-            ]
-        );
+        assert_eq!(ips, vec!["9.0.0.1", "10.0.0.5", "192.168.1.10"]);
     }
 
     #[test]
@@ -292,15 +272,11 @@ mod tests {
     }
 
     #[test]
-    fn fallback_prefers_real_ipv4_over_container_ipv6_and_public() {
+    fn fallback_prefers_real_private_ipv4_over_public_and_containers() {
         let addresses = vec![
             LocalAddress {
                 ip: ip("172.17.0.1"),
                 interface: "docker0".to_string(),
-            },
-            LocalAddress {
-                ip: ip("2001:db8::5"),
-                interface: "eth0".to_string(),
             },
             LocalAddress {
                 ip: ip("100.64.0.1"),
@@ -311,8 +287,7 @@ mod tests {
                 interface: "eth0".to_string(),
             },
         ];
-        // No route (isolated LAN): real IPv4 private first, then public IPv4,
-        // then real IPv6, then container interfaces.
+        // No route (isolated LAN): real private IPv4 before public/container.
         let primary = choose_primary(&addresses, None).expect("fallback address");
         assert_eq!(primary.ip, ip("10.0.0.5"));
         assert_eq!(primary.interface, "eth0");

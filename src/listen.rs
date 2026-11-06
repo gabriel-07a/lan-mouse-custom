@@ -741,29 +741,15 @@ fn per_connection_verify(
     )
 }
 
-/// Listen on a dual-stack socket on Linux (IPv4-mapped addresses are
-/// normalized when accepted), and on IPv4 elsewhere.
+/// Listen on an IPv4-only socket.
+///
+/// Lan Mouse deliberately does not accept or open IPv6 connections: all
+/// supported setups (Windows, macOS and Linux) work over IPv4, and keeping one
+/// family removes the address-flapping/duplicate-session failure modes that
+/// occurred when both A and AAAA records were available.
 async fn bind_listener(port: u16) -> Result<impl Listener, webrtc_util::Error> {
-    #[cfg(target_os = "linux")]
-    let primary = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
-    #[cfg(not(target_os = "linux"))]
     let primary = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-
-    match webrtc_util::conn::conn_udp_listener::listen(primary).await {
-        Ok(listener) => Ok(listener),
-        Err(e) => {
-            #[cfg(target_os = "linux")]
-            {
-                log::warn!("could not listen on [::]:{port} ({e}); falling back to 0.0.0.0");
-                let fallback = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-                webrtc_util::conn::conn_udp_listener::listen(fallback).await
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Err(e)
-            }
-        }
-    }
+    webrtc_util::conn::conn_udp_listener::listen(primary).await
 }
 
 /// Map IPv4-mapped IPv6 addresses (dual-stack sockets) back to IPv4, so

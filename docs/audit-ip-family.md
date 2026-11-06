@@ -1,3 +1,8 @@
+> **UPDATE (2026-11-06):** after this audit the product decision changed to
+> **IPv4-only**. The listener, client address set, dialer and UI now ignore IPv6
+> entirely; the IPv6 failover paths described below are historical and are no
+> longer active. See README "Network tuning" and `bind_listener()`.
+>
 # Diagnóstico e correção — flapping IPv4/IPv6, peers duplicados e endereço ativo instável
 
 - **Reportado em:** v0.2.4-custom (commit `2c8b201`), Windows 11 + Ubuntu 26; colega com Windows 10/11.

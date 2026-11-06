@@ -8,9 +8,10 @@
 //! service can create a second, auto-added "reverse" client for the same
 //! certificate.
 //!
-//! These tests pin the address-mapping invariants that the net-identity fix
-//! (task-17) must preserve; end-to-end duplicate-row behavior is covered by
-//! `scripts/qa-two-instances.sh` (scenario `duplicate`).
+//! Lan Mouse is IPv4-only by product decision: IPv6 answers must be ignored
+//! for identity, dialing and the UI. These tests pin that invariant and the
+//! one-handle-per-configured-peer behavior; end-to-end duplicate-row behavior
+//! is covered by `scripts/qa-two-instances.sh` (scenario `duplicate`).
 //!
 //! Ownership: tests only (task-21 QA); production code belongs to task-17.
 
@@ -45,11 +46,10 @@ fn addr(ip: IpAddr) -> SocketAddr {
     SocketAddr::new(ip, PORT)
 }
 
-/// One configured client must answer for both address families when DNS
-/// returns A+AAAA for it: an inbound packet from either family has to map to
-/// the same client handle (otherwise the service adds a duplicate device).
+/// A DNS answer with A+AAAA must only register the IPv4 address: the peer is
+/// one logical client, and no IPv6 transport/UI entry is allowed.
 #[test]
-fn one_client_maps_ipv4_and_ipv6_to_the_same_handle() {
+fn one_client_ignores_ipv6_and_keeps_a_single_handle() {
     let manager = ClientManager::default();
     let v4 = ip("192.0.2.10");
     let v6 = ip("2001:db8::10");
@@ -61,8 +61,8 @@ fn one_client_maps_ipv4_and_ipv6_to_the_same_handle() {
     assert_eq!(manager.get_client(addr(v4)), Some(handle));
     assert_eq!(
         manager.get_client(addr(v6)),
-        Some(handle),
-        "an inbound IPv6 packet from the same peer must not create a second client"
+        None,
+        "IPv6 is disabled and must not map to a client"
     );
     assert_eq!(
         manager.clients().len(),
@@ -89,7 +89,7 @@ fn dns_answer_churn_keeps_one_client_and_one_handle() {
         };
         manager.set_dns_ips(handle, answers);
         assert_eq!(manager.get_client(addr(v4)), Some(handle));
-        assert_eq!(manager.get_client(addr(v6)), Some(handle));
+        assert_eq!(manager.get_client(addr(v6)), None, "round {round}");
         assert_eq!(manager.clients().len(), 1, "round {round}");
     }
 }
@@ -105,7 +105,11 @@ fn fix_ips_and_dns_ips_are_a_union_on_the_same_client() {
 
     manager.set_dns_ips(handle, vec![dns_v6]);
     assert_eq!(manager.get_client(addr(fix_v4)), Some(handle));
-    assert_eq!(manager.get_client(addr(dns_v6)), Some(handle));
+    assert_eq!(
+        manager.get_client(addr(dns_v6)),
+        None,
+        "IPv6 DNS answers are ignored"
+    );
 
     // Updating the fixed IPs in the UI must update the mapping in place.
     let new_v4 = ip("192.0.2.21");

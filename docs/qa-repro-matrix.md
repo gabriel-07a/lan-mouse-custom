@@ -1,3 +1,7 @@
+> **UPDATE (2026-11-06):** Lan Mouse is now **IPv4-only** (product decision).
+> The IPv6-only rows and IPv6 failover steps below are historical; the current
+> acceptance matrix is IPv4-only (E1) and dual-stack hosts must simply use IPv4.
+>
 # QA — reprodução e matriz de regressão dos 4 bugs reportados (v0.2.4-custom)
 
 Missão (task-21): QA independente dos bugs reportados em Windows 11/10 + Ubuntu 26 —

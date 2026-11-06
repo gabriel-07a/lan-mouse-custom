@@ -414,9 +414,10 @@ By default the gtk frontend will open when running `lan-mouse`.
 To connect a device you want to control, simply click the `Add` button and enter the hostname
 of the device. The **This Computer** section at the top of the window shows the single local IP
 address the other computer should use (the one of the default route), the listening port, and a
-button to copy the address — no terminal needed. The tooltip lists other local addresses (e.g. a
-second NIC or IPv6) and their interfaces. Use the refresh button after connecting to another
-network; the row also updates when the port changes.
+button to copy the address — no terminal needed. The tooltip lists other IPv4 addresses (e.g. a
+second NIC) and their interfaces. Lan Mouse uses IPv4 only; IPv6 is intentionally not used for
+connections or shown in the UI. Use the refresh button after connecting to another network; the
+row also updates when the port changes.
 
 On the *remote* device, authorize your *local* device for incoming traffic using the `Authorize` button
 under the "Incoming Connections" section.
@@ -755,6 +756,11 @@ misconfigurations. Add `--probe` to also initialize the input backends, and
 
 Both options also exist as command line flags (`--motion-batch-ms`,
 `--connect-grace-ms`).
+
+Lan Mouse is **IPv4-only**: it listens on `0.0.0.0`, resolves peers to their
+IPv4 addresses and ignores AAAA records. IPv6 support was removed because it
+caused a second logical transport (and UI/state flapping) for dual-stack peers;
+every supported setup works over IPv4.
 
 ## Clipboard
 
