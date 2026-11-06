@@ -107,9 +107,30 @@ jobs:
 
       - name: cargo clippy (Unix)
         if: runner.os != 'Windows' && matrix.job == 'clippy'
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo clippy --workspace --all-targets --all-features --message-format=short -- -D warnings 2>&1 | tee clippy.log
+          status=${PIPESTATUS[0]}
+          # Turn compiler/clippy diagnostics into check annotations so the
+          # exact failure is visible through the public checks API even
+          # without repository-admin access to the raw job log.
+          grep -E 'warning:|error(\[|:)' clippy.log | head -25 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+          exit "$status"
 
       - name: cargo clippy (Windows)
         if: runner.os == 'Windows' && matrix.job == 'clippy'
         shell: msys2 {0}
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo clippy --workspace --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log
+          status=${PIPESTATUS[0]}
+          grep -E 'warning:|error(\[|:)' clippy.log | head -25 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+          exit "$status"
