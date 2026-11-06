@@ -96,19 +96,80 @@ mod tray {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 mod tray {
+    use async_channel::Sender;
+    use std::sync::{Mutex, OnceLock};
+    use tray_icon::{
+        Icon, TrayIcon, TrayIconBuilder,
+        menu::{Menu, MenuEvent, MenuItem},
+    };
+
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum Command {
         Open,
         Quit,
     }
 
-    // Windows has its own native tray implementation planned; keep the
-    // command channel API identical while that port is in progress.
+    static TRAY: OnceLock<Mutex<Option<TrayIcon>>> = OnceLock::new();
+
+    fn icon() -> Icon {
+        // 16x16 solid accent icon; the production frontend will use the
+        // embedded Lan Mouse icon resource.
+        let mut rgba = vec![0u8; 16 * 16 * 4];
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0x5a, 0xa9, 0xff, 0xff]);
+        }
+        Icon::from_rgba(rgba, 16, 16).expect("valid tray icon")
+    }
+
     pub(crate) fn spawn() -> async_channel::Receiver<Command> {
-        let (_, rx) = async_channel::unbounded();
+        let (tx, rx) = async_channel::unbounded();
+        let click_tx: Sender<Command> = tx.clone();
+        TrayIconEventHandler::install(click_tx);
+
+        let open = MenuItem::new("Open Lan Mouse", true, None);
+        let quit = MenuItem::new("Quit Lan Mouse", true, None);
+        let open_id = open.id().clone();
+        let quit_id = quit.id().clone();
+        let menu = Menu::new();
+        let _ = menu.append(&open);
+        let _ = menu.append(&quit);
+
+        let menu_tx: Sender<Command> = tx;
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if event.id() == &open_id {
+                let _ = menu_tx.send_blocking(Command::Open);
+            } else if event.id() == &quit_id {
+                let _ = menu_tx.send_blocking(Command::Quit);
+            }
+        }));
+
+        match TrayIconBuilder::new()
+            .with_tooltip("Lan Mouse")
+            .with_icon(icon())
+            .with_menu(Box::new(menu))
+            .build()
+        {
+            Ok(tray) => {
+                TRAY.get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .expect("tray lock")
+                    .replace(tray);
+            }
+            Err(error) => log::warn!("Windows system tray unavailable: {error}"),
+        }
         rx
+    }
+
+    struct TrayIconEventHandler;
+
+    impl TrayIconEventHandler {
+        fn install(tx: Sender<Command>) {
+            tray_icon::TrayIconEvent::set_event_handler(Some(move |_event| {
+                let _ = tx.send_blocking(Command::Open);
+            }));
+        }
     }
 }
 
