@@ -99,7 +99,6 @@ mod tray {
 #[cfg(windows)]
 mod tray {
     use async_channel::Sender;
-    use std::sync::{Mutex, OnceLock};
     use tray_icon::{
         Icon, TrayIcon, TrayIconBuilder,
         menu::{Menu, MenuEvent, MenuItem},
@@ -110,8 +109,6 @@ mod tray {
         Open,
         Quit,
     }
-
-    static TRAY: OnceLock<Mutex<Option<TrayIcon>>> = OnceLock::new();
 
     fn icon() -> Icon {
         // 16x16 solid accent icon; the production frontend will use the
@@ -152,10 +149,10 @@ mod tray {
             .build()
         {
             Ok(tray) => {
-                TRAY.get_or_init(|| Mutex::new(None))
-                    .lock()
-                    .expect("tray lock")
-                    .replace(tray);
+                // The Windows tray handle lives for the whole process; leak it
+                // rather than storing it in a static (the platform handle is
+                // !Send and must stay on the UI thread).
+                let _: &'static mut TrayIcon = Box::leak(Box::new(tray));
             }
             Err(error) => log::warn!("Windows system tray unavailable: {error}"),
         }
