@@ -14,3 +14,6 @@ env_logger = "0.11"
 log = "0.4"
 # GPUI 0.2.2 -> zed-async-tar -> xattr 0.2.3 expects libc::ENOATTR on Linux.
 libc = "=0.2.174"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }

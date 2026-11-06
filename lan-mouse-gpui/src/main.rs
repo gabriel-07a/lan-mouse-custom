@@ -20,6 +20,98 @@ const GREEN: u32 = 0x4ade80;
 const AMBER: u32 = 0xfbbf24;
 const RED: u32 = 0xf87171;
 
+#[cfg(target_os = "linux")]
+mod tray {
+    use async_channel::Sender;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Command {
+        Open,
+        Quit,
+    }
+
+    struct LanMouseTray {
+        tx: Sender<Command>,
+    }
+
+    impl ksni::Tray for LanMouseTray {
+        fn id(&self) -> String {
+            "de.feschber.LanMouse".into()
+        }
+
+        fn title(&self) -> String {
+            "Lan Mouse".into()
+        }
+
+        fn icon_name(&self) -> String {
+            "de.feschber.LanMouse".into()
+        }
+
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            use ksni::menu::StandardItem;
+            vec![
+                StandardItem {
+                    label: "Open Lan Mouse".into(),
+                    icon_name: "window-new".into(),
+                    activate: Box::new(|this: &mut Self| {
+                        let _ = this.tx.send_blocking(Command::Open);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                ksni::MenuItem::Separator,
+                StandardItem {
+                    label: "Quit Lan Mouse".into(),
+                    icon_name: "application-exit".into(),
+                    activate: Box::new(|this: &mut Self| {
+                        let _ = this.tx.send_blocking(Command::Quit);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+        }
+
+        fn activate(&mut self, _x: i32, _y: i32) {
+            let _ = self.tx.send_blocking(Command::Open);
+        }
+    }
+
+    pub(crate) fn spawn() -> async_channel::Receiver<Command> {
+        let (tx, rx) = async_channel::unbounded();
+        std::thread::Builder::new()
+            .name("lan-mouse-tray".into())
+            .spawn(move || {
+                use ksni::blocking::TrayMethods;
+                let tray = LanMouseTray { tx };
+                match tray.spawn() {
+                    Ok(_handle) => loop {
+                        std::thread::park();
+                    },
+                    Err(error) => log::warn!("system tray unavailable: {error}"),
+                }
+            })
+            .expect("spawn tray thread");
+        rx
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod tray {
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Command {
+        Open,
+        Quit,
+    }
+
+    // Windows has its own native tray implementation planned; keep the
+    // command channel API identical while that port is in progress.
+    pub(crate) fn spawn() -> async_channel::Receiver<Command> {
+        let (_, rx) = async_channel::unbounded();
+        rx
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ClientRow {
     handle: ClientHandle,
@@ -540,14 +632,36 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(980.0), px(720.0)), cx);
         let dashboard: Entity<Dashboard> = cx.new(Dashboard::new);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, _| dashboard,
-        )
-        .expect("open Lan Mouse GPUI window");
+        let window_handle = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_, _| dashboard,
+            )
+            .expect("open Lan Mouse GPUI window");
+
+        let tray_rx = tray::spawn();
+        cx.spawn(async move |cx| {
+            while let Ok(command) = tray_rx.recv().await {
+                match command {
+                    tray::Command::Open => {
+                        let _ = window_handle.update(cx, |_, window, _| {
+                            window.activate_window();
+                        });
+                    }
+                    tray::Command::Quit => {
+                        // Prototype: tray Quit ends the process. The integrated
+                        // frontend will route this through the application quit
+                        // path instead.
+                        std::process::exit(0);
+                    }
+                }
+            }
+        })
+        .detach();
+
         cx.activate(true);
     });
 }
