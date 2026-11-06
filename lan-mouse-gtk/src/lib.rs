@@ -11,6 +11,7 @@ mod local_addresses;
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
+#[cfg(not(target_os = "macos"))]
 mod tray_menu;
 mod window;
 #[cfg(windows)]

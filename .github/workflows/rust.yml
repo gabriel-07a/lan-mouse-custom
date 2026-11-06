@@ -116,7 +116,11 @@ jobs:
           # Turn compiler/clippy diagnostics into check annotations so the
           # exact failure is visible through the public checks API even
           # without repository-admin access to the raw job log.
-          grep -E 'warning:|error(\[|:)' clippy.log | head -25 | while IFS= read -r line; do
+          {
+            grep -E 'warning:|error(\[|:)' clippy.log | head -15
+            echo "--- clippy log tail ---"
+            tail -n 25 clippy.log
+          } | while IFS= read -r line; do
             echo "::error::${line}"
           done
           exit "$status"
@@ -130,7 +134,11 @@ jobs:
           set +e
           cargo clippy --workspace --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
-          grep -E 'warning:|error(\[|:)' clippy.log | head -25 | while IFS= read -r line; do
+          {
+            grep -E 'warning:|error(\[|:)' clippy.log | head -15
+            echo "--- clippy log tail ---"
+            tail -n 25 clippy.log
+          } | while IFS= read -r line; do
             echo "::error::${line}"
           done
           exit "$status"
