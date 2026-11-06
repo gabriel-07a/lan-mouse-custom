@@ -1,0 +1,41 @@
+name: GPUI frontend
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "lan-mouse-gpui/**"
+      - "lan-mouse-ipc/**"
+      - ".github/workflows/gpui-frontend.yml"
+
+concurrency:
+  group: gpui-frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build GPUI frontend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-2022
+          - windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libfontconfig1-dev libfreetype-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lan-mouse-gpui -> target
+      - name: Build frontend
+        working-directory: lan-mouse-gpui
+        run: cargo build --locked
