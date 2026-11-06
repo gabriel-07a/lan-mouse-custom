@@ -117,9 +117,11 @@ jobs:
           # exact failure is visible through the public checks API even
           # without repository-admin access to the raw job log.
           {
-            echo "--- linker error ---"
-            grep -A20 'error: linking with' clippy.log 2>&1 || true
-          } | head -10 | while IFS= read -r line; do
+            echo "--- diagnostics ---"
+            grep -E 'warning:|error(\[|:)' clippy.log | head -12
+            echo "--- tail ---"
+            tail -n 6 clippy.log
+          } | head -20 | while IFS= read -r line; do
             echo "::error::${line}"
           done
           exit "$status"
@@ -142,9 +144,11 @@ jobs:
           /ucrt64/bin/cargo.exe check --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
           {
-            echo "--- linker error ---"
-            grep -A20 'error: linking with' clippy.log 2>&1 || true
-          } | head -10 | while IFS= read -r line; do
+            echo "--- diagnostics ---"
+            grep -E 'warning:|error(\[|:)' clippy.log | head -12
+            echo "--- tail ---"
+            tail -n 6 clippy.log
+          } | head -20 | while IFS= read -r line; do
             echo "::error::${line}"
           done
           exit "$status"
