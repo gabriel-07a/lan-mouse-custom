@@ -113,7 +113,6 @@ OS integration:
 - GNOME 50+ / Wayland: `org.freedesktop.portal.Clipboard` (requires a one-time
   consent, persisted with a restore token).
 - Windows: `CF_UNICODETEXT`, `CF_HTML`, `PNG`/`CF_DIB`.
-- macOS: `NSPasteboard` (`public.utf8-plain-text`, `public.html`, `public.png`).
 - wlroots/X11: not implemented yet.
 
 ## Windows capture internals
@@ -163,7 +162,6 @@ visually "moves" to the other screen instead of staying parked on the edge.
   `ShowCursor(FALSE)` is used because the display counter is global and an
   unbalanced call (crash, kill) can leave the cursor hidden system-wide, while
   the overlay is owned by the capture thread and disappears with the process.
-- **macOS**: `CGDisplay::hide_cursor` / `show_cursor` around Grab/Release
   already.
 - **Wayland wlroots/layer-shell**: the pointer cursor is set to `NULL` on
   grab; restoring it after release is compositor-dependent and should be
@@ -197,7 +195,6 @@ only and disappear on restart.
 | --- | --- | --- |
 | Linux | `${XDG_CONFIG_HOME:-~/.config}/lan-mouse/` (`config.toml`, `lan-mouse.pem`), `${XDG_STATE_HOME:-~/.local/state}/lan-mouse/` (`audit.jsonl`) | portal consent tokens in the state directory (`input-capture.token`, `remote-desktop.token`, `clipboard.token`), migrated from the legacy `${XDG_CACHE_HOME:-~/.cache}/lan-mouse/` |
 | Windows | `%LOCALAPPDATA%\lan-mouse\` (`config.toml`, `lan-mouse.pem`, `audit.jsonl`) | installation itself: `%PROGRAMFILES64%\Lan Mouse`, shortcuts, `HKLM` keys, firewall rule `Lan Mouse` |
-| macOS | `~/.config/lan-mouse/`, `~/Library/Logs/lan-mouse/audit.jsonl` | Accessibility / Input Monitoring TCC grants (OS-managed, not resettable by the app) |
 
 **Upgrade vs fresh install.** Package upgrades intentionally keep the user's
 configuration. A *fresh* install must not resurrect devices from an older
@@ -221,7 +218,7 @@ renaming it back. Permanent deletion requires an explicit `--purge` /
   `/PURGEUSERDATA` deletes them).
 - **`lan-mouse --reset-config [--dry-run] [--purge]`** (`src/reset.rs`,
   handled in `src/config.rs` before `Config::new` creates anything): moves the
-  config, state, legacy cache and macOS audit directories of the current user
+  config, state and legacy cache directories of the current user
   to timestamped `lan-mouse.bak-<unix timestamp>` siblings (`--purge` deletes
   them instead). It refuses to run while the service is running, only touches
   paths whose final component is exactly `lan-mouse`, does not follow symlinks,
@@ -231,8 +228,7 @@ renaming it back. Permanent deletion requires an explicit `--purge` /
   as root and cannot know which users ran the app). `postrm purge` prints the
   per-user paths and how to reset; `scripts/install-clean.sh`
   (`--dry-run`/`--yes`/`--purge`) is the scripted equivalent for Linux and
-  macOS and also defaults to a reversible backup.
-- **macOS**: move the directories above (or run the reset flag); TCC grants
+  and also defaults to a reversible backup.
   are managed by the OS and only reset in System Settings / with `tccutil`.
 
 See [docs/audit-fresh-install.md](docs/audit-fresh-install.md) for the exact

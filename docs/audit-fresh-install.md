@@ -32,9 +32,6 @@ exceptions and are deliberately not touched by reset/installer cleanup).
 | Windows | `%LOCALAPPDATA%\lan-mouse\` | `config.toml`, `config.toml.bak`, `lan-mouse.pem`, `audit.jsonl` (+ `.1`) | `src/config.rs` (`default_path`), `src/audit.rs` |
 | Windows | `%APPDATA%\lan-mouse\` | only from portable/older builds; current builds never write it, cleaned defensively | installer/uninstaller and `--reset-config` |
 | Windows | `%PROGRAMFILES64%\Lan Mouse\`, shortcuts, `HKLM\Software\de.feschber.LanMouse.Custom`, uninstall entry, firewall rule `Lan Mouse` | installation itself | `installer/windows/lan-mouse-custom.nsi` |
-| macOS | `~/.config/lan-mouse/` | `config.toml`, `lan-mouse.pem` | `src/config.rs` (`#[cfg(unix)]`) |
-| macOS | `~/Library/Logs/lan-mouse/` | `audit.jsonl` (+ `.1`) | `src/audit.rs` |
-| macOS | TCC database | Accessibility / Input Monitoring grants | OS-managed, **cannot** be reset by the app (System Settings → Privacy & Security, or `tccutil reset`) |
 | cross-OS | in-memory | pending approval requests, pairing window | not persisted; disappear on restart |
 
 No SQLite database, keychain entry or registry value is used for devices or
@@ -43,7 +40,7 @@ and `[[denied]]` state all live inside `config.toml`.
 
 ## 2. Semantics: fresh install vs upgrade vs uninstall
 
-| Operation | Windows | Linux `.deb` | Linux tarball / manual | macOS |
+| Operation | Windows | Linux `.deb` | Linux tarball / manual |
 | --- | --- | --- | --- | --- |
 | First install on a clean machine | nothing to move | nothing to move | nothing to move | nothing to move |
 | Install over leftovers of older/test builds | interactive: prompt "start fresh? old configuration is MOVED to a backup" **default Yes**; silent (`/S`): move to backup by default | user data untouched (upgrade-safe); `apt purge` does not touch home data; reset explicitly | reset explicitly | reset explicitly |
@@ -55,7 +52,7 @@ and `[[denied]]` state all live inside `config.toml`.
 Rationale: a *package upgrade* must never destroy a working configuration, but
 the user asked for a **release install** to be clean. The Windows installer can
 ask/act per install; Debian packages cannot (dpkg runs as root and has no idea
-which of the machine's users ran the app), so Linux/macOS get an explicit,
+which of the machine's users ran the app), so Linux gets an explicit,
 documented reset. Backing up instead of deleting keeps the clean install
 reversible even when the prompt defaults to "clean".
 
@@ -69,7 +66,7 @@ any directory, so the command never re-creates the config it just moved away.
 * checks the service is not running (`lan_mouse_ipc::is_service_running`) and
   refuses with a clear message instead of racing/moving files in use;
 * resolves the config directory through `src/config.rs::default_path` (the same
-  function the app uses) plus the state/cache/legacy/macOS-log locations;
+  function the app uses) plus the state/cache/legacy locations;
 * default: rename every existing app directory to a sibling
   `<path>.bak-<unix timestamp>` (one timestamp per run, numeric suffix on
   collision) — atomic, same filesystem, reversible;
@@ -91,7 +88,7 @@ lan-mouse --reset-config --purge     # delete them permanently
 
 Limitations: a custom `--config` / `--cert-path` outside the app directories is
 not touched; on Windows the installed binaries, shortcuts, firewall rule and
-registry are removed by the uninstaller, not by this flag; on macOS the TCC
+registry are removed by the uninstaller, not by this flag.
 (accessibility/input-monitoring) grants are OS-managed; backups accumulate
 until deleted manually.
 
@@ -117,7 +114,7 @@ until deleted manually.
   `%APPDATA%\lan-mouse`, their `.bak-*` siblings, `$INSTDIR`, the Start
   Menu/Desktop/Startup shortcuts and the two registry keys are touched.
 
-### 3.3 Linux/macOS helper (`scripts/install-clean.sh`)
+### 3.3 Linux helper (`scripts/install-clean.sh`)
 
 For installs that are not the Windows installer, and for users who want a
 scripted reset without an up-to-date binary. Default: move each app directory
@@ -126,7 +123,7 @@ to `<path>.bak-<unix timestamp>` (`mv`, atomic within the same parent);
 prompt; `--no-kill` skips stopping a running `lan-mouse` (stopped by default
 so files are not in use). Validates every path (absolute, ends in
 `/lan-mouse`, not below `/`), prints the list and asks before acting. Also
-handles `~/Library/Logs/lan-mouse` on macOS.
+
 
 ### 3.4 Debian package (`scripts/package-deb.sh`)
 
@@ -169,7 +166,6 @@ moves them to a reversible backup, `--purge` deletes; helper script
 | Ubuntu: `lan-mouse --reset-config --dry-run` | lists `~/.config/lan-mouse`, `~/.local/state/lan-mouse`, `~/.cache/lan-mouse` and their backup names, touches nothing |
 | Ubuntu: `lan-mouse --reset-config` while daemon runs | refuses with a clear message; run again after quitting → moved to `.bak-*`, next start fresh |
 | Ubuntu: `lan-mouse --reset-config --purge` | removes the directories permanently, no `.bak-*` left |
-| macOS: reset | config + logs moved to backups, TCC prompt appears again on next start (OS-managed) |
 
 ## 5. Risks and open points
 
@@ -198,7 +194,6 @@ moves them to a reversible backup, `--purge` deletes; helper script
   input capture / remote desktop consent again on the next start. That is the
   intended consequence of a fresh install; the backups still contain the old
   tokens (bearer capabilities) until the user deletes the backup directories.
-* **macOS TCC.** Not resettable by the app; after a reset the permission
   prompts reappear, but a previously granted grant may remain until revoked in
   System Settings (a reset does not and cannot revoke it).
 * **Antivirus / locked files.** If the daemon is still running, Windows may keep

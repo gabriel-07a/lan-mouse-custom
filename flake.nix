@@ -1,7 +1,6 @@
 {
   description = "Nix Flake for lan-mouse";
   inputs = {
-    # 26.05 used here to keep allowing builds on x86_64-darwin, bump this to unstable once they deprecate 26.05
     nixpkgs.url = "github:nixos/nixpkgs/nixos-26.05";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -21,9 +20,7 @@
         f:
         lib.genAttrs
           [
-            "aarch64-darwin"
             "aarch64-linux"
-            "x86_64-darwin"
             "x86_64-linux"
           ]
           (
@@ -33,21 +30,6 @@
                 inherit system;
                 overlays = [
                   rust-overlay.overlays.default
-
-                  #NOTE: appstream's meson build injects the literal string
-                  # "none required" into linker flags on 'aarch64-darwin', causing clang to fail.
-                  # remove this overlay once we bump nixpkgs to unstable branch
-                  (
-                    final: prev:
-                    lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
-                      appstream = prev.appstream.overrideAttrs (old: {
-                        postConfigure = (old.postConfigure or "") + ''
-                          substituteInPlace build.ninja \
-                            --replace-fail "none required" ""
-                        '';
-                      });
-                    }
-                  )
                 ];
               };
               # Default toolchain for devshell

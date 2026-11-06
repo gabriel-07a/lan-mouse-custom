@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remove Lan Mouse's per-user data on Linux and macOS.
+# Remove Lan Mouse's per-user data on Linux.
 #
 # A package upgrade intentionally keeps the user's devices, permissions and
 # certificates. Use this script (or the newer `lan-mouse --reset-config`) when
@@ -13,7 +13,7 @@
 #
 # This script only touches directories literally named "lan-mouse" below the
 # user's config/state/cache directories (plus the audit log directory on
-# macOS). It never touches the rest of $HOME, system files or package files.
+# It never touches the rest of $HOME, system files or package files.
 #
 # Usage:
 #   scripts/install-clean.sh                 # show, ask, then move to backups
@@ -83,7 +83,6 @@ paths=(
     "$cache_base/$app_dir_name"
 )
 case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin) paths+=("$HOME/Library/Logs/$app_dir_name") ;;
 esac
 
 # Validate every path before touching anything: absolute, final component
@@ -216,10 +215,7 @@ else
     echo "  mv <dir>.bak-<timestamp> <dir>"
 fi
 case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin)
-        echo "Note: macOS accessibility/input-monitoring permissions are managed by the OS;"
-        echo "      reset them in System Settings if you want a completely clean state."
-        ;;
+
     *)
         echo "Note: the compositor will ask for portal permissions again on the next start."
         ;;

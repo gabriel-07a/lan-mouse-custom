@@ -44,7 +44,6 @@ Most current desktop environments and operating systems are fully supported, thi
 - Most wlroots based compositors, including Sway (>= 1.8), Hyprland and Wayfire
 - X11
 - Windows
-- MacOS
 
 
 ### Caveats / Known Issues
@@ -72,7 +71,7 @@ Most current desktop environments and operating systems are fully supported, thi
 >
 > - **Local cursor while sending**: the pointer of the machine that currently controls a peer
 > is hidden, so the cursor appears to "move" to the other screen instead of sitting parked at
-> the edge. Windows, macOS and wlroots/layer-shell backends support this; on GNOME/Wayland the
+> the edge. Windows and wlroots/layer-shell backends support this; on GNOME/Wayland the
 > pointer is compositor-owned (libei has no hide API), so it stays visible there. The cursor is
 > restored on every release/Leave/disconnect path, and a crash cannot leave it hidden (the
 > Windows overlay window is destroyed with the process).
@@ -123,18 +122,6 @@ dnf install lan-mouse
 </details>
 
 <details>
-    <summary>MacOS</summary>
-
-- Download the package for your Mac (Intel or ARM) from the releases page
-- Unzip it
-- Remove the quarantine with `xattr -rd com.apple.quarantine "Lan Mouse.app"`
-- Launch the app
-- Use the menu bar item to open the settings window or quit Lan Mouse. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
-- Grant accessibility permissions in System Preferences
-
-</details>
-
-<details>
     <summary>Windows</summary>
 
 Lan Mouse can be installed from the [winget community repositories](https://github.com/microsoft/winget-pkgs/tree/master/manifests/f/feschber/LanMouse):
@@ -155,7 +142,7 @@ Its clean-install behavior is described in
 
 First make sure to [install the necessary dependencies](#installing-dependencies-for-development--compiling-from-source).
 
-Precompiled release binaries for Windows, MacOS and Linux are available in the [releases section](https://github.com/feschber/lan-mouse/releases).
+Precompiled release binaries for Windows and Linux are available in the [releases section](https://github.com/feschber/lan-mouse/releases).
 For Windows, the depenedencies are included in the .zip file, for other operating systems see [Installing Dependencies](#installing-dependencies-for-development--compiling-from-source).
 
 Alternatively, the `lan-mouse` binary can be compiled from source (see below).
@@ -261,7 +248,7 @@ Delete old `lan-mouse.bak-*` directories manually when you no longer need
 them. Quit Lan Mouse before installing/uninstalling manually; the installer
 stops a running instance for you (`taskkill /T /F`).
 
-### Reset (Linux, macOS and Windows)
+### Reset (Linux and Windows)
 
 ```sh
 lan-mouse --reset-config --dry-run   # show every path that would be moved
@@ -275,17 +262,16 @@ which hides the old devices from the next start. Restore it with
 `mv ~/.config/lan-mouse.bak-<timestamp> ~/.config/lan-mouse` (or use
 `--purge` if you are sure you never want the data back). The command only
 touches directories literally named `lan-mouse` (config, state, legacy
-portal-token cache, macOS audit logs), refuses to run while the service is
+portal-token cache), refuses to run while the service is
 running, never follows symlinks and does not touch custom `--config` /
-`--cert-path` locations. On Linux/macOS the helper script
+`--cert-path` locations. On Linux the helper script
 `scripts/install-clean.sh --dry-run` / `--yes` / `--purge` does the same when
 the binary is not installed anymore.
 
 On Debian/Ubuntu (`apt`), package upgrades and even `apt purge` keep the
 per-user data; the postrm explains the paths and the reset command. GNOME/KDE
 will ask for clipboard/input-capture/remote-desktop consent again after a
-reset. On macOS the Accessibility/Input Monitoring grants are managed by the OS
-and are **not** reset by the command.
+reset.
 
 ## Development
 
@@ -308,22 +294,6 @@ git config core.hooksPath .githooks
 The `pre-commit` script runs `cargo fmt --all` (and fails if files were modified), `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --all-features`.
 
 ### Dependencies & Compiling from Source
-<details>
-    <summary>MacOS</summary>
-
-```sh
-# Install dependencies
-brew install libadwaita pkg-config imagemagick
-cargo install cargo-bundle
-# Create the macOS icon file
-scripts/makeicns.sh
-# Create the .app bundle
-cargo bundle
-# Copy all dynamic libraries into the bundle, and update the bundle to find them there
-scripts/copy-macos-dylib.sh
-```
-</details>
-
 <details>
     <summary>Ubuntu and derivatives</summary>
 
@@ -702,8 +672,7 @@ they can be revisited if a large deployment needs more headroom.
 ### Audit log
 
 Every permission change is appended to a JSON-lines audit log at
-`$XDG_STATE_HOME/lan-mouse/audit.jsonl` (`%LOCALAPPDATA%\lan-mouse\audit.jsonl`
-on Windows, `~/Library/Logs/lan-mouse/audit.jsonl` on macOS), rotated at 5 MB
+`$XDG_STATE_HOME/lan-mouse/audit.jsonl` (`%LOCALAPPDATA%\lan-mouse\audit.jsonl` on Windows), rotated at 5 MB
 to `audit.jsonl.1`. It records grants (`grant_created`, `grant_updated`),
 `revoke`, `deny`, pairing windows and adopted devices, address-rule changes and
 TUF certificate pinning, with fingerprint, name, address and a short detail
@@ -775,10 +744,9 @@ between authorized, connected peers.
 - **Linux / Wayland (GNOME 50+)** uses the XDG desktop portal. The first run
   asks for **"Allow Clipboard Access"**; the consent is stored in
   `~/.cache/lan-mouse/clipboard.token` (delete it to be asked again).
-- **Windows** and **macOS** use the native clipboard. On Windows, images are
+- **Windows** uses the native clipboard. Images are
   converted between the canonical PNG and `CF_DIB`/`CF_DIBV5`.
-- Content marked as secret by the source application (macOS
-  `org.nspasteboard.ConcealedType`, KDE password-manager hint, Windows
+- Content marked as secret by the source application (KDE password-manager hint, Windows
   clipboard-history/cloud opt-outs) is never synchronized.
 - Clipboard sync only runs between authorized peers and stops immediately when
   the toggle is off.
@@ -823,7 +791,7 @@ certificate.
 
 ### Sensitivity per device
 
-Wayland reports raw pointer deltas while Windows and macOS report accelerated
+Wayland reports raw pointer deltas while Windows reports accelerated
 ones, so the cursor speed differs between peer combinations. Each client has a
 `sensitivity` (percent, `100` = unchanged) that scales the forwarded motion:
 
@@ -921,18 +889,20 @@ and mouse; only the features above degrade to upstream behaviour.
 - [x] IP Address switching
 - [x] Liveness tracking Automatically ungrab mouse when client unreachable
 - [x] Liveness tracking: Automatically release keys, when server offline
-- [x] MacOS KeyCode Translation
 - [x] Libei Input Capture
-- [x] MacOS Input Capture
 - [x] Windows Input Capture
 - [x] Encryption
 - [x] X11 Input Capture
 - [x] Latency measurement and visualization (RTT per client)
 - [ ] Bandwidth usage measurement and visualization
-- [x] Clipboard support (text, HTML, PNG; portal + data-control + Windows/macOS/X11)
+- [x] Clipboard support (text, HTML, PNG; portal + data-control + Windows/X11)
 
 
 ## Detailed OS Support
+
+> **Supported platforms: Linux and Windows only.** macOS is no longer tested,
+> built by CI or supported. The macOS backend code is kept dormant in the tree
+> for reference and is not part of the supported matrix.
 
 In order to use a device for sending events, an **input-capture** backend is required, while receiving events requires
 a supported **input-emulation** *and* **input-capture** backend.
@@ -943,37 +913,33 @@ The following sections detail the emulation and capture backends provided by lan
 
 ### Input Emulation Support
 
-| Desktop / Backend         | wlroots                  | libei                    | remote-desktop portal    | windows                  |   macos                                | x11                |
-|---------------------------|--------------------------|--------------------------|--------------------------|--------------------------|----------------------------------------|--------------------|
-| Wayland (wlroots)         | :heavy_check_mark:       |                          |                          |                          |                                        |                    |
-| Wayland (KDE)             |                          | :heavy_check_mark:       | :heavy_check_mark:       |                          |                                        |                    |
-| Wayland (Gnome)           |                          | :heavy_check_mark:       | :heavy_check_mark:       |                          |                                        |                    |
-| Windows                   |                          |                          |                          | :heavy_check_mark:       |                                        |                    |
-| MacOS                     |                          |                          |                          |                          |   :heavy_check_mark:                   |                    |
-| X11                       |                          |                          |                          |                          |                                        | :heavy_check_mark: |
+| Desktop / Backend | wlroots            | libei              | remote-desktop portal | windows            | x11                |
+|-------------------|--------------------|--------------------|-----------------------|--------------------|--------------------|
+| Wayland (wlroots) | :heavy_check_mark: |                    |                       |                    |                    |
+| Wayland (KDE)     |                    | :heavy_check_mark: | :heavy_check_mark:    |                    |                    |
+| Wayland (Gnome)   |                    | :heavy_check_mark: | :heavy_check_mark:    |                    |                    |
+| Windows           |                    |                    |                       | :heavy_check_mark: |                    |
+| X11               |                    |                    |                       |                    | :heavy_check_mark: |
 
 - `wlroots`: This backend makes use of the [wlr-virtual-pointer-unstable-v1](https://wayland.app/protocols/wlr-virtual-pointer-unstable-v1) and [virtual-keyboard-unstable-v1](https://wayland.app/protocols/virtual-keyboard-unstable-v1) protocols and is supported by most wlroots based compositors.
 - `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
 - `xdp`: This backend uses the [freedesktop remote-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/#gdbus-org.freedesktop.portal.RemoteDesktop) and is supported on GNOME and Plasma.
 - `x11`: Backend for X11 sessions.
 - `windows`: Backend for Windows.
-- `macos`: Backend for MacOS.
 
 
 
 ### Input Capture Support
 
-| Desktop / Backend         | layer-shell              | libei                    | windows                  |   macos                                | x11 |
-|---------------------------|--------------------------|--------------------------|--------------------------|----------------------------------------|-----|
-| Wayland (wlroots)         | :heavy_check_mark:       |                          |                          |                                        |     |
-| Wayland (KDE)             | :heavy_check_mark:       | :heavy_check_mark:       |                          |                                        |     |
-| Wayland (Gnome)           |                          | :heavy_check_mark:       |                          |                                        |     |
-| Windows                   |                          |                          | :heavy_check_mark:       |                                        |     |
-| MacOS                     |                          |                          |                          |   :heavy_check_mark:                   |     |
-| X11                       |                          |                          |                          |                                        | :heavy_check_mark: |
+| Desktop / Backend | layer-shell        | libei              | windows            | x11                |
+|-------------------|--------------------|--------------------|--------------------|--------------------|
+| Wayland (wlroots) | :heavy_check_mark: |                    |                    |                    |
+| Wayland (KDE)     | :heavy_check_mark: | :heavy_check_mark: |                    |                    |
+| Wayland (Gnome)   |                    | :heavy_check_mark: |                    |                    |
+| Windows           |                    |                    | :heavy_check_mark: |                    |
+| X11               |                    |                    |                    | :heavy_check_mark: |
 
 - `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
 - `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
 - `windows`: Backend for input capture on Windows.
-- `macos`: Backend for input capture on MacOS.
 - `x11`: Backend for X11 sessions (uses pointer barriers and the XTest extension).

@@ -32,8 +32,6 @@ jobs:
           - ubuntu-latest
           - windows-2022
           - windows-2025
-          - macos-latest
-          - macos-15-intel
         job:
           - build
           - check
@@ -49,15 +47,6 @@ jobs:
           sudo apt-get install -y libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev \
             libwayland-dev libxkbcommon-dev
 
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        run: brew install gtk4 libadwaita imagemagick
-
-      - name: Record macOS native lib versions for cache key
-        if: runner.os == 'macOS'
-        run: |
-          echo "MACOS_LIB_VER=$(brew list --versions glib gtk4 libadwaita | tr '\n' '_')" >> "$GITHUB_ENV"
-
       - name: Setup MSYS2 (Windows)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -72,12 +61,10 @@ jobs:
             mingw-w64-ucrt-x86_64-librsvg
 
       - uses: Swatinem/rust-cache@v2
-        if: runner.os != 'Windows'
-        with:
-          prefix-key: ${{ env.MACOS_LIB_VER }}
+        if: runner.os == 'Linux'
 
-      - name: cargo build (Unix)
-        if: runner.os != 'Windows' && matrix.job == 'build'
+      - name: cargo build (Linux)
+        if: runner.os == 'Linux' && matrix.job == 'build'
         run: cargo build
 
       - name: cargo build & smoke test (Windows)
@@ -87,8 +74,8 @@ jobs:
           cargo build
           ./target/debug/lan-mouse.exe doctor --probe --json
 
-      - name: cargo check (Unix)
-        if: runner.os != 'Windows' && matrix.job == 'check'
+      - name: cargo check (Linux)
+        if: runner.os == 'Linux' && matrix.job == 'check'
         run: cargo check --workspace --all-targets --all-features
 
       - name: cargo check (Windows)
@@ -96,8 +83,8 @@ jobs:
         shell: msys2 {0}
         run: cargo check --workspace --all-targets
 
-      - name: cargo test (Unix)
-        if: runner.os != 'Windows' && matrix.job == 'test'
+      - name: cargo test (Linux)
+        if: runner.os == 'Linux' && matrix.job == 'test'
         env:
           CARGO_TERM_COLOR: never
         run: |
@@ -133,8 +120,8 @@ jobs:
           done
           exit "$status"
 
-      - name: cargo clippy (Unix)
-        if: runner.os != 'Windows' && matrix.job == 'clippy'
+      - name: cargo clippy (Linux)
+        if: runner.os == 'Linux' && matrix.job == 'clippy'
         env:
           CARGO_TERM_COLOR: never
         run: |

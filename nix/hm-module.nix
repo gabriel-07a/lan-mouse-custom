@@ -26,11 +26,6 @@ in {
       default = pkgs.stdenv.hostPlatform.isLinux;
       description = "Whether to enable to systemd service for lan-mouse on linux.";
     };
-    launchd = mkOption {
-      type = types.bool;
-      default = pkgs.stdenv.hostPlatform.isDarwin;
-      description = "Whether to enable to launchd service for lan-mouse on macOS.";
-    };
     settings = lib.mkOption {
       inherit (tomlFormat) type;
       default = {};
@@ -58,17 +53,6 @@ in {
         (lib.mkIf config.wayland.windowManager.hyprland.systemd.enable "hyprland-session.target")
         (lib.mkIf config.wayland.windowManager.sway.systemd.enable "sway-session.target")
       ];
-    };
-
-    launchd.agents.lan-mouse = lib.mkIf cfg.launchd {
-      enable = true;
-      config = {
-        ProgramArguments = [
-          "${cfg.package}/bin/lan-mouse"
-          "daemon"
-        ];
-        KeepAlive = true;
-      };
     };
 
     home.packages = [

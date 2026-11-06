@@ -103,7 +103,7 @@ chmod 755 "$stage/DEBIAN/prerm"
 # on `apt purge`. The postrm only explains how to reset it explicitly:
 #   lan-mouse --reset-config          (moves it to a reversible .bak backup;
 #                                      add --purge to delete permanently)
-#   scripts/install-clean.sh --yes    (from the source tree, also macOS)
+#   scripts/install-clean.sh --yes    (from the source tree)
 cat > "$stage/DEBIAN/postrm" <<'POSTRM'
 #!/bin/sh
 set -e

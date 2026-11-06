@@ -42,13 +42,7 @@ impl FakeEnv {
             .expect("clock")
             .as_nanos();
         let unique = NEXT_FAKE_ENV.fetch_add(1, Ordering::Relaxed);
-        // macOS limits AF_UNIX paths to ~104 bytes; the default temp dir on
-        // CI is /var/folders/... and plus HOME/Library/Caches/... exceeds it.
-        #[cfg(target_os = "macos")]
-        let temp_root = PathBuf::from("/tmp");
-        #[cfg(not(target_os = "macos"))]
-        let temp_root = env::temp_dir();
-        let root = temp_root.join(format!(
+        let root = env::temp_dir().join(format!(
             "lm-packaging-{label}-{}-{nanos}-{unique}",
             std::process::id()
         ));
@@ -89,8 +83,6 @@ impl FakeEnv {
             dirs.push(self.path("xdg-config").join("lan-mouse"));
             dirs.push(self.path("xdg-state").join("lan-mouse"));
             dirs.push(self.path("xdg-cache").join("lan-mouse"));
-            #[cfg(target_os = "macos")]
-            dirs.push(self.home().join("Library/Logs/lan-mouse"));
         }
         #[cfg(windows)]
         {
@@ -428,7 +420,6 @@ fn clean_install_script_only_moves_or_purges_app_directories() {
         "${XDG_CONFIG_HOME:-$HOME/.config}",
         "${XDG_STATE_HOME:-$HOME/.local/state}",
         "${XDG_CACHE_HOME:-$HOME/.cache}",
-        "Library/Logs",
         "backup=\"${path}.bak-${stamp}\"",
         "mv -- \"$path\" \"$backup\"",
         "rm -rf -- \"$path\"",
@@ -448,14 +439,12 @@ fn fresh_install_documentation_lists_every_path() {
         "~/.config/lan-mouse",
         "~/.local/state/lan-mouse",
         "~/.cache/lan-mouse",
-        "Library/Logs/lan-mouse",
         "--reset-config",
         "--purge",
         "lan-mouse.bak-",
         "/KEEPUSERDATA",
         "/CLEANUSERDATA",
         "/PURGEUSERDATA",
-        "tccutil",
     ] {
         assert!(doc.contains(needle), "fresh-install doc missing {needle}");
     }
@@ -614,9 +603,6 @@ fn reset_config_refuses_while_the_service_is_running() {
     let env = FakeEnv::new("guard");
     env.create_stale_data();
 
-    #[cfg(target_os = "macos")]
-    let socket_dir = env.home().join("Library/Caches");
-    #[cfg(all(unix, not(target_os = "macos")))]
     let socket_dir = env.path("runtime");
     fs::create_dir_all(&socket_dir).expect("socket dir");
     let socket = socket_dir.join("lan-mouse-socket.sock");
