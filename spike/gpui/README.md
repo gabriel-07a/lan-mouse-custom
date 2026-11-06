@@ -17,9 +17,12 @@ What this validates:
 - Windows must use the **MSVC** toolchain (Zed does not support MSYS2/MinGW
   for GPUI).
 
+Status (2026-11-06): `cargo build --locked` succeeds on ubuntu-latest,
+windows-2022 and windows-2025 (MSVC) in the `GPUI spike` workflow.
+
 Not yet validated here: system tray integration, IPC bridge, GPU/driver matrix,
-DPI/IME/accessibility and performance numbers. Those are tracked in
-`docs/` planning, not by this spike.
+DPI/IME/accessibility and performance numbers. Those are the next go/no-go
+items before the frontend rewrite starts.
 
 Delete this directory and `.github/workflows/gpui-spike.yml` once the real
 frontend and its CI are in place.
