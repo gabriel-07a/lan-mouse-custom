@@ -111,7 +111,7 @@ jobs:
           CARGO_TERM_COLOR: never
         run: |
           set +e
-          cargo clippy --workspace --all-targets --all-features --message-format=short -- -D warnings 2>&1 | tee clippy.log
+          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
           # Turn compiler/clippy diagnostics into check annotations so the
           # exact failure is visible through the public checks API even
@@ -131,7 +131,7 @@ jobs:
           CARGO_TERM_COLOR: never
         run: |
           set +e
-          cargo clippy --workspace --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
           {
             echo "--- linker error ---"
