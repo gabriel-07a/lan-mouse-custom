@@ -38,4 +38,14 @@ jobs:
           workspaces: lan-mouse-gpui -> target
       - name: Build frontend
         working-directory: lan-mouse-gpui
-        run: cargo build --locked
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo build --locked 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          grep -E '^error|^  -->|^warning: unused' build.log | head -30 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+          exit "$status"
