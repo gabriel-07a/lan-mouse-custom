@@ -139,9 +139,12 @@ jobs:
           RUSTC: /ucrt64/bin/rustc.exe
           RUSTC_WORKSPACE_WRAPPER: /ucrt64/bin/clippy-driver.exe
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          # `cargo check` does not accept `-- -D warnings`; pass the lint
+          # level through RUSTFLAGS instead.
+          RUSTFLAGS: -D warnings
         run: |
           set +e
-          /ucrt64/bin/cargo.exe check --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
+          /ucrt64/bin/cargo.exe check --workspace --all-targets 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
           {
             echo "--- diagnostics ---"
