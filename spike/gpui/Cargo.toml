@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "lan-mouse-gpui-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "windows-manifest"] }
+
+# GPUI 0.2.2 -> zed-async-tar 0.5 -> xattr 0.2.3 expects libc::ENOATTR,
+# removed from newer libc on Linux.
+libc = "=0.2.174"

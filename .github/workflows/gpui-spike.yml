@@ -1,0 +1,45 @@
+name: GPUI spike
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "spike/gpui/**"
+      - ".github/workflows/gpui-spike.yml"
+
+concurrency:
+  group: gpui-spike-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build GPUI spike (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-2022
+          - windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libfontconfig1-dev libfreetype-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spike/gpui -> target
+      - name: Build spike (Linux)
+        if: runner.os == 'Linux'
+        working-directory: spike/gpui
+        run: cargo build --locked
+      - name: Build spike (Windows MSVC)
+        if: runner.os == 'Windows'
+        working-directory: spike/gpui
+        run: cargo build --locked
