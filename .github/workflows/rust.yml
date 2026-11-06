@@ -118,18 +118,8 @@ jobs:
           # without repository-admin access to the raw job log.
           {
             echo "--- linker error ---"
-            grep -A15 'error: linking with' clippy.log 2>&1 || true
-            echo "--- toolchain ---"
-            echo "cargo=$(command -v cargo 2>&1)"
-            echo "rustc=$(command -v rustc 2>&1)"
-            echo "clippy-driver=$(command -v clippy-driver 2>&1)"
-            echo "cargo-clippy=$(command -v cargo-clippy 2>&1)"
-            echo "gcc=$(command -v x86_64-w64-mingw32-gcc 2>&1)"
-            echo "link=$(command -v link.exe 2>&1)"
-            echo "RUSTFLAGS=${RUSTFLAGS:-} CARGO_BUILD_TARGET=${CARGO_BUILD_TARGET:-}"
-            cargo --version 2>&1 || true
-            rustc --version --verbose 2>&1 || true
-          } | head -20 | while IFS= read -r line; do
+            grep -A20 'error: linking with' clippy.log 2>&1 || true
+          } | head -10 | while IFS= read -r line; do
             echo "::error::${line}"
           done
           exit "$status"
@@ -145,18 +135,8 @@ jobs:
           status=${PIPESTATUS[0]}
           {
             echo "--- linker error ---"
-            grep -A15 'error: linking with' clippy.log 2>&1 || true
-            echo "--- toolchain ---"
-            echo "cargo=$(command -v cargo 2>&1)"
-            echo "rustc=$(command -v rustc 2>&1)"
-            echo "clippy-driver=$(command -v clippy-driver 2>&1)"
-            echo "cargo-clippy=$(command -v cargo-clippy 2>&1)"
-            echo "gcc=$(command -v x86_64-w64-mingw32-gcc 2>&1)"
-            echo "link=$(command -v link.exe 2>&1)"
-            echo "RUSTFLAGS=${RUSTFLAGS:-} CARGO_BUILD_TARGET=${CARGO_BUILD_TARGET:-}"
-            cargo --version 2>&1 || true
-            rustc --version --verbose 2>&1 || true
-          } | head -20 | while IFS= read -r line; do
+            grep -A20 'error: linking with' clippy.log 2>&1 || true
+          } | head -10 | while IFS= read -r line; do
             echo "::error::${line}"
           done
           exit "$status"
