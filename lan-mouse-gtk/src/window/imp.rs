@@ -209,7 +209,8 @@ impl Window {
     #[template_callback]
     fn handle_copy_local_ips(&self, button: &Button) {
         let addresses = crate::local_addresses::local_addresses();
-        let text = crate::local_addresses::copy_text(&addresses);
+        let primary = crate::local_addresses::primary_address(&addresses);
+        let text = crate::local_addresses::copy_text(primary.as_ref());
         if text.is_empty() {
             self.obj().show_toast("No local IP address to copy");
             return;
@@ -317,6 +318,7 @@ impl Window {
     /// refresh button (Wi-Fi/VPN changes are picked up without a restart).
     pub(super) fn refresh_local_addresses(&self) {
         let addresses = crate::local_addresses::local_addresses();
+        let primary = crate::local_addresses::primary_address(&addresses);
         let hostname = hostname::get()
             .ok()
             .and_then(|name| name.into_string().ok())
@@ -324,16 +326,16 @@ impl Window {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "This computer".to_string());
         self.local_addresses_row.set_title(&hostname);
-        let mut subtitle = crate::local_addresses::subtitle(&addresses);
-        if !addresses.is_empty() {
+        let mut subtitle = crate::local_addresses::subtitle(primary.as_ref());
+        if primary.is_some() {
             // The peer needs both values; keep the port one line below the
-            // addresses even though it is also editable under General.
+            // address even though it is also editable under General.
             subtitle.push_str(&format!("\nPort: {}", self.port.get()));
         }
         self.local_addresses_row.set_subtitle(&subtitle);
         self.local_addresses_row.set_tooltip_text(Some(&format!(
-            "{}Port: {} (editable under General).",
-            crate::local_addresses::tooltip(&addresses),
+            "{}\nPort: {} (editable under General).",
+            crate::local_addresses::tooltip(primary.as_ref(), &addresses),
             self.port.get()
         )));
     }

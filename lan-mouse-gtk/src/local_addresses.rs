@@ -5,7 +5,7 @@
 //! supports Linux, Windows and macOS, which keeps the address list identical
 //! on every platform lan-mouse runs on.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 
 /// One address of this machine and the interface it belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,7 +45,7 @@ where
 {
     let mut addresses = interfaces
         .into_iter()
-        .filter(|(_, ip)| is_usable(*ip))
+        .filter(|(interface, ip)| is_usable(*ip) && !is_container_interface(interface))
         .map(|(interface, ip)| LocalAddress { ip, interface })
         .collect::<Vec<_>>();
 
@@ -73,38 +73,115 @@ fn is_usable(ip: IpAddr) -> bool {
     }
 }
 
-/// The subtitle of the "This computer" row.
-pub(crate) fn subtitle(addresses: &[LocalAddress]) -> String {
-    if addresses.is_empty() {
-        "No local IP address found — is this computer connected to a network?".to_string()
+/// Whether an interface belongs to a container/VM bridge that is not
+/// reachable from another computer on the LAN (Docker, libvirt, Multipass,
+/// podman, VMs). Those addresses made the old multi-address row confusing.
+fn is_container_interface(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "docker0"
+        || name.starts_with("docker")
+        || name.starts_with("br-")
+        || name.starts_with("veth")
+        || name.starts_with("virbr")
+        || name.starts_with("vmnet")
+        || name.starts_with("lxc")
+        || name.starts_with("cni")
+        || name.starts_with("flannel")
+        || name.starts_with("podman")
+}
+
+/// The single address the "This computer" row should show.
+///
+/// The default route is the best answer: it is the address the kernel would
+/// use to reach the rest of the network, so it is the one the other computer
+/// needs. Probing it with a UDP `connect` does a route lookup without sending
+/// a packet and works on Linux, Windows and macOS. When there is no default
+/// route (offline LAN, isolated switch), fall back to ranking the enumerated
+/// addresses: real interfaces before containers, IPv4 before IPv6, private
+/// before public.
+pub(crate) fn primary_address(addresses: &[LocalAddress]) -> Option<LocalAddress> {
+    choose_primary(addresses, default_route_ip())
+}
+
+fn default_route_ip() -> Option<IpAddr> {
+    route_probe("8.8.8.8:80".parse().ok()?)
+        .or_else(|| route_probe("[2001:4860:4860::8888]:80".parse().ok()?))
+}
+
+fn route_probe(destination: SocketAddr) -> Option<IpAddr> {
+    let bind = if destination.is_ipv4() {
+        "0.0.0.0:0"
     } else {
-        addresses
-            .iter()
-            .map(|address| address.ip.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(destination).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
+/// Pure selection step, split from the socket probe so it can be tested.
+fn choose_primary(addresses: &[LocalAddress], route_ip: Option<IpAddr>) -> Option<LocalAddress> {
+    if let Some(route_ip) = route_ip {
+        if let Some(address) = addresses.iter().find(|address| address.ip == route_ip) {
+            return Some(address.clone());
+        }
+        // The route may point at an interface the enumerator hid (rare); the
+        // address is still the correct one to show.
+        return Some(LocalAddress {
+            ip: route_ip,
+            interface: "default route".to_string(),
+        });
     }
+    addresses
+        .iter()
+        .min_by_key(|address| {
+            (
+                u8::from(is_container_interface(&address.interface)),
+                u8::from(address.ip.is_ipv6()),
+                u8::from(!is_private(address.ip)),
+                address.ip,
+            )
+        })
+        .cloned()
+}
+
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => v6.segments()[0] & 0xfe00 == 0xfc00,
+    }
+}
+
+/// The subtitle of the "This computer" row.
+pub(crate) fn subtitle(address: Option<&LocalAddress>) -> String {
+    address.map_or_else(
+        || "No local IP address found — is this computer connected to a network?".to_string(),
+        |address| address.ip.to_string(),
+    )
 }
 
 /// Text copied by the row's copy button: every address, one per line.
-pub(crate) fn copy_text(addresses: &[LocalAddress]) -> String {
-    addresses
-        .iter()
-        .map(|address| address.ip.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
+pub(crate) fn copy_text(address: Option<&LocalAddress>) -> String {
+    address.map_or_else(String::new, |address| address.ip.to_string())
 }
 
 /// Tooltip for the row: which interface each address belongs to.
-pub(crate) fn tooltip(addresses: &[LocalAddress]) -> String {
-    if addresses.is_empty() {
+pub(crate) fn tooltip(primary: Option<&LocalAddress>, all: &[LocalAddress]) -> String {
+    let Some(primary) = primary else {
         return "No address found. Check the network connection and press refresh.".to_string();
-    }
-    addresses
+    };
+    let mut text = format!("{} ({})", primary.ip, primary.interface);
+    let others = all
         .iter()
+        .filter(|address| address.ip != primary.ip)
         .map(|address| format!("{} ({})", address.ip, address.interface))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    if !others.is_empty() {
+        text.push_str("\nOther local addresses:\n");
+        text.push_str(&others.join("\n"));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -117,6 +194,13 @@ mod tests {
 
     fn address(interface: &str, value: &str) -> (String, IpAddr) {
         (interface.to_string(), ip(value))
+    }
+
+    fn local(value: &str) -> LocalAddress {
+        LocalAddress {
+            ip: ip(value),
+            interface: "eth0".to_string(),
+        }
     }
 
     #[test]
@@ -136,6 +220,23 @@ mod tests {
             .map(|address| address.ip)
             .collect::<Vec<_>>();
         assert_eq!(ips, vec![ip("192.168.1.10"), ip("2001:db8::5")]);
+    }
+
+    #[test]
+    fn container_and_vm_interfaces_are_hidden() {
+        let collected = collect_addresses(vec![
+            address("docker0", "172.17.0.1"),
+            address("br-1234", "172.18.0.1"),
+            address("veth12", "172.19.0.1"),
+            address("virbr0", "192.168.122.1"),
+            address("vmnet1", "172.16.0.1"),
+            address("wlp3s0", "192.168.166.197"),
+        ]);
+        let ips = collected
+            .iter()
+            .map(|address| address.ip.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ips, vec!["192.168.166.197"]);
     }
 
     #[test]
@@ -174,33 +275,75 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_lists_one_address_per_line() {
-        let addresses = collect_addresses(vec![
-            address("eth0", "192.168.1.10"),
-            address("wg0", "10.0.0.5"),
-        ]);
-        assert_eq!(subtitle(&addresses), "10.0.0.5\n192.168.1.10");
+    fn default_route_address_wins() {
+        let addresses = vec![local("172.17.0.1"), local("192.168.166.197")];
+        // The route wins even when it is not the first enumerated address.
+        let primary = choose_primary(&addresses, Some(ip("192.168.166.197")));
+        assert_eq!(primary, Some(local("192.168.166.197")));
     }
 
     #[test]
-    fn empty_list_has_a_clear_placeholder_and_copy_is_empty() {
-        assert!(subtitle(&[]).contains("No local IP address"));
-        assert!(copy_text(&[]).is_empty());
-        assert!(tooltip(&[]).contains("refresh"));
+    fn route_address_not_in_the_list_is_still_used() {
+        let addresses = vec![local("192.168.1.10")];
+        let primary = choose_primary(&addresses, Some(ip("10.1.2.3")));
+        let primary = primary.expect("route address");
+        assert_eq!(primary.ip, ip("10.1.2.3"));
+        assert_eq!(primary.interface, "default route");
     }
 
     #[test]
-    fn copy_text_contains_only_addresses() {
-        let addresses = collect_addresses(vec![
-            address("eth0", "192.168.1.10"),
-            address("wg0", "10.0.0.5"),
-        ]);
-        assert_eq!(copy_text(&addresses), "10.0.0.5\n192.168.1.10");
+    fn fallback_prefers_real_ipv4_over_container_ipv6_and_public() {
+        let addresses = vec![
+            LocalAddress {
+                ip: ip("172.17.0.1"),
+                interface: "docker0".to_string(),
+            },
+            LocalAddress {
+                ip: ip("2001:db8::5"),
+                interface: "eth0".to_string(),
+            },
+            LocalAddress {
+                ip: ip("100.64.0.1"),
+                interface: "wlan0".to_string(),
+            },
+            LocalAddress {
+                ip: ip("10.0.0.5"),
+                interface: "eth0".to_string(),
+            },
+        ];
+        // No route (isolated LAN): real IPv4 private first, then public IPv4,
+        // then real IPv6, then container interfaces.
+        let primary = choose_primary(&addresses, None).expect("fallback address");
+        assert_eq!(primary.ip, ip("10.0.0.5"));
+        assert_eq!(primary.interface, "eth0");
     }
 
     #[test]
-    fn tooltip_shows_the_interface_for_each_address() {
-        let addresses = collect_addresses(vec![address("enp3s0", "192.168.1.10")]);
-        assert_eq!(tooltip(&addresses), "192.168.1.10 (enp3s0)");
+    fn no_address_yields_none() {
+        assert_eq!(choose_primary(&[], None), None);
+    }
+
+    #[test]
+    fn subtitle_and_copy_describe_one_address_only() {
+        let address = local("192.168.166.197");
+        assert_eq!(subtitle(Some(&address)), "192.168.166.197");
+        assert!(!subtitle(Some(&address)).contains('\n'));
+        assert_eq!(copy_text(Some(&address)), "192.168.166.197");
+        assert!(subtitle(None).contains("No local IP address"));
+        assert!(copy_text(None).is_empty());
+    }
+
+    #[test]
+    fn tooltip_lists_primary_and_other_addresses() {
+        let primary = local("192.168.166.197");
+        let other = LocalAddress {
+            ip: ip("10.0.0.5"),
+            interface: "wg0".to_string(),
+        };
+        let text = tooltip(Some(&primary), &[primary.clone(), other]);
+        assert!(text.starts_with("192.168.166.197 (eth0)"));
+        assert!(text.contains("Other local addresses:"));
+        assert!(text.contains("10.0.0.5 (wg0)"));
+        assert!(tooltip(None, &[]).contains("refresh"));
     }
 }
