@@ -98,12 +98,40 @@ jobs:
 
       - name: cargo test (Unix)
         if: runner.os != 'Windows' && matrix.job == 'test'
-        run: cargo test --workspace --all-features
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo test --workspace --all-features 2>&1 | tee test.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "--- failing tests ---"
+            grep -E '^test .* FAILED|panicked at|---- .* stdout ----|assertion|test result: FAILED' test.log | head -20
+            echo "--- tail ---"
+            tail -n 15 test.log
+          } | head -25 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+          exit "$status"
 
       - name: cargo test (Windows)
         if: runner.os == 'Windows' && matrix.job == 'test'
         shell: msys2 {0}
-        run: cargo test --workspace -- --test-threads=1
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo test --workspace -- --test-threads=1 2>&1 | tee test.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "--- failing tests ---"
+            grep -E '^test .* FAILED|panicked at|---- .* stdout ----|assertion|test result: FAILED' test.log | head -20
+            echo "--- tail ---"
+            tail -n 15 test.log
+          } | head -25 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+          exit "$status"
 
       - name: cargo clippy (Unix)
         if: runner.os != 'Windows' && matrix.job == 'clippy'
