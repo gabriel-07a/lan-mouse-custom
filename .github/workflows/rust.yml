@@ -129,6 +129,10 @@ jobs:
         shell: msys2 {0}
         env:
           CARGO_TERM_COLOR: never
+          # `cargo clippy` resolves the build-script linker to link.exe on the
+          # MSYS2 runner (LNK1181); force the MSYS2 GNU linker that the normal
+          # build job uses successfully.
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
         run: |
           set +e
           cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
