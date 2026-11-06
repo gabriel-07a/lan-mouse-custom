@@ -287,15 +287,28 @@ impl WindowsEmulation {
     }
 }
 
+/// Warning latch for refused `SendInput` calls: UIPI makes the refusal
+/// permanent for the current foreground integrity level, so retrying every
+/// event would only spam the log.
+static SEND_INPUT_WARNED: AtomicBool = AtomicBool::new(false);
+
 fn send_input_safe(input: INPUT) {
-    input_event::injection::mark();
-    unsafe {
-        loop {
-            /* retval = number of successfully submitted events */
-            if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) > 0 {
-                break;
-            }
-        }
+    // Never busy-loop here. `SendInput` returns 0 when the foreground window
+    // runs at a higher integrity level (UIPI) or the input desktop rejects the
+    // event; looping forever used to freeze the whole single-threaded
+    // `LocalSet` (capture, network, IPC and watchdog) while burning CPU.
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent > 0 {
+        // Only successful submissions count as injected input: the capture
+        // side uses this marker to avoid mistaking remote-controlled motion
+        // for a local barrier crossing.
+        input_event::injection::mark();
+        return;
+    }
+    if !SEND_INPUT_WARNED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "SendInput was refused (an elevated foreground window?);              input events are dropped until injection works again"
+        );
     }
 }
 

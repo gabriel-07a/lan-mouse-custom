@@ -9,9 +9,10 @@
 
 use std::{
     cell::RefCell,
-    io::{Read, Write},
+    env, fs,
+    io::{self, Read, Write},
     os::fd::OwnedFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -50,8 +51,23 @@ pub async fn available_version() -> Result<u32, Error> {
 }
 
 /// Whether a restore token (user consent) has been saved for the portal.
+///
+/// Read-only on purpose: diagnostics call this and must not touch the state
+/// directory (migration happens lazily on the first runtime read).
 pub fn restore_token_present() -> bool {
-    read_token().is_some()
+    read_token_without_migration().is_some()
+}
+
+/// Read a token the runtime can use without migrating legacy cache tokens.
+fn read_token_without_migration() -> Option<String> {
+    let state = token_dir().map(|dir| dir.join(TOKEN_FILE));
+    if let Some(token) = state.as_deref().and_then(read_token_file) {
+        return Some(token);
+    }
+    legacy_token_dir()
+        .map(|dir| dir.join(TOKEN_FILE))
+        .as_deref()
+        .and_then(read_token_file)
 }
 
 pub struct PortalClipboard {
@@ -407,28 +423,101 @@ async fn write_fd(fd: OwnedFd, bytes: Vec<u8>) -> Result<(), Error> {
     .map_err(|e| Error::Backend(format!("clipboard pipe write failed: {e}")))
 }
 
-fn token_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
+/// Directory holding portal tokens: `$XDG_STATE_HOME/lan-mouse`, falling back
+/// to `~/.local/state/lan-mouse`.
+///
+/// State, not cache: cache directories are routinely purged by cleanup tools
+/// and losing the token makes the portal ask for clipboard permission again.
+fn token_dir() -> Option<PathBuf> {
+    let base = env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("lan-mouse").join(TOKEN_FILE))
+        .filter(|path| path.is_absolute())
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
+    Some(base.join("lan-mouse"))
 }
 
-fn read_token() -> Option<String> {
-    let path = token_path()?;
-    let token = std::fs::read_to_string(path).ok()?;
+/// Token location used by builds that stored consent in the cache directory.
+fn legacy_token_dir() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(base.join("lan-mouse"))
+}
+
+fn read_token_file(path: &Path) -> Option<String> {
+    let token = fs::read_to_string(path).ok()?;
     let token = token.trim();
     (!token.is_empty()).then(|| token.to_string())
 }
 
-fn write_token(token: &str) -> std::io::Result<()> {
-    let Some(path) = token_path() else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Read the saved consent token, migrating a token left in the legacy cache
+/// directory so an already-granted consent survives the move.
+fn read_token_from(state_dir: Option<&Path>, legacy_dir: Option<&Path>) -> Option<String> {
+    let state_dir = state_dir?;
+    let path = state_dir.join(TOKEN_FILE);
+    if let Some(token) = read_token_file(&path) {
+        return Some(token);
     }
-    std::fs::write(path, token)
+    let legacy_path = legacy_dir?.join(TOKEN_FILE);
+    let token = read_token_file(&legacy_path)?;
+    log::info!(
+        "migrating clipboard restore token from {} to {}",
+        legacy_path.display(),
+        path.display()
+    );
+    if let Err(e) = write_token_to(state_dir, TOKEN_FILE, &token) {
+        log::warn!("could not migrate the clipboard restore token: {e}");
+    } else if let Err(e) = fs::remove_file(&legacy_path) {
+        // Do not keep a world-readable copy of a bearer capability around.
+        log::debug!("could not remove the legacy restore token: {e}");
+    }
+    Some(token)
+}
+
+fn read_token() -> Option<String> {
+    read_token_from(token_dir().as_deref(), legacy_token_dir().as_deref())
+}
+
+/// Save the consent token atomically with owner-only permissions.
+///
+/// Tokens are bearer capabilities: whoever can read one can restore the
+/// portal session without a permission dialog, hence 0600 for the file and
+/// 0700 for the directory.
+fn write_token(token: &str) -> io::Result<()> {
+    let dir = token_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "neither XDG_STATE_HOME nor HOME is set",
+        )
+    })?;
+    write_token_to(&dir, TOKEN_FILE, token)
+}
+
+fn write_token_to(dir: &Path, name: &str, token: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+
+    let path = dir.join(name);
+    // Write next to the destination and rename: a crash mid-write must not
+    // leave a truncated token that would then be sent back to the portal.
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    // The mode above only applies when the file is created; tighten an
+    // existing file as well.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -512,5 +601,79 @@ mod mime_tests {
                 .iter()
                 .all(|mime| format_for_mime(mime).is_none())
         );
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "lan-mouse-clipboard-token-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn tokens_are_written_atomically_with_owner_only_permissions() {
+        let dir = scratch_dir("write");
+        write_token_to(&dir, TOKEN_FILE, "token-value").unwrap();
+
+        let path = dir.join(TOKEN_FILE);
+        assert_eq!(read_token_file(&path).as_deref(), Some("token-value"));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // The temporary file is renamed, not left behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn empty_tokens_are_treated_as_missing() {
+        let dir = scratch_dir("empty");
+        write_token_to(&dir, TOKEN_FILE, " \n\t").unwrap();
+        assert_eq!(read_token_file(&dir.join(TOKEN_FILE)), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_cache_token_is_migrated_once() {
+        let state = scratch_dir("state");
+        let legacy = scratch_dir("legacy");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(TOKEN_FILE), "legacy-token").unwrap();
+
+        assert_eq!(
+            read_token_from(Some(&state), Some(&legacy)).as_deref(),
+            Some("legacy-token")
+        );
+        assert_eq!(
+            read_token_file(&state.join(TOKEN_FILE)).as_deref(),
+            Some("legacy-token")
+        );
+        // The legacy copy is removed once migration succeeded.
+        assert!(!legacy.join(TOKEN_FILE).exists());
+
+        // The migrated (state) token wins over a stale legacy one.
+        fs::write(state.join(TOKEN_FILE), "current-token").unwrap();
+        fs::write(legacy.join(TOKEN_FILE), "legacy-token").unwrap();
+        assert_eq!(
+            read_token_from(Some(&state), Some(&legacy)).as_deref(),
+            Some("current-token")
+        );
+
+        fs::remove_dir_all(&state).unwrap();
+        fs::remove_dir_all(&legacy).unwrap();
     }
 }

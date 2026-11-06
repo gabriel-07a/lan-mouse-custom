@@ -47,6 +47,112 @@ struct ClientReport {
     ips: Vec<String>,
 }
 
+/// Which portal a restore token belongs to.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PortalTokenKind {
+    /// `org.freedesktop.portal.InputCapture` (outgoing input capture)
+    InputCapture,
+    /// `org.freedesktop.portal.RemoteDesktop` (input emulation)
+    InputEmulation,
+    /// `org.freedesktop.portal.Clipboard` on top of RemoteDesktop
+    Clipboard,
+}
+
+/// Location of one portal restore token.
+///
+/// Only the location and existence are reported: the token itself is a bearer
+/// capability and must never end up in logs or issue reports.
+#[derive(Debug, Serialize)]
+struct PortalTokenReport {
+    kind: PortalTokenKind,
+    /// what the token authorizes
+    purpose: &'static str,
+    /// current `$XDG_STATE_HOME/lan-mouse` location, if resolvable
+    path: Option<String>,
+    /// whether a token was found at `path`
+    in_state: bool,
+    /// whether a usable token exists (state location or legacy cache copy)
+    present: bool,
+    /// old `$XDG_CACHE_HOME/lan-mouse` location, if a stale token is still there
+    legacy_path: Option<String>,
+}
+
+/// Directory where portal tokens are stored: `$XDG_STATE_HOME/lan-mouse`,
+/// falling back to `~/.local/state/lan-mouse` (state, not cache, so cleanup
+/// tools do not purge the user's persisted consents).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn state_token_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state"))
+        })?;
+    Some(base.join("lan-mouse"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn legacy_token_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })?;
+    Some(base.join("lan-mouse"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn token_present(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|contents| !contents.trim().is_empty())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn portal_tokens() -> Vec<PortalTokenReport> {
+    const TOKENS: [(PortalTokenKind, &str, &str); 3] = [
+        (
+            PortalTokenKind::InputCapture,
+            "input capture (InputCapture portal)",
+            "input-capture.token",
+        ),
+        (
+            PortalTokenKind::InputEmulation,
+            "input emulation (RemoteDesktop portal)",
+            "remote-desktop.token",
+        ),
+        (
+            PortalTokenKind::Clipboard,
+            "clipboard (RemoteDesktop/Clipboard portal)",
+            "clipboard.token",
+        ),
+    ];
+
+    let state_dir = state_token_dir();
+    let legacy_dir = legacy_token_dir();
+    TOKENS
+        .iter()
+        .map(|&(kind, purpose, file)| {
+            let path = state_dir.as_ref().map(|dir| dir.join(file));
+            let present_in_state = path.as_deref().is_some_and(token_present);
+            let legacy_path = legacy_dir
+                .as_ref()
+                .map(|dir| dir.join(file))
+                .filter(|path| token_present(path));
+            PortalTokenReport {
+                kind,
+                purpose,
+                // A token left in the legacy cache directory is still usable:
+                // the runtime migrates it on the next read.
+                present: present_in_state || legacy_path.is_some(),
+                in_state: present_in_state,
+                path: path.map(|path| path.display().to_string()),
+                legacy_path: legacy_path.map(|path| path.display().to_string()),
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Serialize)]
 struct Report {
     version: String,
@@ -62,6 +168,10 @@ struct Report {
     emulation_probe: Option<Probe>,
     clipboard_portal: Option<String>,
     clipboard_consent: bool,
+    /// directory holding the portal restore tokens (state, not cache)
+    portal_token_dir: Option<String>,
+    /// portal restore tokens found on disk, by portal
+    portal_tokens: Vec<PortalTokenReport>,
     local_fingerprint: String,
     authorized_fingerprints: Vec<String>,
     /// where the append-only audit log lives
@@ -70,6 +180,58 @@ struct Report {
     recent_audit_events: usize,
     clients: Vec<ClientReport>,
     warnings: Vec<String>,
+}
+
+/// Warnings about missing or stale portal consent tokens.
+///
+/// `linux_portal_session` gates the InputCapture hint: on plain X11 sessions
+/// the libei capture portal is not used, so a missing capture token is normal.
+fn portal_token_warnings(
+    tokens: &[PortalTokenReport],
+    linux_portal_session: bool,
+    clipboard_portal_available: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for token in tokens {
+        if let Some(legacy_path) = &token.legacy_path {
+            warnings.push(format!(
+                "restore token for {} still lives in the legacy cache directory \
+                 ({legacy_path}); it is migrated automatically on the next start",
+                token.purpose
+            ));
+        }
+        if token.present {
+            continue;
+        }
+        match token.kind {
+            PortalTokenKind::InputCapture => {
+                if linux_portal_session {
+                    warnings.push(
+                        "no input-capture consent token: the compositor shows its capture \
+                         permission dialog whenever a capture session starts; the GNOME \
+                         InputCapture portal cannot persist this consent (see \
+                         docs/audit-ubuntu-permissions.md)"
+                            .into(),
+                    );
+                }
+            }
+            PortalTokenKind::InputEmulation => warnings.push(
+                "no input-emulation consent token: the RemoteDesktop dialog will appear on \
+                 first use; tick \"Remember This Selection\" so it is only asked once"
+                    .into(),
+            ),
+            PortalTokenKind::Clipboard => {
+                if clipboard_portal_available {
+                    warnings.push(
+                        "no clipboard consent token: run lan-mouse, enable clipboard sync and \
+                         allow \"Allow Clipboard Access\" (tick \"Remember This Selection\")"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    warnings
 }
 
 fn build_warnings(clients: &[ClientReport], authorized_fingerprints: usize) -> Vec<String> {
@@ -152,12 +314,25 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
     let clipboard_consent = input_clipboard::portal_restore_token_present();
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     let clipboard_consent = false;
-    if clipboard_portal.is_some() && !clipboard_consent {
-        warnings.push(
-            "clipboard portal consent missing: start lan-mouse and allow \"Allow Clipboard Access\""
-                .into(),
-        );
-    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let portal_tokens = portal_tokens();
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let portal_tokens: Vec<PortalTokenReport> = Vec::new();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let portal_token_dir = state_token_dir().map(|dir| dir.display().to_string());
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let portal_token_dir: Option<String> = None;
+    // The libei capture backend (and therefore its consent token) only exists
+    // on Wayland portal sessions.
+    let linux_portal_session = std::env::var("XDG_SESSION_TYPE")
+        .is_ok_and(|session| session == "wayland")
+        || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    warnings.extend(portal_token_warnings(
+        &portal_tokens,
+        linux_portal_session,
+        clipboard_portal.is_some(),
+    ));
 
     let mut capture_probe = None;
     let mut emulation_probe = None;
@@ -186,6 +361,8 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         emulation_probe,
         clipboard_portal,
         clipboard_consent,
+        portal_token_dir,
+        portal_tokens,
         local_fingerprint,
         authorized_fingerprints,
         audit_log,
@@ -243,11 +420,34 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         if report.clipboard_consent {
             " (consent saved)"
         } else if report.clipboard_portal.is_some() {
-            " (consent missing: run lan-mouse and allow clipboard access)"
+            " (consent missing)"
         } else {
             ""
         }
     );
+    if !report.portal_tokens.is_empty() {
+        println!(
+            "  portal tokens:   {}",
+            report.portal_token_dir.as_deref().unwrap_or("unknown")
+        );
+        for token in &report.portal_tokens {
+            match (&token.path, token.in_state, token.present) {
+                (Some(path), true, _) => println!("    {}: present ({path})", token.purpose),
+                (Some(path), false, true) => println!(
+                    "    {}: present in legacy cache ({})",
+                    token.purpose,
+                    token.legacy_path.as_deref().unwrap_or(path)
+                ),
+                (Some(path), false, false) => println!("    {}: missing ({path})", token.purpose),
+                (None, _, _) => println!("    {}: unknown (HOME is not set)", token.purpose),
+            }
+            if token.in_state {
+                if let Some(legacy) = &token.legacy_path {
+                    println!("      legacy copy: {legacy} (migrated on next start)");
+                }
+            }
+        }
+    }
     println!("  fingerprint:     {}", report.local_fingerprint);
     println!(
         "  authorized:      {}",
@@ -404,5 +604,64 @@ mod tests {
             "unavailable (no session)"
         );
         assert_eq!(format_probe(&Probe::default()), "unknown");
+    }
+
+    fn portal_token(
+        kind: PortalTokenKind,
+        present: bool,
+        legacy: Option<&str>,
+    ) -> PortalTokenReport {
+        PortalTokenReport {
+            kind,
+            purpose: "test portal",
+            path: Some("/state/lan-mouse/test.token".to_string()),
+            in_state: present,
+            present: present || legacy.is_some(),
+            legacy_path: legacy.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn missing_portal_tokens_are_reported_for_each_portal() {
+        let tokens = [
+            portal_token(PortalTokenKind::InputCapture, false, None),
+            portal_token(PortalTokenKind::InputEmulation, false, None),
+            portal_token(PortalTokenKind::Clipboard, false, None),
+        ];
+        let warnings = portal_token_warnings(&tokens, true, true);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("input-capture")));
+        assert!(warnings.iter().any(|w| w.contains("input-emulation")));
+        assert!(warnings.iter().any(|w| w.contains("clipboard")));
+    }
+
+    #[test]
+    fn present_tokens_do_not_warn() {
+        let tokens = [
+            portal_token(PortalTokenKind::InputCapture, true, None),
+            portal_token(PortalTokenKind::InputEmulation, true, None),
+            portal_token(PortalTokenKind::Clipboard, true, None),
+        ];
+        assert!(portal_token_warnings(&tokens, true, true).is_empty());
+    }
+
+    #[test]
+    fn capture_warning_is_only_emitted_on_portal_sessions() {
+        let tokens = [portal_token(PortalTokenKind::InputCapture, false, None)];
+        assert!(portal_token_warnings(&tokens, false, false).is_empty());
+        assert_eq!(portal_token_warnings(&tokens, true, false).len(), 1);
+    }
+
+    #[test]
+    fn stale_legacy_tokens_are_flagged_for_migration() {
+        let tokens = [portal_token(
+            PortalTokenKind::InputEmulation,
+            true,
+            Some("/cache/lan-mouse/remote-desktop.token"),
+        )];
+        let warnings = portal_token_warnings(&tokens, true, true);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("legacy cache directory"));
+        assert!(warnings[0].contains("/cache/lan-mouse/remote-desktop.token"));
     }
 }

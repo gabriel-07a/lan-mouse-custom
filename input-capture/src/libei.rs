@@ -1,9 +1,9 @@
 use ashpd::{
     desktop::{
-        Session,
+        PersistMode, Session,
         input_capture::{
-            Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSessionOptions,
-            InputCapture, Region, ReleaseOptions, Zones,
+            Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSession2Options,
+            CreateSessionOptions, InputCapture, Region, ReleaseOptions, StartOptions, Zones,
         },
     },
     enumflags2::BitFlags,
@@ -18,9 +18,10 @@ use reis::{
 use std::{
     cell::Cell,
     collections::HashMap,
-    env, io,
+    env, fs, io,
     num::NonZeroU32,
     os::unix::net::UnixStream,
+    path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
     sync::{Arc, LazyLock},
@@ -45,6 +46,115 @@ use super::{
     Capture as LanMouseInputCapture, Position,
     error::{CaptureError, LibeiCaptureCreationError},
 };
+
+/// Name of the InputCapture restore token file.
+///
+/// The token is the user's persisted consent. The portal invalidates it after
+/// every successful `Start` and returns a replacement, so it is rewritten on
+/// each start.
+const CAPTURE_TOKEN_FILE: &str = "input-capture.token";
+
+/// Capabilities requested from the input capture portal.
+fn requested_capabilities() -> BitFlags<Capabilities> {
+    Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen
+}
+
+/// Directory holding portal tokens: `$XDG_STATE_HOME/lan-mouse`, falling back
+/// to `~/.local/state/lan-mouse`.
+///
+/// State, not cache: cache directories are routinely purged by cleanup tools
+/// and losing the token makes the compositor ask for permission again.
+fn token_dir() -> Option<PathBuf> {
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
+    Some(base.join("lan-mouse"))
+}
+
+/// Token location used by builds that stored consent in the cache directory.
+fn legacy_token_dir() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(base.join("lan-mouse"))
+}
+
+fn read_token_file(path: &Path) -> Option<String> {
+    let token = fs::read_to_string(path).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Read the saved consent token, migrating a token left in the legacy cache
+/// directory so an already-granted consent survives the move.
+fn read_token_from(state_dir: Option<&Path>, legacy_dir: Option<&Path>) -> Option<String> {
+    let state_dir = state_dir?;
+    let path = state_dir.join(CAPTURE_TOKEN_FILE);
+    if let Some(token) = read_token_file(&path) {
+        return Some(token);
+    }
+    let legacy_path = legacy_dir?.join(CAPTURE_TOKEN_FILE);
+    let token = read_token_file(&legacy_path)?;
+    log::info!(
+        "migrating input capture restore token from {} to {}",
+        legacy_path.display(),
+        path.display()
+    );
+    if let Err(e) = write_token_to(state_dir, CAPTURE_TOKEN_FILE, &token) {
+        log::warn!("could not migrate the input capture restore token: {e}");
+    } else if let Err(e) = fs::remove_file(&legacy_path) {
+        // Do not keep a world-readable copy of a bearer capability around.
+        log::debug!("could not remove the legacy restore token: {e}");
+    }
+    Some(token)
+}
+
+fn read_token() -> Option<String> {
+    read_token_from(token_dir().as_deref(), legacy_token_dir().as_deref())
+}
+
+/// Save the consent token atomically with owner-only permissions.
+///
+/// Tokens are bearer capabilities: whoever can read one can restore the
+/// portal session without a permission dialog, hence 0600 for the file and
+/// 0700 for the directory.
+fn write_token(token: &str) -> io::Result<()> {
+    let dir = token_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "neither XDG_STATE_HOME nor HOME is set",
+        )
+    })?;
+    write_token_to(&dir, CAPTURE_TOKEN_FILE, token)
+}
+
+fn write_token_to(dir: &Path, name: &str, token: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+
+    let path = dir.join(name);
+    // Write next to the destination and rename: a crash mid-write must not
+    // leave a truncated token that would then be sent back to the portal.
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    // The mode above only applies when the file is created; tighten an
+    // existing file as well.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
 
 /* there is a bug in xdg-remote-desktop-portal-gnome / mutter that
  * prevents receiving further events after a session has been disabled once.
@@ -178,16 +288,68 @@ async fn update_barriers(
     Ok((barriers, id_map))
 }
 
+/// Create (and, on portal v2, start) an input capture session.
+///
+/// The version 2 flow (`CreateSession2` + `Start`) is preferred because only
+/// that flow carries `persist_mode`/`restore_token`: the token persists the
+/// user's consent across session restarts instead of prompting again. Portals
+/// that only implement version 1 (e.g. the GNOME backend as of GNOME 50)
+/// reject the v2 calls with `RequiresVersion`; the legacy `CreateSession` is
+/// started implicitly and cannot persist anything.
 async fn create_session(
     input_capture: &InputCapture,
 ) -> std::result::Result<(Session<InputCapture>, BitFlags<Capabilities>), ashpd::Error> {
     log::debug!("creating input capture session");
-    let create_session_options = CreateSessionOptions::default().set_capabilities(
-        Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen,
-    );
-    input_capture
-        .create_session(None, create_session_options)
+    match input_capture
+        .create_session2(CreateSession2Options::default())
         .await
+    {
+        Ok(session) => {
+            let restore_token = read_token();
+            log::debug!(
+                "starting input capture session (restore token {})",
+                if restore_token.is_some() {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
+            let options = StartOptions::default()
+                .set_capabilities(requested_capabilities())
+                .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                .set_restore_token(restore_token);
+            let response = input_capture
+                .start(&session, None, options)
+                .await?
+                .response()?;
+            // The token is single-use: the portal invalidated the one that was
+            // just used and returned a replacement, which has to be saved
+            // again or the next start prompts.
+            if let Some(token) = response.restore_token() {
+                if let Err(e) = write_token(token) {
+                    log::warn!("could not save the input capture restore token: {e}");
+                }
+            }
+            Ok((session, response.capabilities()))
+        }
+        Err(ashpd::Error::RequiresVersion(required, current)) => {
+            // The compositor implements the original InputCapture interface,
+            // which has no way to remember consent: expect a dialog whenever
+            // a capture session is created.
+            log::debug!(
+                "input capture portal v{current} < v{required}: restore tokens are \
+                 unsupported, the compositor will ask for permission again whenever \
+                 a capture session is created"
+            );
+            input_capture
+                .create_session(
+                    None,
+                    CreateSessionOptions::default().set_capabilities(requested_capabilities()),
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn connect_to_eis(
@@ -234,7 +396,13 @@ impl LibeiInputCapture {
     pub async fn new() -> std::result::Result<Self, LibeiCaptureCreationError> {
         let input_capture = Box::pin(InputCapture::new().await?);
         let input_capture_ptr = input_capture.as_ref().get_ref() as *const InputCapture;
-        let first_session = Some(create_session(unsafe { &*input_capture_ptr }).await?);
+
+        // No session is created here on purpose: creating one makes the
+        // compositor show its input-capture permission dialog. Portals that
+        // cannot persist consent (InputCapture v1, e.g. GNOME) would then ask
+        // on every lan-mouse start, even when no client is configured for
+        // outgoing input. `do_capture` creates the session lazily once a
+        // capture is actually requested.
 
         // One slot made the reader task suspend on every single event; a
         // small queue lets it batch while still bounding memory.
@@ -248,7 +416,6 @@ impl LibeiInputCapture {
             input_capture_ptr,
             notify_rx,
             notify_release.clone(),
-            first_session,
             event_tx,
             cancellation_token.clone(),
         );
@@ -272,12 +439,9 @@ async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
-    session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
 ) -> Result<(), CaptureError> {
-    let mut session = session.map(|s| s.0);
-
     /* safety: libei_task does not outlive Self */
     let input_capture = unsafe { &*input_capture };
     let mut active_clients: Vec<Position> = vec![];
@@ -317,11 +481,9 @@ async fn do_capture(
         };
 
         if !active_clients.is_empty() {
-            // create session
-            let mut session = match session.take() {
-                Some(s) => s,
-                None => create_session(input_capture).await?.0,
-            };
+            // Session creation is deferred to this point: a machine that only
+            // receives input never triggers the compositor's capture dialog.
+            let mut session = create_session(input_capture).await?.0;
 
             let capture_session = do_capture_session(
                 input_capture,
@@ -667,5 +829,79 @@ impl Stream for LibeiInputCapture {
             },
             Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
         }
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "lan-mouse-capture-token-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn tokens_are_written_atomically_with_owner_only_permissions() {
+        let dir = scratch_dir("write");
+        write_token_to(&dir, CAPTURE_TOKEN_FILE, "token-value").unwrap();
+
+        let path = dir.join(CAPTURE_TOKEN_FILE);
+        assert_eq!(read_token_file(&path).as_deref(), Some("token-value"));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // The temporary file is renamed, not left behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn empty_tokens_are_treated_as_missing() {
+        let dir = scratch_dir("empty");
+        write_token_to(&dir, CAPTURE_TOKEN_FILE, " \n\t").unwrap();
+        assert_eq!(read_token_file(&dir.join(CAPTURE_TOKEN_FILE)), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_cache_token_is_migrated_once() {
+        let state = scratch_dir("state");
+        let legacy = scratch_dir("legacy");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(CAPTURE_TOKEN_FILE), "legacy-token").unwrap();
+
+        assert_eq!(
+            read_token_from(Some(&state), Some(&legacy)).as_deref(),
+            Some("legacy-token")
+        );
+        assert_eq!(
+            read_token_file(&state.join(CAPTURE_TOKEN_FILE)).as_deref(),
+            Some("legacy-token")
+        );
+        // The legacy copy is removed once migration succeeded.
+        assert!(!legacy.join(CAPTURE_TOKEN_FILE).exists());
+
+        // The migrated (state) token wins over a stale legacy one.
+        fs::write(state.join(CAPTURE_TOKEN_FILE), "current-token").unwrap();
+        fs::write(legacy.join(CAPTURE_TOKEN_FILE), "legacy-token").unwrap();
+        assert_eq!(
+            read_token_from(Some(&state), Some(&legacy)).as_deref(),
+            Some("current-token")
+        );
+
+        fs::remove_dir_all(&state).unwrap();
+        fs::remove_dir_all(&legacy).unwrap();
     }
 }

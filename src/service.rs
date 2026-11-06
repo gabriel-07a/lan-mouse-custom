@@ -638,6 +638,14 @@ impl Service {
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { addr, fingerprint } => {
+                // A revoked device must not keep producing permission dialogs
+                // (and pending entries) just because it keeps retrying. The
+                // listener already rejects it; drop the event here as well so
+                // the frontend is not asked again.
+                if self.devices.read().expect("lock").is_denied(&fingerprint) {
+                    log::debug!("ignoring connection request from denied device {fingerprint}");
+                    return;
+                }
                 // Track the request so it can be reviewed later (also from the
                 // CLI or after a GUI restart) instead of showing a one-shot
                 // dialog.
@@ -692,12 +700,18 @@ impl Service {
                 if is_new {
                     log::info!("connection request from {addr} ({fingerprint})");
                 }
-                self.notify_frontend(FrontendEvent::ConnectionAttempt {
-                    addr,
-                    fingerprint: fingerprint.clone(),
-                    sas,
-                    previous_fingerprint,
-                });
+                // Only open the approval dialog for a genuinely new request (or
+                // when the identity of an existing request changed). Re-emitting
+                // ConnectionAttempt for every 2 s handshake retry made the modal
+                // reopen continuously and looked like "it keeps asking".
+                if is_new || previous_fingerprint.is_some() {
+                    self.notify_frontend(FrontendEvent::ConnectionAttempt {
+                        addr,
+                        fingerprint: fingerprint.clone(),
+                        sas,
+                        previous_fingerprint,
+                    });
+                }
                 self.broadcast_pending();
             }
             EmulationEvent::Entered {

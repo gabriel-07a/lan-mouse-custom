@@ -102,7 +102,21 @@ impl EventThread {
 
     fn signal(&self, event_type: RequestType) {
         let id = self.thread_id;
-        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)).unwrap() };
+        // The thread id is published before the message loop starts, so a
+        // request posted immediately after construction can race with the
+        // creation of the thread's message queue. Panicking here aborted the
+        // whole process (`panic = "abort"` in release, e.g. during the
+        // `doctor --probe` smoke test); retry briefly instead and give up with
+        // a log instead of crashing.
+        let request = event_type as usize;
+        for _ in 0..50 {
+            let posted = unsafe { PostThreadMessageW(id, WM_USER, WPARAM(request), LPARAM(0)) };
+            if posted.is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        log::error!("could not post a message to the capture thread (id {id})");
     }
 }
 
