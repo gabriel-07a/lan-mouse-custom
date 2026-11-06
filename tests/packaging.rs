@@ -530,7 +530,12 @@ fn reset_config_moves_only_the_apps_own_directories_to_a_backup() {
         unrelated.join("important.txt").exists(),
         "unrelated data is kept"
     );
-    assert!(env.path("xdg-config").exists(), "parent directories stay");
+    let config_parent = config_dir.parent().expect("config parent");
+    assert!(
+        config_parent.exists(),
+        "parent directories stay ({})",
+        config_parent.display()
+    );
 }
 
 #[test]
