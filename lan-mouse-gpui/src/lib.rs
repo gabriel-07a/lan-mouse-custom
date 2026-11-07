@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use gpui::{
-    App, Application, Bounds, Context, Entity, FocusHandle, KeyDownEvent, Render, SharedString,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent, Render,
+    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use lan_mouse_ipc::{
     AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
@@ -1581,17 +1581,27 @@ impl Dashboard {
             .into_any_element()
     }
 
-    fn render_identity_card(&self) -> impl IntoElement + use<> {
+    fn render_identity_card(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ips = if self.local_ips.is_empty() {
             "no IPv4 address".to_string()
         } else {
             self.local_ips.join(" · ")
         };
-        let fingerprint = self
+        let ips_for_copy = self
+            .local_ips
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let self_port = self.port;
+        let fingerprint_full = self
             .public_fingerprint
-            .as_deref()
-            .map(|fp| format!("{}…", &fp[..fp.len().min(16)]))
+            .clone()
             .unwrap_or_else(|| "fingerprint not received".to_string());
+        let fingerprint = if self.public_fingerprint.is_some() {
+            format!("{}…", &fingerprint_full[..fingerprint_full.len().min(16)])
+        } else {
+            fingerprint_full.clone()
+        };
         div()
             .flex()
             .flex_col()
@@ -1630,6 +1640,35 @@ impl Dashboard {
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .child(format!("certificate {fingerprint}")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(self.action_button(
+                        "copy-address",
+                        "Copy address",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(format!(
+                                "{ips_for_copy}:{self_port}"
+                            )));
+                        },
+                    ))
+                    .child(self.action_button(
+                        "copy-fingerprint",
+                        "Copy fingerprint",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                fingerprint_full.clone(),
+                            ));
+                        },
+                    )),
             )
     }
 
@@ -1771,7 +1810,7 @@ impl Dashboard {
             .when(self.add_dialog.is_some(), |this| {
                 this.child(self.render_add_dialog(cx))
             })
-            .child(self.render_identity_card())
+            .child(self.render_identity_card(cx))
             .when(has_pending, |this| this.child(self.render_pending(cx)))
             .children(cards)
             .when(self.clients.is_empty(), |this| {
