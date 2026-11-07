@@ -18,6 +18,8 @@ path = "src/main.rs"
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11", "windows-manifest"] }
 lan-mouse-ipc = { path = "../lan-mouse-ipc" }
 async-channel = "2"
+hostname = "0.4"
+if-addrs = "0.15"
 env_logger = "0.11"
 log = "0.4"
 thiserror = "2"

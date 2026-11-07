@@ -5,8 +5,9 @@ use gpui::{
     WindowOptions, div, prelude::*, px, rgb, size,
 };
 use lan_mouse_ipc::{
-    ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest, FrontendRequestWriter,
-    PendingView,
+    AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
+    DirectionPolicy, FrontendEvent, FrontendRequest, FrontendRequestWriter, PendingView, Position,
+    Status,
 };
 
 const BG: u32 = 0x0f1115;
@@ -231,6 +232,25 @@ impl ClientRow {
     }
 }
 
+/// Best-effort IPv4 addresses for the "This Computer" card.
+fn discover_local_ipv4() -> Vec<String> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut ips = interfaces
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => {
+                Some(v4.ip.to_string())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
 enum BridgeMessage {
     Writer(FrontendRequestWriter),
     Event(Box<FrontendEvent>),
@@ -241,9 +261,20 @@ struct Dashboard {
     writer: Option<FrontendRequestWriter>,
     clients: HashMap<ClientHandle, (ClientConfig, ClientState)>,
     pending: Vec<PendingView>,
+    devices: Vec<DeviceView>,
+    address_rules: Vec<AddressRuleView>,
+    authorized: std::collections::HashMap<String, String>,
     status: String,
     page: Page,
     selected_client: Option<ClientHandle>,
+    hostname: String,
+    local_ips: Vec<String>,
+    public_fingerprint: Option<String>,
+    port: u16,
+    capture_status: Status,
+    emulation_status: Status,
+    clipboard_status: ClipboardStatus,
+    pairing_active: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -295,9 +326,23 @@ impl Dashboard {
             writer: None,
             clients: HashMap::new(),
             pending: Vec::new(),
+            devices: Vec::new(),
+            address_rules: Vec::new(),
+            authorized: std::collections::HashMap::new(),
             status: "Connecting to Lan Mouse service…".to_string(),
             page: Page::Devices,
             selected_client: None,
+            hostname: hostname::get()
+                .ok()
+                .and_then(|name| name.into_string().ok())
+                .unwrap_or_else(|| "This computer".to_string()),
+            local_ips: discover_local_ipv4(),
+            public_fingerprint: None,
+            port: lan_mouse_ipc::DEFAULT_PORT,
+            capture_status: Status::Disabled,
+            emulation_status: Status::Disabled,
+            clipboard_status: ClipboardStatus::default(),
+            pairing_active: false,
         }
     }
 
@@ -310,6 +355,7 @@ impl Dashboard {
                 let _ = writer.request(FrontendRequest::Enumerate());
                 let _ = writer.request(FrontendRequest::ListDevices);
                 let _ = writer.request(FrontendRequest::ListPending);
+                let _ = writer.request(FrontendRequest::ListAddressRules);
                 let _ = writer.request(FrontendRequest::Sync);
                 self.writer = Some(writer);
                 self.status = "Connected to service".to_string();
@@ -346,6 +392,23 @@ impl Dashboard {
                 self.status = format!("Service connected (IPC v{ipc_version})");
             }
             FrontendEvent::Error(error) => self.status = error,
+            FrontendEvent::Devices(devices) => self.devices = devices,
+            FrontendEvent::AddressRules(rules) => self.address_rules = rules,
+            FrontendEvent::AuthorizedUpdated(authorized) => self.authorized = authorized,
+            FrontendEvent::PublicKeyFingerprint(fingerprint) => {
+                self.public_fingerprint = Some(fingerprint)
+            }
+            FrontendEvent::PortChanged(port, message) => {
+                self.port = port;
+                if let Some(message) = message {
+                    self.status = message;
+                }
+            }
+            FrontendEvent::CaptureStatus(status) => self.capture_status = status,
+            FrontendEvent::EmulationStatus(status) => self.emulation_status = status,
+            FrontendEvent::ClipboardStatus(status) => self.clipboard_status = status,
+            FrontendEvent::PairingActive(active) => self.pairing_active = active,
+            FrontendEvent::Diagnostics(_) => {}
             _ => {}
         }
     }
@@ -370,6 +433,46 @@ impl Dashboard {
 
     fn add_device(&mut self) {
         self.send(FrontendRequest::Create);
+    }
+
+    fn approve_pending(&mut self, fingerprint: String) {
+        self.send(FrontendRequest::RespondPending {
+            fingerprint,
+            accept: true,
+            name: None,
+            position: Some(Position::Left),
+            incoming: Some(DirectionPolicy::allow_all()),
+            outgoing: Some(DirectionPolicy::allow_all()),
+        });
+    }
+
+    fn deny_pending(&mut self, fingerprint: String) {
+        self.send(FrontendRequest::RespondPending {
+            fingerprint,
+            accept: false,
+            name: None,
+            position: None,
+            incoming: None,
+            outgoing: None,
+        });
+    }
+
+    fn enable_capture(&mut self) {
+        self.send(FrontendRequest::EnableCapture);
+    }
+
+    fn enable_emulation(&mut self) {
+        self.send(FrontendRequest::EnableEmulation);
+    }
+
+    fn toggle_clipboard(&mut self) {
+        self.send(FrontendRequest::SetClipboardEnabled(
+            !self.clipboard_status.enabled,
+        ));
+    }
+
+    fn start_pairing(&mut self) {
+        self.send(FrontendRequest::StartPairing(60));
     }
 
     fn active_count(&self) -> usize {
@@ -548,15 +651,8 @@ impl Render for Dashboard {
 
         let content = match self.page {
             Page::Devices => self.render_devices(cx).into_any_element(),
-            Page::Network => self
-                .render_placeholder("Network", "Device discovery will live here.")
-                .into_any_element(),
-            Page::Settings => self
-                .render_placeholder(
-                    "Settings",
-                    "Capture, clipboard and pairing settings will live here.",
-                )
-                .into_any_element(),
+            Page::Network => self.render_network(cx).into_any_element(),
+            Page::Settings => self.render_settings(cx).into_any_element(),
         };
 
         div().flex().size_full().bg(rgb(BG)).child(sidebar).child(
@@ -604,6 +700,155 @@ impl Render for Dashboard {
 }
 
 impl Dashboard {
+    fn action_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        background: u32,
+        foreground: u32,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut Self, &gpui::ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(id))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(background))
+            .text_color(rgb(foreground))
+            .text_sm()
+            .cursor_pointer()
+            .child(label)
+            .on_click(cx.listener(handler))
+    }
+
+    fn render_identity_card(&self) -> impl IntoElement + use<> {
+        let ips = if self.local_ips.is_empty() {
+            "no IPv4 address".to_string()
+        } else {
+            self.local_ips.join(" · ")
+        };
+        let fingerprint = self
+            .public_fingerprint
+            .as_deref()
+            .map(|fp| format!("{}…", &fp[..fp.len().min(16)]))
+            .unwrap_or_else(|| "fingerprint not received".to_string());
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child(format!("{} (this computer)", self.hostname)),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_full()
+                            .bg(rgb(0x173225))
+                            .text_color(rgb(GREEN))
+                            .text_xs()
+                            .child(format!("port {}", self.port)),
+                    ),
+            )
+            .child(div().text_sm().text_color(rgb(MUTED)).child(ips))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!("certificate {fingerprint}")),
+            )
+    }
+
+    fn render_pending(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let pending = self.pending.clone();
+        let mut cards = Vec::new();
+        for request in pending {
+            let approve_fp = request.fingerprint.clone();
+            let deny_fp = request.fingerprint.clone();
+            let name = request
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| request.addr.to_string());
+            let sas = if request.sas.is_empty() {
+                "······".to_string()
+            } else {
+                request.sas.clone()
+            };
+            let card = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .rounded_lg()
+                .bg(rgb(0x2b2413))
+                .border_1()
+                .border_color(rgb(0x6b5520))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(AMBER))
+                                .child(format!("Connection request from {name}")),
+                        )
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(rgb(TEXT))
+                                .child(sas),
+                        ),
+                )
+                .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                    "{} · {} attempt(s)",
+                    request.addr, request.attempts
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(self.action_button(
+                            "approve-pending",
+                            "Approve",
+                            GREEN,
+                            0x081018,
+                            cx,
+                            move |this, _, _, _| this.approve_pending(approve_fp.clone()),
+                        ))
+                        .child(self.action_button(
+                            "deny-pending",
+                            "Deny",
+                            0x3a2020,
+                            RED,
+                            cx,
+                            move |this, _, _, _| this.deny_pending(deny_fp.clone()),
+                        )),
+                );
+            cards.push(card);
+        }
+        div().flex().flex_col().gap_2().children(cards)
+    }
+
     fn render_devices(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let mut cards = Vec::new();
         let mut handles: Vec<ClientHandle> = self.clients.keys().copied().collect();
@@ -615,6 +860,7 @@ impl Dashboard {
         }
 
         let pending = self.pending.len();
+        let has_pending = pending > 0;
         div()
             .id("devices-page")
             .flex()
@@ -633,6 +879,8 @@ impl Dashboard {
                     }
                 )),
             ))
+            .child(self.render_identity_card())
+            .when(has_pending, |this| this.child(self.render_pending(cx)))
             .children(cards)
             .when(self.clients.is_empty(), |this| {
                 this.child(
@@ -657,30 +905,289 @@ impl Dashboard {
                         ),
                 )
             })
-            .when(!self.pending.is_empty(), |this| {
-                this.child(
-                    div()
-                        .p_3()
-                        .rounded_md()
-                        .bg(rgb(0x2b2413))
-                        .text_color(rgb(AMBER))
-                        .text_sm()
-                        .child(format!(
-                            "{} connection request(s) awaiting approval",
-                            self.pending.len()
-                        )),
-                )
-            })
     }
 
-    fn render_placeholder(&self, title: &'static str, body: &'static str) -> impl IntoElement {
-        let _ = title;
+    fn render_network(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         div()
             .flex()
-            .items_center()
-            .justify_center()
+            .flex_col()
+            .gap_3()
             .p_6()
-            .child(div().text_sm().text_color(rgb(MUTED)).child(body))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("Find Lan Mouse instances on the local IPv4 network."),
+                    )
+                    .child(self.action_button(
+                        "scan-network",
+                        "Scan network",
+                        ACCENT,
+                        0x081018,
+                        cx,
+                        |this, _, _, _| this.send(FrontendRequest::ScanNetwork),
+                    )),
+            )
+            .child(
+                div()
+                    .p_6()
+                    .rounded_lg()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(div().text_sm().text_color(rgb(MUTED)).child(
+                        "Network scan results will appear here. The IPC scan request is already wired.",
+                    )),
+            )
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let capture_label = if matches!(self.capture_status, Status::Enabled) {
+            "capture enabled"
+        } else {
+            "capture disabled"
+        };
+        let emulation_label = if matches!(self.emulation_status, Status::Enabled) {
+            "emulation enabled"
+        } else {
+            "emulation disabled"
+        };
+        let clipboard_summary = self.clipboard_status.summary();
+        let pairing_label = if self.pairing_active {
+            "pairing window open"
+        } else {
+            "open a 60 second pairing window"
+        };
+        let mut authorized = self
+            .authorized
+            .iter()
+            .map(|(fingerprint, name)| {
+                format!("{name} · {}…", &fingerprint[..fingerprint.len().min(16)])
+            })
+            .collect::<Vec<_>>();
+        authorized.sort();
+        let mut rules = self
+            .address_rules
+            .iter()
+            .map(|rule| {
+                format!(
+                    "{} · in:{} out:{}",
+                    rule.address,
+                    rule.incoming.capabilities.summary(),
+                    rule.outgoing.capabilities.summary()
+                )
+            })
+            .collect::<Vec<_>>();
+        rules.sort();
+
+        let enabled_color = if matches!(self.capture_status, Status::Enabled) {
+            GREEN
+        } else {
+            AMBER
+        };
+        let emulation_color = if matches!(self.emulation_status, Status::Enabled) {
+            GREEN
+        } else {
+            AMBER
+        };
+        div()
+            .id("settings-page")
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_6()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("Input"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(enabled_color))
+                                    .child(capture_label),
+                            )
+                            .child(self.action_button(
+                                "enable-capture",
+                                "Reenable",
+                                ACCENT,
+                                0x081018,
+                                cx,
+                                |this, _, _, _| this.enable_capture(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(emulation_color))
+                                    .child(emulation_label),
+                            )
+                            .child(self.action_button(
+                                "enable-emulation",
+                                "Reenable",
+                                ACCENT,
+                                0x081018,
+                                cx,
+                                |this, _, _, _| this.enable_emulation(),
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("Clipboard"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(MUTED))
+                                    .child(clipboard_summary),
+                            )
+                            .child(self.action_button(
+                                "toggle-clipboard",
+                                if self.clipboard_status.enabled {
+                                    "Disable"
+                                } else {
+                                    "Enable"
+                                },
+                                ACCENT,
+                                0x081018,
+                                cx,
+                                |this, _, _, _| this.toggle_clipboard(),
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("Pairing"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().text_color(rgb(MUTED)).child(pairing_label))
+                            .child(self.action_button(
+                                "start-pairing",
+                                "Open",
+                                ACCENT,
+                                0x081018,
+                                cx,
+                                |this, _, _, _| this.start_pairing(),
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child(format!("Authorized devices ({})", authorized.len())),
+                    )
+                    .child(div().text_sm().text_color(rgb(MUTED)).child(
+                        if authorized.is_empty() {
+                            "No authorized devices.".to_string()
+                        } else {
+                            authorized.join(" · ")
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(CARD))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child(format!("Allowed addresses ({})", rules.len())),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child(if rules.is_empty() {
+                                "No address rules.".to_string()
+                            } else {
+                                rules.join(" · ")
+                            }),
+                    ),
+            )
     }
 }
 
