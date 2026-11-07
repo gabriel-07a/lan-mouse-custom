@@ -6,14 +6,21 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[lib]
+name = "lan_mouse_gpui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lan-mouse-gpui"
+path = "src/main.rs"
+
 [dependencies]
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11", "windows-manifest"] }
 lan-mouse-ipc = { path = "../lan-mouse-ipc" }
 async-channel = "2"
 env_logger = "0.11"
 log = "0.4"
-# GPUI 0.2.2 -> zed-async-tar -> xattr 0.2.3 expects libc::ENOATTR on Linux.
-libc = "=0.2.174"
+thiserror = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", features = ["blocking"] }

@@ -2,10 +2,6 @@ name: GPUI spike
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "spike/gpui/**"
-      - ".github/workflows/gpui-spike.yml"
 
 concurrency:
   group: gpui-spike-${{ github.ref }}

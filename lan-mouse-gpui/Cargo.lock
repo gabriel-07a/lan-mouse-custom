@@ -3085,6 +3085,7 @@ dependencies = [
  "lan-mouse-ipc",
  "libc",
  "log",
+ "thiserror 2.0.21",
  "tray-icon",
 ]
 

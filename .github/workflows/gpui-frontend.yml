@@ -2,11 +2,6 @@ name: GPUI frontend
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "lan-mouse-gpui/**"
-      - "lan-mouse-ipc/**"
-      - ".github/workflows/gpui-frontend.yml"
 
 concurrency:
   group: gpui-frontend-${{ github.ref }}

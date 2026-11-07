@@ -15,6 +15,8 @@ use lan_mouse::{
     service::{Service, ServiceError},
 };
 use lan_mouse_cli::CliError;
+#[cfg(all(feature = "gpui", not(feature = "gtk")))]
+use lan_mouse_gpui::GpuiError;
 #[cfg(feature = "gtk")]
 use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
@@ -43,6 +45,9 @@ enum LanMouseError {
     #[cfg(feature = "gtk")]
     #[error(transparent)]
     Gtk(#[from] GtkError),
+    #[cfg(all(feature = "gpui", not(feature = "gtk")))]
+    #[error(transparent)]
+    Gpui(#[from] GpuiError),
     #[error(transparent)]
     Cli(#[from] CliError),
     #[error(transparent)]
@@ -93,6 +98,28 @@ fn run() -> Result<(), LanMouseError> {
         None => {
             //  otherwise start the service as a child process and
             //  run a frontend
+            #[cfg(all(feature = "gpui", not(feature = "gtk")))]
+            {
+                let mut service = if lan_mouse_ipc::is_service_running() {
+                    log::info!("daemon already running, connecting to existing instance");
+                    None
+                } else {
+                    Some(start_service()?)
+                };
+                let res = lan_mouse_gpui::run(config::local_commit());
+                if let Some(ref mut service) = service {
+                    #[cfg(unix)]
+                    {
+                        let pid = service.id() as libc::pid_t;
+                        unsafe {
+                            libc::kill(pid, libc::SIGINT);
+                        }
+                        service.wait()?;
+                    }
+                    service.kill()?;
+                }
+                res?;
+            }
             #[cfg(feature = "gtk")]
             {
                 // Only spawn a new daemon if one isn't already running
