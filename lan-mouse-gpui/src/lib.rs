@@ -317,6 +317,7 @@ enum SettingsDialogKind {
     Address,
     Certificate,
     Client { handle: ClientHandle },
+    RenameDevice { fingerprint: String },
 }
 
 #[derive(Clone, Debug)]
@@ -367,10 +368,23 @@ impl SettingsDialog {
         }
     }
 
+    fn new_rename(fingerprint: String, name: String) -> Self {
+        Self {
+            kind: SettingsDialogKind::RenameDevice { fingerprint },
+            hostname: String::new(),
+            port: String::new(),
+            address: String::new(),
+            name,
+            fingerprint: String::new(),
+            field: 0,
+        }
+    }
+
     fn field_count(&self) -> u8 {
         match self.kind {
             SettingsDialogKind::Address => 1,
             SettingsDialogKind::Certificate | SettingsDialogKind::Client { .. } => 2,
+            SettingsDialogKind::RenameDevice { .. } => 1,
         }
     }
 
@@ -391,6 +405,7 @@ impl SettingsDialog {
                     &mut self.port
                 }
             }
+            SettingsDialogKind::RenameDevice { .. } => &mut self.name,
         }
     }
 }
@@ -658,6 +673,10 @@ impl Dashboard {
         }
     }
 
+    fn open_device_rename(&mut self, fingerprint: String, name: String) {
+        self.settings_dialog = Some(SettingsDialog::new_rename(fingerprint, name));
+    }
+
     fn close_settings_dialog(&mut self) {
         self.settings_dialog = None;
     }
@@ -692,6 +711,15 @@ impl Dashboard {
                     },
                     fingerprint.to_string(),
                 ));
+            }
+            SettingsDialogKind::RenameDevice { fingerprint } => {
+                let name = dialog.name.trim();
+                if !name.is_empty() {
+                    self.send(FrontendRequest::RenameDevice {
+                        fingerprint,
+                        name: name.to_string(),
+                    });
+                }
             }
             SettingsDialogKind::Client { handle } => {
                 let hostname = dialog.hostname.trim().to_string();
@@ -1315,6 +1343,11 @@ impl Dashboard {
                     ("port", dialog.port.clone()),
                 ],
             ),
+            SettingsDialogKind::RenameDevice { .. } => (
+                "Rename device",
+                "Display name only; the certificate fingerprint stays the identity.",
+                vec![("display name", dialog.name.clone())],
+            ),
         };
         let mut field_rows = Vec::new();
         for (idx, (label, value)) in fields.clone().into_iter().enumerate() {
@@ -1828,6 +1861,8 @@ impl Dashboard {
             let incoming_fp = fp.clone();
             let outgoing_fp = fp.clone();
             let deny_fp = fp.clone();
+            let rename_fp = fp.clone();
+            let rename_name = device.name.clone();
             let revoke_fp = fp;
             let row = div()
                 .flex()
@@ -1937,6 +1972,17 @@ impl Dashboard {
                                     DirectionPolicy::deny(),
                                     DirectionPolicy::deny(),
                                 )
+                            },
+                        ))
+                        .child(self.action_button(
+                            "rename-device",
+                            "Rename",
+                            0x1d2430,
+                            TEXT,
+                            cx,
+                            move |this, _, window, _| {
+                                this.open_device_rename(rename_fp.clone(), rename_name.clone());
+                                window.focus(&this.add_focus);
                             },
                         ))
                         .child(self.action_button(
