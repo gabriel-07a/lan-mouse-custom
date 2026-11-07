@@ -24,12 +24,8 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 
 - _Now with a fast GPUI frontend (GTK fallback still available)_
 
-<picture>
-    <source media="(prefers-color-scheme: dark)" srcset="/screenshots/dark.png?raw=true">
-    <source media="(prefers-color-scheme: light)" srcset="/screenshots/light.png?raw=true">
-    <img alt="Screenshot of Lan-Mouse" srcset="/screenshots/dark.png">
-</picture>
-
+> UI screenshot will be refreshed for the new GPUI frontend; the old
+> `screenshots/` files still show the legacy GTK layout.
 
 ## Encryption
 
