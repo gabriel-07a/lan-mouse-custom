@@ -458,6 +458,7 @@ struct Dashboard {
     emulation_status: Status,
     clipboard_status: ClipboardStatus,
     pairing_active: bool,
+    pairing_review: Vec<DeviceView>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -531,6 +532,7 @@ impl Dashboard {
             emulation_status: Status::Disabled,
             clipboard_status: ClipboardStatus::default(),
             pairing_active: false,
+            pairing_review: Vec::new(),
         }
     }
 
@@ -629,6 +631,7 @@ impl Dashboard {
             FrontendEvent::EmulationStatus(status) => self.emulation_status = status,
             FrontendEvent::ClipboardStatus(status) => self.clipboard_status = status,
             FrontendEvent::PairingActive(active) => self.pairing_active = active,
+            FrontendEvent::PairingReview(devices) => self.pairing_review = devices,
             FrontendEvent::Diagnostics(_) => {}
             _ => {}
         }
@@ -879,6 +882,11 @@ impl Dashboard {
             fingerprint,
             disconnect: true,
         });
+    }
+
+    fn dismiss_pairing_review(&mut self, fingerprint: String) {
+        self.pairing_review
+            .retain(|device| device.fingerprint != fingerprint);
     }
 
     fn approve_pending(&mut self, fingerprint: String) {
@@ -1891,6 +1899,81 @@ impl Dashboard {
             )
     }
 
+    fn render_pairing_review(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let mut rows = Vec::new();
+        for device in self.pairing_review.clone() {
+            let keep_fp = device.fingerprint.clone();
+            let revoke_fp = device.fingerprint.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!(
+                        "pair-review-{}",
+                        device.fingerprint
+                    )))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_sm().text_color(rgb(TEXT)).child(device.name))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                "{}… · authorized via {}",
+                                &device.fingerprint[..device.fingerprint.len().min(20)],
+                                device.source
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(self.action_button(
+                                "pairing-keep",
+                                "Keep",
+                                GREEN,
+                                0x081018,
+                                cx,
+                                move |this, _, _, _| this.dismiss_pairing_review(keep_fp.clone()),
+                            ))
+                            .child(self.action_button(
+                                "pairing-revoke",
+                                "Revoke",
+                                0x3a2020,
+                                RED,
+                                cx,
+                                move |this, _, _, _| {
+                                    this.revoke_device(revoke_fp.clone());
+                                    this.dismiss_pairing_review(revoke_fp.clone());
+                                },
+                            )),
+                    ),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(0x2b2413))
+            .border_1()
+            .border_color(rgb(0x6b5520))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(AMBER))
+                    .child(format!("Pairing review ({})", rows.len())),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "Devices adopted while the pairing window was open. Keep them or revoke access.",
+            ))
+            .children(rows)
+    }
+
     fn render_device_permissions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let devices = self.devices.clone();
         let mut rows = Vec::new();
@@ -2350,6 +2433,9 @@ impl Dashboard {
                             }),
                     ),
             )
+            .when(!self.pairing_review.is_empty(), |this| {
+                this.child(self.render_pairing_review(cx))
+            })
             .child(self.render_device_permissions(cx))
             .child(
                 div()
