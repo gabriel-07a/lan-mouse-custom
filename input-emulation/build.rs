@@ -1,15 +1,13 @@
 fn main() {
-    let unix = cfg!(unix);
-    let libei = cfg!(feature = "libei");
-    let x11 = cfg!(feature = "x11");
-    let macos = cfg!(target_os = "macos");
-    let wlroots = cfg!(feature = "wlroots");
-    let rdp = cfg!(feature = "remote_desktop_portal");
+    let unix = std::env::var_os("CARGO_CFG_UNIX").is_some();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let macos = target_os == "macos";
+    let feature = |name: &str| std::env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
 
-    let libei = unix && !macos && libei;
-    let wlroots = unix && !macos && wlroots;
-    let x11 = unix && !macos && x11;
-    let rdp = unix && !macos && rdp;
+    let libei = unix && !macos && feature("LIBEI");
+    let wlroots = unix && !macos && feature("WLROOTS");
+    let x11 = unix && !macos && feature("X11");
+    let rdp = unix && !macos && feature("REMOTE_DESKTOP_PORTAL");
 
     println!("cargo::rustc-check-cfg=cfg(wlroots)");
     println!("cargo::rustc-check-cfg=cfg(libei)");

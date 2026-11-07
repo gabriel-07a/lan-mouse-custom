@@ -8,17 +8,19 @@ fn main() {
         .build()
         .expect("shadow build");
 
-    let unix = cfg!(unix);
-    let macos = cfg!(target_os = "macos");
+    let unix = std::env::var_os("CARGO_CFG_UNIX").is_some();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let macos = target_os == "macos";
+    let feature = |name: &str| std::env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
 
-    let layer_shell_capture = cfg!(feature = "layer_shell_capture");
-    let libei_capture = cfg!(feature = "libei_capture");
-    let x11_capture = cfg!(feature = "x11_capture");
+    let layer_shell_capture = feature("LAYER_SHELL_CAPTURE");
+    let libei_capture = feature("LIBEI_CAPTURE");
+    let x11_capture = feature("X11_CAPTURE");
 
-    let libei_emulation = cfg!(feature = "libei_emulation");
-    let x11_emulation = cfg!(feature = "x11_emulation");
-    let wlroots_emulation = cfg!(feature = "wlroots_emulation");
-    let rdp_emulation = cfg!(feature = "rdp_emulation");
+    let libei_emulation = feature("LIBEI_EMULATION");
+    let x11_emulation = feature("X11_EMULATION");
+    let wlroots_emulation = feature("WLROOTS_EMULATION");
+    let rdp_emulation = feature("RDP_EMULATION");
 
     let layer_shell_capture = unix && !macos && layer_shell_capture;
     let libei_capture = unix && !macos && libei_capture;
