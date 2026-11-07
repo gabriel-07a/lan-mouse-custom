@@ -312,6 +312,89 @@ enum AddField {
     Fingerprint,
 }
 
+#[derive(Clone, Debug)]
+enum SettingsDialogKind {
+    Address,
+    Certificate,
+    Client { handle: ClientHandle },
+}
+
+#[derive(Clone, Debug)]
+struct SettingsDialog {
+    kind: SettingsDialogKind,
+    hostname: String,
+    port: String,
+    address: String,
+    name: String,
+    fingerprint: String,
+    field: u8,
+}
+
+impl SettingsDialog {
+    fn new_address() -> Self {
+        Self {
+            kind: SettingsDialogKind::Address,
+            hostname: String::new(),
+            port: String::new(),
+            address: String::new(),
+            name: String::new(),
+            fingerprint: String::new(),
+            field: 0,
+        }
+    }
+
+    fn new_certificate() -> Self {
+        Self {
+            kind: SettingsDialogKind::Certificate,
+            hostname: String::new(),
+            port: String::new(),
+            address: String::new(),
+            name: String::new(),
+            fingerprint: String::new(),
+            field: 0,
+        }
+    }
+
+    fn new_client(handle: ClientHandle, config: &ClientConfig) -> Self {
+        Self {
+            kind: SettingsDialogKind::Client { handle },
+            hostname: config.hostname.clone().unwrap_or_default(),
+            port: config.port.to_string(),
+            address: String::new(),
+            name: String::new(),
+            fingerprint: String::new(),
+            field: 0,
+        }
+    }
+
+    fn field_count(&self) -> u8 {
+        match self.kind {
+            SettingsDialogKind::Address => 1,
+            SettingsDialogKind::Certificate | SettingsDialogKind::Client { .. } => 2,
+        }
+    }
+
+    fn value_mut(&mut self) -> &mut String {
+        match self.kind {
+            SettingsDialogKind::Address => &mut self.address,
+            SettingsDialogKind::Certificate => {
+                if self.field == 0 {
+                    &mut self.name
+                } else {
+                    &mut self.fingerprint
+                }
+            }
+            SettingsDialogKind::Client { .. } => {
+                if self.field == 0 {
+                    &mut self.hostname
+                } else {
+                    &mut self.port
+                }
+            }
+        }
+    }
+}
+
 impl AddDeviceDialog {
     fn new() -> Self {
         Self {
@@ -345,6 +428,7 @@ struct Dashboard {
     discovered: Vec<DiscoveredDevice>,
     pending_add: Option<PendingAdd>,
     add_dialog: Option<AddDeviceDialog>,
+    settings_dialog: Option<SettingsDialog>,
     add_focus: FocusHandle,
     address_rules: Vec<AddressRuleView>,
     authorized: std::collections::HashMap<String, String>,
@@ -414,6 +498,7 @@ impl Dashboard {
             discovered: Vec::new(),
             pending_add: None,
             add_dialog: None,
+            settings_dialog: None,
             add_focus: cx.focus_handle(),
             address_rules: Vec::new(),
             authorized: std::collections::HashMap::new(),
@@ -557,6 +642,100 @@ impl Dashboard {
         if page == Page::Network && self.discovered.is_empty() {
             self.send(FrontendRequest::ScanNetwork);
         }
+    }
+
+    fn open_address_dialog(&mut self) {
+        self.settings_dialog = Some(SettingsDialog::new_address());
+    }
+
+    fn open_certificate_dialog(&mut self) {
+        self.settings_dialog = Some(SettingsDialog::new_certificate());
+    }
+
+    fn open_client_edit(&mut self, handle: ClientHandle) {
+        if let Some((config, _)) = self.clients.get(&handle) {
+            self.settings_dialog = Some(SettingsDialog::new_client(handle, config));
+        }
+    }
+
+    fn close_settings_dialog(&mut self) {
+        self.settings_dialog = None;
+    }
+
+    fn submit_settings_dialog(&mut self) {
+        let Some(dialog) = self.settings_dialog.take() else {
+            return;
+        };
+        match dialog.kind {
+            SettingsDialogKind::Address => {
+                let address = dialog.address.trim();
+                if address.is_empty() {
+                    return;
+                }
+                self.send(FrontendRequest::AddAddressRule {
+                    address: address.to_string(),
+                    incoming: DirectionPolicy::allow_all(),
+                    outgoing: DirectionPolicy::allow_all(),
+                });
+            }
+            SettingsDialogKind::Certificate => {
+                let fingerprint = dialog.fingerprint.trim();
+                if fingerprint.is_empty() {
+                    return;
+                }
+                let name = dialog.name.trim();
+                self.send(FrontendRequest::AuthorizeKey(
+                    if name.is_empty() {
+                        "authorized device".to_string()
+                    } else {
+                        name.to_string()
+                    },
+                    fingerprint.to_string(),
+                ));
+            }
+            SettingsDialogKind::Client { handle } => {
+                let hostname = dialog.hostname.trim().to_string();
+                self.send(FrontendRequest::UpdateHostname(
+                    handle,
+                    (!hostname.is_empty()).then_some(hostname),
+                ));
+                if let Ok(port) = dialog.port.trim().parse::<u16>() {
+                    self.send(FrontendRequest::UpdatePort(handle, port));
+                }
+            }
+        }
+    }
+
+    fn on_settings_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => self.close_settings_dialog(),
+            "enter" => self.submit_settings_dialog(),
+            "tab" => {
+                if let Some(dialog) = self.settings_dialog.as_mut() {
+                    dialog.field = (dialog.field + 1) % dialog.field_count();
+                }
+            }
+            "backspace" => {
+                if let Some(dialog) = self.settings_dialog.as_mut() {
+                    dialog.value_mut().pop();
+                }
+            }
+            key if key.len() == 1
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform =>
+            {
+                if let Some(dialog) = self.settings_dialog.as_mut() {
+                    dialog.value_mut().push_str(key);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     fn add_device(&mut self) {
@@ -864,6 +1043,17 @@ impl Dashboard {
                         sensitivity
                     )))
                     .child(self.action_button(
+                        "edit-client",
+                        "Edit",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        move |this, _, window, _| {
+                            this.open_client_edit(handle);
+                            window.focus(&this.add_focus);
+                        },
+                    ))
+                    .child(self.action_button(
                         "resolve-dns",
                         "DNS",
                         0x1d222a,
@@ -1061,9 +1251,15 @@ impl Render for Dashboard {
                                 .text_sm()
                                 .cursor_pointer()
                                 .child("+ Add device")
-                                .on_click(cx.listener(|this, _, _, _| this.add_device())),
+                                .on_click(cx.listener(|this, _, window, _| {
+                                    this.add_device();
+                                    window.focus(&this.add_focus);
+                                })),
                         ),
                 )
+                .when(self.settings_dialog.is_some(), |this| {
+                    this.child(self.render_settings_dialog(cx))
+                })
                 .child(content),
         )
     }
@@ -1090,6 +1286,111 @@ impl Dashboard {
             .cursor_pointer()
             .child(label)
             .on_click(cx.listener(handler))
+    }
+
+    fn render_settings_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let Some(dialog) = self.settings_dialog.clone() else {
+            return div().into_any_element();
+        };
+        let focus = self.add_focus.clone();
+        let (title, hint, fields) = match dialog.kind {
+            SettingsDialogKind::Address => (
+                "Add allowed address",
+                "IPv4 address or CIDR. Tab switches fields, Enter saves, Esc cancels.",
+                vec![("address", dialog.address.clone())],
+            ),
+            SettingsDialogKind::Certificate => (
+                "Authorize certificate",
+                "Fingerprint and display name of the peer. Tab switches fields.",
+                vec![
+                    ("name", dialog.name.clone()),
+                    ("fingerprint", dialog.fingerprint.clone()),
+                ],
+            ),
+            SettingsDialogKind::Client { .. } => (
+                "Edit client",
+                "Hostname/IP and port. Leave the hostname empty to use the address.",
+                vec![
+                    ("hostname / IP", dialog.hostname.clone()),
+                    ("port", dialog.port.clone()),
+                ],
+            ),
+        };
+        let mut field_rows = Vec::new();
+        for (idx, (label, value)) in fields.clone().into_iter().enumerate() {
+            let active = dialog.field as usize == idx;
+            let row = div()
+                .id(SharedString::from(format!("settings-field-{idx}")))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .bg(rgb(if active { 0x1d2430 } else { 0x121826 }))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(if active { ACCENT } else { MUTED }))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child(format!("{value}▌")),
+                )
+                .on_click(cx.listener(move |this, _, window, _| {
+                    if let Some(dialog) = this.settings_dialog.as_mut() {
+                        dialog.field = idx as u8;
+                    }
+                    window.focus(&this.add_focus);
+                }));
+            field_rows.push(row);
+        }
+        div()
+            .id("settings-dialog")
+            .track_focus(&focus)
+            .on_key_down(cx.listener(Self::on_settings_key))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(0x121826))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child(title),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
+            .children(field_rows)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(self.action_button(
+                        "settings-dialog-submit",
+                        "Save",
+                        ACCENT,
+                        0x081018,
+                        cx,
+                        |this, _, _, _| this.submit_settings_dialog(),
+                    ))
+                    .child(self.action_button(
+                        "settings-dialog-cancel",
+                        "Cancel",
+                        0x1d222a,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| this.close_settings_dialog(),
+                    )),
+            )
+            .into_any_element()
     }
 
     fn render_add_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1880,18 +2181,89 @@ impl Dashboard {
                     .border_color(rgb(BORDER))
                     .child(
                         div()
-                            .text_base()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
-                            .child(format!("Authorized devices ({})", authorized.len())),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child(format!(
+                                        "Authorized devices ({})",
+                                        self.authorized.len()
+                                    )),
+                            )
+                            .child(self.action_button(
+                                "add-certificate",
+                                "Add",
+                                ACCENT,
+                                0x081018,
+                                cx,
+                                |this, _, window, _| {
+                                    this.open_certificate_dialog();
+                                    window.focus(&this.add_focus);
+                                },
+                            )),
                     )
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(
-                        if authorized.is_empty() {
-                            "No authorized devices.".to_string()
-                        } else {
-                            authorized.join(" · ")
-                        },
-                    )),
+                    .when(self.authorized.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child("No authorized devices."),
+                        )
+                    })
+                    .children(
+                        self.authorized
+                            .iter()
+                            .map(|(fingerprint, name)| (fingerprint.clone(), name.clone()))
+                            .collect::<std::collections::BTreeMap<_, _>>()
+                            .into_iter()
+                            .map(|(fingerprint, name)| {
+                                let remove_fp = fingerprint.clone();
+                                div()
+                                    .id(SharedString::from(format!("cert-{fingerprint}")))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div().text_sm().text_color(rgb(TEXT)).child(name),
+                                            )
+                                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                                format!(
+                                                    "{}…",
+                                                    &fingerprint[..fingerprint.len().min(24)]
+                                                ),
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "remove-cert-{fingerprint}"
+                                            )))
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .bg(rgb(0x2a2020))
+                                            .text_color(rgb(RED))
+                                            .text_sm()
+                                            .cursor_pointer()
+                                            .child("Remove")
+                                            .on_click(cx.listener(move |this, _, _, _| {
+                                                this.send(FrontendRequest::RemoveAuthorizedKey(
+                                                    remove_fp.clone(),
+                                                ))
+                                            })),
+                                    )
+                            }),
+                    ),
             )
             .child(self.render_device_permissions(cx))
             .child(
@@ -1906,21 +2278,80 @@ impl Dashboard {
                     .border_color(rgb(BORDER))
                     .child(
                         div()
-                            .text_base()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
-                            .child(format!("Allowed addresses ({})", rules.len())),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child(format!(
+                                        "Allowed addresses ({})",
+                                        self.address_rules.len()
+                                    )),
+                            )
+                            .child(self.action_button(
+                                "add-address-rule",
+                                "Add",
+                                ACCENT,
+                                0x081018,
+                                cx,
+                                |this, _, window, _| {
+                                    this.open_address_dialog();
+                                    window.focus(&this.add_focus);
+                                },
+                            )),
                     )
-                    .child(
+                    .when(self.address_rules.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child("No address rules."),
+                        )
+                    })
+                    .children(self.address_rules.clone().into_iter().map(|rule| {
+                        let address = rule.address.clone();
                         div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child(if rules.is_empty() {
-                                "No address rules.".to_string()
-                            } else {
-                                rules.join(" · ")
-                            }),
-                    ),
+                            .id(SharedString::from(format!("rule-{}", rule.address)))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(TEXT))
+                                            .child(rule.address.clone()),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                        "in:{} · out:{}",
+                                        rule.incoming.capabilities.summary(),
+                                        rule.outgoing.capabilities.summary()
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("remove-rule-{}", address)))
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x2a2020))
+                                    .text_color(rgb(RED))
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .child("Remove")
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        this.send(FrontendRequest::UntrustAddress(address.clone()))
+                                    })),
+                            )
+                    })),
             )
     }
 }
