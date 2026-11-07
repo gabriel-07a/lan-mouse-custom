@@ -88,7 +88,7 @@ windows = { version = "0.61.2", features = [
 
 [features]
 default = [
-    "gtk",
+    "gpui",
     "layer_shell_capture",
     "x11_capture",
     "libei_capture",
