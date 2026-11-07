@@ -53,7 +53,7 @@ Run from repo root—no `cd` in scripts.
 ## Testing
 
 - Unit tests for utilities; integration tests for protocol behavior.
-- OS-specific backends: test via GTK/CLI on target OS or document manual verification.
+- OS-specific backends: test via the GPUI/CLI frontends on target OS or document manual verification.
 - Dummy backend exercises pipeline without real dependencies.
 - Verify `terminate()` releases keys on unexpected disconnect.
 
