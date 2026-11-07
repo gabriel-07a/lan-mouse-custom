@@ -2504,3 +2504,71 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
     });
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_labels_cover_all_sides() {
+        assert_eq!(position_label(Position::Left), "left");
+        assert_eq!(position_label(Position::Right), "right");
+        assert_eq!(position_label(Position::Top), "top");
+        assert_eq!(position_label(Position::Bottom), "bottom");
+    }
+
+    #[test]
+    fn disabled_client_is_offline_with_connect_action() {
+        let config = ClientConfig::default();
+        let state = ClientState::default();
+        let row = ClientRow::from_state(&config, &state);
+        assert_eq!(row.state, "Disconnected");
+        assert_eq!(row.action, "Connect");
+        assert!(!row.active);
+        assert!(!row.healthy);
+    }
+
+    #[test]
+    fn active_client_with_fresh_pong_is_connected() {
+        let config = ClientConfig::default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let state = ClientState {
+            active: true,
+            last_pong_at: Some(now),
+            ..Default::default()
+        };
+        let row = ClientRow::from_state(&config, &state);
+        assert_eq!(row.state, "Connected");
+        assert_eq!(row.action, "Disconnect");
+        assert!(row.healthy);
+    }
+
+    #[test]
+    fn active_client_without_pong_is_still_connecting() {
+        let config = ClientConfig::default();
+        let state = ClientState {
+            active: true,
+            last_pong_at: Some(0),
+            ..Default::default()
+        };
+        let row = ClientRow::from_state(&config, &state);
+        assert!(row.active);
+        assert!(!row.healthy);
+    }
+
+    #[test]
+    fn local_ipv4_discovery_returns_only_non_loopback_ipv4() {
+        let ips = discover_local_ipv4();
+        for ip in ips {
+            let address: std::net::IpAddr = ip.parse().expect("valid IP string");
+            let std::net::IpAddr::V4(v4) = address else {
+                panic!("discovery returned a non-IPv4 address: {address}");
+            };
+            assert!(!v4.is_loopback());
+            assert!(!v4.is_link_local());
+        }
+    }
+}
