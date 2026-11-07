@@ -6,8 +6,8 @@ use gpui::{
 };
 use lan_mouse_ipc::{
     AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
-    DirectionPolicy, FrontendEvent, FrontendRequest, FrontendRequestWriter, PendingView, Position,
-    Status,
+    DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest, FrontendRequestWriter,
+    PendingView, Position, Status,
 };
 
 const BG: u32 = 0x0f1115;
@@ -232,6 +232,15 @@ impl ClientRow {
     }
 }
 
+fn position_label(position: Position) -> &'static str {
+    match position {
+        Position::Left => "left",
+        Position::Right => "right",
+        Position::Top => "top",
+        Position::Bottom => "bottom",
+    }
+}
+
 /// Best-effort IPv4 addresses for the "This Computer" card.
 fn discover_local_ipv4() -> Vec<String> {
     let Ok(interfaces) = if_addrs::get_if_addrs() else {
@@ -262,6 +271,8 @@ struct Dashboard {
     clients: HashMap<ClientHandle, (ClientConfig, ClientState)>,
     pending: Vec<PendingView>,
     devices: Vec<DeviceView>,
+    discovered: Vec<DiscoveredDevice>,
+    pending_add: Option<(std::net::IpAddr, u16)>,
     address_rules: Vec<AddressRuleView>,
     authorized: std::collections::HashMap<String, String>,
     status: String,
@@ -327,6 +338,8 @@ impl Dashboard {
             clients: HashMap::new(),
             pending: Vec::new(),
             devices: Vec::new(),
+            discovered: Vec::new(),
+            pending_add: None,
             address_rules: Vec::new(),
             authorized: std::collections::HashMap::new(),
             status: "Connecting to Lan Mouse service…".to_string(),
@@ -377,8 +390,16 @@ impl Dashboard {
                 }
                 log::info!("GPUI frontend received {} client(s)", self.clients.len());
             }
-            FrontendEvent::Created(handle, config, state)
-            | FrontendEvent::State(handle, config, state) => {
+            FrontendEvent::Created(handle, config, state) => {
+                self.clients.insert(handle, (config, state));
+                if let Some((ip, port)) = self.pending_add.take() {
+                    self.send(FrontendRequest::UpdateFixIps(handle, vec![ip]));
+                    self.send(FrontendRequest::UpdatePort(handle, port));
+                    self.send(FrontendRequest::UpdatePosition(handle, Position::Left));
+                    self.send(FrontendRequest::Activate(handle, true));
+                }
+            }
+            FrontendEvent::State(handle, config, state) => {
                 self.clients.insert(handle, (config, state));
             }
             FrontendEvent::Deleted(handle) => {
@@ -393,6 +414,7 @@ impl Dashboard {
             }
             FrontendEvent::Error(error) => self.status = error,
             FrontendEvent::Devices(devices) => self.devices = devices,
+            FrontendEvent::NetworkScan(devices) => self.discovered = devices,
             FrontendEvent::AddressRules(rules) => self.address_rules = rules,
             FrontendEvent::AuthorizedUpdated(authorized) => self.authorized = authorized,
             FrontendEvent::PublicKeyFingerprint(fingerprint) => {
@@ -433,6 +455,54 @@ impl Dashboard {
 
     fn add_device(&mut self) {
         self.send(FrontendRequest::Create);
+    }
+
+    fn add_discovered(&mut self, ip: std::net::IpAddr, port: u16) {
+        self.pending_add = Some((ip, port));
+        self.send(FrontendRequest::Create);
+    }
+
+    fn cycle_position(&mut self, handle: ClientHandle, current: Position) {
+        let next = match current {
+            Position::Left => Position::Right,
+            Position::Right => Position::Top,
+            Position::Top => Position::Bottom,
+            Position::Bottom => Position::Left,
+        };
+        self.send(FrontendRequest::UpdatePosition(handle, next));
+    }
+
+    fn adjust_sensitivity(&mut self, handle: ClientHandle, current: u16, delta: i32) {
+        let next = (i32::from(current) + delta).clamp(10, 500) as u16;
+        self.send(FrontendRequest::UpdateSensitivity(handle, next));
+    }
+
+    fn resolve_dns(&mut self, handle: ClientHandle) {
+        self.send(FrontendRequest::ResolveDns(handle));
+    }
+
+    fn delete_client(&mut self, handle: ClientHandle) {
+        self.send(FrontendRequest::Delete(handle));
+    }
+
+    fn set_policy(
+        &mut self,
+        fingerprint: String,
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    ) {
+        self.send(FrontendRequest::SetDevicePolicy {
+            fingerprint,
+            incoming,
+            outgoing,
+        });
+    }
+
+    fn revoke_device(&mut self, fingerprint: String) {
+        self.send(FrontendRequest::RevokeDevice {
+            fingerprint,
+            disconnect: true,
+        });
     }
 
     fn approve_pending(&mut self, fingerprint: String) {
@@ -518,6 +588,8 @@ impl Dashboard {
     ) -> impl IntoElement + use<> {
         let mut row = ClientRow::from_state(config, state);
         row.handle = handle;
+        let position = config.pos;
+        let sensitivity = config.sensitivity;
         let (state_color, state_bg) = if row.healthy {
             (GREEN, 0x173225)
         } else if row.active {
@@ -598,6 +670,122 @@ impl Dashboard {
                         }
                     ))),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                        "position {} · sensitivity {}%",
+                        position_label(position),
+                        sensitivity
+                    )))
+                    .child(self.action_button(
+                        "resolve-dns",
+                        "DNS",
+                        0x1d222a,
+                        TEXT,
+                        cx,
+                        move |this, _, _, _| this.resolve_dns(handle),
+                    ))
+                    .child(self.action_button(
+                        "position",
+                        "Position",
+                        0x1d222a,
+                        TEXT,
+                        cx,
+                        move |this, _, _, _| this.cycle_position(handle, position),
+                    ))
+                    .child(self.action_button(
+                        "sensitivity-down",
+                        "-",
+                        0x1d222a,
+                        TEXT,
+                        cx,
+                        move |this, _, _, _| this.adjust_sensitivity(handle, sensitivity, -10),
+                    ))
+                    .child(self.action_button(
+                        "sensitivity-up",
+                        "+",
+                        0x1d222a,
+                        TEXT,
+                        cx,
+                        move |this, _, _, _| this.adjust_sensitivity(handle, sensitivity, 10),
+                    ))
+                    .child(self.action_button(
+                        "delete-client",
+                        "Remove",
+                        0x3a2020,
+                        RED,
+                        cx,
+                        move |this, _, _, _| this.delete_client(handle),
+                    )),
+            )
+    }
+
+    fn render_network_row(
+        &self,
+        device: DiscoveredDevice,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let name = device
+            .hostname
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| device.ip.to_string());
+        let port = device.port.unwrap_or(lan_mouse_ipc::DEFAULT_PORT);
+        let status = if device.configured {
+            "configured".to_string()
+        } else if device.lan_mouse {
+            "Lan Mouse available".to_string()
+        } else {
+            "host reachable (Lan Mouse not confirmed)".to_string()
+        };
+        let version = device
+            .version
+            .clone()
+            .map(|version| format!(" · build {version}"))
+            .unwrap_or_default();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{}:{} · {status}{version}", device.ip, port)),
+                    ),
+            )
+            .when(!device.configured, |this| {
+                this.child(self.action_button(
+                    "add-discovered",
+                    "Add",
+                    ACCENT,
+                    0x081018,
+                    cx,
+                    move |this, _, _, _| this.add_discovered(device.ip, port),
+                ))
+            })
     }
 }
 
@@ -933,17 +1121,192 @@ impl Dashboard {
                         |this, _, _, _| this.send(FrontendRequest::ScanNetwork),
                     )),
             )
+            .when(self.discovered.is_empty(), |this| {
+                this.child(
+                    div()
+                        .p_6()
+                        .rounded_lg()
+                        .bg(rgb(CARD))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child("No devices discovered yet. Press Scan network."),
+                        ),
+                )
+            })
+            .child(
+                div().flex().flex_col().gap_2().children(
+                    self.discovered
+                        .clone()
+                        .into_iter()
+                        .map(|device| self.render_network_row(device, cx).into_any_element())
+                        .collect::<Vec<_>>(),
+                ),
+            )
+    }
+
+    fn render_device_permissions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let devices = self.devices.clone();
+        let mut rows = Vec::new();
+        for device in devices {
+            let fp = device.fingerprint.clone();
+            let allow_fp = fp.clone();
+            let incoming_fp = fp.clone();
+            let outgoing_fp = fp.clone();
+            let deny_fp = fp.clone();
+            let revoke_fp = fp;
+            let row = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_4()
+                .rounded_lg()
+                .bg(rgb(CARD))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(device.name.clone()),
+                                )
+                                .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                    "{}… · in:{} · out:{} · {}",
+                                    &device.fingerprint[..device.fingerprint.len().min(16)],
+                                    device.incoming.capabilities.summary(),
+                                    device.outgoing.capabilities.summary(),
+                                    device.source
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_full()
+                                .bg(rgb(if device.connected { 0x173225 } else { 0x1d222a }))
+                                .text_color(rgb(if device.connected { GREEN } else { MUTED }))
+                                .text_xs()
+                                .child(if device.connected {
+                                    "connected"
+                                } else {
+                                    "offline"
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(self.action_button(
+                            "policy-both",
+                            "Both",
+                            0x1d2430,
+                            TEXT,
+                            cx,
+                            move |this, _, _, _| {
+                                this.set_policy(
+                                    allow_fp.clone(),
+                                    DirectionPolicy::allow_all(),
+                                    DirectionPolicy::allow_all(),
+                                )
+                            },
+                        ))
+                        .child(self.action_button(
+                            "policy-in",
+                            "Control me",
+                            0x1d2430,
+                            TEXT,
+                            cx,
+                            move |this, _, _, _| {
+                                this.set_policy(
+                                    incoming_fp.clone(),
+                                    DirectionPolicy::allow_all(),
+                                    DirectionPolicy::deny(),
+                                )
+                            },
+                        ))
+                        .child(self.action_button(
+                            "policy-out",
+                            "I control",
+                            0x1d2430,
+                            TEXT,
+                            cx,
+                            move |this, _, _, _| {
+                                this.set_policy(
+                                    outgoing_fp.clone(),
+                                    DirectionPolicy::deny(),
+                                    DirectionPolicy::allow_all(),
+                                )
+                            },
+                        ))
+                        .child(self.action_button(
+                            "policy-none",
+                            "Block",
+                            0x3a2020,
+                            RED,
+                            cx,
+                            move |this, _, _, _| {
+                                this.set_policy(
+                                    deny_fp.clone(),
+                                    DirectionPolicy::deny(),
+                                    DirectionPolicy::deny(),
+                                )
+                            },
+                        ))
+                        .child(self.action_button(
+                            "revoke-device",
+                            "Revoke",
+                            0x3a2020,
+                            RED,
+                            cx,
+                            move |this, _, _, _| this.revoke_device(revoke_fp.clone()),
+                        )),
+                );
+            rows.push(row);
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
             .child(
                 div()
-                    .p_6()
-                    .rounded_lg()
-                    .bg(rgb(CARD))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(
-                        "Network scan results will appear here. The IPC scan request is already wired.",
-                    )),
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child(format!("Device permissions ({})", rows.len())),
             )
+            .when(rows.is_empty(), |this| {
+                this.child(
+                    div()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(CARD))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child("No known devices."),
+                        ),
+                )
+            })
+            .children(rows)
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1160,6 +1523,7 @@ impl Dashboard {
                         },
                     )),
             )
+            .child(self.render_device_permissions(cx))
             .child(
                 div()
                     .flex()
