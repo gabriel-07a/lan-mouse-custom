@@ -552,6 +552,13 @@ impl Dashboard {
         self.selected_client = Some(handle);
     }
 
+    fn switch_page(&mut self, page: Page) {
+        self.page = page;
+        if page == Page::Network && self.discovered.is_empty() {
+            self.send(FrontendRequest::ScanNetwork);
+        }
+    }
+
     fn add_device(&mut self) {
         self.add_dialog = Some(AddDeviceDialog::new());
     }
@@ -668,13 +675,26 @@ impl Dashboard {
     }
 
     fn approve_pending(&mut self, fingerprint: String) {
+        self.respond_pending_with(
+            fingerprint,
+            DirectionPolicy::allow_all(),
+            DirectionPolicy::allow_all(),
+        );
+    }
+
+    fn respond_pending_with(
+        &mut self,
+        fingerprint: String,
+        incoming: DirectionPolicy,
+        outgoing: DirectionPolicy,
+    ) {
         self.send(FrontendRequest::RespondPending {
             fingerprint,
             accept: true,
             name: None,
             position: Some(Position::Left),
-            incoming: Some(DirectionPolicy::allow_all()),
-            outgoing: Some(DirectionPolicy::allow_all()),
+            incoming: Some(incoming),
+            outgoing: Some(outgoing),
         });
     }
 
@@ -739,7 +759,7 @@ impl Dashboard {
             .text_color(if selected { rgb(TEXT) } else { rgb(MUTED) })
             .child(div().text_base().child(icon))
             .child(div().text_sm().child(label))
-            .on_click(cx.listener(move |this, _, _, _| this.page = page))
+            .on_click(cx.listener(move |this, _, _, _| this.switch_page(page)))
     }
 
     fn render_client(
@@ -1284,6 +1304,8 @@ impl Dashboard {
         let mut cards = Vec::new();
         for request in pending {
             let approve_fp = request.fingerprint.clone();
+            let control_me_fp = request.fingerprint.clone();
+            let i_control_fp = request.fingerprint.clone();
             let deny_fp = request.fingerprint.clone();
             let name = request
                 .name
@@ -1334,11 +1356,39 @@ impl Dashboard {
                         .gap_2()
                         .child(self.action_button(
                             "approve-pending",
-                            "Approve",
+                            "Approve both",
                             GREEN,
                             0x081018,
                             cx,
                             move |this, _, _, _| this.approve_pending(approve_fp.clone()),
+                        ))
+                        .child(self.action_button(
+                            "approve-control-me",
+                            "Control me",
+                            0x1d2430,
+                            TEXT,
+                            cx,
+                            move |this, _, _, _| {
+                                this.respond_pending_with(
+                                    control_me_fp.clone(),
+                                    DirectionPolicy::allow_all(),
+                                    DirectionPolicy::deny(),
+                                )
+                            },
+                        ))
+                        .child(self.action_button(
+                            "approve-i-control",
+                            "I control it",
+                            0x1d2430,
+                            TEXT,
+                            cx,
+                            move |this, _, _, _| {
+                                this.respond_pending_with(
+                                    i_control_fp.clone(),
+                                    DirectionPolicy::deny(),
+                                    DirectionPolicy::allow_all(),
+                                )
+                            },
                         ))
                         .child(self.action_button(
                             "deny-pending",
