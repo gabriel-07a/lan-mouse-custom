@@ -1608,6 +1608,16 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
             )
             .expect("open Lan Mouse GPUI window");
 
+        // Closing the window keeps the process alive in the tray: minimize
+        // instead of destroying the window, matching the GTK close-to-tray
+        // behavior until the native tray can hide/show the window directly.
+        let _ = window_handle.update(cx, |_, window, cx| {
+            window.on_window_should_close(cx, |window, _cx| {
+                window.minimize_window();
+                false
+            });
+        });
+
         let tray_rx = tray::spawn();
         cx.spawn(async move |cx| {
             while let Ok(command) = tray_rx.recv().await {
