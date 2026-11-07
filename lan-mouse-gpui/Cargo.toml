@@ -34,3 +34,9 @@ tokio = { version = "1", features = ["rt", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.26", default-features = false, optional = true }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = true
+panic = "abort"
