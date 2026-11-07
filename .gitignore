@@ -13,3 +13,5 @@ extfile.conf
 .flatpak-builder
 repo
 dist/
+
+target/
