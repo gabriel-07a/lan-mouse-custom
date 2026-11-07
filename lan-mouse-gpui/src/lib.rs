@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use gpui::{
-    App, Application, Bounds, Context, Entity, Render, SharedString, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Entity, FocusHandle, KeyDownEvent, Render, SharedString,
+    Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use lan_mouse_ipc::{
     AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
@@ -284,6 +284,53 @@ fn discover_local_ipv4() -> Vec<String> {
     ips
 }
 
+#[derive(Clone, Debug)]
+enum PendingAdd {
+    Discovered {
+        ip: std::net::IpAddr,
+        port: u16,
+    },
+    Manual {
+        hostname: String,
+        port: u16,
+        fingerprint: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct AddDeviceDialog {
+    hostname: String,
+    port: String,
+    fingerprint: String,
+    field: AddField,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddField {
+    Hostname,
+    Port,
+    Fingerprint,
+}
+
+impl AddDeviceDialog {
+    fn new() -> Self {
+        Self {
+            hostname: String::new(),
+            port: lan_mouse_ipc::DEFAULT_PORT.to_string(),
+            fingerprint: String::new(),
+            field: AddField::Hostname,
+        }
+    }
+
+    fn value_mut(&mut self) -> &mut String {
+        match self.field {
+            AddField::Hostname => &mut self.hostname,
+            AddField::Port => &mut self.port,
+            AddField::Fingerprint => &mut self.fingerprint,
+        }
+    }
+}
+
 enum BridgeMessage {
     Writer(FrontendRequestWriter),
     Event(Box<FrontendEvent>),
@@ -296,7 +343,9 @@ struct Dashboard {
     pending: Vec<PendingView>,
     devices: Vec<DeviceView>,
     discovered: Vec<DiscoveredDevice>,
-    pending_add: Option<(std::net::IpAddr, u16)>,
+    pending_add: Option<PendingAdd>,
+    add_dialog: Option<AddDeviceDialog>,
+    add_focus: FocusHandle,
     address_rules: Vec<AddressRuleView>,
     authorized: std::collections::HashMap<String, String>,
     status: String,
@@ -364,6 +413,8 @@ impl Dashboard {
             devices: Vec::new(),
             discovered: Vec::new(),
             pending_add: None,
+            add_dialog: None,
+            add_focus: cx.focus_handle(),
             address_rules: Vec::new(),
             authorized: std::collections::HashMap::new(),
             status: "Connecting to Lan Mouse service…".to_string(),
@@ -416,9 +467,33 @@ impl Dashboard {
             }
             FrontendEvent::Created(handle, config, state) => {
                 self.clients.insert(handle, (config, state));
-                if let Some((ip, port)) = self.pending_add.take() {
-                    self.send(FrontendRequest::UpdateFixIps(handle, vec![ip]));
-                    self.send(FrontendRequest::UpdatePort(handle, port));
+                if let Some(pending) = self.pending_add.take() {
+                    match pending {
+                        PendingAdd::Discovered { ip, port } => {
+                            self.send(FrontendRequest::UpdateFixIps(handle, vec![ip]));
+                            self.send(FrontendRequest::UpdatePort(handle, port));
+                        }
+                        PendingAdd::Manual {
+                            hostname,
+                            port,
+                            fingerprint,
+                        } => {
+                            let hostname = hostname.trim();
+                            if !hostname.is_empty() {
+                                self.send(FrontendRequest::UpdateHostname(
+                                    handle,
+                                    Some(hostname.to_string()),
+                                ));
+                            }
+                            self.send(FrontendRequest::UpdatePort(handle, port));
+                            if let Some(fingerprint) = fingerprint {
+                                self.send(FrontendRequest::UpdateFingerprint(
+                                    handle,
+                                    Some(fingerprint),
+                                ));
+                            }
+                        }
+                    }
                     self.send(FrontendRequest::UpdatePosition(handle, Position::Left));
                     self.send(FrontendRequest::Activate(handle, true));
                 }
@@ -478,11 +553,74 @@ impl Dashboard {
     }
 
     fn add_device(&mut self) {
+        self.add_dialog = Some(AddDeviceDialog::new());
+    }
+
+    fn close_add_dialog(&mut self) {
+        self.add_dialog = None;
+    }
+
+    fn submit_add_dialog(&mut self) {
+        let Some(dialog) = self.add_dialog.take() else {
+            return;
+        };
+        let port = dialog
+            .port
+            .trim()
+            .parse::<u16>()
+            .unwrap_or(lan_mouse_ipc::DEFAULT_PORT);
+        let fingerprint = dialog
+            .fingerprint
+            .trim()
+            .is_empty()
+            .then_some(None)
+            .unwrap_or_else(|| Some(dialog.fingerprint.trim().to_string()));
+        self.pending_add = Some(PendingAdd::Manual {
+            hostname: dialog.hostname,
+            port,
+            fingerprint,
+        });
         self.send(FrontendRequest::Create);
     }
 
+    fn on_add_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                self.close_add_dialog();
+            }
+            "enter" => {
+                self.submit_add_dialog();
+            }
+            "tab" => {
+                if let Some(dialog) = self.add_dialog.as_mut() {
+                    dialog.field = match dialog.field {
+                        AddField::Hostname => AddField::Port,
+                        AddField::Port => AddField::Fingerprint,
+                        AddField::Fingerprint => AddField::Hostname,
+                    };
+                }
+            }
+            "backspace" => {
+                if let Some(dialog) = self.add_dialog.as_mut() {
+                    dialog.value_mut().pop();
+                }
+            }
+            key if key.len() == 1
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform =>
+            {
+                if let Some(dialog) = self.add_dialog.as_mut() {
+                    dialog.value_mut().push_str(key);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
     fn add_discovered(&mut self, ip: std::net::IpAddr, port: u16) {
-        self.pending_add = Some((ip, port));
+        self.pending_add = Some(PendingAdd::Discovered { ip, port });
         self.send(FrontendRequest::Create);
     }
 
@@ -934,6 +1072,161 @@ impl Dashboard {
             .on_click(cx.listener(handler))
     }
 
+    fn render_add_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let Some(dialog) = self.add_dialog.clone() else {
+            return div().into_any_element();
+        };
+        let focus = self.add_focus.clone();
+        let host_focus = focus.clone();
+        let host_active = dialog.field == AddField::Hostname;
+        let port_active = dialog.field == AddField::Port;
+        let fp_active = dialog.field == AddField::Fingerprint;
+        div()
+            .id("add-device-dialog")
+            .track_focus(&focus)
+            .on_key_down(cx.listener(Self::on_add_key))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(0x121826))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("Add device"),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "Type a hostname or IPv4 address. Tab switches fields, Enter adds, Esc cancels.",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.action_button(
+                        "add-field-host",
+                        "Host",
+                        0x1d2430,
+                        if host_active { ACCENT } else { TEXT },
+                        cx,
+                        move |this, _, window, _| {
+                            if let Some(dialog) = this.add_dialog.as_mut() {
+                                dialog.field = AddField::Hostname;
+                            }
+                            window.focus(&host_focus);
+                        },
+                    ))
+                    .child(self.action_button(
+                        "add-field-port",
+                        "Port",
+                        0x1d2430,
+                        if port_active { ACCENT } else { TEXT },
+                        cx,
+                        |this, _, window, _| {
+                            if let Some(dialog) = this.add_dialog.as_mut() {
+                                dialog.field = AddField::Port;
+                            }
+                            window.focus(&this.add_focus);
+                        },
+                    ))
+                    .child(self.action_button(
+                        "add-field-fingerprint",
+                        "Fingerprint",
+                        0x1d2430,
+                        if fp_active { ACCENT } else { TEXT },
+                        cx,
+                        |this, _, window, _| {
+                            if let Some(dialog) = this.add_dialog.as_mut() {
+                                dialog.field = AddField::Fingerprint;
+                            }
+                            window.focus(&this.add_focus);
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if host_active { ACCENT } else { MUTED }))
+                            .child("hostname / IP"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(format!("{}▌", dialog.hostname)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if port_active { ACCENT } else { MUTED }))
+                            .child("port"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(format!("{}▌", dialog.port)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if fp_active { ACCENT } else { MUTED }))
+                            .child("fingerprint (optional, advanced)"),
+                    )
+                    .child(div().text_sm().text_color(rgb(TEXT)).child(
+                        if dialog.fingerprint.is_empty() {
+                            "—".to_string()
+                        } else {
+                            format!("{}▌", dialog.fingerprint)
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(self.action_button(
+                        "add-dialog-submit",
+                        "Add device",
+                        ACCENT,
+                        0x081018,
+                        cx,
+                        |this, _, _, _| this.submit_add_dialog(),
+                    ))
+                    .child(self.action_button(
+                        "add-dialog-cancel",
+                        "Cancel",
+                        0x1d222a,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| this.close_add_dialog(),
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn render_identity_card(&self) -> impl IntoElement + use<> {
         let ips = if self.local_ips.is_empty() {
             "no IPv4 address".to_string()
@@ -1091,6 +1384,9 @@ impl Dashboard {
                     }
                 )),
             ))
+            .when(self.add_dialog.is_some(), |this| {
+                this.child(self.render_add_dialog(cx))
+            })
             .child(self.render_identity_card())
             .when(has_pending, |this| this.child(self.render_pending(cx)))
             .children(cards)
