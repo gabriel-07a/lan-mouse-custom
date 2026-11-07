@@ -643,3 +643,12 @@ fn reset_config_refuses_while_the_service_is_running() {
         assert_eq!(backups_of(&dir).len(), 1, "one backup after the reset");
     }
 }
+
+#[test]
+fn default_frontend_is_gpui() {
+    let cargo = read("Cargo.toml");
+    assert!(
+        cargo.contains("default = [\n    \"gpui\",\n    \"layer_shell_capture\","),
+        "the default frontend must be GPUI, not GTK"
+    );
+}
