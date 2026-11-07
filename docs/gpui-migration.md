@@ -50,7 +50,7 @@ keeps the tray working and isolates UI crashes from the input service.
 | GPUI frontend unit tests | `cargo test` in `lan-mouse-gpui` |
 | Windows MSVC frontend compile | verified in the earlier GPUI spike workflow |
 | Windows GNU main cross-build | verified locally with `cargo zigbuild --target x86_64-pc-windows-gnu` |
-| Windows frontend cross-build | not fully verifiable on Linux: GPUI's build script compiles HLSL with `fxc.exe` from the Windows SDK; the Windows CI job is required |
+| Windows frontend debug cross-build | verified locally with `cargo zigbuild` (release needs Windows SDK `fxc.exe` for HLSL, so the Windows CI job is still required) |
 | Windows release main + frontend package | workflow prepared; needs a manual CI run |
 | Nix package | updated; needs a Nix evaluation/build |
 | Performance | GPUI release frontend ~142 MB RSS in a debug-ish isolated run; release profile now uses LTO/strip |
