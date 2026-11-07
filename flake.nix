@@ -60,7 +60,12 @@
             cargo = rustToolchainForBuild;
             rustc = rustToolchainForBuild;
           };
-          lan-mouse = pkgs.callPackage ./nix { rustPlatform = customRustPlatform; };
+          main = pkgs.callPackage ./nix { rustPlatform = customRustPlatform; };
+          gpui = pkgs.callPackage ./nix/gpui.nix { rustPlatform = customRustPlatform; };
+          lan-mouse = pkgs.symlinkJoin {
+            name = "lan-mouse";
+            paths = [ main gpui ];
+          };
         in
         {
           default = lan-mouse;
@@ -76,9 +81,14 @@
               [
                 rustToolchain
                 pkg-config
-                gtk4
-                libadwaita
-                librsvg
+                libxkbcommon
+                libxcb
+                wayland
+                fontconfig
+                freetype
+                dbus
+                libGL
+                vulkan-loader
               ]
               ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 libX11

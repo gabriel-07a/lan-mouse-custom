@@ -4,11 +4,7 @@
   lib,
   pkg-config,
   libX11,
-  gtk4,
-  libadwaita,
   libXtst,
-  wrapGAppsHook4,
-  librsvg,
   git,
 }:
 let
@@ -22,16 +18,10 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     pkg-config
-    wrapGAppsHook4
     git
   ];
 
-  buildInputs = [
-    gtk4
-    libadwaita
-    librsvg
-  ]
-  ++ lib.optionals stdenv.hostPlatform.isLinux [
+  buildInputs = lib.optionals stdenv.hostPlatform.isLinux [
     libX11
     libXtst
   ];
