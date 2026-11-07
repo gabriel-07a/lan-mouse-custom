@@ -45,6 +45,7 @@
 !define APPID "de.feschber.LanMouse.Custom"
 !define PUBLISHER "Gabriel Arcanjo"
 !define EXENAME "lan-mouse.exe"
+!define FRONTENDEXENAME "lan-mouse-gpui.exe"
 
 ; The only directories this installer/uninstaller may touch.
 !define LOCAL_USERDATA "$LOCALAPPDATA\lan-mouse"
@@ -85,6 +86,7 @@ Var /GLOBAL BackupStamp     ; yyyyMMdd-HHmmss suffix for the backup directory
 ; so taskkill by image name stops both; /T also terminates child processes.
 !macro StopLanMouse
   nsExec::ExecToLog 'taskkill /F /T /IM "${EXENAME}"'
+  nsExec::ExecToLog 'taskkill /F /T /IM "${FRONTENDEXENAME}"'
   Sleep 500
 !macroend
 

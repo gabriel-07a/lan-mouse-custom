@@ -10,10 +10,15 @@ set -euo pipefail
 version="${1:?usage: package-deb.sh <version> [target-dir]}"
 target="${2:-target}"
 binary="$target/release/lan-mouse"
+frontend="$target/release/lan-mouse-gpui"
 out="lan-mouse-custom_${version}_amd64.deb"
 
 [ -x "$binary" ] || {
     echo "missing $binary: run 'cargo build --release' first" >&2
+    exit 1
+}
+[ -x "$frontend" ] || {
+    echo "missing $frontend: build lan-mouse-gpui in release mode first" >&2
     exit 1
 }
 
@@ -21,6 +26,7 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
 install -Dm755 "$binary" "$stage/usr/bin/lan-mouse"
+install -Dm755 "$frontend" "$stage/usr/bin/lan-mouse-gpui"
 install -Dm644 de.feschber.LanMouse.desktop "$stage/usr/share/applications/de.feschber.LanMouse.desktop"
 install -Dm644 lan-mouse-gtk/resources/de.feschber.LanMouse.svg \
     "$stage/usr/share/icons/hicolor/scalable/apps/de.feschber.LanMouse.svg"
@@ -39,7 +45,7 @@ Version: $version
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libgtk-4-1, libadwaita-1-0
+Depends: libgtk-4-1, libadwaita-1-0, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcb1, libfontconfig1, libfreetype6
 Recommends: gnome-shell-extension-appindicator
 Installed-Size: $installed_size
 Maintainer: Gabriel Arcanjo <gabrielarcanjo1907@gmail.com>

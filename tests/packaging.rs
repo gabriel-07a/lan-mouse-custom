@@ -199,6 +199,10 @@ fn deb_package_ships_icons_and_a_trusted_desktop_shortcut() {
         "icons are not installed into hicolor"
     );
 
+    assert!(
+        script.contains("usr/bin/lan-mouse-gpui"),
+        "the deb must install the GPUI frontend binary"
+    );
     assert!(script.contains("DEBIAN/postinst"), "postinst");
     assert!(script.contains("DEBIAN/prerm"), "prerm");
     assert!(
@@ -262,6 +266,8 @@ fn release_workflow_builds_both_platforms() {
     // MSYS2 ships prebuilt GTK; gvsbuild needs a specific Visual Studio.
     assert!(workflow.contains("msys2/setup-msys2"));
     assert!(workflow.contains("msystem: UCRT64"));
+    assert!(workflow.contains("windows-gpui-frontend"));
+    assert!(workflow.contains("lan-mouse-gpui.exe"));
     assert!(workflow.contains("doctor"));
     assert!(workflow.contains("--probe"));
     assert!(workflow.contains("--json"));
