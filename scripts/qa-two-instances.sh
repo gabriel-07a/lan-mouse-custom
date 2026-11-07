@@ -230,7 +230,7 @@ proc_cpu_ticks() {
 
 # Non-spin regression for the emulation event loop (P0 found by security-auditor):
 # a closed `edge_return_rx` used to make the select arm fire forever (100% of a
-# core on Linux/macOS/Dummy). A live daemon whose peer never connects must stay
+# core on Linux/Dummy). A live daemon whose peer never connects must stay
 # essentially idle; a busy loop is trivially visible in the CPU time delta.
 scenario_no_spin() {
     say ""
