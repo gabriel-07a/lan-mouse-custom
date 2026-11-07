@@ -44,7 +44,7 @@ enum LanMouseError {
     #[cfg(feature = "gtk")]
     #[error(transparent)]
     Gtk(#[from] GtkError),
-    #[cfg(all(feature = "gpui", not(feature = "gtk")))]
+    #[cfg(any(feature = "gtk", feature = "gpui"))]
     #[error("GPUI frontend failed: {0}")]
     GpuiFrontend(String),
     #[error(transparent)]
@@ -128,7 +128,14 @@ fn run() -> Result<(), LanMouseError> {
                 } else {
                     Some(start_service()?)
                 };
-                let res = lan_mouse_gtk::run(config::local_commit());
+                let use_gpui =
+                    std::env::var_os("LAN_MOUSE_FRONTEND").is_some_and(|value| value == "gpui");
+                let res = if use_gpui {
+                    log::info!("LAN_MOUSE_FRONTEND=gpui selected");
+                    run_gpui_frontend()
+                } else {
+                    lan_mouse_gtk::run(config::local_commit()).map_err(LanMouseError::from)
+                };
                 if let Some(ref mut service) = service {
                     #[cfg(unix)]
                     {
@@ -159,7 +166,7 @@ fn run() -> Result<(), LanMouseError> {
     Ok(())
 }
 
-#[cfg(all(feature = "gpui", not(feature = "gtk")))]
+#[cfg(any(feature = "gtk", feature = "gpui"))]
 fn run_gpui_frontend() -> Result<(), LanMouseError> {
     let frontend = gpui_frontend_path()?;
     log::info!("launching GPUI frontend: {frontend:?}");
@@ -173,7 +180,7 @@ fn run_gpui_frontend() -> Result<(), LanMouseError> {
     }
 }
 
-#[cfg(all(feature = "gpui", not(feature = "gtk")))]
+#[cfg(any(feature = "gtk", feature = "gpui"))]
 fn gpui_frontend_path() -> Result<std::path::PathBuf, std::io::Error> {
     if let Some(path) = std::env::var_os("LAN_MOUSE_GPUI") {
         let path = std::path::PathBuf::from(path);
