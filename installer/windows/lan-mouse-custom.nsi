@@ -82,8 +82,8 @@ Var /GLOBAL BackupStamp     ; yyyyMMdd-HHmmss suffix for the backup directory
 !insertmacro MUI_LANGUAGE "English"
 !insertmacro MUI_LANGUAGE "PortugueseBR"
 
-; Stop the GUI and the daemon it spawned. Both use the same executable name,
-; so taskkill by image name stops both; /T also terminates child processes.
+; Stop the GUI (lan-mouse-gpui.exe) and the service/daemon it spawned
+; (lan-mouse.exe); /T also terminates child processes.
 !macro StopLanMouse
   nsExec::ExecToLog 'taskkill /F /T /IM "${EXENAME}"'
   nsExec::ExecToLog 'taskkill /F /T /IM "${FRONTENDEXENAME}"'
