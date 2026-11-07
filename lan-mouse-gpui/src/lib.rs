@@ -459,6 +459,7 @@ struct Dashboard {
     clipboard_status: ClipboardStatus,
     pairing_active: bool,
     pairing_review: Vec<DeviceView>,
+    local_commit: [u8; 8],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -469,7 +470,7 @@ enum Page {
 }
 
 impl Dashboard {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(cx: &mut Context<Self>, local_commit: [u8; 8]) -> Self {
         let (tx, rx) = async_channel::unbounded();
 
         std::thread::spawn(move || {
@@ -533,6 +534,7 @@ impl Dashboard {
             clipboard_status: ClipboardStatus::default(),
             pairing_active: false,
             pairing_review: Vec::new(),
+            local_commit,
         }
     }
 
@@ -985,6 +987,9 @@ impl Dashboard {
     ) -> impl IntoElement + use<> {
         let mut row = ClientRow::from_state(config, state);
         row.handle = handle;
+        let version_mismatch = state
+            .peer_commit
+            .is_some_and(|peer| peer != self.local_commit);
         let position = config.pos;
         let sensitivity = config.sensitivity;
         let (state_color, state_bg) = if row.healthy {
@@ -1065,7 +1070,15 @@ impl Dashboard {
                         } else {
                             "offline"
                         }
-                    ))),
+                    )))
+                    .when(version_mismatch, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(AMBER))
+                                .child("build mismatch with this peer; update both machines"),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -2543,9 +2556,9 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
         String::from_utf8_lossy(&local_commit)
     );
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(980.0), px(720.0)), cx);
-        let dashboard: Entity<Dashboard> = cx.new(Dashboard::new);
+        let dashboard: Entity<Dashboard> = cx.new(|cx| Dashboard::new(cx, local_commit));
         let window_handle = cx
             .open_window(
                 WindowOptions {
