@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent, Render,
-    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
+    size,
 };
 use lan_mouse_ipc::{
     AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
@@ -2563,6 +2564,12 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Lan Mouse".into()),
+                        appears_transparent: false,
+                        traffic_light_position: None,
+                    }),
+                    app_id: Some("de.feschber.LanMouse".into()),
                     ..Default::default()
                 },
                 |_, _| dashboard,
