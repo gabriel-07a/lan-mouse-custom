@@ -49,6 +49,7 @@ keeps the tray working and isolates UI crashes from the input service.
 | Linux `.deb` contains both binaries | verified locally |
 | GPUI frontend unit tests | `cargo test` in `lan-mouse-gpui` |
 | Windows MSVC frontend compile | verified in the earlier GPUI spike workflow |
+| Windows GNU cross-build (main + frontend) | verified locally with `cargo zigbuild --target x86_64-pc-windows-gnu` |
 | Windows release main + frontend package | workflow prepared; needs a manual CI run |
 | Nix package | updated; needs a Nix evaluation/build |
 | Performance | GPUI release frontend ~142 MB RSS in a debug-ish isolated run; release profile now uses LTO/strip |
