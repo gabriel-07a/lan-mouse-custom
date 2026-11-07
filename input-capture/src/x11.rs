@@ -13,7 +13,7 @@ impl X11InputCapture {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Capture for X11InputCapture {
     async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
         Ok(())

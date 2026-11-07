@@ -15,8 +15,7 @@ use lan_mouse::{
     service::{Service, ServiceError},
 };
 use lan_mouse_cli::CliError;
-#[cfg(all(feature = "gpui", not(feature = "gtk")))]
-use lan_mouse_gpui::GpuiError;
+
 #[cfg(feature = "gtk")]
 use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
@@ -46,8 +45,8 @@ enum LanMouseError {
     #[error(transparent)]
     Gtk(#[from] GtkError),
     #[cfg(all(feature = "gpui", not(feature = "gtk")))]
-    #[error(transparent)]
-    Gpui(#[from] GpuiError),
+    #[error("GPUI frontend failed: {0}")]
+    GpuiFrontend(String),
     #[error(transparent)]
     Cli(#[from] CliError),
     #[error(transparent)]
@@ -106,7 +105,7 @@ fn run() -> Result<(), LanMouseError> {
                 } else {
                     Some(start_service()?)
                 };
-                let res = lan_mouse_gpui::run(config::local_commit());
+                let res = run_gpui_frontend();
                 if let Some(ref mut service) = service {
                     #[cfg(unix)]
                     {
@@ -158,6 +157,47 @@ fn run() -> Result<(), LanMouseError> {
     }
 
     Ok(())
+}
+
+#[cfg(all(feature = "gpui", not(feature = "gtk")))]
+fn run_gpui_frontend() -> Result<(), LanMouseError> {
+    let frontend = gpui_frontend_path()?;
+    log::info!("launching GPUI frontend: {frontend:?}");
+    let status = std::process::Command::new(&frontend).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(LanMouseError::GpuiFrontend(format!(
+            "{frontend:?} exited with {status}"
+        )))
+    }
+}
+
+#[cfg(all(feature = "gpui", not(feature = "gtk")))]
+fn gpui_frontend_path() -> Result<std::path::PathBuf, std::io::Error> {
+    if let Some(path) = std::env::var_os("LAN_MOUSE_GPUI") {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    let current = std::env::current_exe()?;
+    let name = if cfg!(windows) {
+        "lan-mouse-gpui.exe"
+    } else {
+        "lan-mouse-gpui"
+    };
+    let path = current.with_file_name(name);
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "GPUI frontend binary not found at {path:?}; build lan-mouse-gpui or set LAN_MOUSE_GPUI"
+            ),
+        ))
+    }
 }
 
 fn run_async<F, E>(f: F) -> Result<(), LanMouseError>

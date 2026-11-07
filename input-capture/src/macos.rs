@@ -763,7 +763,7 @@ impl Drop for MacOSInputCapture {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Capture for MacOSInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();

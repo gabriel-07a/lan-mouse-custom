@@ -21,7 +21,7 @@ const GREEN: u32 = 0x4ade80;
 const AMBER: u32 = 0xfbbf24;
 const RED: u32 = 0xf87171;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "tray", target_os = "linux"))]
 mod tray {
     use async_channel::Sender;
 
@@ -83,21 +83,31 @@ mod tray {
         std::thread::Builder::new()
             .name("lan-mouse-tray".into())
             .spawn(move || {
-                use ksni::blocking::TrayMethods;
-                let tray = LanMouseTray { tx };
-                match tray.spawn() {
-                    Ok(_handle) => loop {
-                        std::thread::park();
-                    },
-                    Err(error) => log::warn!("system tray unavailable: {error}"),
-                }
+                use ksni::TrayMethods;
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        log::warn!("could not create tray runtime: {error}");
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let tray = LanMouseTray { tx };
+                    match tray.spawn().await {
+                        Ok(_handle) => std::future::pending::<()>().await,
+                        Err(error) => log::warn!("system tray unavailable: {error}"),
+                    }
+                });
             })
             .expect("spawn tray thread");
         rx
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "tray", windows))]
 mod tray {
     use async_channel::Sender;
     use tray_icon::{
@@ -168,6 +178,20 @@ mod tray {
                 let _ = tx.send_blocking(Command::Open);
             }));
         }
+    }
+}
+
+#[cfg(not(feature = "tray"))]
+mod tray {
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Command {
+        Open,
+        Quit,
+    }
+
+    pub(crate) fn spawn() -> async_channel::Receiver<Command> {
+        let (_tx, rx) = async_channel::unbounded();
+        rx
     }
 }
 

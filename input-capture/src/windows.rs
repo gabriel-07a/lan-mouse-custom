@@ -17,7 +17,7 @@ pub struct WindowsInputCapture {
     event_thread: EventThread,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Capture for WindowsInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.event_thread.create(pos);

@@ -771,7 +771,7 @@ async fn handle_ei_event(
     Ok(())
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LanMouseInputCapture for LibeiInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let _ = self

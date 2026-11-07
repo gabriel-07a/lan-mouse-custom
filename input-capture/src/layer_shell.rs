@@ -615,7 +615,7 @@ impl Inner {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Capture for LayerShellInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.add_client(pos);

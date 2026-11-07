@@ -6,6 +6,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = ["tray"]
+tray = ["dep:ksni", "dep:tray-icon"]
+
 [lib]
 name = "lan_mouse_gpui"
 path = "src/lib.rs"
@@ -25,7 +29,8 @@ log = "0.4"
 thiserror = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ksni = { version = "0.3", features = ["blocking"] }
+ksni = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt", "time"] }
 
 [target.'cfg(windows)'.dependencies]
-tray-icon = { version = "0.26", default-features = false }
+tray-icon = { version = "0.26", default-features = false, optional = true }

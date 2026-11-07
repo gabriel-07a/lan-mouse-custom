@@ -34,7 +34,7 @@ impl Default for DummyInputCapture {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Capture for DummyInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         if pos == Position::Left {

@@ -309,7 +309,7 @@ impl Stream for InputCapture {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
     /// create a new client with the given id
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
