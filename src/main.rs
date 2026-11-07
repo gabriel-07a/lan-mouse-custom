@@ -170,7 +170,12 @@ fn run() -> Result<(), LanMouseError> {
 fn run_gpui_frontend() -> Result<(), LanMouseError> {
     let frontend = gpui_frontend_path()?;
     log::info!("launching GPUI frontend: {frontend:?}");
-    let status = std::process::Command::new(&frontend).status()?;
+    let status = std::process::Command::new(&frontend)
+        .env(
+            "LAN_MOUSE_LOCAL_COMMIT",
+            String::from_utf8_lossy(&config::local_commit()).to_string(),
+        )
+        .status()?;
     if status.success() {
         Ok(())
     } else {
