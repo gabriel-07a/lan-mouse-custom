@@ -156,6 +156,11 @@ jobs:
             echo "::error::installed binary missing at $exe"
             throw "Installed binary missing at $exe"
           }
+          $frontend = "C:\Program Files\Lan Mouse\lan-mouse-gpui.exe"
+          if (-not (Test-Path $frontend)) {
+            echo "::error::installed GPUI frontend missing at $frontend"
+            throw "Installed GPUI frontend missing at $frontend"
+          }
           # The release binary is a GUI-subsystem executable. PowerShell's `&`
           # piping can miss its stdout; redirect through files instead so the
           # doctor JSON is reliably captured and failures are diagnosable.
