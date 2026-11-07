@@ -45,7 +45,7 @@ Version: $version
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libgtk-4-1, libadwaita-1-0, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcb1, libfontconfig1, libfreetype6
+Depends: libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcb1, libfontconfig1, libfreetype6
 Recommends: gnome-shell-extension-appindicator
 Installed-Size: $installed_size
 Maintainer: Gabriel Arcanjo <gabrielarcanjo1907@gmail.com>

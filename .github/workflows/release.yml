@@ -25,7 +25,7 @@ jobs:
       - name: install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev \
+          sudo apt-get install -y libx11-dev libxtst-dev \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
             libfontconfig1-dev libfreetype-dev librsvg2-bin imagemagick
       - name: Release build
@@ -58,8 +58,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build GPUI frontend (MSVC)
+      - name: Build GPUI frontend (MSVC, static CRT)
         working-directory: lan-mouse-gpui
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release
       - name: Upload GPUI frontend
         uses: actions/upload-artifact@v4
@@ -87,9 +89,6 @@ jobs:
             mingw-w64-ucrt-x86_64-rust
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-gtk4
-            mingw-w64-ucrt-x86_64-libadwaita
-            mingw-w64-ucrt-x86_64-librsvg
       - name: Release build
         shell: msys2 {0}
         run: cargo build --release
@@ -102,10 +101,6 @@ jobs:
             | awk '/\/ucrt64\/bin\// {print $3}' \
             | sort -u \
             | xargs -r cp -t lan-mouse-windows
-          # GTK looks up its settings schemas next to the executable.
-          mkdir -p lan-mouse-windows/share/glib-2.0
-          cp -r /ucrt64/share/glib-2.0/schemas lan-mouse-windows/share/glib-2.0/
-          glib-compile-schemas lan-mouse-windows/share/glib-2.0/schemas
       - name: Create zip
         shell: pwsh
         run: Compress-Archive -Path "lan-mouse-windows\*" -DestinationPath lan-mouse-windows-x86_64.zip
