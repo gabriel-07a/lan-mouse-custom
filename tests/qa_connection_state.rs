@@ -23,6 +23,8 @@ fn state() -> ClientState {
         active_addr: Some("192.0.2.10:4242".parse::<SocketAddr>().expect("addr")),
         alive: true,
         rtt_ms: Some(7),
+        jitter_ms: Some(1),
+        loss_percent: Some(0),
         last_pong_at: Some(1_760_000_000_123),
         dns_ips: vec![
             "192.0.2.10".parse::<IpAddr>().expect("v4"),

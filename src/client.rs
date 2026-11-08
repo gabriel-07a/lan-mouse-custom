@@ -97,6 +97,8 @@ impl ClientManager {
                 s.active_addr = None;
                 s.alive = false;
                 s.rtt_ms = None;
+                s.jitter_ms = None;
+                s.loss_percent = None;
                 // No live link, therefore no round-trip proof either.
                 s.last_pong_at = None;
                 true
@@ -453,6 +455,7 @@ impl ClientManager {
         let Some((_, state)) = clients.get_mut(handle as usize) else {
             return;
         };
+        let previous = state.rtt_ms;
         let smoothed = match (state.rtt_ms, rtt_ms) {
             // Exponential moving average: 3/4 old, 1/4 new. Keeps the UI
             // from flickering on a single outlier while still tracking
@@ -462,6 +465,19 @@ impl ClientManager {
             (old, None) => old,
         };
         state.rtt_ms = smoothed;
+        if let (Some(old), Some(new)) = (previous, smoothed) {
+            let sample = old.abs_diff(new);
+            state.jitter_ms = Some(match state.jitter_ms {
+                Some(previous) => ((u64::from(previous) * 3 + u64::from(sample)) / 4) as u32,
+                None => sample,
+            });
+        }
+    }
+
+    pub(crate) fn set_loss_percent(&self, handle: ClientHandle, loss_percent: Option<u8>) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.loss_percent = loss_percent;
+        }
     }
 
     /// Timestamp (Unix ms) of the last `Pong` received on the outgoing link.

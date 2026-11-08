@@ -201,6 +201,12 @@ pub struct ClientState {
     /// smoothed round-trip time to the peer in milliseconds, if known
     #[serde(default)]
     pub rtt_ms: Option<u32>,
+    /// smoothed absolute RTT variation (jitter) in milliseconds
+    #[serde(default)]
+    pub jitter_ms: Option<u32>,
+    /// percentage of ping rounds without a reply since the link was established
+    #[serde(default)]
+    pub loss_percent: Option<u8>,
     /// Unix timestamp in milliseconds of the **last `Pong` received on the
     /// current outgoing link**, or `None` while no round-trip has been proven
     /// yet (fresh handshake, peer that never answers, or a service build that
@@ -949,6 +955,8 @@ mod tests {
             )),
             alive: true,
             rtt_ms: Some(12),
+            jitter_ms: Some(2),
+            loss_percent: Some(0),
             last_pong_at: Some(1_700_000_000_123),
             dns_ips: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3))],
             ips: HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]),
@@ -967,6 +975,8 @@ mod tests {
         };
         let decoded = json_roundtrip(state);
         assert_eq!(decoded.rtt_ms, Some(12));
+        assert_eq!(decoded.jitter_ms, Some(2));
+        assert_eq!(decoded.loss_percent, Some(0));
         assert_eq!(decoded.last_pong_at, Some(1_700_000_000_123));
         assert_eq!(decoded.peer_proto_version, 1);
         assert_eq!(decoded.peer_capabilities, 0b101);

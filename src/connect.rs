@@ -793,6 +793,10 @@ const MAX_SILENT_ROUNDS: u32 = 30;
 struct PingWatchdog {
     send_failures: u32,
     missed_rounds: u32,
+    /// Total rounds since this transport was established.
+    rounds: u32,
+    /// Rounds without a reply since this transport was established.
+    lost_rounds: u32,
     /// The peer answered at least one ping on this connection.
     ever_answered: bool,
 }
@@ -819,11 +823,13 @@ impl PingWatchdog {
 
     /// Record the outcome of one ping round.
     fn on_round(&mut self, answered: bool) -> PingVerdict {
+        self.rounds = self.rounds.saturating_add(1);
         if answered {
             self.ever_answered = true;
             self.missed_rounds = 0;
             return PingVerdict::Keep;
         }
+        self.lost_rounds = self.lost_rounds.saturating_add(1);
         self.missed_rounds += 1;
         let limit = if self.ever_answered {
             MAX_MISSED_ROUNDS
@@ -835,6 +841,11 @@ impl PingWatchdog {
         } else {
             PingVerdict::Keep
         }
+    }
+
+    fn loss_percent(&self) -> Option<u8> {
+        (self.rounds > 0)
+            .then(|| ((u64::from(self.lost_rounds) * 100) / u64::from(self.rounds)) as u8)
     }
 }
 
@@ -886,7 +897,11 @@ async fn ping_pong(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnection)
             return;
         }
         let answered = ctx.ping_response.borrow_mut().remove(&addr);
-        if watchdog.on_round(answered) == PingVerdict::Close {
+        let verdict = watchdog.on_round(answered);
+        ctx.client_manager
+            .set_loss_percent(handle, watchdog.loss_percent());
+        ctx.notify_state_changed(handle);
+        if verdict == PingVerdict::Close {
             if watchdog.ever_answered {
                 log::warn!("{addr} stopped answering pings, closing connection");
             } else {

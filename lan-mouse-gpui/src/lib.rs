@@ -956,12 +956,7 @@ impl Dashboard {
         cx.notify();
     }
 
-    fn add_discovered(
-        &mut self,
-        ip: std::net::IpAddr,
-        port: u16,
-        fingerprint: Option<String>,
-    ) {
+    fn add_discovered(&mut self, ip: std::net::IpAddr, port: u16, fingerprint: Option<String>) {
         self.pending_add = Some(PendingAdd::Discovered {
             ip,
             port,
@@ -1118,10 +1113,16 @@ impl Dashboard {
         let version_mismatch = state
             .peer_commit
             .is_some_and(|peer| peer != self.local_commit);
-        let link_metrics = state
+        let mut link_metrics = state
             .rtt_ms
             .map(|rtt| format!(" · RTT {rtt} ms"))
             .unwrap_or_default();
+        if let Some(jitter) = state.jitter_ms {
+            link_metrics.push_str(&format!(" · jitter {jitter} ms"));
+        }
+        if let Some(loss) = state.loss_percent {
+            link_metrics.push_str(&format!(" · loss {loss}%"));
+        }
         let last_pong = state
             .last_pong_at
             .map(|seen| {
@@ -1315,7 +1316,11 @@ impl Dashboard {
             Some(_) => "fingerprint not verified",
             None => "fingerprint unavailable",
         };
-        let verification_color = if device.fingerprint_verified { GREEN } else { AMBER };
+        let verification_color = if device.fingerprint_verified {
+            GREEN
+        } else {
+            AMBER
+        };
         let last_seen = device
             .last_seen
             .map(|seen| {
@@ -1348,12 +1353,10 @@ impl Dashboard {
                             .text_color(rgb(TEXT))
                             .child(name),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(format!("{}:{} · {status}{version}{last_seen}", device.ip, port)),
-                    )
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                        "{}:{} · {status}{version}{last_seen}",
+                        device.ip, port
+                    )))
                     .child(
                         div()
                             .text_xs()
