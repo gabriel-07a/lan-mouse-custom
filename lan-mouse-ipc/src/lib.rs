@@ -528,6 +528,15 @@ pub struct DiscoveredDevice {
     /// device can be authorized before it ever connects.
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// Whether that fingerprint is already known/authorized locally. Discovery
+    /// beacons are unauthenticated, so the UI must not present an unknown
+    /// fingerprint as verified.
+    #[serde(default)]
+    pub fingerprint_verified: bool,
+    /// Unix timestamp in milliseconds when this device was last seen by a
+    /// scan or announcement.
+    #[serde(default)]
+    pub last_seen: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -300,9 +300,9 @@ impl Service {
             self.activate_client(handle);
         }
 
-        // Answer discovery beacons for the whole session and list what is
-        // currently reachable, so the device table is populated when the
-        // window opens.
+        // Answer discovery beacons for the whole session. Active subnet
+        // scanning is user-triggered (`ScanNetwork`) so a large/VPN-heavy
+        // network does not get probed every time the service starts.
         let discovery_port = discovery::DEFAULT_DISCOVERY_PORT;
         spawn_local(discovery::beacon_task(
             self.port,
@@ -311,7 +311,6 @@ impl Service {
             self.public_key_fingerprint.clone(),
             self.announced_tx.clone(),
         ));
-        self.start_scan();
 
         loop {
             tokio::select! {
@@ -322,8 +321,9 @@ impl Service {
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.discovery_rx.recv() => self.handle_discovery_event(event),
                 event = self.announced_rx.recv() => {
-                    if let Some(announced) = event {
+                    if let Some(mut announced) = event {
                         self.apply_discovered_hostname(&announced.device);
+                        self.annotate_discovered(&mut announced.device);
                         self.discovered.insert(announced.ip, announced.device);
                         self.broadcast_network();
                     }
@@ -1717,6 +1717,9 @@ impl Service {
             .write()
             .expect("lock")
             .pending_remove(&fingerprint);
+        let previous_fingerprint = pending
+            .as_ref()
+            .and_then(|pending| pending.previous_fingerprint.clone());
         if !accept {
             self.devices
                 .write()
@@ -1778,6 +1781,43 @@ impl Service {
                 outgoing,
                 source: DeviceSource::Manual,
             });
+        }
+        // Certificate rotation: accepting the new identity must not leave the
+        // old one trusted/configured. Re-pin matching clients and revoke the
+        // previous fingerprint so a stale certificate cannot reconnect.
+        if let Some(previous) = previous_fingerprint {
+            if previous == fingerprint {
+                self.refresh_maps();
+                self.save_config();
+                self.broadcast_devices();
+                self.broadcast_pending();
+                return;
+            }
+            self.devices.write().expect("lock").remove(&previous);
+            self.authorized_keys
+                .write()
+                .expect("lock")
+                .remove(&previous);
+            self.disconnect_fingerprint(&previous);
+            for handle in self.client_manager.all_handles_for_fingerprint(&previous) {
+                self.deactivate_client_and_peer(handle);
+                self.client_manager
+                    .set_fingerprint(handle, Some(fingerprint.clone()));
+                self.client_manager.set_hostname(handle, Some(name.clone()));
+                self.activate_client(handle);
+                self.broadcast_client(handle);
+            }
+            self.audit.event(
+                "cert_rotated",
+                Some(&fingerprint),
+                Some(&name),
+                pending
+                    .as_ref()
+                    .map(|pending| pending.addr.to_string())
+                    .as_deref(),
+                Some(&format!("previous={previous} action=revoke_old")),
+            );
+            log::info!("rotated device identity {previous} -> {fingerprint}");
         }
         self.refresh_maps();
         // Only set up the reverse direction when it is actually allowed; the
@@ -2136,7 +2176,7 @@ impl Service {
                     self.apply_discovered_hostname(device);
                 }
                 for device in &mut devices {
-                    device.configured = self.client_with_ip(device.ip).is_some();
+                    self.annotate_discovered(device);
                 }
                 self.discovered.clear();
                 for device in &devices {
@@ -2169,11 +2209,21 @@ impl Service {
         }
     }
 
+    /// Enrich a discovery result with local knowledge the beacon cannot prove.
+    fn annotate_discovered(&self, device: &mut DiscoveredDevice) {
+        device.configured = self.client_with_ip(device.ip).is_some();
+        device.fingerprint_verified = device
+            .fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| self.devices.read().expect("lock").is_known(fingerprint));
+        device.last_seen = Some(now_millis());
+    }
+
     /// Send the current device table to the frontend, useful entries first.
     fn broadcast_network(&mut self) {
         let mut devices: Vec<DiscoveredDevice> = self.discovered.values().cloned().collect();
         for device in &mut devices {
-            device.configured = self.client_with_ip(device.ip).is_some();
+            self.annotate_discovered(device);
         }
         devices.sort_by_key(|device| {
             let ip = match device.ip {
@@ -2649,6 +2699,13 @@ impl std::fmt::Display for HookKind {
 /// fingerprint is only compatible with the same fingerprint; an entry with no
 /// pin (legacy address-only configuration) may adopt the incoming peer, which
 /// is how the first connection pins the client.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn reverse_client_compatible(incoming: Option<&str>, pinned: Option<&str>) -> bool {
     match (incoming, pinned) {
         (_, None) => true,

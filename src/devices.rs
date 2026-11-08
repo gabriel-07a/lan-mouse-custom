@@ -26,6 +26,11 @@ use std::{
 /// (250 ms - 5 s backoff), so a request that is not answered simply expires.
 pub(crate) const PENDING_TTL: Duration = Duration::from_secs(300);
 
+/// Hard cap on simultaneously tracked unauthorized identities. The listener
+/// already rate-limits handshakes per IP, but a spoofed/rotating source must
+/// not be able to grow the pending map without bound.
+pub(crate) const MAX_PENDING_REQUESTS: usize = 64;
+
 /// Where the authorization of a device came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DeviceSource {
@@ -414,6 +419,12 @@ impl DeviceStore {
                 false
             }
             None => {
+                if self.pending.len() >= MAX_PENDING_REQUESTS {
+                    self.prune_pending();
+                    if self.pending.len() >= MAX_PENDING_REQUESTS {
+                        return false;
+                    }
+                }
                 self.pending.insert(
                     fingerprint.to_string(),
                     PendingDevice {

@@ -287,6 +287,8 @@ pub async fn scan(discovery_port: u16) -> Vec<DiscoveredDevice> {
                 lan_mouse: false,
                 configured: false,
                 fingerprint: None,
+                fingerprint_verified: false,
+                last_seen: None,
             });
         }
     }
@@ -310,6 +312,8 @@ fn device_from_probe(ip: Ipv4Addr, outcome: HostProbe) -> DiscoveredDevice {
             lan_mouse: true,
             configured: false,
             fingerprint: reply.fingerprint,
+            fingerprint_verified: false,
+            last_seen: None,
         },
         HostProbe::HostOnly => DiscoveredDevice {
             ip: IpAddr::V4(ip),
@@ -320,6 +324,8 @@ fn device_from_probe(ip: Ipv4Addr, outcome: HostProbe) -> DiscoveredDevice {
             lan_mouse: false,
             configured: false,
             fingerprint: None,
+            fingerprint_verified: false,
+            last_seen: None,
         },
     }
 }

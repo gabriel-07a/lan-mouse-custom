@@ -355,6 +355,7 @@ enum PendingAdd {
         ip: std::net::IpAddr,
         port: u16,
         position: Position,
+        fingerprint: Option<String>,
     },
     Manual {
         hostname: String,
@@ -665,10 +666,21 @@ impl Dashboard {
                 self.clients.insert(handle, (config, state));
                 if let Some(pending) = self.pending_add.take() {
                     match pending {
-                        PendingAdd::Discovered { ip, port, position } => {
+                        PendingAdd::Discovered {
+                            ip,
+                            port,
+                            position,
+                            fingerprint,
+                        } => {
                             self.send(FrontendRequest::UpdateFixIps(handle, vec![ip]));
                             self.send(FrontendRequest::UpdatePort(handle, port));
                             self.send(FrontendRequest::UpdatePosition(handle, position));
+                            if let Some(fingerprint) = fingerprint {
+                                self.send(FrontendRequest::UpdateFingerprint(
+                                    handle,
+                                    Some(fingerprint),
+                                ));
+                            }
                         }
                         PendingAdd::Manual {
                             hostname,
@@ -755,9 +767,9 @@ impl Dashboard {
 
     fn switch_page(&mut self, page: Page) {
         self.page = page;
-        if page == Page::Network && self.discovered.is_empty() {
-            self.send(FrontendRequest::ScanNetwork);
-        }
+        // Discovery is only started explicitly from the Network page/header.
+        // Automatically probing every subnet when the tab opens caused
+        // unnecessary traffic (and looked like a frozen UI on large networks).
     }
 
     fn open_address_dialog(&mut self) {
@@ -944,11 +956,17 @@ impl Dashboard {
         cx.notify();
     }
 
-    fn add_discovered(&mut self, ip: std::net::IpAddr, port: u16) {
+    fn add_discovered(
+        &mut self,
+        ip: std::net::IpAddr,
+        port: u16,
+        fingerprint: Option<String>,
+    ) {
         self.pending_add = Some(PendingAdd::Discovered {
             ip,
             port,
             position: Position::Left,
+            fingerprint,
         });
         self.send(FrontendRequest::Create);
     }
@@ -1100,6 +1118,10 @@ impl Dashboard {
         let version_mismatch = state
             .peer_commit
             .is_some_and(|peer| peer != self.local_commit);
+        let link_metrics = state
+            .rtt_ms
+            .map(|rtt| format!(" · RTT {rtt} ms"))
+            .unwrap_or_default();
         let position = config.pos;
         let sensitivity = config.sensitivity;
         let (state_color, state_bg) = if row.healthy {
@@ -1172,7 +1194,7 @@ impl Dashboard {
                             .on_click(cx.listener(move |this, _, _, _| this.toggle_client(handle))),
                     )
                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                        "{}",
+                        "{}{link_metrics}",
                         if row.healthy {
                             "link healthy"
                         } else if row.active {
@@ -1278,6 +1300,22 @@ impl Dashboard {
             .clone()
             .map(|version| format!(" · build {version}"))
             .unwrap_or_default();
+        let verification = match device.fingerprint.as_ref() {
+            Some(_) if device.fingerprint_verified => "fingerprint verified",
+            Some(_) => "fingerprint not verified",
+            None => "fingerprint unavailable",
+        };
+        let verification_color = if device.fingerprint_verified { GREEN } else { AMBER };
+        let last_seen = device
+            .last_seen
+            .map(|seen| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0);
+                format!(" · seen {}s ago", now.saturating_sub(seen) / 1000)
+            })
+            .unwrap_or_default();
         div()
             .flex()
             .items_center()
@@ -1304,7 +1342,13 @@ impl Dashboard {
                         div()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(format!("{}:{} · {status}{version}", device.ip, port)),
+                            .child(format!("{}:{} · {status}{version}{last_seen}", device.ip, port)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(verification_color))
+                            .child(verification),
                     ),
             )
             .when(!device.configured, |this| {
@@ -1314,7 +1358,9 @@ impl Dashboard {
                     ACCENT,
                     0x081018,
                     cx,
-                    move |this, _, _, _| this.add_discovered(device.ip, port),
+                    move |this, _, _, _| {
+                        this.add_discovered(device.ip, port, device.fingerprint.clone())
+                    },
                 ))
             })
     }
@@ -2021,6 +2067,13 @@ impl Dashboard {
             let control_me_fp = request.fingerprint.clone();
             let i_control_fp = request.fingerprint.clone();
             let deny_fp = request.fingerprint.clone();
+            let cert_changed = request.previous_fingerprint.is_some();
+            let cert_warning = request.previous_fingerprint.as_deref().map(|previous| {
+                format!(
+                    "⚠ certificate changed (old: {}…). Only approve if you replaced it; the old identity will be revoked.",
+                    &previous[..previous.len().min(20)]
+                )
+            });
             let name = request
                 .name
                 .clone()
@@ -2064,13 +2117,25 @@ impl Dashboard {
                     "{} · {} attempt(s)",
                     request.addr, request.attempts
                 )))
+                .when(cert_warning.is_some(), move |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(RED))
+                            .child(cert_warning.clone().unwrap_or_default()),
+                    )
+                })
                 .child(
                     div()
                         .flex()
                         .gap_2()
                         .child(self.action_button(
                             "approve-pending",
-                            "Approve both",
+                            if cert_changed {
+                                "Trust new certificate"
+                            } else {
+                                "Approve both"
+                            },
                             GREEN,
                             0x081018,
                             cx,
@@ -3061,6 +3126,7 @@ impl Dashboard {
                     })
                     .children(self.address_rules.clone().into_iter().map(|rule| {
                         let address = rule.address.clone();
+                        let broad = rule.broad;
                         div()
                             .id(SharedString::from(format!("rule-{}", rule.address)))
                             .flex()
@@ -3082,7 +3148,12 @@ impl Dashboard {
                                         "in:{} · out:{}",
                                         rule.incoming.capabilities.summary(),
                                         rule.outgoing.capabilities.summary()
-                                    ))),
+                                    )))
+                                    .when(broad, |this| {
+                                        this.child(div().text_xs().text_color(rgb(AMBER)).child(
+                                            "⚠ broad range: this can auto-authorize devices outside your LAN",
+                                        ))
+                                    }),
                             )
                             .child(
                                 div()
