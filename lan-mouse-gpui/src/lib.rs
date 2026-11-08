@@ -1333,22 +1333,41 @@ impl Render for Dashboard {
                                     Page::Settings => "Settings",
                                 }),
                         )
-                        .child(
-                            div()
-                                .id("add-device")
-                                .px_3()
-                                .py_2()
-                                .rounded_md()
-                                .bg(rgb(ACCENT))
-                                .text_color(rgb(0x081018))
-                                .text_sm()
-                                .cursor_pointer()
-                                .child("+ Add device")
-                                .on_click(cx.listener(|this, _, window, _| {
-                                    this.add_device();
-                                    window.focus(&this.add_focus);
-                                })),
-                        ),
+                        .when(self.page == Page::Devices, |this| {
+                            this.child(
+                                div()
+                                    .id("add-device")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0x081018))
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .child("+ Add device")
+                                    .on_click(cx.listener(|this, _, window, _| {
+                                        this.add_device();
+                                        window.focus(&this.add_focus);
+                                    })),
+                            )
+                        })
+                        .when(self.page == Page::Network, |this| {
+                            this.child(
+                                div()
+                                    .id("scan-network-header")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0x081018))
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .child("Scan network")
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.send(FrontendRequest::ScanNetwork)
+                                    })),
+                            )
+                        }),
                 )
                 .when(self.settings_dialog.is_some(), |this| {
                     this.child(self.render_settings_dialog(cx))
