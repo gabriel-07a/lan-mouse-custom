@@ -130,6 +130,8 @@ pub struct Service {
     conn_state_rx: Receiver<ClientHandle>,
     /// current port
     port: u16,
+    /// UDP discovery/announcement port
+    discovery_port: u16,
     /// the public key fingerprint for (D)TLS
     public_key_fingerprint: String,
     /// notify for pending frontend events
@@ -238,6 +240,7 @@ impl Service {
         let (discovery_tx, discovery_rx) = local_channel::mpsc::channel();
         let (announced_tx, announced_rx) = local_channel::mpsc::channel();
         let port = config.port();
+        let discovery_port = config.discovery_port();
         let service = Self {
             config,
             capture,
@@ -277,6 +280,7 @@ impl Service {
             conn_state_rx,
             frontend_event_pending: Default::default(),
             port,
+            discovery_port,
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
             emulation_status: Default::default(),
@@ -303,7 +307,7 @@ impl Service {
         // Answer discovery beacons for the whole session. Active subnet
         // scanning is user-triggered (`ScanNetwork`) so a large/VPN-heavy
         // network does not get probed every time the service starts.
-        let discovery_port = discovery::DEFAULT_DISCOVERY_PORT;
+        let discovery_port = self.discovery_port;
         spawn_local(discovery::beacon_task(
             self.port,
             discovery_port,
@@ -1787,37 +1791,34 @@ impl Service {
         // previous fingerprint so a stale certificate cannot reconnect.
         if let Some(previous) = previous_fingerprint {
             if previous == fingerprint {
-                self.refresh_maps();
-                self.save_config();
-                self.broadcast_devices();
-                self.broadcast_pending();
-                return;
+                // Nothing to rotate; keep the normal approval path below.
+            } else {
+                self.devices.write().expect("lock").remove(&previous);
+                self.authorized_keys
+                    .write()
+                    .expect("lock")
+                    .remove(&previous);
+                self.disconnect_fingerprint(&previous);
+                for handle in self.client_manager.all_handles_for_fingerprint(&previous) {
+                    self.deactivate_client_and_peer(handle);
+                    self.client_manager
+                        .set_fingerprint(handle, Some(fingerprint.clone()));
+                    self.client_manager.set_hostname(handle, Some(name.clone()));
+                    self.activate_client(handle);
+                    self.broadcast_client(handle);
+                }
+                self.audit.event(
+                    "cert_rotated",
+                    Some(&fingerprint),
+                    Some(&name),
+                    pending
+                        .as_ref()
+                        .map(|pending| pending.addr.to_string())
+                        .as_deref(),
+                    Some(&format!("previous={previous} action=revoke_old")),
+                );
+                log::info!("rotated device identity {previous} -> {fingerprint}");
             }
-            self.devices.write().expect("lock").remove(&previous);
-            self.authorized_keys
-                .write()
-                .expect("lock")
-                .remove(&previous);
-            self.disconnect_fingerprint(&previous);
-            for handle in self.client_manager.all_handles_for_fingerprint(&previous) {
-                self.deactivate_client_and_peer(handle);
-                self.client_manager
-                    .set_fingerprint(handle, Some(fingerprint.clone()));
-                self.client_manager.set_hostname(handle, Some(name.clone()));
-                self.activate_client(handle);
-                self.broadcast_client(handle);
-            }
-            self.audit.event(
-                "cert_rotated",
-                Some(&fingerprint),
-                Some(&name),
-                pending
-                    .as_ref()
-                    .map(|pending| pending.addr.to_string())
-                    .as_deref(),
-                Some(&format!("previous={previous} action=revoke_old")),
-            );
-            log::info!("rotated device identity {previous} -> {fingerprint}");
         }
         self.refresh_maps();
         // Only set up the reverse direction when it is actually allowed; the
@@ -2148,8 +2149,9 @@ impl Service {
     /// Kick off a background scan of the local subnets.
     fn start_scan(&self) {
         let tx = self.discovery_tx.clone();
+        let discovery_port = self.discovery_port;
         spawn_local(async move {
-            let devices = discovery::scan(discovery::DEFAULT_DISCOVERY_PORT).await;
+            let devices = discovery::scan(discovery_port).await;
             let _ = tx.send(DiscoveryEvent::Scan(devices));
         });
     }
@@ -2221,6 +2223,11 @@ impl Service {
 
     /// Send the current device table to the frontend, useful entries first.
     fn broadcast_network(&mut self) {
+        // Discovery results are only a hint; stale entries from a peer that
+        // went away must not stay in the Network tab forever.
+        let cutoff = now_millis().saturating_sub(5 * 60 * 1000);
+        self.discovered
+            .retain(|_, device| device.last_seen.is_none_or(|last_seen| last_seen >= cutoff));
         let mut devices: Vec<DiscoveredDevice> = self.discovered.values().cloned().collect();
         for device in &mut devices {
             self.annotate_discovered(device);

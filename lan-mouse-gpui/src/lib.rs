@@ -1122,6 +1122,16 @@ impl Dashboard {
             .rtt_ms
             .map(|rtt| format!(" · RTT {rtt} ms"))
             .unwrap_or_default();
+        let last_pong = state
+            .last_pong_at
+            .map(|seen| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0);
+                format!(" · last Pong {}s ago", now.saturating_sub(seen) / 1000)
+            })
+            .unwrap_or_default();
         let position = config.pos;
         let sensitivity = config.sensitivity;
         let (state_color, state_bg) = if row.healthy {
@@ -1194,7 +1204,7 @@ impl Dashboard {
                             .on_click(cx.listener(move |this, _, _, _| this.toggle_client(handle))),
                     )
                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                        "{}{link_metrics}",
+                        "{}{link_metrics}{last_pong}",
                         if row.healthy {
                             "link healthy"
                         } else if row.active {

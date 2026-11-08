@@ -775,4 +775,16 @@ mod tests {
             assert_eq!(DeviceSource::parse(source.as_str()), source);
         }
     }
+    #[test]
+    fn pending_requests_are_capped() {
+        let mut store = DeviceStore::default();
+        for n in 0..(MAX_PENDING_REQUESTS + 10) {
+            let fingerprint = format!("{n:064x}");
+            store.pending_upsert(&fingerprint, addr(4000), None, None);
+        }
+        assert!(
+            store.pending_count() <= MAX_PENDING_REQUESTS,
+            "pending map must stay bounded"
+        );
+    }
 }

@@ -38,6 +38,13 @@ struct Probe {
 }
 
 #[derive(Debug, Serialize)]
+struct InterfaceReport {
+    name: String,
+    address: String,
+    prefix: u8,
+}
+
+#[derive(Debug, Serialize)]
 struct ClientReport {
     handle: u64,
     hostname: Option<String>,
@@ -163,6 +170,10 @@ struct Report {
     session_type: Option<String>,
     desktop: Option<String>,
     port: u16,
+    discovery_port: u16,
+    listen_port_available: bool,
+    discovery_port_available: bool,
+    interfaces: Vec<InterfaceReport>,
     capture_backend_requested: Option<String>,
     emulation_backend_requested: Option<String>,
     capture_probe: Option<Probe>,
@@ -342,6 +353,30 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         emulation_probe = Some(probe_emulation(&config).await);
     }
 
+    let port = config.port();
+    let discovery_port = config.discovery_port();
+    let service_running = lan_mouse_ipc::is_service_running();
+    let listen_port_available = udp_port_available(port);
+    let discovery_port_available = udp_port_available(discovery_port);
+    let interfaces = crate::discovery::local_interfaces()
+        .into_iter()
+        .map(|interface| InterfaceReport {
+            name: interface.name,
+            address: interface.addr.to_string(),
+            prefix: interface.prefix,
+        })
+        .collect::<Vec<_>>();
+    if !service_running && !listen_port_available {
+        warnings.push(format!(
+            "UDP port {port} is already in use; the DTLS listener cannot start"
+        ));
+    }
+    if !service_running && !discovery_port_available {
+        warnings.push(format!(
+            "UDP discovery port {discovery_port} is already in use; scan/announcements may be disabled"
+        ));
+    }
+
     let audit = crate::audit::AuditLog::new(crate::audit::AuditLog::default_path());
     let audit_log = audit.path().display().to_string();
     let recent_audit_events = audit.recent(20).len();
@@ -350,10 +385,14 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         commit: String::from_utf8_lossy(&crate::config::local_commit()).to_string(),
         config_path: config.config_path().display().to_string(),
-        service_running: lan_mouse_ipc::is_service_running(),
+        service_running,
         session_type: std::env::var("XDG_SESSION_TYPE").ok(),
         desktop: std::env::var("XDG_CURRENT_DESKTOP").ok(),
-        port: config.port(),
+        port,
+        discovery_port,
+        listen_port_available,
+        discovery_port_available,
+        interfaces,
         capture_backend_requested: config.capture_backend().map(|backend| backend.to_string()),
         emulation_backend_requested: config
             .emulation_backend()
@@ -395,6 +434,32 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         report.desktop.as_deref().unwrap_or("unknown")
     );
     println!("  port:            {}", report.port);
+    println!(
+        "  discovery port:  {} ({})",
+        report.discovery_port,
+        if report.discovery_port_available {
+            "available"
+        } else {
+            "in use"
+        }
+    );
+    println!(
+        "  listen socket:   {}",
+        if report.listen_port_available {
+            "available"
+        } else {
+            "in use"
+        }
+    );
+    if !report.interfaces.is_empty() {
+        println!("  interfaces:");
+        for interface in &report.interfaces {
+            println!(
+                "    {}: {}/{}",
+                interface.name, interface.address, interface.prefix
+            );
+        }
+    }
     println!(
         "  capture backend: {}",
         report
@@ -485,6 +550,10 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
     }
 
     Ok(())
+}
+
+fn udp_port_available(port: u16) -> bool {
+    std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok()
 }
 
 fn format_probe(probe: &Probe) -> String {

@@ -67,6 +67,8 @@ struct ConfigToml {
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
+    /// UDP discovery/broadcast port (defaults to 4245)
+    discovery_port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
     /// batch window for pointer motion events in milliseconds (0 disables)
     motion_batch_ms: Option<u64>,
@@ -937,6 +939,14 @@ impl Config {
             .port
             .or(self.config_toml.as_ref().and_then(|c| c.port))
             .unwrap_or(DEFAULT_PORT)
+    }
+
+    /// UDP port used for discovery announcements/scans.
+    pub fn discovery_port(&self) -> u16 {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.discovery_port)
+            .unwrap_or(crate::discovery::DEFAULT_DISCOVERY_PORT)
     }
 
     /// list of configured clients
