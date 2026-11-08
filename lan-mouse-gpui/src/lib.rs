@@ -268,21 +268,47 @@ fn position_label(position: Position) -> &'static str {
 
 /// Best-effort IPv4 addresses for the "This Computer" card.
 fn discover_local_ipv4() -> Vec<String> {
+    // Prefer the address of the default route: that is the interface a peer
+    // on the LAN can reach. A UDP connect selects the route without sending a
+    // packet.
+    if let Some(ip) = default_route_ipv4() {
+        return vec![ip.to_string()];
+    }
+
     let Ok(interfaces) = if_addrs::get_if_addrs() else {
         return Vec::new();
     };
-    let mut ips = interfaces
+    let mut candidates = interfaces
         .into_iter()
         .filter_map(|interface| match interface.addr {
             if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => {
-                Some(v4.ip.to_string())
+                let name = interface.name.to_ascii_lowercase();
+                let virtual_interface = [
+                    "docker", "br-", "veth", "virbr", "podman", "cni", "flannel", "tun", "tap",
+                ]
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+                (!virtual_interface).then_some(v4.ip)
             }
             _ => None,
         })
         .collect::<Vec<_>>();
-    ips.sort();
-    ips.dedup();
-    ips
+    candidates.sort();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .next()
+        .map(|ip| vec![ip.to_string()])
+        .unwrap_or_default()
+}
+
+fn default_route_ipv4() -> Option<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    socket.connect(("8.8.8.8", 80)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3178,6 +3204,7 @@ mod tests {
     #[test]
     fn local_ipv4_discovery_returns_only_non_loopback_ipv4() {
         let ips = discover_local_ipv4();
+        assert!(ips.len() <= 1, "only the primary IPv4 should be shown");
         for ip in ips {
             let address: std::net::IpAddr = ip.parse().expect("valid IP string");
             let std::net::IpAddr::V4(v4) = address else {
