@@ -3,13 +3,51 @@ use std::collections::HashMap;
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent,
     MouseButton, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowDecorations,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    WindowOptions, div, prelude::*, rgb, size,
 };
 use lan_mouse_ipc::{
     AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
     Diagnostics, DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest,
     FrontendRequestWriter, HistoryEntry, PendingView, Position, Status,
 };
+
+/// UI zoom applied to every layout/font size.
+///
+/// GPUI scales logical pixels by the display scale factor, but a 4K monitor
+/// running at 100% still has far more logical pixels than a 1080p one, so the
+/// same 980×720 window looks tiny. Scale the logical UI proportionally to the
+/// display height (clamped), while letting an explicit `LAN_MOUSE_UI_SCALE`
+/// override win for users who prefer a different size.
+static UI_SCALE_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+fn ui_scale() -> f32 {
+    UI_SCALE_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
+fn set_ui_scale(scale: f32) {
+    let permille = (scale.clamp(0.75, 2.5) * 1000.0).round() as u32;
+    UI_SCALE_PERMILLE.store(permille, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Drop-in replacement for `gpui::px` so every existing layout constant and
+/// font size participates in the UI zoom.
+fn px(value: f32) -> gpui::Pixels {
+    gpui::px(value * ui_scale())
+}
+
+fn automatic_ui_scale(cx: &App) -> f32 {
+    if let Ok(value) = std::env::var("LAN_MOUSE_UI_SCALE")
+        && let Ok(scale) = value.parse::<f32>()
+        && (0.75..=2.5).contains(&scale)
+    {
+        return scale;
+    }
+    let logical_height = cx
+        .primary_display()
+        .map(|display| f32::from(display.bounds().size.height))
+        .unwrap_or(1080.0);
+    (logical_height / 1080.0).clamp(1.0, 1.75)
+}
 
 const BG: u32 = 0x0f1115;
 const SIDEBAR: u32 = 0x14171d;
@@ -1284,6 +1322,10 @@ impl Dashboard {
 
 impl Render for Dashboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rem_size = px(16.0);
+        if window.rem_size() != rem_size {
+            window.set_rem_size(rem_size);
+        }
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             log::info!("GPUI first render");
@@ -3082,6 +3124,8 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
     );
 
     Application::new().run(move |cx: &mut App| {
+        set_ui_scale(automatic_ui_scale(cx));
+        log::info!("UI scale: {:.0}%", ui_scale() * 100.0);
         let bounds = Bounds::centered(None, size(px(980.0), px(720.0)), cx);
         let dashboard: Entity<Dashboard> = cx.new(|cx| Dashboard::new(cx, local_commit));
         let window_handle = cx
@@ -3101,7 +3145,10 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
                     },
                     ..Default::default()
                 },
-                |_, _| dashboard,
+                |window, _| {
+                    window.set_rem_size(px(16.0));
+                    dashboard
+                },
             )
             .expect("open Lan Mouse GPUI window");
         log::info!("GPUI window created in {:?}", startup.elapsed());
