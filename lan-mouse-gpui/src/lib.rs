@@ -1308,6 +1308,15 @@ impl Render for Dashboard {
             Page::Settings => self.render_settings(cx).into_any_element(),
         };
 
+        // Explicit height is required for overflow_y_scroll: without a bounded
+        // parent the page grows to its content and is clipped by the window.
+        let chrome_height = if cfg!(target_os = "linux") {
+            34.0 + 64.0
+        } else {
+            64.0
+        };
+        let content_height = (window.viewport_size().height - px(chrome_height)).max(px(120.0));
+
         let shell = div().flex().flex_grow().child(sidebar).child(
             div()
                 .flex()
@@ -1374,9 +1383,9 @@ impl Render for Dashboard {
                 })
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .flex_grow()
+                        .w_full()
+                        .h(content_height)
+                        .flex_none()
                         .overflow_hidden()
                         .child(content),
                 ),
