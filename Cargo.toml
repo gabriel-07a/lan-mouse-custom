@@ -14,7 +14,7 @@ members = [
 [package]
 name = "lan-mouse"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gabriel-07a/lan-mouse-custom"
