@@ -389,6 +389,62 @@ activate_on_startup = true"
     fi
 }
 
+# Discovery + explicit disconnect + reconnect across two real service
+# processes. This guards the user-facing contract: a discovery result must find
+# the peer, deactivating one side must revoke both links, and activating again
+# must reconnect (the AuthRevoke must not leave a half-open/reconnecting link).
+scenario_disconnect() {
+    say ""
+    say "### scenario disconnect: descoberta, AuthRevoke bilateral e reconexão"
+    setup_instance a
+    setup_instance b
+    write_config a "$PORT_A" \
+        "[[clients]]
+position = \"right\"
+ips = [\"127.0.0.1\"]
+port = $PORT_B
+activate_on_startup = true"
+    write_config b "$PORT_B"
+    # Start B first so it owns the shared discovery port: A's beacon binding
+    # fails (same host), but A's scan can still probe the loopback alias. The
+    # extra-host hook is test-only and does not affect normal builds.
+    start_daemon b || return 0
+    export LAN_MOUSE_DISCOVERY_EXTRA_HOSTS=127.0.0.1
+    start_daemon a || return 0
+    sleep 0.5
+    enable_emulation a
+    enable_emulation b
+    if ! wait_connected a 10; then
+        fail "A não conectou a B"
+        return 0
+    fi
+
+    local scan_out
+    scan_out="$(cli a scan 2>&1 || true)"
+    check_contains "scan de A encontra o peer Lan Mouse" "lan-mouse" "$scan_out"
+
+    cli a deactivate 0 >/dev/null 2>&1 || true
+    sleep 2
+    case "$(first_status a)" in
+        connected*) fail "A continuou connected após deactivate" ;;
+        *) pass "A desconectou após deactivate" ;;
+    esac
+    if wait_connected a 2; then
+        fail "A reconectou sozinho após desconectar explicitamente"
+    else
+        pass "A não reconectou sozinho (AuthRevoke)"
+    fi
+
+    cli a activate 0 >/dev/null 2>&1 || true
+    if wait_connected a 10; then
+        pass "A reconectou ao ativar de novo"
+    else
+        fail "A não reconectou após activate"
+    fi
+    unset LAN_MOUSE_DISCOVERY_EXTRA_HOSTS
+    if [ "$KEEP" = 1 ]; then note "logs: $(inst_dir a)/daemon.log $(inst_dir b)/daemon.log"; fi
+}
+
 # A dead peer must stop being reported as connected. This is the CLI/service
 # mirror of the false "Connected" badge; the GTK-level assertion is manual.
 scenario_peer_down() {
@@ -567,7 +623,7 @@ fi
 
 SCENARIOS=("$@")
 if [ "${#SCENARIOS[@]}" -eq 0 ]; then
-    SCENARIOS=(dual duplicate ipv6_only peer_down stale_config reset_config no_spin isolation)
+    SCENARIOS=(dual duplicate ipv6_only peer_down disconnect stale_config reset_config no_spin isolation)
 fi
 
 say "lan-mouse QA two-instances (repo: $REPO_ROOT, bin: $BIN, base: $BASE)"
@@ -580,6 +636,7 @@ for scenario in "${SCENARIOS[@]}"; do
         duplicate) scenario_duplicate ;;
         ipv6_only) scenario_ipv6_only ;;
         peer_down) scenario_peer_down ;;
+        disconnect) scenario_disconnect ;;
         stale_config) scenario_stale_config ;;
         reset_config) scenario_reset_config ;;
         no_spin) scenario_no_spin ;;

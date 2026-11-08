@@ -10,6 +10,7 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::config::Config;
+use lan_mouse_ipc::{Diagnostics, FrontendEvent, FrontendRequest};
 
 #[derive(Args, Clone, Debug, Eq, PartialEq)]
 pub struct DoctorArgs {
@@ -191,6 +192,8 @@ struct Report {
     /// number of audit entries read as a cheap health signal
     recent_audit_events: usize,
     clients: Vec<ClientReport>,
+    /// live diagnostics fetched from the running service, when available
+    live_diagnostics: Option<Diagnostics>,
     warnings: Vec<String>,
 }
 
@@ -313,7 +316,18 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         })
         .collect::<Vec<_>>();
 
+    let live_diagnostics = if lan_mouse_ipc::is_service_running() {
+        query_live_diagnostics()
+    } else {
+        None
+    };
     let mut warnings = build_warnings(&clients, authorized_fingerprints.len());
+    if let Some(error) = live_diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.last_connection_error.as_deref())
+    {
+        warnings.push(format!("last connection/handshake error: {error}"));
+    }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     let clipboard_portal = input_clipboard::portal_available_version()
@@ -408,6 +422,7 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         audit_log,
         recent_audit_events,
         clients,
+        live_diagnostics,
         warnings,
     };
 
@@ -524,6 +539,31 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         }
     );
 
+    if let Some(diagnostics) = &report.live_diagnostics {
+        println!(
+            "  live:            capture={} emulation={} clipboard={} proto=v{}",
+            diagnostics.capture_backend.as_deref().unwrap_or("unknown"),
+            diagnostics
+                .emulation_backend
+                .as_deref()
+                .unwrap_or("unknown"),
+            diagnostics
+                .clipboard_backend
+                .as_deref()
+                .unwrap_or("unavailable"),
+            diagnostics.proto_version
+        );
+        println!(
+            "  last error:      {}",
+            diagnostics
+                .last_connection_error
+                .as_deref()
+                .unwrap_or("none")
+        );
+    } else if report.service_running {
+        println!("  live:            service did not return diagnostics");
+    }
+
     println!("  clients:");
     if report.clients.is_empty() {
         println!("    (none)");
@@ -550,6 +590,44 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
     }
 
     Ok(())
+}
+
+/// Ask the running service for diagnostics (`Sync` produces a snapshot).
+///
+/// Runs in a short-lived thread with a hard timeout so `doctor` can never hang
+/// when a service accepts IPC but does not answer.
+fn query_live_diagnostics() -> Option<Diagnostics> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut reader, mut writer)) = lan_mouse_ipc::try_connect() else {
+            let _ = tx.send(None);
+            return;
+        };
+        if writer
+            .request(FrontendRequest::Hello {
+                ipc_version: lan_mouse_ipc::IPC_VERSION,
+            })
+            .is_err()
+            || writer.request(FrontendRequest::Sync).is_err()
+        {
+            let _ = tx.send(None);
+            return;
+        }
+        for _ in 0..64 {
+            match reader.next_event() {
+                Some(Ok(FrontendEvent::Diagnostics(diagnostics))) => {
+                    let _ = tx.send(Some(diagnostics));
+                    return;
+                }
+                Some(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        let _ = tx.send(None);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .ok()
+        .flatten()
 }
 
 fn udp_port_available(port: u16) -> bool {

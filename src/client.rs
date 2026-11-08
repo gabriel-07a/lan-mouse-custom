@@ -99,6 +99,7 @@ impl ClientManager {
                 s.rtt_ms = None;
                 s.jitter_ms = None;
                 s.loss_percent = None;
+                s.last_error = None;
                 // No live link, therefore no round-trip proof either.
                 s.last_pong_at = None;
                 true
@@ -471,6 +472,12 @@ impl ClientManager {
                 Some(previous) => ((u64::from(previous) * 3 + u64::from(sample)) / 4) as u32,
                 None => sample,
             });
+        }
+    }
+
+    pub(crate) fn set_last_error(&self, handle: ClientHandle, error: Option<String>) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.last_error = error;
         }
     }
 

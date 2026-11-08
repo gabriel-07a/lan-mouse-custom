@@ -25,6 +25,7 @@ fn state() -> ClientState {
         rtt_ms: Some(7),
         jitter_ms: Some(1),
         loss_percent: Some(0),
+        last_error: None,
         last_pong_at: Some(1_760_000_000_123),
         dns_ips: vec![
             "192.0.2.10".parse::<IpAddr>().expect("v4"),

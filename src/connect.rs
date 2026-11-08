@@ -763,6 +763,14 @@ async fn connect_to_handle(
     .await;
 
     ctx.connecting.borrow_mut().remove(&handle);
+    match &result {
+        Ok(()) => ctx.client_manager.set_last_error(handle, None),
+        Err(error) => {
+            log::warn!("client {handle} connect attempt failed: {error}");
+            ctx.client_manager
+                .set_last_error(handle, Some(error.to_string()));
+        }
+    }
     if result.is_err() && ctx.client_manager.is_active(handle) {
         // Retry in the background even though no connection has been
         // established yet (the peer may still be booting).

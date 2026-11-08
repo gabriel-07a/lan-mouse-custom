@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent,
@@ -513,6 +513,13 @@ impl AddDeviceDialog {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MetricSample {
+    rtt_ms: u32,
+    jitter_ms: u32,
+    loss_percent: u8,
+}
+
 enum BridgeMessage {
     Writer(FrontendRequestWriter),
     Event(Box<FrontendEvent>),
@@ -545,6 +552,7 @@ struct Dashboard {
     pairing_review: Vec<DeviceView>,
     local_commit: [u8; 8],
     diagnostics: Diagnostics,
+    metric_history: HashMap<ClientHandle, VecDeque<MetricSample>>,
     history: Vec<HistoryEntry>,
     policy_export: Option<String>,
     first_frame_logged: bool,
@@ -624,6 +632,7 @@ impl Dashboard {
             pairing_review: Vec::new(),
             local_commit,
             diagnostics: Diagnostics::default(),
+            metric_history: HashMap::new(),
             history: Vec::new(),
             policy_export: None,
             first_frame_logged: false,
@@ -658,11 +667,13 @@ impl Dashboard {
             FrontendEvent::Enumerate(rows) => {
                 self.clients.clear();
                 for (handle, config, state) in rows {
+                    self.remember_metrics(handle, &state);
                     self.clients.insert(handle, (config, state));
                 }
                 log::info!("GPUI frontend received {} client(s)", self.clients.len());
             }
             FrontendEvent::Created(handle, config, state) => {
+                self.remember_metrics(handle, &state);
                 self.clients.insert(handle, (config, state));
                 if let Some(pending) = self.pending_add.take() {
                     match pending {
@@ -709,10 +720,12 @@ impl Dashboard {
                 }
             }
             FrontendEvent::State(handle, config, state) => {
+                self.remember_metrics(handle, &state);
                 self.clients.insert(handle, (config, state));
             }
             FrontendEvent::Deleted(handle) => {
                 self.clients.remove(&handle);
+                self.metric_history.remove(&handle);
                 if self.selected_client == Some(handle) {
                     self.selected_client = None;
                 }
@@ -1067,6 +1080,23 @@ impl Dashboard {
         self.send(FrontendRequest::StartPairing(60));
     }
 
+    fn remember_metrics(&mut self, handle: ClientHandle, state: &ClientState) {
+        let (Some(rtt_ms), jitter_ms, loss_percent) =
+            (state.rtt_ms, state.jitter_ms.unwrap_or(0), state.loss_percent.unwrap_or(0))
+        else {
+            return;
+        };
+        let history = self.metric_history.entry(handle).or_default();
+        history.push_back(MetricSample {
+            rtt_ms,
+            jitter_ms,
+            loss_percent,
+        });
+        while history.len() > 40 {
+            history.pop_front();
+        }
+    }
+
     fn active_count(&self) -> usize {
         self.clients
             .values()
@@ -1123,6 +1153,7 @@ impl Dashboard {
         if let Some(loss) = state.loss_percent {
             link_metrics.push_str(&format!(" · loss {loss}%"));
         }
+        let last_error = state.last_error.clone();
         let last_pong = state
             .last_pong_at
             .map(|seen| {
@@ -1221,6 +1252,17 @@ impl Dashboard {
                                 .text_color(rgb(AMBER))
                                 .child("build mismatch with this peer; update both machines"),
                         )
+                    })
+                    .when(last_error.is_some(), |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(RED))
+                                .child(format!(
+                                    "last error: {}",
+                                    last_error.clone().unwrap_or_default()
+                                )),
+                        )
                     }),
             )
             .child(
@@ -1285,6 +1327,57 @@ impl Dashboard {
                         cx,
                         move |this, _, _, _| this.delete_client(handle),
                     )),
+            )
+            .child(self.render_metric_sparkline(handle))
+    }
+
+    fn render_metric_sparkline(&self, handle: ClientHandle) -> impl IntoElement + use<> {
+        let samples = self
+            .metric_history
+            .get(&handle)
+            .cloned()
+            .unwrap_or_default();
+        let max = samples
+            .iter()
+            .map(|sample| sample.rtt_ms.max(1))
+            .max()
+            .unwrap_or(1);
+        let mut bars = Vec::new();
+        for sample in &samples {
+            let height = 4.0 + 24.0 * (sample.rtt_ms as f32 / max as f32);
+            let color = if sample.loss_percent > 0 {
+                AMBER
+            } else if sample.jitter_ms > 25 {
+                ACCENT
+            } else {
+                GREEN
+            };
+            bars.push(
+                div()
+                    .w(px(3.0))
+                    .h(px(height))
+                    .rounded_sm()
+                    .bg(rgb(color))
+                    .into_any_element(),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("RTT history (last samples)"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(1.0))
+                    .h(px(30.0))
+                    .children(bars),
             )
     }
 

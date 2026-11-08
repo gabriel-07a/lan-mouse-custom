@@ -268,6 +268,24 @@ pub async fn scan(discovery_port: u16) -> Vec<DiscoveredDevice> {
         }
     }
 
+    // Test/advanced hook: allow probing explicitly listed hosts (e.g. a
+    // loopback alias in CI where the normal subnet sweep cannot reach the
+    // second instance). No effect unless the variable is set.
+    if let Ok(extra) = std::env::var("LAN_MOUSE_DISCOVERY_EXTRA_HOSTS") {
+        for raw in extra.split(',') {
+            let Ok(ip) = raw.trim().parse::<Ipv4Addr>() else {
+                continue;
+            };
+            if own_addresses.contains(&ip) || !seen.insert(ip) {
+                continue;
+            }
+            let Some(outcome) = probe_host(ip, discovery_port).await else {
+                continue;
+            };
+            results.push(device_from_probe(ip, outcome));
+        }
+    }
+
     // Broadcast catches hosts whose firewall drops the ICMP error we rely on.
     broadcast_probe(discovery_port, &mut results, &mut seen, &own_addresses).await;
 

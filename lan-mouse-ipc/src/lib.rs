@@ -207,6 +207,9 @@ pub struct ClientState {
     /// percentage of ping rounds without a reply since the link was established
     #[serde(default)]
     pub loss_percent: Option<u8>,
+    /// last connection-attempt/handshake error for this client, if any
+    #[serde(default)]
+    pub last_error: Option<String>,
     /// Unix timestamp in milliseconds of the **last `Pong` received on the
     /// current outgoing link**, or `None` while no round-trip has been proven
     /// yet (fresh handshake, peer that never answers, or a service build that
@@ -698,6 +701,9 @@ pub struct Diagnostics {
     /// whether clipboard synchronization is enabled
     #[serde(default)]
     pub clipboard_enabled: bool,
+    /// Last connection/handshake error reported by a client.
+    #[serde(default)]
+    pub last_connection_error: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -957,6 +963,7 @@ mod tests {
             rtt_ms: Some(12),
             jitter_ms: Some(2),
             loss_percent: Some(0),
+            last_error: Some("timeout".to_string()),
             last_pong_at: Some(1_700_000_000_123),
             dns_ips: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3))],
             ips: HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]),
@@ -1036,6 +1043,7 @@ mod tests {
             capabilities: 0,
             clipboard_backend: Some("portal".into()),
             clipboard_enabled: true,
+            last_connection_error: None,
         }));
         json_roundtrip(FrontendEvent::State(
             1,

@@ -1121,6 +1121,11 @@ impl Service {
             capabilities: CAPABILITIES,
             clipboard_backend: self.clipboard_status.backend.clone(),
             clipboard_enabled: self.clipboard_status.enabled,
+            last_connection_error: self
+                .client_manager
+                .get_client_states()
+                .iter()
+                .find_map(|(_, _, state)| state.last_error.clone()),
         }
     }
 
