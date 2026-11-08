@@ -2408,6 +2408,48 @@ impl Dashboard {
             .when(!history_rows.is_empty(), |this| this.children(history_rows))
     }
 
+    fn render_settings_about(&self) -> impl IntoElement + use<> {
+        let commit = String::from_utf8_lossy(&self.local_commit)
+            .trim_matches('\0')
+            .to_string();
+        let platform = if cfg!(target_os = "windows") {
+            "Windows"
+        } else {
+            "Linux"
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("About"),
+            )
+            .child(div().text_sm().text_color(rgb(TEXT)).child(
+                "Lan Mouse — unofficial fork · GPUI frontend · GPL-3.0-or-later",
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "build {commit} · frontend {} · {platform}",
+                        env!("CARGO_PKG_VERSION")
+                    )),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "The GTK frontend is still available as an opt-in fallback; the IPC/service protocol is unchanged.",
+            ))
+    }
+
     fn render_device_permissions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let devices = self.devices.clone();
         let mut rows = Vec::new();
@@ -2960,6 +3002,7 @@ impl Dashboard {
                     })),
             )
             .child(self.render_settings_advanced(cx))
+            .child(self.render_settings_about())
     }
 }
 
