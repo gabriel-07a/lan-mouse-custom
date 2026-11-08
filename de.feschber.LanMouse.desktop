@@ -8,5 +8,6 @@ Icon=de.feschber.LanMouse
 Name[en_US]=Lan Mouse
 Name=Lan Mouse
 StartupNotify=false
+StartupWMClass=de.feschber.LanMouse
 Terminal=false
 Type=Application
