@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use gpui::{
-    App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent, Render,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
-    size,
+    App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent,
+    MouseButton, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowDecorations,
+    WindowOptions, div, prelude::*, px, rgb, size,
 };
 use lan_mouse_ipc::{
     AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
@@ -1212,7 +1212,7 @@ impl Dashboard {
 }
 
 impl Render for Dashboard {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = div()
             .w(px(220.0))
             .h_full()
@@ -1265,7 +1265,7 @@ impl Render for Dashboard {
             Page::Settings => self.render_settings(cx).into_any_element(),
         };
 
-        div().flex().size_full().bg(rgb(BG)).child(sidebar).child(
+        let shell = div().flex().flex_grow().child(sidebar).child(
             div()
                 .flex()
                 .flex_col()
@@ -1311,11 +1311,107 @@ impl Render for Dashboard {
                     this.child(self.render_settings_dialog(cx))
                 })
                 .child(content),
-        )
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(BG))
+            .when(cfg!(target_os = "linux"), |this| {
+                this.child(self.render_titlebar(window, cx))
+            })
+            .child(shell)
     }
 }
 
 impl Dashboard {
+    fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let maximized = window.is_maximized();
+        div()
+            .h(px(34.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .bg(rgb(0x0b0d11))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .id("titlebar-drag")
+                    .flex()
+                    .flex_grow()
+                    .h_full()
+                    .items_center()
+                    .pl_3()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, window, _| {
+                            window.start_window_move();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("Lan Mouse"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("window-minimize")
+                            .w(px(36.0))
+                            .h(px(34.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x202631)))
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child("—")
+                            .on_click(cx.listener(|_, _, window, _| window.minimize_window())),
+                    )
+                    .child(
+                        div()
+                            .id("window-zoom")
+                            .w(px(36.0))
+                            .h(px(34.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x202631)))
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(if maximized { "❐" } else { "□" })
+                            .on_click(cx.listener(|_, _, window, _| window.zoom_window())),
+                    )
+                    .child(
+                        div()
+                            .id("window-close")
+                            .w(px(36.0))
+                            .h(px(34.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0xc42b1c)))
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child("✕")
+                            .on_click(cx.listener(|_, _, window, _| window.remove_window())),
+                    ),
+            )
+    }
+
     fn action_button(
         &self,
         id: &'static str,
@@ -2570,6 +2666,11 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
                         traffic_light_position: None,
                     }),
                     app_id: Some("de.feschber.LanMouse".into()),
+                    window_decorations: if cfg!(target_os = "linux") {
+                        Some(WindowDecorations::Client)
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 },
                 |_, _| dashboard,
