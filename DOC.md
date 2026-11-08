@@ -36,20 +36,36 @@ The dispatcher component takes events from the event receiver and passes them
 to the correct backend corresponding to the type of client.
 
 
-## Requests
+## Transport, Discovery and Authorization
 
-// TODO this currently works differently
+The current implementation does **not** use the old TCP request channel that
+earlier revisions of this document described. The actual flow is:
 
-Aside from events, requests can be sent via a simple protocol.
-For this, a simple tcp server is listening on the same port as the udp
-event receiver and accepts requests for connecting to a device or to
-request the keymap of a device.
+- **Discovery**: UDP port **4245**. Instances broadcast a small announcement
+  and answer probes. This is only a convenience/scan mechanism: a beacon is
+  unauthenticated and must never be treated as proof of identity.
+- **Transport**: one or more **DTLS-over-UDP** associations on port **4242**.
+  Each side presents a self-signed certificate; the peer identity is the
+  SHA-256 certificate fingerprint. Connections are direct, peer-to-peer, with
+  no relay or central server.
+- **Incoming authorization**: the listener accepts a certificate only when its
+  fingerprint is authorized (manual device, authorized key, an address rule, a
+  pairing window, or an approved pending request). A certificate change is
+  surfaced as a pending request with the previous fingerprint.
+- **Identity learning (TOFU)**: an outgoing connection to an unpinned client
+  learns and pins the peer certificate. Incoming control is still denied until
+  the user authorizes the device.
+- **Permissions**: once the extended handshake is understood, both sides send
+  `AuthRequest`/`AuthResponse` with the capabilities granted in each direction;
+  revocation uses `AuthRevoke`.
+- **Liveness**: `Ping`/`Pong` provides RTT and detects a dead peer; a watchdog
+  closes the transport and the reconnect loop backs off.
 
-```mermaid
-sequenceDiagram
-    Alice->>+Bob: Request Connection (secret)
-    Bob-->>-Alice: Ack (Keyboard Layout)
-```
+A beacon advertising a fingerprint is displayed as *unverified* until the
+fingerprint is known locally, pinned by a handshake, or accepted by the user.
+
+The frontend never speaks this protocol directly: it talks to the local service
+over IPC (Unix socket on Linux, loopback TCP on Windows).
 
 ## Problems
 The general Idea is to have a bidirectional connection by default, meaning
