@@ -7,8 +7,8 @@ use gpui::{
 };
 use lan_mouse_ipc::{
     AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
-    DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest, FrontendRequestWriter,
-    PendingView, Position, Status,
+    Diagnostics, DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest,
+    FrontendRequestWriter, HistoryEntry, PendingView, Position, Status,
 };
 
 const BG: u32 = 0x0f1115;
@@ -290,11 +290,13 @@ enum PendingAdd {
     Discovered {
         ip: std::net::IpAddr,
         port: u16,
+        position: Position,
     },
     Manual {
         hostname: String,
         port: u16,
         fingerprint: Option<String>,
+        position: Position,
     },
 }
 
@@ -303,6 +305,7 @@ struct AddDeviceDialog {
     hostname: String,
     port: String,
     fingerprint: String,
+    position: Position,
     field: AddField,
 }
 
@@ -319,6 +322,7 @@ enum SettingsDialogKind {
     Certificate,
     Client { handle: ClientHandle },
     RenameDevice { fingerprint: String },
+    Port,
 }
 
 #[derive(Clone, Debug)]
@@ -381,11 +385,23 @@ impl SettingsDialog {
         }
     }
 
+    fn new_port(current: u16) -> Self {
+        Self {
+            kind: SettingsDialogKind::Port,
+            hostname: String::new(),
+            port: current.to_string(),
+            address: String::new(),
+            name: String::new(),
+            fingerprint: String::new(),
+            field: 0,
+        }
+    }
+
     fn field_count(&self) -> u8 {
         match self.kind {
             SettingsDialogKind::Address => 1,
             SettingsDialogKind::Certificate | SettingsDialogKind::Client { .. } => 2,
-            SettingsDialogKind::RenameDevice { .. } => 1,
+            SettingsDialogKind::RenameDevice { .. } | SettingsDialogKind::Port => 1,
         }
     }
 
@@ -407,6 +423,7 @@ impl SettingsDialog {
                 }
             }
             SettingsDialogKind::RenameDevice { .. } => &mut self.name,
+            SettingsDialogKind::Port => &mut self.port,
         }
     }
 }
@@ -417,6 +434,7 @@ impl AddDeviceDialog {
             hostname: String::new(),
             port: lan_mouse_ipc::DEFAULT_PORT.to_string(),
             fingerprint: String::new(),
+            position: Position::Left,
             field: AddField::Hostname,
         }
     }
@@ -461,6 +479,9 @@ struct Dashboard {
     pairing_active: bool,
     pairing_review: Vec<DeviceView>,
     local_commit: [u8; 8],
+    diagnostics: Diagnostics,
+    history: Vec<HistoryEntry>,
+    policy_export: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -536,6 +557,9 @@ impl Dashboard {
             pairing_active: false,
             pairing_review: Vec::new(),
             local_commit,
+            diagnostics: Diagnostics::default(),
+            history: Vec::new(),
+            policy_export: None,
         }
     }
 
@@ -549,6 +573,7 @@ impl Dashboard {
                 let _ = writer.request(FrontendRequest::ListDevices);
                 let _ = writer.request(FrontendRequest::ListPending);
                 let _ = writer.request(FrontendRequest::ListAddressRules);
+                let _ = writer.request(FrontendRequest::ListHistory { limit: 20 });
                 let _ = writer.request(FrontendRequest::Sync);
                 self.writer = Some(writer);
                 self.status = "Connected to service".to_string();
@@ -574,14 +599,16 @@ impl Dashboard {
                 self.clients.insert(handle, (config, state));
                 if let Some(pending) = self.pending_add.take() {
                     match pending {
-                        PendingAdd::Discovered { ip, port } => {
+                        PendingAdd::Discovered { ip, port, position } => {
                             self.send(FrontendRequest::UpdateFixIps(handle, vec![ip]));
                             self.send(FrontendRequest::UpdatePort(handle, port));
+                            self.send(FrontendRequest::UpdatePosition(handle, position));
                         }
                         PendingAdd::Manual {
                             hostname,
                             port,
                             fingerprint,
+                            position,
                         } => {
                             let hostname = hostname.trim();
                             if !hostname.is_empty() {
@@ -597,9 +624,9 @@ impl Dashboard {
                                     Some(fingerprint),
                                 ));
                             }
+                            self.send(FrontendRequest::UpdatePosition(handle, position));
                         }
                     }
-                    self.send(FrontendRequest::UpdatePosition(handle, Position::Left));
                     self.send(FrontendRequest::Activate(handle, true));
                 }
             }
@@ -635,7 +662,9 @@ impl Dashboard {
             FrontendEvent::ClipboardStatus(status) => self.clipboard_status = status,
             FrontendEvent::PairingActive(active) => self.pairing_active = active,
             FrontendEvent::PairingReview(devices) => self.pairing_review = devices,
-            FrontendEvent::Diagnostics(_) => {}
+            FrontendEvent::Diagnostics(diagnostics) => self.diagnostics = diagnostics,
+            FrontendEvent::ConnectionHistory(history) => self.history = history,
+            FrontendEvent::PolicyExport { json } => self.policy_export = Some(json),
             _ => {}
         }
     }
@@ -679,6 +708,10 @@ impl Dashboard {
         }
     }
 
+    fn open_port_dialog(&mut self) {
+        self.settings_dialog = Some(SettingsDialog::new_port(self.port));
+    }
+
     fn open_device_rename(&mut self, fingerprint: String, name: String) {
         self.settings_dialog = Some(SettingsDialog::new_rename(fingerprint, name));
     }
@@ -717,6 +750,11 @@ impl Dashboard {
                     },
                     fingerprint.to_string(),
                 ));
+            }
+            SettingsDialogKind::Port => {
+                if let Ok(port) = dialog.port.trim().parse::<u16>() {
+                    self.send(FrontendRequest::ChangePort(port));
+                }
             }
             SettingsDialogKind::RenameDevice { fingerprint } => {
                 let name = dialog.name.trim();
@@ -799,6 +837,7 @@ impl Dashboard {
             hostname: dialog.hostname,
             port,
             fingerprint,
+            position: dialog.position,
         });
         self.send(FrontendRequest::Create);
     }
@@ -840,7 +879,11 @@ impl Dashboard {
     }
 
     fn add_discovered(&mut self, ip: std::net::IpAddr, port: u16) {
-        self.pending_add = Some(PendingAdd::Discovered { ip, port });
+        self.pending_add = Some(PendingAdd::Discovered {
+            ip,
+            port,
+            position: Position::Left,
+        });
         self.send(FrontendRequest::Create);
     }
 
@@ -1466,6 +1509,11 @@ impl Dashboard {
                 "Display name only; the certificate fingerprint stays the identity.",
                 vec![("display name", dialog.name.clone())],
             ),
+            SettingsDialogKind::Port => (
+                "Change listening port",
+                "The UDP listener is recreated on this port. Peers must use the same port.",
+                vec![("port", dialog.port.clone())],
+            ),
         };
         let mut field_rows = Vec::new();
         for (idx, (label, value)) in fields.clone().into_iter().enumerate() {
@@ -1674,6 +1722,72 @@ impl Dashboard {
                             format!("{}▌", dialog.fingerprint)
                         },
                     )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("peer is on the"),
+                    )
+                    .child(self.action_button(
+                        "add-pos-left",
+                        "Left",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            if let Some(dialog) = this.add_dialog.as_mut() {
+                                dialog.position = Position::Left;
+                            }
+                        },
+                    ))
+                    .child(self.action_button(
+                        "add-pos-right",
+                        "Right",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            if let Some(dialog) = this.add_dialog.as_mut() {
+                                dialog.position = Position::Right;
+                            }
+                        },
+                    ))
+                    .child(self.action_button(
+                        "add-pos-top",
+                        "Top",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            if let Some(dialog) = this.add_dialog.as_mut() {
+                                dialog.position = Position::Top;
+                            }
+                        },
+                    ))
+                    .child(self.action_button(
+                        "add-pos-bottom",
+                        "Bottom",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            if let Some(dialog) = this.add_dialog.as_mut() {
+                                dialog.position = Position::Bottom;
+                            }
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(ACCENT))
+                            .child(position_label(dialog.position)),
+                    ),
             )
             .child(
                 div()
@@ -2084,6 +2198,216 @@ impl Dashboard {
             .children(rows)
     }
 
+    fn render_settings_general(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let local_commit = String::from_utf8_lossy(&self.local_commit)
+            .trim_matches('\0')
+            .to_string();
+        let ips = if self.local_ips.is_empty() {
+            "no IPv4 address".to_string()
+        } else {
+            self.local_ips.join(" · ")
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("General"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .child(self.hostname.clone()),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(ips))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().text_color(rgb(MUTED)).child(format!(
+                        "listening port {} · build {}",
+                        self.port, local_commit
+                    )))
+                    .child(self.action_button(
+                        "change-port",
+                        "Change port",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, window, _| {
+                            this.open_port_dialog();
+                            window.focus(&this.add_focus);
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(self.action_button(
+                        "save-config",
+                        "Save configuration",
+                        ACCENT,
+                        0x081018,
+                        cx,
+                        |this, _, _, _| this.send(FrontendRequest::SaveConfiguration),
+                    ))
+                    .child(self.action_button(
+                        "refresh-history",
+                        "Refresh history",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| this.send(FrontendRequest::ListHistory { limit: 20 }),
+                    )),
+            )
+    }
+
+    fn render_settings_advanced(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let capture = self
+            .diagnostics
+            .capture_backend
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let emulation = self
+            .diagnostics
+            .emulation_backend
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let session = self
+            .diagnostics
+            .session_type
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let desktop = self
+            .diagnostics
+            .desktop
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let clipboard_backend = self
+            .diagnostics
+            .clipboard_backend
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_string());
+        let mut history_rows = Vec::new();
+        for entry in self.history.iter().take(8) {
+            let when = entry.ts;
+            let subject = entry
+                .name
+                .clone()
+                .or_else(|| {
+                    entry
+                        .fingerprint
+                        .clone()
+                        .map(|fp| fp[..fp.len().min(16)].to_string())
+                })
+                .unwrap_or_else(|| "—".to_string());
+            let detail = entry
+                .detail
+                .clone()
+                .or_else(|| entry.addr.clone())
+                .unwrap_or_default();
+            history_rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(format!("{} · {subject}", entry.event)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{when} {detail}")),
+                    ),
+            );
+        }
+        let exported = self
+            .policy_export
+            .as_ref()
+            .map(|json| format!("{} bytes ready", json.len()))
+            .unwrap_or_else(|| "not exported yet".to_string());
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("Diagnostics & history"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "capture: {capture} · emulation: {emulation} · session: {session} · desktop: {desktop} · clipboard: {clipboard_backend}"
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "protocol v{} · capabilities {:#x} · port {}",
+                        self.diagnostics.proto_version,
+                        self.diagnostics.capabilities,
+                        self.diagnostics.port
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(self.action_button(
+                        "export-policy",
+                        "Export policy",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            this.send(FrontendRequest::ExportPolicy);
+                        },
+                    ))
+                    .child(self.action_button(
+                        "copy-policy",
+                        "Copy exported",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, cx| {
+                            if let Some(policy) = this.policy_export.clone() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(policy));
+                            }
+                        },
+                    )),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(exported))
+            .when(!history_rows.is_empty(), |this| this.children(history_rows))
+    }
+
     fn render_device_permissions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let devices = self.devices.clone();
         let mut rows = Vec::new();
@@ -2314,6 +2638,7 @@ impl Dashboard {
             .gap_4()
             .p_6()
             .overflow_y_scroll()
+            .child(self.render_settings_general(cx))
             .child(
                 div()
                     .flex()
@@ -2634,6 +2959,7 @@ impl Dashboard {
                             )
                     })),
             )
+            .child(self.render_settings_advanced(cx))
     }
 }
 
