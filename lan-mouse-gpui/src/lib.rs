@@ -508,6 +508,7 @@ struct Dashboard {
     diagnostics: Diagnostics,
     history: Vec<HistoryEntry>,
     policy_export: Option<String>,
+    first_frame_logged: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -586,6 +587,7 @@ impl Dashboard {
             diagnostics: Diagnostics::default(),
             history: Vec::new(),
             policy_export: None,
+            first_frame_logged: false,
         }
     }
 
@@ -1282,6 +1284,10 @@ impl Dashboard {
 
 impl Render for Dashboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.first_frame_logged {
+            self.first_frame_logged = true;
+            log::info!("GPUI first render");
+        }
         let sidebar = div()
             .w(px(220.0))
             .h_full()
@@ -2143,23 +2149,9 @@ impl Dashboard {
             .overflow_y_scroll()
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child("Find Lan Mouse instances on the local IPv4 network."),
-                    )
-                    .child(self.action_button(
-                        "scan-network",
-                        "Scan network",
-                        ACCENT,
-                        0x081018,
-                        cx,
-                        |this, _, _, _| this.send(FrontendRequest::ScanNetwork),
-                    )),
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("Find Lan Mouse instances on the local IPv4 network."),
             )
             .when(self.discovered.is_empty(), |this| {
                 this.child(
@@ -3081,6 +3073,7 @@ pub enum GpuiError {
 /// Run the GPUI frontend. The caller (the `lan-mouse` binary) starts the
 /// service/IPC first, exactly as it does for the GTK frontend.
 pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
+    let startup = std::time::Instant::now();
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
     log::info!(
@@ -3111,6 +3104,7 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
                 |_, _| dashboard,
             )
             .expect("open Lan Mouse GPUI window");
+        log::info!("GPUI window created in {:?}", startup.elapsed());
 
         // Closing the window keeps the process alive in the tray: minimize
         // instead of destroying the window, matching the GTK close-to-tray
