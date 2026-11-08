@@ -68,6 +68,8 @@ enum CaptureRequest {
     Create(CaptureHandle, Position, CaptureType),
     /// destory a capture client
     Destroy(CaptureHandle),
+    /// explicit user disconnect: revoke/close the outgoing transport
+    Disconnect(CaptureHandle),
     /// reenable input capture
     Reenable,
     /// set release bind
@@ -190,6 +192,16 @@ impl Capture {
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
         self.request_tx
             .send(CaptureRequest::Destroy(handle))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Close the outgoing transport of a client after an explicit user
+    /// disconnect. The service marks the client inactive first so the
+    /// reconnect loop does not restart it.
+    pub(crate) fn disconnect(&self, handle: CaptureHandle) {
+        self.request_tx
+            .send(CaptureRequest::Disconnect(handle))
             .ok()
             .unwrap_or_default();
     }
@@ -374,6 +386,7 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Connect(h) => self.conn.ensure_connected(h),
+                        CaptureRequest::Disconnect(h) => self.conn.disconnect(h).await,
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
@@ -542,6 +555,7 @@ impl CaptureTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Connect(h) => self.conn.ensure_connected(h),
+                    CaptureRequest::Disconnect(h) => self.conn.disconnect(h).await,
                     CaptureRequest::SetSensitivity(h, scale) => {
                         self.sensitivity.insert(h, scale);
                     }

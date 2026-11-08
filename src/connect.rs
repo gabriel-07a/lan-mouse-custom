@@ -350,6 +350,26 @@ impl LanMouseConnection {
         self.state_rx.take()
     }
 
+    /// Explicit user disconnect: tell the peer to stop reconnecting, then
+    /// close the live transport. The service deactivates the client first, so
+    /// the reconnect loop observes `active == false` and stays stopped.
+    pub(crate) async fn disconnect(&self, handle: ClientHandle) {
+        let Some(active) = self.sender.ctx.active(handle) else {
+            return;
+        };
+        // `AuthRevoke` exists in both current peers and older forks and is safe
+        // to receive (unknown new event ids would close legacy connections).
+        // Use the raw send path: the peer may have disabled emulation, which
+        // must not prevent the explicit-disconnect notification.
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::AuthRevoke {
+            session_id: 0,
+            reason: 1,
+        }
+        .into();
+        let _ = self.sender.send_raw(handle, &buf[..len]).await;
+        self.sender.ctx.disconnect(handle, active.generation).await;
+    }
+
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
         self.recv_rx.recv().await.expect("channel closed")
     }
@@ -1037,10 +1057,15 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnecti
                         ctx.notify_state_changed(handle);
                     }
                     ProtoEvent::AuthRevoke { reason, .. } => {
-                        log::debug!("peer {addr} revoked permission grants (reason {reason})");
-                        ctx.client_manager
-                            .set_peer_permissions(handle, Some(0), Some(0));
+                        log::warn!(
+                            "peer {addr} explicitly disconnected (auth revoke reason {reason}); closing link"
+                        );
+                        // A user disconnect on either side is mandatory for both
+                        // sides: never let the reconnect loop revive the link.
+                        ctx.client_manager.deactivate_client(handle);
                         ctx.notify_state_changed(handle);
+                        ctx.disconnect(handle, active.generation).await;
+                        return;
                     }
                     // The listener is the responder for permission requests.
                     ProtoEvent::AuthRequest { .. } => {}

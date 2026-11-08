@@ -442,7 +442,20 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
-                    EmulationRequest::Disconnect(addr) => self.listener.disconnect(addr).await,
+                    EmulationRequest::Disconnect(addr) => {
+                        // Tell the peer this is an explicit user disconnect so
+                        // it deactivates its client instead of reconnecting.
+                        self.listener
+                            .reply(
+                                addr,
+                                ProtoEvent::AuthRevoke {
+                                    session_id: 0,
+                                    reason: 1,
+                                },
+                            )
+                            .await;
+                        self.listener.disconnect(addr).await
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;

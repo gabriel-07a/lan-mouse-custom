@@ -309,6 +309,17 @@ impl ClientManager {
     }
 
     /// Find the client that is pinned to `fingerprint`.
+    pub(crate) fn all_handles_for_fingerprint(&self, fingerprint: &str) -> Vec<ClientHandle> {
+        self.clients
+            .borrow()
+            .iter()
+            .filter_map(|(handle, (config, _))| {
+                (config.fingerprint.as_deref() == Some(fingerprint))
+                    .then_some(handle as ClientHandle)
+            })
+            .collect()
+    }
+
     pub(crate) fn find_by_fingerprint(&self, fingerprint: &str) -> Option<ClientHandle> {
         self.clients.borrow().iter().find_map(|(k, (c, _))| {
             (c.fingerprint.as_deref() == Some(fingerprint)).then_some(k as ClientHandle)

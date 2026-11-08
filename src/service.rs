@@ -958,10 +958,21 @@ impl Service {
                     Some(&addr.to_string()),
                     Some(&format!("reason={reason}")),
                 );
+                let fingerprint = self
+                    .incoming_conn_info
+                    .values()
+                    .find(|incoming| incoming.addr == addr)
+                    .map(|incoming| incoming.fingerprint.clone());
                 if let Some(handle) = self.client_for_incoming(addr) {
                     self.client_manager
                         .set_peer_permissions(handle, Some(0), Some(0));
                     self.broadcast_client(handle);
+                }
+                if let Some(fingerprint) = fingerprint {
+                    log::info!(
+                        "peer at {addr} explicitly disconnected; deactivating client(s) for {fingerprint}"
+                    );
+                    self.deactivate_fingerprint(&fingerprint);
                 }
             }
             EmulationEvent::PeerHello {
@@ -2404,7 +2415,7 @@ impl Service {
         if active {
             self.activate_client(handle);
         } else {
-            self.deactivate_client(handle);
+            self.deactivate_client_and_peer(handle);
         }
     }
 
@@ -2414,6 +2425,35 @@ impl Service {
             self.capture.destroy(handle);
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
+        }
+    }
+
+    /// Explicit user disconnect (or a peer's explicit disconnect): unlike
+    /// internal deactivations (position change, another client at the same
+    /// edge), this must tear the live link down on both machines. The client is
+    /// marked inactive first so the reconnect loop cannot revive it; the
+    /// outgoing transport sends `AuthRevoke` before closing and all incoming
+    /// sessions for the same identity are closed too.
+    fn deactivate_client_and_peer(&mut self, handle: ClientHandle) {
+        log::debug!("explicitly disconnecting client {handle}");
+        let fingerprint = self.client_manager.fingerprint(handle);
+        if self.client_manager.deactivate_client(handle) {
+            self.capture.disconnect(handle);
+            if let Some(fingerprint) = fingerprint {
+                self.disconnect_fingerprint(&fingerprint);
+            }
+            self.capture.destroy(handle);
+            self.broadcast_client(handle);
+            log::info!("explicitly disconnected client {handle}");
+        }
+    }
+
+    /// Deactivate every configured/local client entry belonging to `fingerprint`.
+    /// Used when the peer explicitly disconnects and must stop reconnecting.
+    fn deactivate_fingerprint(&mut self, fingerprint: &str) {
+        let handles = self.client_manager.all_handles_for_fingerprint(fingerprint);
+        for handle in handles {
+            self.deactivate_client_and_peer(handle);
         }
     }
 
