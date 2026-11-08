@@ -7,6 +7,6 @@ Exec=lan-mouse
 Icon=de.feschber.LanMouse
 Name[en_US]=Lan Mouse
 Name=Lan Mouse
-StartupNotify=true
+StartupNotify=false
 Terminal=false
 Type=Application
