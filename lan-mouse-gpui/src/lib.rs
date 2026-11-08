@@ -1372,7 +1372,14 @@ impl Render for Dashboard {
                 .when(self.settings_dialog.is_some(), |this| {
                     this.child(self.render_settings_dialog(cx))
                 })
-                .child(content),
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_grow()
+                        .overflow_hidden()
+                        .child(content),
+                ),
         );
 
         div()
@@ -2042,6 +2049,7 @@ impl Dashboard {
         let has_pending = pending > 0;
         div()
             .id("devices-page")
+            .size_full()
             .flex()
             .flex_col()
             .gap_3()
@@ -2091,10 +2099,13 @@ impl Dashboard {
 
     fn render_network(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         div()
+            .id("network-page")
+            .size_full()
             .flex()
             .flex_col()
             .gap_3()
             .p_6()
+            .overflow_y_scroll()
             .child(
                 div()
                     .flex()
@@ -2694,6 +2705,7 @@ impl Dashboard {
         };
         div()
             .id("settings-page")
+            .size_full()
             .flex()
             .flex_col()
             .gap_4()
