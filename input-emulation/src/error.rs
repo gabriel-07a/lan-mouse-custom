@@ -59,6 +59,16 @@ pub enum EmulationCreationError {
     NoAvailableBackend,
 }
 
+impl InputEmulationError {
+    /// Whether the failure was an explicit denial/cancel of a portal request.
+    pub fn cancelled_by_user(&self) -> bool {
+        match self {
+            Self::Create(e) => e.cancelled_by_user(),
+            Self::Emulate(_) => false,
+        }
+    }
+}
+
 impl EmulationCreationError {
     /// request was intentionally denied by the user
     pub(crate) fn cancelled_by_user(&self) -> bool {

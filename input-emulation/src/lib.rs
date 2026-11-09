@@ -145,6 +145,20 @@ pub struct InputEmulation {
 }
 
 impl InputEmulation {
+    /// Backends that show a desktop-portal permission dialog when started.
+    fn is_portal_backend(backend: Backend) -> bool {
+        #[cfg(libei)]
+        if matches!(backend, Backend::Libei) {
+            return true;
+        }
+        #[cfg(rdp)]
+        if matches!(backend, Backend::Xdp) {
+            return true;
+        }
+        let _ = backend;
+        false
+    }
+
     async fn with_backend(backend: Backend) -> Result<InputEmulation, EmulationCreationError> {
         let emulation: Box<dyn Emulation> = match backend {
             #[cfg(wlroots)]
@@ -195,6 +209,19 @@ impl InputEmulation {
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
+        Self::new_with_portal(backend, true).await
+    }
+
+    /// Like [\`InputEmulation::new\`], but a portal-backed backend is only
+    /// selected when \`allow_portal\` is set.
+    ///
+    /// The service passes \`false\` when no portal consent was saved: the
+    /// portal backend would open a permission dialog, so another backend (X11,
+    /// wlroots, dummy) is tried instead. An explicit user enable passes \`true\`.
+    pub async fn new_with_portal(
+        backend: Option<Backend>,
+        allow_portal: bool,
+    ) -> Result<InputEmulation, EmulationCreationError> {
         if let Some(backend) = backend {
             let b = Self::with_backend(backend).await;
             if b.is_ok() {
@@ -218,6 +245,15 @@ impl InputEmulation {
             Backend::MacOs,
             Backend::Dummy,
         ] {
+            if !allow_portal && Self::is_portal_backend(backend) {
+                log::debug!("skipping {backend}: no portal consent yet");
+                continue;
+            }
+            // Without portal consent a dummy backend would silently swallow
+            // remote input; only an explicit backend choice may select it.
+            if !allow_portal && matches!(backend, Backend::Dummy) {
+                continue;
+            }
             match Self::with_backend(backend).await {
                 Ok(b) => {
                     log::info!("using emulation backend: {backend}");

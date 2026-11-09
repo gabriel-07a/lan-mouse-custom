@@ -689,6 +689,8 @@ impl EmulationProxy {
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
         let exit_requested = Rc::new(Cell::new(false));
+        let allow_portal = !input_emulation::backend_needs_portal_consent(backend)
+            || input_emulation::remote_desktop_consent_present();
         let emulation_task = EmulationTask {
             backend,
             exit_requested: exit_requested.clone(),
@@ -699,6 +701,7 @@ impl EmulationProxy {
             next_id: 0,
             selected_backend,
             pending_remote: None,
+            allow_portal,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -802,6 +805,9 @@ struct EmulationTask {
     /// RemoteEnter/RemoteLeave received while the backend was still being
     /// created: they must not be dropped (the service does not re-send Enter).
     pending_remote: Option<PointerEdge>,
+    /// Whether the portal-backed backend may be selected (persisted consent or
+    /// an explicit user enable).
+    allow_portal: bool,
 }
 
 impl EmulationTask {
@@ -811,16 +817,9 @@ impl EmulationTask {
         // until the first input actually has to be injected (or until the user
         // explicitly enables emulation again).
         let mut warmup: Option<(Event, SocketAddr)> = None;
-        // Portal-backed backends only start automatically when consent was
-        // persisted by an earlier explicit approval. Without it, an automatic
-        // start would show a permission dialog on the user's screen; instead we
-        // stay off until the user explicitly enables emulation.
-        let needs_consent = input_emulation::backend_needs_portal_consent(self.backend);
-        let auto_start_allowed =
-            !needs_consent || input_emulation::remote_desktop_consent_present();
-        if !auto_start_allowed {
+        if !self.allow_portal {
             log::info!(
-                "input emulation is off: no saved portal consent - enable emulation once in the UI to grant it (no permission dialog is opened automatically)"
+                "no saved portal consent: emulation will not open a permission dialog; enable emulation once in the UI to grant it"
             );
         }
         // Wait for the first reason to start the backend. A cancelled portal
@@ -831,15 +830,14 @@ impl EmulationTask {
             match self.request_rx.recv().await.expect("channel closed") {
                 ProxyRequest::Terminate => return,
                 // explicit user request: always allowed to (re)try
-                ProxyRequest::Reenable => break,
-                ProxyRequest::WarmUp if auto_start_allowed => break,
-                ProxyRequest::Input(event, addr) if auto_start_allowed => {
-                    warmup = Some((event, addr));
+                ProxyRequest::Reenable => {
+                    self.allow_portal = true;
                     break;
                 }
-                ProxyRequest::WarmUp | ProxyRequest::Input(..) => {
-                    // Stay silent: no automatic permission prompts.
-                    continue;
+                ProxyRequest::WarmUp => break,
+                ProxyRequest::Input(event, addr) => {
+                    warmup = Some((event, addr));
+                    break;
                 }
                 ProxyRequest::RemoteEnter(edge) => {
                     self.pending_remote = Some(edge);
@@ -851,9 +849,15 @@ impl EmulationTask {
 
         loop {
             if let Err(e) = self.do_emulation(warmup.take()).await {
-                log::warn!(
-                    "input emulation could not start ({e}); automatic retries are disabled - enable emulation again to retry"
-                );
+                if e.cancelled_by_user() {
+                    log::warn!(
+                        "input emulation permission was denied; automatic retries are disabled - enable emulation again to retry"
+                    );
+                } else {
+                    log::warn!(
+                        "input emulation could not start ({e}); automatic retries are disabled - enable emulation again to retry"
+                    );
+                }
                 // Tell the frontend/peers the truth: input cannot be injected
                 // until the user enables emulation again (a denied portal
                 // permission must not keep advertising an active backend).
@@ -861,10 +865,9 @@ impl EmulationTask {
                     .send(EmulationEvent::EmulationDisabled)
                     .ok()
                     .unwrap_or_default();
-                if needs_consent {
-                    // A cancelled/failed portal request invalidates the token
-                    // anyway. Remove it so the next app start never opens an
-                    // unsolicited permission dialog.
+                if e.cancelled_by_user() {
+                    // A denied request invalidates the token anyway. Remove it
+                    // so the next app start never opens an unsolicited dialog.
                     input_emulation::clear_remote_desktop_consent();
                 }
             }
@@ -919,7 +922,7 @@ impl EmulationTask {
     /// Create the emulation backend while preserving semantic requests that
     /// arrive during the (possibly slow, portal-backed) creation.
     async fn create_emulation(&mut self) -> Result<Option<InputEmulation>, InputEmulationError> {
-        let create = InputEmulation::new(self.backend);
+        let create = InputEmulation::new_with_portal(self.backend, self.allow_portal);
         tokio::pin!(create);
         loop {
             tokio::select! {
@@ -977,7 +980,7 @@ impl EmulationTask {
 
         // A peer may have entered while the portal was still coming up: replay
         // the edge so absolute tracking arms for this session.
-        if let Some(edge) = self.pending_remote.take() {
+        if let Some(edge) = self.pending_remote {
             emulation.begin_remote_control(edge).await;
         }
 
@@ -1047,9 +1050,14 @@ impl EmulationTask {
                         self.closed.remove(&addr);
                     }
                     ProxyRequest::RemoteEnter(edge) => {
+                        // Remember the edge: if the backend restarts while the
+                        // peer still drives, creation replays it and arms the
+                        // new backend instead of injecting relative-only input.
+                        self.pending_remote = Some(edge);
                         emulation.begin_remote_control(edge).await;
                     }
                     ProxyRequest::RemoteLeave => {
+                        self.pending_remote = None;
                         emulation.end_remote_control().await;
                     }
                     ProxyRequest::Terminate => break Ok(()),

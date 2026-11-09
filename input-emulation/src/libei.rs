@@ -57,6 +57,8 @@ struct Devices {
     /// return hand-off at the entry edge
     absolute: Arc<RwLock<Option<AbsolutePointer>>>,
     absolute_generation: Arc<AtomicU64>,
+    /// monotonically increasing sequence for ei_device.start_emulating
+    resume_sequence: Arc<AtomicU64>,
     /// EIS devices the compositor paused; absolute events must not be sent then
     paused: Arc<RwLock<HashSet<ei::Device>>>,
     scroll: Arc<RwLock<Option<(ei::Device, ei::Scroll)>>>,
@@ -219,9 +221,15 @@ impl AbsoluteTracker {
         let raw_y = self.y + dy;
         // The compositor clamps the real cursor into the layout; mirror that so
         // overshooting an edge and coming back behaves correctly.
-        (self.x, self.y) = self.clamped(raw_x, raw_y);
+        let (clamped_x, clamped_y) = self.clamped(raw_x, raw_y);
+        // The position that will actually be sent: snapped into a real region.
+        // Keeping the tracked position equal to the sent one prevents a desync
+        // when the cursor is pushed into a gap between monitors.
+        let (x, y) = self.snap(clamped_x, clamped_y);
 
         if self.fired {
+            self.x = x;
+            self.y = y;
             // Re-arm when the pointer is well inside the entry screen area.
             let inset = 20.0;
             if self.x > f64::from(self.entry.0) + inset
@@ -234,14 +242,26 @@ impl AbsoluteTracker {
             return None;
         }
 
+        // The hand-off requires BOTH: the real cursor reached the entry edge
+        // (snapped position in the edge band) AND the user's motion pushed past
+        // it. The band check prevents a false fire when the cursor is pinned in
+        // a hole between monitors while the invisible push overruns the layout.
         let (x0, y0, x1, y1) = self.entry;
+        let near_edge = match self.edge {
+            PointerEdge::Left => x <= f64::from(x0) + 1.0,
+            PointerEdge::Right => x >= f64::from(x1) - 2.0,
+            PointerEdge::Top => y <= f64::from(y0) + 1.0,
+            PointerEdge::Bottom => y >= f64::from(y1) - 2.0,
+        };
         let past_edge = match self.edge {
             PointerEdge::Left => raw_x < f64::from(x0) - RETURN_MARGIN_PX,
             PointerEdge::Right => raw_x > f64::from(x1) + RETURN_MARGIN_PX,
             PointerEdge::Top => raw_y < f64::from(y0) - RETURN_MARGIN_PX,
             PointerEdge::Bottom => raw_y > f64::from(y1) + RETURN_MARGIN_PX,
         };
-        if past_edge {
+        self.x = x;
+        self.y = y;
+        if near_edge && past_edge {
             self.fired = true;
             // Snap to the edge so reversing the push moves the cursor again
             // immediately (the overrun distance must not be swallowed).
@@ -261,20 +281,21 @@ impl AbsoluteTracker {
     /// Absolute events are only valid inside a region (half-open bounds); a
     /// position in a gap between monitors is clamped into the nearest region.
     fn absolute(&self) -> (f32, f32) {
-        let x = self.x;
-        let y = self.y;
+        (self.x as f32, self.y as f32)
+    }
+
+    /// Snap a layout position into the region that contains it, or the
+    /// nearest one (used both for detection bookkeeping and the sent value).
+    fn snap(&self, x: f64, y: f64) -> (f64, f64) {
         for region in &self.regions {
             let (x0, y0, x1, y1) = *region;
-            if x >= f64::from(x0)
-                && x < f64::from(x1) - 1.0
-                && y >= f64::from(y0)
-                && y < f64::from(y1) - 1.0
-            {
-                return (x as f32, y as f32);
+            let max_x = f64::from(x1) - 1.0;
+            let max_y = f64::from(y1) - 1.0;
+            if x >= f64::from(x0) && x <= max_x && y >= f64::from(y0) && y <= max_y {
+                return (x, y);
             }
         }
-        // Not inside any region (gap/outside): snap into the nearest one.
-        let mut best: Option<((f32, f32), f64)> = None;
+        let mut best: Option<((f64, f64), f64)> = None;
         for region in &self.regions {
             let (x0, y0, x1, y1) = *region;
             let cx = x.clamp(f64::from(x0), f64::from(x1) - 1.0);
@@ -284,11 +305,11 @@ impl AbsoluteTracker {
                 .as_ref()
                 .is_none_or(|(_, best_distance)| distance < *best_distance)
             {
-                best = Some(((cx as f32, cy as f32), distance));
+                best = Some(((cx, cy), distance));
             }
         }
         best.map(|(position, _)| position)
-            .unwrap_or((self.layout_min_x, self.layout_min_y))
+            .unwrap_or((f64::from(self.layout_min_x), f64::from(self.layout_min_y)))
     }
 }
 
@@ -721,14 +742,14 @@ fn discrete_scroll_deltas(axis: u8, value: i32) -> Option<(i32, i32)> {
 
 async fn ei_task(
     mut events: EiConvertEventStream,
-    _conn: Connection,
+    conn: Connection,
     context: ei::Context,
     devices: Devices,
     libei_error: Arc<AtomicBool>,
     error: Arc<Mutex<Option<EmulationError>>>,
 ) {
     loop {
-        match ei_event_handler(&mut events, &context, &devices).await {
+        match ei_event_handler(&mut events, &conn, &context, &devices).await {
             Ok(()) => {}
             Err(e) => {
                 libei_error.store(true, Ordering::SeqCst);
@@ -745,6 +766,7 @@ async fn ei_task(
 
 async fn ei_event_handler(
     events: &mut EiConvertEventStream,
+    conn: &Connection,
     context: &ei::Context,
     devices: &Devices,
 ) -> Result<(), EmulationError> {
@@ -849,7 +871,13 @@ async fn ei_event_handler(
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(e.device().device());
-                e.device().device().start_emulating(0, 0);
+                let sequence = devices
+                    .resume_sequence
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
+                e.device()
+                    .device()
+                    .start_emulating(conn.serial(), sequence as u32);
             }
             EiEvent::KeyboardModifiers(e) => {
                 log::debug!("modifiers: {e:?}");
@@ -1020,6 +1048,31 @@ mod absolute_tracker_tests {
             Some((1920.0, 0.0, 3200.0, 720.0))
         );
         assert_eq!(entry_region_bounds(&[], PointerEdge::Left), None);
+    }
+
+    #[test]
+    fn hole_between_monitors_does_not_fire_a_false_handoff() {
+        // L-shaped layout: A(0,0,1920x1080), B(1920,0,1920x1080),
+        // C(3840,1080,1920x1080); there is an empty lower-left quadrant.
+        let regions = vec![
+            (0.0, 0.0, 1920.0, 1080.0),
+            (1920.0, 0.0, 3840.0, 1080.0),
+            (3840.0, 1080.0, 5760.0, 2160.0),
+        ];
+        let mut tracker = AbsoluteTracker::new(PointerEdge::Bottom, 1, regions).expect("regions");
+        // anchor is the centre of C, (4800, 1620)
+        assert_eq!(tracker.absolute(), (4800.0, 1620.0));
+        // push left into the empty quadrant: the real cursor is snapped to a
+        // monitor edge, so this must NOT hand off
+        assert_eq!(tracker.apply(-3000.0, 0.0), None);
+        assert!(!tracker.fired);
+        // more vertical push while still in the hole: still no hand-off
+        assert_eq!(tracker.apply(0.0, 600.0), None);
+        assert!(!tracker.fired);
+        // reach C again, then genuinely push past its bottom edge
+        let _ = tracker.apply(2500.0, 0.0);
+        let _ = tracker.apply(0.0, 500.0);
+        assert_eq!(tracker.apply(0.0, 700.0), Some(PointerEdge::Bottom));
     }
 
     #[test]
