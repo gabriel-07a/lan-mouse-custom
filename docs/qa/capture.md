@@ -82,3 +82,15 @@ No changes in dummy.rs, error.rs, build.rs, x11.rs.
 | RT-02 | P2 | windows/event_thread.rs + display_util.rs | Absolute devices (tablets/digitizers/RDP) unusable: normalized 0..65535 values treated as pixel deltas when MOUSE_VIRTUAL_DESKTOP was set (1% move = 655 px jump) | MOUSE_VIRTUAL_DESKTOP semantics inverted: MS docs say absolute values are ALWAYS normalized; the flag only selects virtual-desktop vs primary-monitor extent. GetSystemMetrics was also DPI-virtualized | absolute values always normalized; extent = virtual desktop or primary monitor from EnumDisplayMonitors/GetMonitorInfoW (primary flag collected); new mapping_extent(); tests rewritten (1% move -> 19 px) |
 | RT-03 | P2 | layer_shell.rs flush_events/poll_next/prepare_read | One transient WouldBlock from queue.flush() (compositor busy/suspended) permanently disabled layer-shell capture | refactor mapped every Wayland Io error to fatal; prepare_read could also spin when the send buffer is full | WouldBlock is non-fatal: skip prepare_read and return Pending (retry on next readiness); prepare_read bounded (16) to prevent spin |
 | RT-04 | P3 | layer_shell.rs add_client | Position stayed registered after a failed create; a later hotplug recreated windows for a position with no client, so the pointer could be grabbed/hidden with nothing to release it | error return did not roll back active_positions | remove pos and return Err (also when no output/window could be created) |
+
+
+## Post-release round (v0.2.7 user report) - R-02 fixed: one portal session per run
+
+| ID | Sev | Location | Symptom | Root cause | Fix |
+|---|---|---|---|---|---|
+| R-02 | P1 (UX) | input-capture/src/libei.rs do_capture/do_capture_session | On Ubuntu/GNOME the "allow input capture" dialog appeared on every hand-off/activation ("o tempo todo") | the capture loop cancelled and closed the portal session on every client-set change, zones change and EIS device change, then created a new session for the next activation. GNOME's InputCapture portal is v1: it cannot persist consent, so every CreateSession shows the dialog again | ONE portal session is created per app run and reused: capture/release cycles keep the session (and the EIS connection) alive; client changes and ZonesChanged only re-establish pointer barriers; activations without an enabled client are released immediately; the session is only recreated if the portal/EIS fails (bounded 3 attempts, falling back to the previous behaviour). The LM_RESTART_SESSION_ON_DEVICE_CHANGE workaround is gone. |
+
+Note: InputCapture v1 (GNOME 50 as shipped by Ubuntu) has no restore token, so at most ONE prompt per
+lan-mouse launch can be guaranteed; with portal v2 (KDE and newer compositors) the token makes the
+consent persist across restarts as well. The dialog is only requested when the first client starts
+capturing (never on a receive-only machine).

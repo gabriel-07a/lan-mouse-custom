@@ -24,8 +24,9 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
-    sync::{Arc, LazyLock},
+    sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::{
     sync::{
@@ -154,29 +155,6 @@ fn write_token_to(dir: &Path, name: &str, token: &str) -> io::Result<()> {
     file.sync_all()?;
     fs::rename(&tmp, &path)?;
     Ok(())
-}
-
-/* there is a bug in xdg-remote-desktop-portal-gnome / mutter that
- * prevents receiving further events after a session has been disabled once.
- * Therefore the session needs to be recreated when the barriers are updated */
-
-/* mutter also kills the session whenever ei devices come and go, so there the
- * whole session has to be torn down and recreated on every device change.
- * Elsewhere that is pure overhead: each restart costs a CreateSession +
- * ConnectToEIS round trip, and compositors that keep per-session state around
- * (hyprland leaks a keymap fd per eis session, see hyprwm/Hyprland) can be
- * driven out of file descriptors by the churn.
- * Set LM_RESTART_SESSION_ON_DEVICE_CHANGE=1/0 to override the default. */
-static RESTART_SESSION_ON_DEVICE_CHANGE: LazyLock<bool> =
-    LazyLock::new(restart_session_on_device_change);
-
-fn restart_session_on_device_change() -> bool {
-    match env::var("LM_RESTART_SESSION_ON_DEVICE_CHANGE").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => env::var("XDG_CURRENT_DESKTOP")
-            .is_ok_and(|desktops| desktops.to_uppercase().split(':').any(|d| d == "GNOME")),
-    }
 }
 
 /// events that necessitate restarting the capture session
@@ -377,24 +355,6 @@ async fn connect_to_eis(
     Ok((context, conn, event_stream))
 }
 
-async fn libei_event_handler(
-    mut ei_event_stream: EiConvertEventStream,
-    context: ei::Context,
-    event_tx: Sender<(Position, CaptureEvent)>,
-    release_session: Arc<Notify>,
-    current_pos: Rc<Cell<Option<Position>>>,
-) -> Result<(), CaptureError> {
-    loop {
-        let ei_event = ei_event_stream
-            .next()
-            .await
-            .ok_or(CaptureError::EndOfStream)??;
-        log::trace!("from ei: {ei_event:?}");
-        let client = current_pos.get();
-        handle_ei_event(ei_event, client, &context, &event_tx, &release_session).await?;
-    }
-}
-
 impl LibeiInputCapture {
     pub async fn new() -> std::result::Result<Self, LibeiCaptureCreationError> {
         let input_capture = Arc::new(InputCapture::new().await?);
@@ -449,271 +409,309 @@ async fn do_capture(
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
     // Portal calls can block indefinitely (a permission dialog the user never
-    // answers). Shutdown must not wait for them, so both the initial signal
-    // subscription and the session creation below observe the token.
+    // answers). Shutdown must not wait for them, so the signal subscription and
+    // every portal call below observe the token.
     let mut zones_changed = tokio::select! {
         zones = input_capture.receive_zones_changed() => zones?,
         _ = cancellation_token.cancelled() => return Ok(()),
     };
 
+    let mut session_attempts = 0u32;
     loop {
-        // do capture session
-        let cancel_session = CancellationToken::new();
-        let cancel_update = CancellationToken::new();
-
-        let mut capture_event_occured: Option<LibeiNotifyEvent> = None;
-        let mut zones_have_changed = false;
-
-        // kill session if clients need to be updated
-        let handle_session_update_request = async {
+        // Defer session creation until a client can actually capture: a machine
+        // that only receives input never triggers the permission dialog.
+        while active_clients.is_empty() {
             tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    log::debug!("cancelled")
-                }, /* exit requested */
-                _ = cancel_update.cancelled() => {
-                    log::debug!("update task cancelled");
-                }, /* session exited */
-                _ = zones_changed.next() => {
-                    log::debug!("zones changed!");
-                    zones_have_changed = true
-                }, /* zones have changed */
-                e = capture_event.recv() => if let Some(e) = e { /* clients changed */
-                    log::debug!("capture event: {e:?}");
-                    capture_event_occured.replace(e);
+                _ = cancellation_token.cancelled() => return Ok(()),
+                event = capture_event.recv() => match event {
+                    Some(event) => apply_client_event(&mut active_clients, event),
+                    None => return Ok(()),
                 },
             }
-            // kill session (might already be dead!)
-            log::debug!("=> cancelling session");
-            cancel_session.cancel();
+        }
+
+        // ONE portal session for the whole run. Portals without persisted
+        // consent (InputCapture v1, e.g. GNOME) present a permission dialog for
+        // every CreateSession, so the session must survive capture->release
+        // cycles and barrier updates instead of being recreated per hand-off.
+        let mut session = tokio::select! {
+            session = create_session(input_capture) => session?.0,
+            _ = cancellation_token.cancelled() => {
+                log::debug!("cancelled while creating the capture session");
+                return Ok(());
+            }
         };
+        log::info!("input capture session ready; it is reused until shutdown");
 
-        if !active_clients.is_empty() {
-            // Session creation is deferred to this point: a machine that only
-            // receives input never triggers the compositor's capture dialog.
-            let mut session = tokio::select! {
-                session = create_session(input_capture) => session?.0,
-                _ = cancellation_token.cancelled() => {
-                    log::debug!("cancelled while creating the capture session");
-                    break Ok(());
+        let result = do_capture_session(CaptureSessionCtx {
+            input_capture,
+            session: &mut session,
+            event_tx: &event_tx,
+            active_clients: &mut active_clients,
+            next_barrier_id: &mut next_barrier_id,
+            notify_release: &notify_release,
+            zones_changed: &mut zones_changed,
+            capture_event: &mut capture_event,
+            cancellation_token: &cancellation_token,
+        })
+        .await;
+
+        // Tear down only when this session cannot be used anymore: every client
+        // was removed, shutdown was requested, or a portal/EIS error surfaced.
+        log::debug!("closing input capture session");
+        if let Err(e) = input_capture.disable(&session, Default::default()).await {
+            log::warn!("input_capture.disable(&session) {e}");
+        }
+        if let Err(e) = session.close().await {
+            log::warn!("session.close(): {e}");
+        }
+        match result {
+            Ok(()) => {
+                // do_capture_session only returns Ok when shutdown was
+                // requested.
+                return Ok(());
+            }
+            Err(e) => {
+                if cancellation_token.is_cancelled() {
+                    return Ok(());
                 }
-            };
-
-            let capture_session = do_capture_session(
-                input_capture,
-                &mut session,
-                &event_tx,
-                &active_clients,
-                &mut next_barrier_id,
-                &notify_release,
-                (cancel_session.clone(), cancel_update.clone()),
-            );
-
-            let (capture_result, ()) = tokio::join!(capture_session, handle_session_update_request);
-            log::debug!("capture session + session_update task done!");
-
-            // disable capture
-            log::debug!("disabling input capture");
-            if let Err(e) = input_capture.disable(&session, Default::default()).await {
-                log::warn!("input_capture.disable(&session) {e}");
-            }
-            if let Err(e) = session.close().await {
-                log::warn!("session.close(): {e}");
-            }
-
-            // propagate error from capture session
-            capture_result?;
-        } else {
-            handle_session_update_request.await;
-        }
-
-        // update clients if requested
-        if let Some(event) = capture_event_occured.take() {
-            match event {
-                LibeiNotifyEvent::Create(p) => active_clients.push(p),
-                LibeiNotifyEvent::Destroy(p) => active_clients.retain(|&pos| pos != p),
+                session_attempts = session_attempts.saturating_add(1);
+                if session_attempts >= 3 {
+                    // A persistently failing portal is surfaced to the service
+                    // so it can report the backend as unavailable instead of
+                    // retrying forever.
+                    return Err(e);
+                }
+                // Fall back to the previous behaviour: recreate the session.
+                // Portals that cannot persist consent will ask again, but a
+                // transient portal/EIS failure must not disable capture for the
+                // rest of the session.
+                log::warn!(
+                    "input capture session failed ({e}); recreating it (attempt {session_attempts}/3)"
+                );
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                // Re-read the client set: the session may have failed after the
+                // clients changed.
+                while active_clients.is_empty() {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => return Ok(()),
+                        event = capture_event.recv() => match event {
+                            Some(event) => apply_client_event(&mut active_clients, event),
+                            None => return Ok(()),
+                        },
+                    }
+                }
             }
         }
-
-        // break
-        if cancellation_token.is_cancelled() {
-            break Ok(());
-        }
+        // Session ended without shutdown: try again with a new session.
     }
 }
 
-async fn do_capture_session(
-    input_capture: &InputCapture,
-    session: &mut Session<InputCapture>,
-    event_tx: &Sender<(Position, CaptureEvent)>,
-    active_clients: &[Position],
-    next_barrier_id: &mut NonZeroU32,
-    notify_release: &Notify,
-    cancel: (CancellationToken, CancellationToken),
-) -> Result<(), CaptureError> {
-    let (cancel_session, cancel_update) = cancel;
-    // current client
-    let current_pos = Rc::new(Cell::new(None));
+/// Apply one client-set change sent by the capture front-end.
+fn apply_client_event(active_clients: &mut Vec<Position>, event: LibeiNotifyEvent) {
+    match event {
+        LibeiNotifyEvent::Create(pos) => {
+            if !active_clients.contains(&pos) {
+                active_clients.push(pos);
+            }
+        }
+        LibeiNotifyEvent::Destroy(pos) => active_clients.retain(|&p| p != pos),
+    }
+}
 
-    // connect to eis server
-    let (context, _conn, ei_event_stream) = connect_to_eis(input_capture, session).await?;
+/// Everything the per-session capture loop needs. Grouped so the function
+/// signature stays readable (and clippy-clean).
+struct CaptureSessionCtx<'a, S> {
+    input_capture: &'a InputCapture,
+    session: &'a mut Session<InputCapture>,
+    event_tx: &'a Sender<(Position, CaptureEvent)>,
+    active_clients: &'a mut Vec<Position>,
+    next_barrier_id: &'a mut NonZeroU32,
+    notify_release: &'a Notify,
+    zones_changed: &'a mut S,
+    capture_event: &'a mut Receiver<LibeiNotifyEvent>,
+    cancellation_token: &'a CancellationToken,
+}
 
-    // set barriers
-    let (barriers, pos_for_barrier_id) =
+async fn do_capture_session<S>(ctx: CaptureSessionCtx<'_, S>) -> Result<(), CaptureError>
+where
+    S: futures::Stream + Unpin,
+{
+    let CaptureSessionCtx {
+        input_capture,
+        session,
+        event_tx,
+        active_clients,
+        next_barrier_id,
+        notify_release,
+        zones_changed,
+        capture_event,
+        cancellation_token,
+    } = ctx;
+    // The EIS connection persists across Enable()/Disable() cycles and across
+    // activations; it is set up once per portal session (portal docs).
+    let (context, _conn, mut ei_event_stream) = connect_to_eis(input_capture, session).await?;
+    let (mut barriers, mut pos_for_barrier_id) =
         update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
-
     log::debug!("enabling session");
     input_capture.enable(session, Default::default()).await?;
+    let mut activated = input_capture.receive_activated().await?;
+    let current_pos = Rc::new(Cell::new(None));
+    // Barrier positions must be refreshed when clients or zones change, but the
+    // portal only accepts a new barrier set outside of an active capture.
+    let mut barriers_dirty = false;
 
-    // cancellation token to release session
-    let release_session = Arc::new(Notify::new());
+    loop {
+        if barriers_dirty {
+            if active_clients.is_empty() {
+                // The portal may reject an empty barrier set; keep the last one
+                // and just release any activation that still fires (see below).
+                log::debug!("no client enabled; keeping the previous barrier set");
+            } else {
+                (barriers, pos_for_barrier_id) =
+                    update_barriers(input_capture, session, active_clients, next_barrier_id)
+                        .await?;
+            }
+            barriers_dirty = false;
+        }
 
-    // async event task
-    let cancel_ei_handler = CancellationToken::new();
-    let event_chan = event_tx.clone();
-    let pos = current_pos.clone();
-    let cancel_session_clone = cancel_session.clone();
-    let release_session_clone = release_session.clone();
-    let cancel_ei_handler_clone = cancel_ei_handler.clone();
-    let ei_task = async move {
         tokio::select! {
-            r = libei_event_handler(
-                ei_event_stream,
-                context,
-                event_chan,
-                release_session_clone,
-                pos,
-            ) => {
-                log::debug!("libei exited: {r:?} cancelling session task");
-                cancel_session_clone.cancel();
+            _ = cancellation_token.cancelled() => return Ok(()),
+            _ = notify_release.notified() => {
+                // Not capturing right now; nothing to hand back.
+                log::debug!("release requested while no capture is active");
             }
-            _ = cancel_ei_handler_clone.cancelled() => {},
-        }
-        Ok::<(), CaptureError>(())
-    };
-
-    let capture_session_task = async {
-        // receiver for activation tokens
-        let mut activated = input_capture.receive_activated().await?;
-        let mut ei_devices_changed = false;
-        loop {
-            tokio::select! {
-                activated = activated.next() => {
-                    let activated = activated.ok_or(CaptureError::ActivationClosed)?;
-                    log::debug!("activated: {activated:?}");
-
-                    // The cursor position is optional in the protocol (KDE does
-                    // not report barrier ids, some compositors do not report the
-                    // position). An activation we cannot map to a client is
-                    // dropped instead of panicking inside the capture task.
-                    let barrier_id = match activated.barrier_id() {
-                        Some(ActivatedBarrier::Barrier(id)) => id,
-                        // workaround for KDE plasma not reporting barrier ids
-                        Some(ActivatedBarrier::UnknownBarrier) | None => {
-                            let Some(cursor_position) = activated.cursor_position() else {
-                                log::warn!(
-                                    "ignoring activation without a barrier id or cursor position"
-                                );
-                                continue;
-                            };
-                            let Some(id) = find_corresponding_client(&barriers, cursor_position)
-                            else {
-                                log::warn!("activation does not match any registered barrier");
-                                continue;
-                            };
-                            id
-                        }
-                    };
-
-                    // find client corresponding to barrier
-                    let pos = match pos_for_barrier_id.get(&barrier_id) {
-                        Some(id) => *id,
-                        None => {
-                            log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
-                            let Some(cursor_position) = activated.cursor_position() else {
-                                log::warn!(
-                                    "ignoring activation with an unknown barrier id and no cursor position"
-                                );
-                                continue;
-                            };
-                            let Some(id) = find_corresponding_client(&barriers, cursor_position)
-                            else {
-                                log::warn!("activation does not match any registered barrier");
-                                continue;
-                            };
-                            match pos_for_barrier_id.get(&id) {
-                                Some(pos) => *pos,
-                                None => {
-                                    log::warn!("barrier {id} has no registered client");
-                                    continue;
-                                }
-                            }
-                        },
-                    };
-                    current_pos.replace(Some(pos));
-
-                    // client entered => send event
-                    if event_tx
-                        .send((pos, CaptureEvent::Begin))
-                        .await
-                        .is_err()
-                    {
-                        return Err(CaptureError::EndOfStream);
-                    }
-
-                    tokio::select! {
-                        _ = notify_release.notified() => { /* capture release */
-                            log::debug!("release session requested");
-                        },
-                        _ = release_session.notified() => { /* release session */
-                            log::debug!("ei devices changed");
-                            ei_devices_changed = true;
-                        },
-                        _ = cancel_session.cancelled() => { /* kill session notify */
-                            log::debug!("session cancel requested");
-                            break
-                        },
-                    }
-
-                    release_capture(input_capture, session, activated, pos).await?;
-                    // No client is being driven anymore: input events that
-                    // arrive before the next activation must not be forwarded
-                    // with the previous client's position.
-                    current_pos.replace(None);
+            _ = zones_changed.next() => {
+                log::debug!("zones changed; refreshing barriers");
+                barriers_dirty = true;
+            }
+            event = capture_event.recv() => match event {
+                Some(event) => {
+                    apply_client_event(active_clients, event);
+                    // Keep the session alive while no client is enabled: closing
+                    // and recreating it would ask for consent again on portals
+                    // that cannot persist it (InputCapture v1, GNOME).
+                    barriers_dirty = true;
                 }
-                _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
-                    log::debug!("release session requested");
-                },
-                _ = release_session.notified() => { /* release session */
-                    log::debug!("ei devices changed");
-                    ei_devices_changed = true;
-                },
-                _ = cancel_session.cancelled() => { /* kill session notify */
-                    log::debug!("session cancel requested");
-                    break
-                },
-            }
-            if ei_devices_changed {
-                /* for whatever reason, GNOME seems to kill the session
-                 * as soon as devices are added or removed, so we need
-                 * to cancel */
-                break;
+                None => return Ok(()),
+            },
+            activated_event = activated.next() => {
+                let Some(activated_event) = activated_event else {
+                    return Err(CaptureError::EndOfStream);
+                };
+                log::debug!("activated: {activated_event:?}");
+                if active_clients.is_empty() {
+                    // Stale barrier (all clients were disabled): give the
+                    // compositor its capture back immediately and keep waiting.
+                    log::debug!("activation without an enabled client; releasing");
+                    release_capture(input_capture, session, activated_event, Position::Left)
+                        .await?;
+                    continue;
+                }
+
+                // The cursor position is optional in the protocol (KDE does not
+                // report barrier ids, some compositors do not report the
+                // position). An activation that cannot be mapped is dropped
+                // instead of panicking inside the capture task.
+                let barrier_id = match activated_event.barrier_id() {
+                    Some(ActivatedBarrier::Barrier(id)) => id,
+                    Some(ActivatedBarrier::UnknownBarrier) | None => {
+                        let Some(cursor_position) = activated_event.cursor_position() else {
+                            log::warn!(
+                                "ignoring activation without a barrier id or cursor position"
+                            );
+                            continue;
+                        };
+                        let Some(id) = find_corresponding_client(&barriers, cursor_position) else {
+                            log::warn!("activation does not match any registered barrier");
+                            continue;
+                        };
+                        id
+                    }
+                };
+                let pos = match pos_for_barrier_id.get(&barrier_id) {
+                    Some(pos) => *pos,
+                    None => {
+                        log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
+                        let Some(cursor_position) = activated_event.cursor_position() else {
+                            log::warn!(
+                                "ignoring activation with an unknown barrier id and no cursor position"
+                            );
+                            continue;
+                        };
+                        let Some(id) = find_corresponding_client(&barriers, cursor_position) else {
+                            log::warn!("activation does not match any registered barrier");
+                            continue;
+                        };
+                        match pos_for_barrier_id.get(&id) {
+                            Some(pos) => *pos,
+                            None => {
+                                log::warn!("barrier {id} has no registered client");
+                                continue;
+                            }
+                        }
+                    }
+                };
+                current_pos.replace(Some(pos));
+                if event_tx.send((pos, CaptureEvent::Begin)).await.is_err() {
+                    return Err(CaptureError::EndOfStream);
+                }
+
+                // Feed EIS input to the service until this activation is released.
+                let mut release_now = false;
+                loop {
+                    tokio::select! {
+                        _ = notify_release.notified() => {
+                            log::debug!("release session requested");
+                            release_now = true;
+                        }
+                        _ = cancellation_token.cancelled() => {
+                            release_now = true;
+                        }
+                        _ = zones_changed.next() => {
+                            barriers_dirty = true;
+                        }
+                        event = capture_event.recv() => match event {
+                            Some(event) => {
+                                apply_client_event(active_clients, event);
+                                if active_clients.is_empty() {
+                                    release_now = true;
+                                }
+                                barriers_dirty = true;
+                            }
+                            None => release_now = true,
+                        },
+                        ei = ei_event_stream.next() => match ei {
+                            Some(Ok(ei_event)) => {
+                                log::trace!("from ei: {ei_event:?}");
+                                handle_ei_event(
+                                    ei_event,
+                                    current_pos.get(),
+                                    &context,
+                                    event_tx,
+                                )
+                                .await?;
+                            }
+                            Some(Err(e)) => return Err(e.into()),
+                            None => return Err(CaptureError::EndOfStream),
+                        },
+                    }
+                    if release_now {
+                        break;
+                    }
+                }
+
+                release_capture(input_capture, session, activated_event, pos).await?;
+                // No client is being driven anymore: input events that arrive
+                // before the next activation must not be forwarded with the
+                // previous client's position.
+                current_pos.replace(None);
+                if cancellation_token.is_cancelled() {
+                    return Ok(());
+                }
             }
         }
-        // cancel libei task
-        log::debug!("session exited: killing libei task");
-        cancel_ei_handler.cancel();
-        Ok::<(), CaptureError>(())
-    };
-
-    let (a, b) = tokio::join!(ei_task, capture_session_task);
-
-    cancel_update.cancel();
-
-    log::debug!("both session and ei task finished!");
-    a?;
-    b?;
-
-    Ok(())
+    }
 }
 
 async fn release_capture(
@@ -788,7 +786,6 @@ async fn handle_ei_event(
     current_client: Option<Position>,
     context: &ei::Context,
     event_tx: &Sender<(Position, CaptureEvent)>,
-    release_session: &Notify,
 ) -> Result<(), CaptureError> {
     let all_capabilities = DeviceCapability::Pointer
         | DeviceCapability::PointerAbsolute
@@ -801,18 +798,11 @@ async fn handle_ei_event(
             s.seat.bind_capabilities(all_capabilities);
             context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
         }
-        EiEvent::SeatRemoved(_) => {
-            log::debug!("releasing session: {ei_event:?}");
-            release_session.notify_waiters();
-        }
-        /* EiEvent::DeviceAdded(_) | */
-        EiEvent::DeviceRemoved(_) => {
-            if *RESTART_SESSION_ON_DEVICE_CHANGE {
-                log::debug!("releasing session: {ei_event:?}");
-                release_session.notify_waiters();
-            } else {
-                log::debug!("ignoring device change: {ei_event:?}");
-            }
+        EiEvent::SeatRemoved(_) | EiEvent::DeviceRemoved(_) => {
+            // The portal session and the EIS connection are kept for the whole
+            // run: restarting them would make portals without persisted consent
+            // ask the user again. Device churn is handled by the EIS protocol.
+            log::debug!("ignoring device/seat change: {ei_event:?}");
         }
         EiEvent::DevicePaused(_) | EiEvent::DeviceResumed(_) => {}
         EiEvent::DeviceStartEmulating(_) => log::debug!("START EMULATING"),
@@ -1028,5 +1018,26 @@ mod token_tests {
 
         fs::remove_dir_all(&state).unwrap();
         fs::remove_dir_all(&legacy).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_events_update_the_capture_set_without_duplicates() {
+        let mut clients = Vec::new();
+        apply_client_event(&mut clients, LibeiNotifyEvent::Create(Position::Left));
+        apply_client_event(&mut clients, LibeiNotifyEvent::Create(Position::Right));
+        apply_client_event(&mut clients, LibeiNotifyEvent::Create(Position::Left));
+        assert_eq!(clients, vec![Position::Left, Position::Right]);
+
+        apply_client_event(&mut clients, LibeiNotifyEvent::Destroy(Position::Left));
+        assert_eq!(clients, vec![Position::Right]);
+        apply_client_event(&mut clients, LibeiNotifyEvent::Destroy(Position::Left));
+        assert_eq!(clients, vec![Position::Right]);
+        apply_client_event(&mut clients, LibeiNotifyEvent::Destroy(Position::Right));
+        assert!(clients.is_empty());
     }
 }

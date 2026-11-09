@@ -121,6 +121,12 @@ reiniciando o app. Se retornar `1`, vale a limitação do GNOME.
 
 ## 7. Limitações / hipóteses não verificadas (follow-ups)
 
+> **Atualização (pós-v0.2.7, R-02):** a sessão de captura agora é única por execução e reutilizada
+> entre hand-offs; com InputCapture v1 (GNOME) o compositor ainda pede consentimento uma vez por
+> **execução** (v1 não tem restore token). O override LM_RESTART_SESSION_ON_DEVICE_CHANGE deixou de
+> existir: mudanças de device não recriam mais a sessão.
+
+
 - **Captura no GNOME (v1) não tem correção via portal.** Workarounds: aceitar um
   prompt por sessão de captura; extensão GNOME Shell que fale libei/EIS sem
   portal; aguardar `xdg-desktop-portal-gnome` implementar InputCapture v2
