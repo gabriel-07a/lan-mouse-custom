@@ -873,6 +873,16 @@ impl Service {
                 self.expire_session_grants(addr);
                 let _ = self.clipboard_peer_events.send(addr);
                 if let Some(handle) = self.client_for_incoming(addr) {
+                    // The connection closed on the peer side. Because a
+                    // connection is bidirectional, keep it fully closed: stop
+                    // the outgoing link too instead of letting it redial the
+                    // peer that just hung up.
+                    if self.client_manager.is_active(handle) {
+                        log::info!(
+                            "incoming session from {addr} ended: deactivating the outgoing link of client {handle}"
+                        );
+                        self.deactivate_client(handle);
+                    }
                     if self.client_manager.incoming_addr(handle).is_some() {
                         self.client_manager.set_incoming_addr(handle, None);
                         self.broadcast_client(handle);
@@ -2657,8 +2667,8 @@ impl Service {
     /// Register an incoming session on an existing client entry.
     ///
     /// Reusing the configured client is what keeps one logical peer from being
-    /// shown as two devices. Its position, port and activation state are left
-    /// untouched: an incoming connection only proves the peer is reachable.
+    /// shown as two devices. Its position and port are left untouched: an
+    /// incoming connection only proves the peer is reachable.
     fn attach_incoming(&mut self, handle: ClientHandle, addr: SocketAddr) {
         let mut changed = false;
         if self.client_manager.incoming_addr(handle) != Some(addr) {
@@ -2668,6 +2678,42 @@ impl Service {
         if changed {
             self.broadcast_client(handle);
         }
+        // Connecting is bidirectional by definition: if the peer reached us,
+        // this machine must be able to reach the peer too.
+        self.ensure_bidirectional(handle);
+    }
+
+    /// An established incoming session means the peer is connected to this
+    /// machine. The configured outgoing link must then be active as well, so a
+    /// connection is bidirectional automatically instead of requiring the old
+    /// "Also connect" button.
+    fn ensure_bidirectional(&mut self, handle: ClientHandle) {
+        if self.client_manager.is_active(handle) {
+            return;
+        }
+        // An auto-created reverse client has no known listen port yet. Dialing
+        // the default port would create a phantom connection, so stay
+        // receiving-only until discovery or the user supplies the address.
+        if self.auto_reverse_clients.contains(&handle) {
+            let Some((config, _)) = self.client_manager.get_state(handle) else {
+                return;
+            };
+            let known_port = config
+                .fix_ips
+                .first()
+                .and_then(|ip| self.discovered.get(ip).and_then(|device| device.port));
+            match known_port {
+                Some(port) => self.client_manager.set_port(handle, port),
+                None => {
+                    log::info!(
+                        "incoming session established but the listen port of the peer is unknown; keeping client {handle} receiving-only"
+                    );
+                    return;
+                }
+            }
+        }
+        log::info!("incoming session established: activating client {handle} back (bidirectional)");
+        self.set_client_active(handle, true);
     }
 
     /// Drop an auto-added reverse client once the configured client for the

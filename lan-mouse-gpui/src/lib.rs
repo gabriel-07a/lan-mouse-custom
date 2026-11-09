@@ -346,8 +346,6 @@ impl LinkState {
 enum RowAction {
     /// Turn the client on and connect to it.
     Connect,
-    /// The peer is already connected to us: enable the outgoing direction too.
-    ConnectAlso,
     /// Stop a pending attempt (the service keeps retrying while the client is
     /// enabled; deactivating is the only cancellation the IPC offers).
     Cancel,
@@ -359,7 +357,6 @@ impl RowAction {
     fn label(self) -> &'static str {
         match self {
             Self::Connect => "Connect",
-            Self::ConnectAlso => "Also connect",
             Self::Cancel => "Cancel",
             Self::Disconnect => "Disconnect",
         }
@@ -367,7 +364,7 @@ impl RowAction {
 
     /// Whether pressing the action turns the client on.
     fn wants_activation(self) -> bool {
-        matches!(self, Self::Connect | Self::ConnectAlso)
+        matches!(self, Self::Connect)
     }
 }
 
@@ -1746,32 +1743,12 @@ impl Dashboard {
         let sensitivity = peer.sensitivity;
         let primary = peer.primary;
         let action_members = peer.members.clone();
-        let also_connect_members = peer.members.clone();
         let edit_members = peer.members.clone();
         let dns_members = peer.members.clone();
         let position_members = peer.members.clone();
         let sensitivity_down_members = peer.members.clone();
         let sensitivity_up_members = peer.members.clone();
         let delete_members = peer.members.clone();
-        // Optional secondary action: a receiving-only peer can still be asked
-        // to also connect back, while the primary action is now Disconnect.
-        let also_connect: Vec<gpui::AnyElement> = if state == LinkState::Receiving && !peer.active {
-            vec![
-                self.action_button(
-                    "connect-also",
-                    "Also connect",
-                    0x1d222a,
-                    TEXT,
-                    cx,
-                    move |this, _, _, _| {
-                        this.apply_row_action(&also_connect_members, RowAction::ConnectAlso)
-                    },
-                )
-                .into_any_element(),
-            ]
-        } else {
-            Vec::new()
-        };
         div()
             .flex()
             .flex_col()
@@ -1828,11 +1805,11 @@ impl Dashboard {
                             .py_2()
                             .rounded_md()
                             .bg(rgb(match action {
-                                RowAction::Connect | RowAction::ConnectAlso => 0x1b2a3a,
+                                RowAction::Connect => 0x1b2a3a,
                                 _ => 0x2a2020,
                             }))
                             .text_color(rgb(match action {
-                                RowAction::Connect | RowAction::ConnectAlso => ACCENT,
+                                RowAction::Connect => ACCENT,
                                 _ => RED,
                             }))
                             .text_sm()
@@ -1842,7 +1819,6 @@ impl Dashboard {
                                 this.apply_row_action(&action_members, action)
                             })),
                     )
-                    .children(also_connect)
                     .child(div().text_xs().text_color(rgb(MUTED)).child(detail))
                     .when(version_mismatch, |this| {
                         this.child(

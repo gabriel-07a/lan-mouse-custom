@@ -693,6 +693,20 @@ activate_on_startup = true"
         return 1
     fi
     pass "A conectado a B"
+    write_config b "$PORT_B" "[[clients]]
+hostname = \"a\"
+ips = [\"127.0.0.1\"]
+port = $PORT_A
+position = \"left\""
+    restart_daemon b || return 1
+    local waited=0
+    while [ "$waited" -lt 50 ]; do
+        case "$(first_status b)" in
+            *bidirectional*) break ;;
+        esac
+        sleep 0.2
+        waited=$((waited + 1))
+    done
     cli a set-position 0 left >/dev/null 2>&1
     sleep 1
     check_contains "lado do controlador trocado ao vivo" "(left)" "$(client_lines a | head -1)"
@@ -700,7 +714,7 @@ activate_on_startup = true"
     cli b set-position 0 bottom >/dev/null 2>&1
     sleep 1
     check_contains "lado do receptor trocado ao vivo" "(bottom)" "$(client_lines b | head -1)"
-    check_contains "receptor continua recebendo" "receiving-only" "$(first_status b)"
+    check_contains "receptor tambem controla (bidirecional)" "bidirectional" "$(first_status b)"
     check_contains "controlador não caiu com a troca do receptor" "connected" "$(first_status a)"
 }
 
@@ -721,7 +735,21 @@ activate_on_startup = true"
         fail "A não conectou a B antes do teste"
         return 1
     fi
-    check_contains "receptor vê a sessão de entrada" "receiving-only" "$(first_status b)"
+    write_config b "$PORT_B" "[[clients]]
+hostname = \"a\"
+ips = [\"127.0.0.1\"]
+port = $PORT_A
+position = \"left\""
+    restart_daemon b || return 1
+    local waited=0
+    while [ "$waited" -lt 50 ]; do
+        case "$(first_status b)" in
+            *bidirectional*) break ;;
+        esac
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    check_contains "receptor ve a sessao bidirecional" "bidirectional" "$(first_status b)"
 
     cli b deactivate 0 >/dev/null 2>&1
     local waited=0
@@ -765,9 +793,16 @@ activate_on_startup = true"
         return 1
     fi
     cli b set-position 0 bottom >/dev/null 2>&1
-    sleep 1
+    waited=0
+    while [ "$waited" -lt 50 ]; do
+        case "$(first_status b)" in
+            *bidirectional*) break ;;
+        esac
+        sleep 0.2
+        waited=$((waited + 1))
+    done
     check_contains "trocar o lado no receptor mantém o controlador conectado" "connected" "$(first_status a)"
-    check_contains "trocar o lado no receptor mantém a sessão de entrada" "receiving-only" "$(first_status b)"
+    check_contains "trocar o lado no receptor mantem a sessao bidirecional" "bidirectional" "$(first_status b)"
 }
 
 # Regression (user report): a local Disconnect must be final. The controller no

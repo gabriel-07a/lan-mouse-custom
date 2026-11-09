@@ -139,3 +139,15 @@ Follow-ups from independent verification (all fixed):
   device (AuthorizeKey/AuthorizeDevice); both now clear it and grant the handshake budget;
 - datagrams already queued in the emulation channel when a session was closed are no longer injected
   (the proxy keeps a closed-address set and ignores them until a new Enter opens the address again).
+
+
+## R-14: connections are bidirectional by default
+
+An established incoming session used to leave the outgoing link inactive: the peer controlled this machine
+and the user had to press "Also connect" to be able to control the peer back. The UI no longer offers that
+button: as soon as an incoming session from a known device is attached, the service activates the configured
+outgoing link automatically (when its listen port is known; an auto-created reverse client stays receiving-only
+until discovery supplies the port, instead of dialing a phantom default port).
+
+Closing the connection on either side keeps closing both directions: when the incoming session ends, the
+service also deactivates the outgoing link so it cannot redial the peer that just hung up.
