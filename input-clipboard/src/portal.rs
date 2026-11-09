@@ -101,7 +101,21 @@ impl PortalClipboard {
         clipboard
             .request(&session, RequestClipboardOptions::default())
             .await
-            .map_err(|e| Error::Backend(format!("request clipboard: {e}")))?;
+            .map_err(|e| {
+                let text = e.to_string();
+                if text.contains("Invalid state") {
+                    // Known xdg-desktop-portal failure mode: the portal
+                    // frontend cached the *backend* RemoteDesktop version from
+                    // before an update, so RequestClipboard is rejected even
+                    // though the backend supports it. Restarting the portal
+                    // (or logging out/in) repairs it.
+                    Error::Backend(format!(
+                        "request clipboard rejected with a stale portal state ({text});                          restart the desktop portal (systemctl --user restart xdg-desktop-portal)                          or log out and back in"
+                    ))
+                } else {
+                    Error::Backend(format!("request clipboard: {text}"))
+                }
+            })?;
 
         let restore_token = read_token();
         let options = SelectDevicesOptions::default()
