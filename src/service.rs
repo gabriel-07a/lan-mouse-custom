@@ -802,6 +802,10 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                // A peer is about to drive this machine: make sure the
+                // (lazily created) emulation backend exists so input can be
+                // injected and the capability is advertised back to the peer.
+                self.emulation.warm_up();
                 // The peer is driving this machine: local barrier detection
                 // must not react to the injected pointer motion (ping-pong at
                 // the shared border). Knowing *which* edge the peer entered
@@ -897,6 +901,7 @@ impl Service {
                 incoming,
                 outgoing,
             } => {
+                self.emulation.warm_up();
                 // The listener trusted the certificate (allowlisted address
                 // or open pairing window). It only inserted the fingerprint
                 // after the handshake succeeded; persist it here so the next
@@ -954,6 +959,8 @@ impl Service {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::Connected { addr, fingerprint } => {
+                // Pre-warm for a peer that may drive this machine next.
+                self.emulation.warm_up();
                 // The peer that was just authorized also becomes a configured
                 // client, so it can control this device too.
                 let name = self.peer_display_name(addr.ip(), &fingerprint);

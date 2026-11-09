@@ -143,6 +143,9 @@ enum EmulationRequest {
     /// with disconnect), including sessions that never registered a capture
     /// zone
     DisconnectFingerprint(String),
+    /// Create the (possibly portal-backed) emulation backend as soon as a peer
+    /// session exists, instead of waiting for the first input. Idempotent.
+    WarmUp,
     ChangePort(u16),
     Terminate,
 }
@@ -244,6 +247,18 @@ impl Emulation {
     pub(crate) fn reenable(&self) {
         self.request_tx
             .send(EmulationRequest::Reenable)
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Prepare the emulation backend for an incoming peer session.
+    ///
+    /// The backend is created lazily so an idle machine never shows a portal
+    /// permission dialog; the first authorized session (or explicit enable)
+    /// wakes it up. Idempotent while it is already running.
+    pub(crate) fn warm_up(&self) {
+        self.request_tx
+            .send(EmulationRequest::WarmUp)
             .ok()
             .unwrap_or_default();
     }
@@ -569,6 +584,7 @@ impl ListenTask {
                         // identity but not yet in the emulation map.
                         self.listener.disconnect_fingerprint(&fingerprint).await;
                     }
+                    EmulationRequest::WarmUp => self.emulation_proxy.reenable(),
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -726,9 +742,37 @@ struct EmulationTask {
 
 impl EmulationTask {
     async fn run(mut self) {
+        // Creating the emulation backend can present a portal permission dialog
+        // (libei/RemoteDesktop on Wayland). Never ask at service startup: wait
+        // until the first input actually has to be injected (or until the user
+        // explicitly enables emulation again). Otherwise every app launch or
+        // reconnect would queue another permission dialog, even when nothing is
+        // being controlled.
+        let mut warmup: Option<(Event, SocketAddr)> = None;
         loop {
-            if let Err(e) = self.do_emulation().await {
-                log::warn!("input emulation exited: {e}");
+            match self.request_rx.recv().await.expect("channel closed") {
+                ProxyRequest::Terminate => return,
+                ProxyRequest::Reenable => break,
+                ProxyRequest::Input(event, addr) => {
+                    warmup = Some((event, addr));
+                    break;
+                }
+                ProxyRequest::Remove(..) | ProxyRequest::Open(..) => continue,
+            }
+        }
+
+        loop {
+            if let Err(e) = self.do_emulation(warmup.take()).await {
+                log::warn!(
+                    "input emulation could not start ({e}); enable emulation again to retry"
+                );
+                // Tell the frontend/peers the truth: input cannot be injected
+                // until the user enables emulation again (a denied portal
+                // permission must not keep advertising an active backend).
+                self.event_tx
+                    .send(EmulationEvent::EmulationDisabled)
+                    .ok()
+                    .unwrap_or_default();
             }
             if self.exit_requested.get() {
                 break;
@@ -747,7 +791,37 @@ impl EmulationTask {
         }
     }
 
-    async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
+    /// Inject one input event, creating the emulation target for the peer on
+    /// first use.
+    async fn consume_input(
+        &mut self,
+        emulation: &mut InputEmulation,
+        event: Event,
+        addr: SocketAddr,
+    ) -> Result<(), InputEmulationError> {
+        if self.closed.contains(&addr) {
+            return Ok(());
+        }
+        let handle = match self.handles.get(&addr) {
+            Some(&handle) => handle,
+            None => {
+                let handle = self.next_id;
+                self.next_id += 1;
+                emulation.create(handle).await;
+                self.handles.insert(addr, handle);
+                handle
+            }
+        };
+        emulation
+            .consume(event, handle)
+            .await
+            .map_err(InputEmulationError::from)
+    }
+
+    async fn do_emulation(
+        &mut self,
+        warmup: Option<(Event, SocketAddr)>,
+    ) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
             r = InputEmulation::new(self.backend) => r?,
@@ -775,6 +849,15 @@ impl EmulationTask {
         if let Err(e) = self.create_clients(&mut emulation).await {
             emulation.terminate().await;
             return Err(e);
+        }
+
+        // The input that triggered the (lazy) backend start is injected first so
+        // the hand-off does not lose the first motion.
+        if let Some((event, addr)) = warmup {
+            if let Err(e) = self.consume_input(&mut emulation, event, addr).await {
+                emulation.terminate().await;
+                return Err(e);
+            }
         }
 
         let res = self
@@ -823,23 +906,9 @@ impl EmulationTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
-                        if self.closed.contains(&addr) {
-                            // The session was closed explicitly: datagrams that
-                            // were already queued before the close must not be
-                            // injected after it.
-                            continue;
-                        }
-                        let handle = match self.handles.get(&addr) {
-                            Some(&handle) => handle,
-                            None => {
-                                let handle = self.next_id;
-                                self.next_id += 1;
-                                emulation.create(handle).await;
-                                self.handles.insert(addr, handle);
-                                handle
-                            }
-                        };
-                        emulation.consume(event, handle).await?;
+                        // Datagrams queued before an explicit close are dropped
+                        // instead of being injected after it (see Remove).
+                        self.consume_input(emulation, event, addr).await?;
                     },
                     ProxyRequest::Remove(addr) => {
                         self.closed.insert(addr);

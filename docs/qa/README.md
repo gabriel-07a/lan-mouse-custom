@@ -146,3 +146,7 @@ See capture.md R-02 and frontend.md R-03/R-04.
   that holds the capture, or disconnect. Native Windows edge reporting stays.
 - A peer you connected to is registered as a trusted device with the bidirectional defaults, so accepting
   it once no longer produces a second permission prompt when it connects back (scenario noprompt).
+
+- The emulation backend is created lazily now: the GNOME RemoteDesktop permission dialog is not requested at
+  app startup any more. It appears at most once per run, when a peer actually connects (or when emulation is
+  enabled explicitly); a cancelled dialog disables emulation until the user retries instead of looping.
