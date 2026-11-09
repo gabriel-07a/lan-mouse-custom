@@ -674,9 +674,39 @@ activate_on_startup = true"
     check_contains "receptor negou o dispositivo" "no devices known yet" "$(cli b devices)"
 }
 
+# Regression: changing a peer's screen side while it is connected must take
+# effect live, on both sides, without dropping the connection (the controller
+# keeps active_addr; the receiver keeps its incoming session and only moves the
+# capture zone).
+scenario_side() {
+    say "### scenario side: trocar o lado com o peer conectado (ao vivo)"
+    start_pair || return 1
+    write_config a "$PORT_A" "[[clients]]
+hostname = \"b\"
+ips = [\"127.0.0.1\"]
+port = $PORT_B
+position = \"right\"
+activate_on_startup = true"
+    restart_daemon a || return 1
+    if ! wait_connected a 10; then
+        fail "A não conectou a B antes do teste"
+        return 1
+    fi
+    pass "A conectado a B"
+    cli a set-position 0 left >/dev/null 2>&1
+    sleep 1
+    check_contains "lado do controlador trocado ao vivo" "(left)" "$(client_lines a | head -1)"
+    check_contains "controlador continua conectado" "connected" "$(first_status a)"
+    cli b set-position 0 bottom >/dev/null 2>&1
+    sleep 1
+    check_contains "lado do receptor trocado ao vivo" "(bottom)" "$(client_lines b | head -1)"
+    check_contains "receptor continua recebendo" "receiving-only" "$(first_status b)"
+    check_contains "controlador não caiu com a troca do receptor" "connected" "$(first_status a)"
+}
+
 SCENARIOS=("$@")
 if [ "${#SCENARIOS[@]}" -eq 0 ]; then
-    SCENARIOS=(dual duplicate peer_down disconnect revoke stale_config reset_config no_spin isolation)
+    SCENARIOS=(dual duplicate peer_down disconnect revoke side stale_config reset_config no_spin isolation)
 fi
 
 say "lan-mouse QA two-instances (repo: $REPO_ROOT, bin: $BIN, base: $BASE)"
@@ -689,6 +719,7 @@ for scenario in "${SCENARIOS[@]}"; do
         duplicate) scenario_duplicate ;;
         ipv6_only) scenario_ipv6_only ;;
         peer_down) scenario_peer_down ;;
+        side) scenario_side ;;
         revoke)
             scenario_revoke
             ;;

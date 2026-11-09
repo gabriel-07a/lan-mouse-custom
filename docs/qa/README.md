@@ -116,3 +116,6 @@ never registered a capture zone. Regression: scripts/qa-two-instances.sh revoke.
 - Windows: the GPUI frontend no longer allocates a console window.
 - Device approval always grants both directions (single Approve action).
 See capture.md R-02 and frontend.md R-03/R-04.
+
+- (v0.2.8) Peer side is now an explicit selector on the card and can be changed live on both the
+  controller and the receiving side without disconnecting. Regression: qa-two-instances.sh side.

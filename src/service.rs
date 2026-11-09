@@ -158,6 +158,11 @@ pub struct Service {
     /// A frontend asked the service to shut down (CLI/installer upgrade path).
     /// The run loop breaks and the regular teardown runs once.
     shutdown_requested: bool,
+    /// Peer currently driving this machine (addr, entry edge), if any.
+    ///
+    /// Needed to move the capture suppression edge when the user changes the
+    /// peer's side while it is already connected/controlling.
+    active_remote_peer: Option<(SocketAddr, Position)>,
 }
 
 #[derive(Debug)]
@@ -302,6 +307,7 @@ impl Service {
             return_serial: 0,
             peer_permissions_seen: Default::default(),
             shutdown_requested: false,
+            active_remote_peer: None,
         };
         Ok(service)
     }
@@ -797,6 +803,7 @@ impl Service {
                 // through also lets the capture side still detect the return
                 // hand-off at exactly that edge.
                 self.capture.set_remote_peer(Some(pos));
+                self.active_remote_peer = Some((addr, pos));
                 // Resolve the client entry before the fingerprint is moved
                 // into the session registry below.
                 let handle = self.client_for_peer(addr, &fingerprint);
@@ -837,6 +844,11 @@ impl Service {
                 }
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
+                }
+                if let Some((active, _)) = self.active_remote_peer {
+                    if active == addr {
+                        self.active_remote_peer = None;
+                    }
                 }
                 if self.incoming_conns.is_empty() {
                     self.capture.set_remote_peer(None);
@@ -1336,6 +1348,7 @@ impl Service {
         }
         if self.incoming_conns.is_empty() {
             self.capture.set_remote_peer(None);
+            self.active_remote_peer = None;
         }
     }
 
@@ -2826,9 +2839,51 @@ impl Service {
 
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
         // update state in event input emulator & input capture
-        if self.client_manager.set_pos(handle, pos) {
-            self.deactivate_client(handle);
-            self.activate_client(handle);
+        if !self.client_manager.set_pos(handle, pos) {
+            self.broadcast_client(handle);
+            return;
+        }
+        // A live incoming session uses the client's position as its capture
+        // zone: move the zone now so changing the side while the peer is
+        // connected takes effect without disconnecting/reconnecting.
+        if let Some(addr) = self.client_manager.incoming_addr(handle) {
+            let fingerprint = self.client_manager.fingerprint(handle).unwrap_or_default();
+            self.update_incoming(addr, pos, fingerprint);
+            if matches!(self.active_remote_peer, Some((active, _)) if active == addr) {
+                self.active_remote_peer = Some((addr, pos));
+                // Follow the peer's new entry edge for local-input suppression
+                // and for the return hand-off.
+                self.capture.set_remote_peer(Some(pos));
+            }
+        }
+        // Move the outgoing capture barrier in place. The transport must stay
+        // up: deactivating/reactivating the client cleared active_addr and the
+        // UI fell back to "waiting approval" even though the link was alive.
+        if self.client_manager.is_active(handle) {
+            if let Some(other) = self.client_manager.client_at(pos) {
+                if other != handle {
+                    let same_peer = matches!(
+                        (
+                            self.client_manager.fingerprint(handle),
+                            self.client_manager.fingerprint(other),
+                        ),
+                        (Some(a), Some(b)) if a == b
+                    );
+                    if same_peer {
+                        log::warn!("not deactivating {other}: it is the same peer as {handle}");
+                    } else {
+                        self.deactivate_client(other);
+                    }
+                }
+            }
+            self.capture.destroy(handle);
+            self.capture
+                .create(handle, pos, crate::capture::CaptureType::Default);
+            self.capture.set_sensitivity(
+                handle,
+                self.client_manager.get_sensitivity(handle) as f64 / 100.0,
+            );
+            self.capture.connect(handle);
         }
         self.broadcast_client(handle);
     }

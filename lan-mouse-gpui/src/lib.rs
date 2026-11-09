@@ -637,6 +637,14 @@ fn has_fresh_pong(
     })
 }
 
+/// Sides a peer can be placed on, in the order shown in the UI.
+const SIDES: [Position; 4] = [
+    Position::Left,
+    Position::Right,
+    Position::Top,
+    Position::Bottom,
+];
+
 fn position_label(position: Position) -> &'static str {
     match position {
         Position::Left => "left",
@@ -1470,15 +1478,14 @@ impl Dashboard {
         self.send(FrontendRequest::Create);
     }
 
-    fn cycle_position(&mut self, members: &[ClientHandle], current: Position) {
-        let next = match current {
-            Position::Left => Position::Right,
-            Position::Right => Position::Top,
-            Position::Top => Position::Bottom,
-            Position::Bottom => Position::Left,
-        };
+    /// Place a peer on the given screen side.
+    ///
+    /// Works both for configured clients and for connected peers that only
+    /// receive input: the service moves the live capture zone immediately, so
+    /// no disconnect/reconnect is needed.
+    fn set_position(&mut self, members: &[ClientHandle], position: Position) {
         for handle in members {
-            self.send(FrontendRequest::UpdatePosition(*handle, next));
+            self.send(FrontendRequest::UpdatePosition(*handle, position));
         }
     }
 
@@ -1829,11 +1836,47 @@ impl Dashboard {
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                        "position {} · sensitivity {}%",
-                        position_label(position),
-                        sensitivity
-                    )))
+                    .child({
+                        // Clearly labelled side selector. Changing the side used
+                        // to be hidden behind a button that silently cycled
+                        // left -> right -> top -> bottom.
+                        let mut sides: Vec<gpui::AnyElement> = Vec::new();
+                        for side in SIDES {
+                            let side_members = position_members.clone();
+                            let is_current = side == position;
+                            sides.push(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "side-{}-{primary}",
+                                        position_label(side)
+                                    )))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(if is_current { 0x1b2a3a } else { 0x1d222a }))
+                                    .text_color(rgb(if is_current { ACCENT } else { TEXT }))
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .child(position_label(side))
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        this.set_position(&side_members, side)
+                                    }))
+                                    .into_any_element(),
+                            );
+                        }
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("Side"))
+                            .children(sides)
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("sensitivity {sensitivity}%")),
+                    )
                     .child(self.action_button(
                         "edit-client",
                         "Edit",
@@ -1852,14 +1895,6 @@ impl Dashboard {
                         TEXT,
                         cx,
                         move |this, _, _, _| this.resolve_dns(&dns_members),
-                    ))
-                    .child(self.action_button(
-                        "position",
-                        "Position",
-                        0x1d222a,
-                        TEXT,
-                        cx,
-                        move |this, _, _, _| this.cycle_position(&position_members, position),
                     ))
                     .child(self.action_button(
                         "sensitivity-down",
@@ -3985,6 +4020,23 @@ mod tests {
         state: ClientState,
     ) -> (ClientHandle, ClientConfig, ClientState) {
         (handle, config, state)
+    }
+
+    #[test]
+    fn side_selector_offers_every_side_exactly_once() {
+        assert_eq!(SIDES.len(), 4);
+        for side in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            assert_eq!(
+                SIDES.iter().filter(|candidate| **candidate == side).count(),
+                1,
+                "side {side:?} must be offered exactly once"
+            );
+        }
     }
 
     #[test]

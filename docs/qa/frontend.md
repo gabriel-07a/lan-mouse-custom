@@ -155,3 +155,10 @@ No new frontend findings: the verifier re-checked GPUI LinkState/RowAction (appl
 |---|---|---|---|---|---|
 | R-03 | P2 | lan-mouse-gpui/src/main.rs | A console window reappeared on Windows after the v0.2.6 frontend split | the standalone GPUI launcher binary is a console-subsystem executable and the GUI binary spawns it | added the same windows_subsystem attribute (release builds) as the main binary |
 | R-04 | P2 (UX) | lan-mouse-gpui/src/lib.rs pending-request card | approving a device required choosing "Approve both" / directional presets | the approval card exposed directional choices | accepting a request always grants both directions now (single "Approve" / "Trust new certificate"); per-direction presets remain in the device permissions panel for later adjustments |
+
+
+## Post-release round (v0.2.7 user report) - R-05: live side change
+
+| ID | Sev | Location | Symptom | Root cause | Fix |
+|---|---|---|---|---|---|
+| R-05 | P2 (UX) | lan-mouse-gpui/src/lib.rs render_peer + src/service.rs update_pos | There was no obvious way to change the peer's screen side while it was connected; the only control was a "Position" button that silently cycled left/right/top/bottom. On the receiving side a connected peer's live capture zone did not move at all | the side was only editable through the cycle button, and update_pos only handled active outgoing clients (deactivate+activate, which cleared active_addr and showed "waiting approval"); live incoming zones were never repositioned | the peer card now has an explicit "Side: Left / Right / Top / Bottom" selector (current side highlighted); the service moves a live incoming capture zone in place and moves the outgoing barrier by destroy/create without dropping the transport, so the link stays connected on both sides |
