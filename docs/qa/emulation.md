@@ -180,3 +180,12 @@ modified; there is no capability bit, version bump or mixed-version requirement 
 | R-11 | P1 (UX) | src/emulation.rs (EmulationTask), input-emulation/src/lib.rs | The GNOME "Remote Desktop" permission dialog reappeared endlessly and could not be dismissed permanently | automatic wake-ups (peer Connected/AutoAuthorized/Entered) and incoming input queued re-enable requests; when the user cancelled the dialog the creation failed and every queued request immediately retried it. A second path always attempted a portal session even when no consent had ever been persisted | automatic wake-ups are a distinct request that may start the backend only for the first session; after a cancelled/failed creation the task waits exclusively for an explicit "enable emulation" (frontend button / cli enable-emulation), drops every automatic trigger and deletes the now-invalid consent token. With no persisted consent at all the backend does not start automatically, so the app can never open a permission dialog on its own. Explicit enable shows exactly one dialog; with "Remember this selection" the token makes later runs silent. |
 
 Also hardened after independent review: RemoteEnter/RemoteLeave are stashed while the backend is being created instead of being discarded; absolute tracking is ignored when the compositor replaces/pauses the device (falling back to relative injection); EI frame timestamps use CLOCK_MONOTONIC; the anchor/clamp uses one real EIS region touching the entry edge (no holes between monitors); the fired latch re-arms when the pointer returns inside.
+
+
+### R-12: absolute pointer sensitivity on HiDPI
+
+The EIS absolute pointer region is expressed in logical pixels (e.g. 1536x960 for a 2560x1600 panel at
+166% scaling) while the peer's motion deltas are physical-ish. Injected deltas are therefore divided by the
+region scale reported by the compositor, so the physical cursor speed matches the previous relative
+injection; the value is logged in the "absolute pointer armed ... scale X" line.
+LAN_MOUSE_ABSOLUTE_SCALE (environment variable, multiplier) fine-tunes it without rebuilding.

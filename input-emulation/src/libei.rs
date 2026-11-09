@@ -47,6 +47,8 @@ struct AbsolutePointer {
     generation: u64,
     /// device regions in logical pixels (x0, y0, x1, y1)
     regions: Vec<(f32, f32, f32, f32)>,
+    /// logical-to-physical scale of each region (same order as regions)
+    scales: Vec<f32>,
 }
 
 #[derive(Clone, Default)]
@@ -150,6 +152,9 @@ struct AbsoluteTracker {
     edge: PointerEdge,
     /// absolute device generation this tracker was armed against
     generation: u64,
+    /// multiplies incoming deltas: 1/monitor-scale so the physical speed
+    /// matches the previous relative injection (and a user override)
+    delta_scale: f64,
     /// monitor regions in logical pixels: (x0, y0, x1, y1), half-open
     regions: Vec<(f32, f32, f32, f32)>,
     /// region touching the entry edge (anchor + return threshold)
@@ -164,7 +169,12 @@ struct AbsoluteTracker {
 }
 
 impl AbsoluteTracker {
-    fn new(edge: PointerEdge, generation: u64, regions: Vec<(f32, f32, f32, f32)>) -> Option<Self> {
+    fn new(
+        edge: PointerEdge,
+        generation: u64,
+        regions: Vec<(f32, f32, f32, f32)>,
+        delta_scale: f64,
+    ) -> Option<Self> {
         let entry = entry_region_bounds(&regions, edge)?;
         let layout_min_x = regions.iter().map(|r| r.0).fold(f32::INFINITY, f32::min);
         let layout_min_y = regions.iter().map(|r| r.1).fold(f32::INFINITY, f32::min);
@@ -179,6 +189,7 @@ impl AbsoluteTracker {
         Some(Self {
             edge,
             generation,
+            delta_scale,
             regions,
             entry,
             layout_min_x,
@@ -217,6 +228,10 @@ impl AbsoluteTracker {
             log::debug!("dropping implausible absolute delta ({dx}, {dy})");
             return None;
         }
+        // HiDPI: the EIS region is in logical pixels while the peer's deltas
+        // are physical-ish; dividing by the monitor scale keeps the physical
+        // cursor speed identical to the previous relative injection.
+        let (dx, dy) = (dx * self.delta_scale, dy * self.delta_scale);
         let raw_x = self.x + dx;
         let raw_y = self.y + dy;
         // The compositor clamps the real cursor into the layout; mirror that so
@@ -429,8 +444,31 @@ impl LibeiEmulation {
             log::debug!("absolute pointer paused by the compositor; waiting for resume");
             return false;
         }
-        let Some(tracker) = AbsoluteTracker::new(edge, pointer.generation, pointer.regions.clone())
-        else {
+        let entry = entry_region_bounds(&pointer.regions, edge);
+        let entry_scale = entry
+            .and_then(|entry| {
+                pointer
+                    .regions
+                    .iter()
+                    .zip(pointer.scales.iter())
+                    .find(|(region, _)| **region == entry)
+                    .map(|(_, scale)| f64::from(*scale))
+            })
+            .filter(|scale| scale.is_finite() && *scale > 0.05)
+            .unwrap_or(1.0);
+        // user override for fine tuning without recompiling
+        let user_scale = std::env::var("LAN_MOUSE_ABSOLUTE_SCALE")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.05 && *value < 20.0)
+            .unwrap_or(1.0);
+        let delta_scale = (1.0 / entry_scale).clamp(0.2, 5.0) * user_scale;
+        let Some(tracker) = AbsoluteTracker::new(
+            edge,
+            pointer.generation,
+            pointer.regions.clone(),
+            delta_scale,
+        ) else {
             log::warn!("absolute pointer has no usable region; automatic edge return disabled");
             return false;
         };
@@ -442,7 +480,7 @@ impl LibeiEmulation {
         }
         let (min_x, min_y, max_x, max_y) = tracker.entry_bounds();
         log::info!(
-            "absolute pointer armed at ({x},{y}) region {min_x},{min_y}..{max_x},{max_y}; push the cursor past the {edge:?} edge to hand control back"
+            "absolute pointer armed at ({x},{y}) region {min_x},{min_y}..{max_x},{max_y} scale {delta_scale:.3}; push the cursor past the {edge:?} edge to hand control back"
         );
         self.absolute = Some(tracker);
         true
@@ -808,6 +846,13 @@ async fn ei_event_handler(
                             "absolute pointer device has no usable region; automatic edge return disabled"
                         );
                     } else {
+                        let scales: Vec<f32> = e
+                            .device()
+                            .regions()
+                            .iter()
+                            .filter(|region| region.width > 0 && region.height > 0)
+                            .map(|region| region.scale)
+                            .collect();
                         let generation = devices
                             .absolute_generation
                             .fetch_add(1, Ordering::SeqCst)
@@ -825,6 +870,7 @@ async fn ei_event_handler(
                                 pointer,
                                 generation,
                                 regions,
+                                scales,
                             });
                     }
                 }
@@ -915,7 +961,7 @@ mod absolute_tracker_tests {
     const H: f32 = 1600.0;
 
     fn tracker(edge: PointerEdge) -> AbsoluteTracker {
-        AbsoluteTracker::new(edge, 1, vec![(0.0, 0.0, W, H)]).expect("single region")
+        AbsoluteTracker::new(edge, 1, vec![(0.0, 0.0, W, H)], 1.0).expect("single region")
     }
 
     fn dual_regions() -> Vec<(f32, f32, f32, f32)> {
@@ -979,7 +1025,7 @@ mod absolute_tracker_tests {
 
     #[test]
     fn pointer_can_cross_into_the_adjacent_monitor() {
-        let mut tracker = AbsoluteTracker::new(PointerEdge::Left, 1, dual_regions()).unwrap();
+        let mut tracker = AbsoluteTracker::new(PointerEdge::Left, 1, dual_regions(), 1.0).unwrap();
         // anchor is the centre of the monitor that was entered (960, 540)
         assert_eq!(tracker.absolute(), (960.0, 540.0));
         assert_eq!(tracker.apply(2000.0, 0.0), None);
@@ -991,7 +1037,7 @@ mod absolute_tracker_tests {
     #[test]
     fn pointer_can_cross_into_a_stacked_monitor() {
         let regions = vec![(0.0, 0.0, 1920.0, 1080.0), (0.0, 1080.0, 1920.0, 2160.0)];
-        let mut tracker = AbsoluteTracker::new(PointerEdge::Top, 1, regions).unwrap();
+        let mut tracker = AbsoluteTracker::new(PointerEdge::Top, 1, regions, 1.0).unwrap();
         assert_eq!(tracker.apply(0.0, 1500.0), None);
         let (_, y) = tracker.absolute();
         assert!(y > 1080.0, "cursor must reach the lower monitor, got {y}");
@@ -1015,6 +1061,27 @@ mod absolute_tracker_tests {
         assert_eq!(tracker.apply(-1.0e12, 0.0), None);
         assert!(!tracker.fired);
         assert_eq!(tracker.absolute(), before);
+    }
+
+    #[test]
+    fn hidpi_scale_normalises_the_physical_speed() {
+        // display scale 1.6667: 100 physical-ish counts must move the logical
+        // cursor 60 px, matching the previous relative injection feel
+        let mut tracker = AbsoluteTracker::new(
+            PointerEdge::Left,
+            1,
+            vec![(0.0, 0.0, 1536.0, 960.0)],
+            1.0 / 1.66667,
+        )
+        .expect("region");
+        let (x0, _) = tracker.absolute();
+        assert_eq!(tracker.apply(1000.0, 0.0), None);
+        let (x1, _) = tracker.absolute();
+        assert!(
+            (x1 - x0 - 600.0).abs() < 2.0,
+            "expected ~600 px, got {}",
+            x1 - x0
+        );
     }
 
     #[test]
@@ -1059,7 +1126,8 @@ mod absolute_tracker_tests {
             (1920.0, 0.0, 3840.0, 1080.0),
             (3840.0, 1080.0, 5760.0, 2160.0),
         ];
-        let mut tracker = AbsoluteTracker::new(PointerEdge::Bottom, 1, regions).expect("regions");
+        let mut tracker =
+            AbsoluteTracker::new(PointerEdge::Bottom, 1, regions, 1.0).expect("regions");
         // anchor is the centre of C, (4800, 1620)
         assert_eq!(tracker.absolute(), (4800.0, 1620.0));
         // push left into the empty quadrant: the real cursor is snapped to a
