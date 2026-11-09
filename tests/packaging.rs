@@ -16,7 +16,12 @@ use std::{
 
 fn read(relative: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    // Normalise line endings: the Windows CI checkout converts checked-in
+    // files to CRLF (core.autocrlf), which used to break literal assertions
+    // such as the Cargo.toml default-features block.
+    fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 fn exists(relative: &str) -> bool {
