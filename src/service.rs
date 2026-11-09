@@ -911,6 +911,9 @@ impl Service {
             },
             EmulationEvent::EmulationDisabled => {
                 self.emulation_status = Status::Disabled;
+                self.notify_frontend(FrontendEvent::AbsoluteSensitivity(
+                    self.config.absolute_pointer_sensitivity(),
+                ));
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::EmulationEnabled => {
@@ -3056,6 +3059,7 @@ impl Service {
         let percent = percent.clamp(10, 500);
         self.config.set_absolute_pointer_sensitivity(percent);
         self.emulation.set_absolute_sensitivity(percent);
+        self.notify_frontend(FrontendEvent::AbsoluteSensitivity(percent));
     }
 
     fn update_sensitivity(&mut self, handle: ClientHandle, sensitivity: u16) {

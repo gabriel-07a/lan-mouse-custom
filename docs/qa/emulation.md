@@ -187,15 +187,15 @@ Also hardened after independent review: RemoteEnter/RemoteLeave are stashed whil
 Absolute injection positions the cursor in logical pixels. The mapping is screen-relative: one pointer count
 moves one logical pixel, independent of the monitor resolution and scale, matching the relative injection path.
 
-The missing piece was pointer acceleration: the relative path is accelerated by libinput, absolute injection
-is linear. The backend reads the GNOME mouse settings (speed, accel-profile) at creation and applies a
-libinput-like adaptive curve: slow motion stays at base speed for fine control, fast motion gets the same
-velocity-dependent boost (bounded by speed-adjustment * 2.2). Pointer velocity comes from the wire timestamp
-when the capture backend provides one, otherwise from the local arrival time (Windows/macOS report time = 0);
-real pauses keep their duration instead of being replaced by a synthetic interval.
+The local mouse speed setting (speed) is deliberately NOT applied to input received from another machine:
+it describes this machine's own mouse and made remote input slower/faster than expected. Only the acceleration
+profile is mirrored: with the adaptive profile a libinput-like velocity curve is applied (slow motion stays
+1:1 for fine control, fast motion gets a bounded boost); with the flat profile the mapping is linear.
+Pointer velocity comes from the wire timestamp when the capture backend provides one, otherwise from the local
+arrival time (Windows/macOS report time = 0); real pauses keep their duration.
 
-A persisted sensitivity percentage (default 100, clamped 10..500) scales the mapping for personal taste:
-config key absolute_pointer_sensitivity in config.toml, or the live command
-"lan-mouse cli set-absolute-sensitivity <percent>" (applied immediately, saved).
-LAN_MOUSE_ABSOLUTE_SCALE overrides the multiplier temporarily. The arm log line shows the effective gain:
-"absolute pointer armed at (x,y) region ... gain 1.00x (accel mirrored)".
+A persisted sensitivity percentage (default 100 = screen-relative 1:1, clamped 10..500) scales the mapping for
+personal taste. It is adjustable in the GPUI Settings page ("Incoming pointer sensitivity", -/+ 10% steps,
+applied live and saved), in config.toml (absolute_pointer_sensitivity) or through the CLI:
+"lan-mouse cli set-absolute-sensitivity <percent>". LAN_MOUSE_ABSOLUTE_SCALE overrides it temporarily.
+The arm log line shows the effective gain: "absolute pointer armed at ... gain 1.00x (accel mirrored)".

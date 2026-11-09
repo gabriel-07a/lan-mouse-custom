@@ -911,6 +911,8 @@ struct Dashboard {
     port: u16,
     capture_status: Status,
     emulation_status: Status,
+    /// sensitivity of input received from peers through the absolute pointer
+    absolute_sensitivity: u16,
     clipboard_status: ClipboardStatus,
     pairing_active: bool,
     pairing_review: Vec<DeviceView>,
@@ -1020,6 +1022,7 @@ impl Dashboard {
             port: lan_mouse_ipc::DEFAULT_PORT,
             capture_status: Status::Disabled,
             emulation_status: Status::Disabled,
+            absolute_sensitivity: 100,
             clipboard_status: ClipboardStatus::default(),
             pairing_active: false,
             pairing_review: Vec::new(),
@@ -1157,6 +1160,9 @@ impl Dashboard {
                 if let Some(message) = message {
                     self.status = message;
                 }
+            }
+            FrontendEvent::AbsoluteSensitivity(percent) => {
+                self.absolute_sensitivity = percent;
             }
             FrontendEvent::CaptureStatus(status) => self.capture_status = status,
             FrontendEvent::EmulationStatus(status) => self.emulation_status = status,
@@ -3128,6 +3134,52 @@ impl Dashboard {
                             window.focus(&this.add_focus);
                         },
                     )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child("Incoming pointer sensitivity"),
+                    )
+                    .child(self.action_button(
+                        "abs-sensitivity-down",
+                        "-",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            let next = this.absolute_sensitivity.saturating_sub(10).max(10);
+                            this.send(FrontendRequest::SetAbsoluteSensitivity(next));
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(format!("{}%", self.absolute_sensitivity)),
+                    )
+                    .child(self.action_button(
+                        "abs-sensitivity-up",
+                        "+",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            let next = (this.absolute_sensitivity + 10).min(500);
+                            this.send(FrontendRequest::SetAbsoluteSensitivity(next));
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("applies to input received from other machines; 100% = 1:1"),
+                    ),
             )
             .child(
                 div()

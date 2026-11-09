@@ -157,14 +157,17 @@ struct PointerSettings {
 
 impl PointerSettings {
     fn detect() -> Self {
-        let speed = read_gsettings("org.gnome.desktop.peripherals.mouse", "speed")
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .unwrap_or(0.0)
-            .clamp(-1.0, 1.0);
+        // The local mouse speed setting is about *this* machine's mouse and
+        // must not slow down input received from another machine. Only the
+        // acceleration profile is mirrored (adaptive adds a curve, flat keeps
+        // the mapping linear), so 100% sensitivity is exactly 1:1.
         let profile = read_gsettings("org.gnome.desktop.peripherals.mouse", "accel-profile")
             .unwrap_or_else(|| "adaptive".to_string());
         let adaptive = !profile.trim_matches('\'').eq_ignore_ascii_case("flat");
-        Self { speed, adaptive }
+        Self {
+            speed: 0.0,
+            adaptive,
+        }
     }
 
     /// Velocity-dependent acceleration factor, mirroring libinput's adaptive

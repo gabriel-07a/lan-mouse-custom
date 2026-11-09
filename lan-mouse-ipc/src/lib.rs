@@ -581,6 +581,9 @@ pub enum FrontendEvent {
     Enumerate(Vec<(ClientHandle, ClientConfig, ClientState)>),
     /// an error occured
     Error(String),
+    /// sensitivity of input received from peers through the absolute pointer,
+    /// in percent (100 = screen-relative 1:1)
+    AbsoluteSensitivity(u16),
     /// capture status
     CaptureStatus(Status),
     /// emulation status
