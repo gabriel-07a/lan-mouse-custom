@@ -424,12 +424,26 @@ impl LanMouseConnection {
         self.sender.peer_supports_enter_ack(handle)
     }
 
+    pub(crate) fn peer_rtt_ms(&self, handle: ClientHandle) -> Option<u32> {
+        self.sender.peer_rtt_ms(handle)
+    }
+
+    #[allow(dead_code)]
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
         self.sender.send(event, handle).await
+    }
+
+    pub(crate) async fn send_with_grace(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+        grace: Duration,
+    ) -> Result<(), LanMouseConnectionError> {
+        self.sender.send_with_grace(event, handle, grace).await
     }
 
     /// Best-effort send that never waits for a connection. Used by teardown
@@ -462,14 +476,26 @@ impl ConnectionSender {
         caps & lan_mouse_proto::capabilities::ENTER_ACK != 0
     }
 
+    pub(crate) fn peer_rtt_ms(&self, handle: ClientHandle) -> Option<u32> {
+        self.ctx.client_manager.rtt_ms(handle)
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
+        self.send_with_grace(event, handle, self.ctx.grace).await
+    }
+
+    pub(crate) async fn send_with_grace(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+        grace: Duration,
+    ) -> Result<(), LanMouseConnectionError> {
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        self.send_bytes(&buf[..len], handle, self.ctx.grace, true)
-            .await
+        self.send_bytes(&buf[..len], handle, grace, true).await
     }
 
     pub(crate) async fn send_now(

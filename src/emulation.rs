@@ -1,9 +1,9 @@
 use crate::config::local_commit;
 use crate::devices::DeviceStore;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCommand, ListenerCreationError};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, PointerEdge};
-use input_event::Event;
+use input_event::{Event, PointerEvent};
 use lan_mouse_proto::clipboard::ClipboardFrame;
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -710,6 +710,7 @@ impl EmulationProxy {
             backend,
             exit_requested: exit_requested.clone(),
             request_rx,
+            peeked_request: None,
             event_tx,
             handles: Default::default(),
             closed: Default::default(),
@@ -819,6 +820,8 @@ struct EmulationTask {
     backend: Option<input_emulation::Backend>,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
+    /// Next request already popped while draining consecutive motion events.
+    peeked_request: Option<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     /// addresses whose session was explicitly closed: input datagrams that were
@@ -835,6 +838,61 @@ struct EmulationTask {
     /// absolute-pointer sensitivity gain (1.0 = 100%), applied on creation and
     /// on every live update
     absolute_sensitivity: f64,
+}
+
+/// Receive the next [`ProxyRequest`], returning `peeked` first if a previous
+/// motion-coalescing pass already popped an item from `rx`.
+async fn next_proxy_request(
+    rx: &mut Receiver<ProxyRequest>,
+    peeked: &mut Option<ProxyRequest>,
+) -> Option<ProxyRequest> {
+    if let Some(req) = peeked.take() {
+        return Some(req);
+    }
+    rx.recv().await
+}
+
+/// Drain any immediately available `PointerEvent::Motion` requests for the same
+/// `addr` from `rx` into `event`, stopping at the first non-motion or
+/// different-peer request and storing it in `peeked` so event ordering is
+/// strictly preserved.
+fn coalesce_queued_motion(
+    rx: &mut Receiver<ProxyRequest>,
+    peeked: &mut Option<ProxyRequest>,
+    event: Event,
+    addr: SocketAddr,
+) -> Event {
+    let Event::Pointer(PointerEvent::Motion {
+        mut time,
+        mut dx,
+        mut dy,
+    }) = event
+    else {
+        return event;
+    };
+    debug_assert!(peeked.is_none());
+    while let Some(next) = rx.recv().now_or_never() {
+        match next {
+            Some(ProxyRequest::Input(
+                Event::Pointer(PointerEvent::Motion {
+                    time: t2,
+                    dx: dx2,
+                    dy: dy2,
+                }),
+                addr2,
+            )) if addr2 == addr => {
+                time = t2;
+                dx += dx2;
+                dy += dy2;
+            }
+            Some(other) => {
+                *peeked = Some(other);
+                break;
+            }
+            None => break,
+        }
+    }
+    Event::Pointer(PointerEvent::Motion { time, dx, dy })
 }
 
 impl EmulationTask {
@@ -854,7 +912,10 @@ impl EmulationTask {
         // later attempts require an explicit "enable emulation" request (see
         // the second loop below).
         loop {
-            match self.request_rx.recv().await.expect("channel closed") {
+            match next_proxy_request(&mut self.request_rx, &mut self.peeked_request)
+                .await
+                .expect("channel closed")
+            {
                 ProxyRequest::Terminate => return,
                 // explicit user request: always allowed to (re)try
                 ProxyRequest::Reenable => {
@@ -907,7 +968,10 @@ impl EmulationTask {
             // wait for an explicit enable request (automatic wake-ups are
             // deliberately dropped while blocked)
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
+                match next_proxy_request(&mut self.request_rx, &mut self.peeked_request)
+                    .await
+                    .expect("channel closed")
+                {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
@@ -960,7 +1024,7 @@ impl EmulationTask {
         loop {
             tokio::select! {
                 result = &mut create => return Ok(Some(result?)),
-                request = self.request_rx.recv() => match request.expect("channel closed") {
+                request = next_proxy_request(&mut self.request_rx, &mut self.peeked_request) => match request.expect("channel closed") {
                     ProxyRequest::Terminate => return Ok(None),
                     ProxyRequest::RemoteEnter(edge) => self.pending_remote = Some(edge),
                     ProxyRequest::RemoteLeave => self.pending_remote = None,
@@ -1073,8 +1137,14 @@ impl EmulationTask {
                         log::debug!("edge-return notifier closed; hand-off disabled");
                     }
                 },
-                e = self.request_rx.recv() => match e.expect("channel closed") {
+                e = next_proxy_request(&mut self.request_rx, &mut self.peeked_request) => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
+                        let event = coalesce_queued_motion(
+                            &mut self.request_rx,
+                            &mut self.peeked_request,
+                            event,
+                            addr,
+                        );
                         // Datagrams queued before an explicit close are dropped
                         // instead of being injected after it (see Remove).
                         self.consume_input(emulation, event, addr).await?;
@@ -1278,5 +1348,101 @@ mod tests {
         assert!(session_addrs_for_fingerprint(&map, "aa:bb:cc").is_empty());
         assert!(session_addrs_for_fingerprint(&map, "").is_empty());
         assert!(session_addrs_for_fingerprint(&HashMap::new(), "aa:bb").is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesce_queued_motion_merges_same_peer_and_preserves_order() {
+        let (tx, mut rx) = channel::<ProxyRequest>();
+        let mut peeked = None;
+        let peer: SocketAddr = "127.0.0.1:4242".parse().expect("addr");
+        let other: SocketAddr = "127.0.0.2:4242".parse().expect("addr");
+
+        tx.send(ProxyRequest::Input(
+            Event::Pointer(PointerEvent::Motion {
+                time: 2,
+                dx: 3.5,
+                dy: -1.5,
+            }),
+            peer,
+        ))
+        .expect("send");
+        tx.send(ProxyRequest::Input(
+            Event::Pointer(PointerEvent::Motion {
+                time: 3,
+                dx: -0.5,
+                dy: 4.0,
+            }),
+            peer,
+        ))
+        .expect("send");
+        tx.send(ProxyRequest::Input(
+            Event::Pointer(PointerEvent::Button {
+                time: 4,
+                button: 1,
+                state: 1,
+            }),
+            peer,
+        ))
+        .expect("send");
+        tx.send(ProxyRequest::Input(
+            Event::Pointer(PointerEvent::Motion {
+                time: 5,
+                dx: 10.0,
+                dy: 10.0,
+            }),
+            other,
+        ))
+        .expect("send");
+
+        let merged = coalesce_queued_motion(
+            &mut rx,
+            &mut peeked,
+            Event::Pointer(PointerEvent::Motion {
+                time: 1,
+                dx: 1.0,
+                dy: 2.0,
+            }),
+            peer,
+        );
+        assert_eq!(
+            merged,
+            Event::Pointer(PointerEvent::Motion {
+                time: 3,
+                dx: 4.0,
+                dy: 4.5,
+            })
+        );
+
+        // The button event must be yielded next in exact sequence.
+        let Some(ProxyRequest::Input(next_ev, next_addr)) =
+            next_proxy_request(&mut rx, &mut peeked).await
+        else {
+            panic!("expected button input next");
+        };
+        assert_eq!(next_addr, peer);
+        assert_eq!(
+            next_ev,
+            Event::Pointer(PointerEvent::Button {
+                time: 4,
+                button: 1,
+                state: 1,
+            })
+        );
+
+        // And the motion from the other peer must follow without being merged into `peer`.
+        let Some(ProxyRequest::Input(other_ev, other_addr)) =
+            next_proxy_request(&mut rx, &mut peeked).await
+        else {
+            panic!("expected other peer motion next");
+        };
+        assert_eq!(other_addr, other);
+        assert_eq!(
+            other_ev,
+            Event::Pointer(PointerEvent::Motion {
+                time: 5,
+                dx: 10.0,
+                dy: 10.0,
+            })
+        );
     }
 }

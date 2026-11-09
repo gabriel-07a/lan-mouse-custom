@@ -170,6 +170,15 @@ impl PointerSettings {
         }
     }
 
+    async fn detect_async() -> Self {
+        tokio::task::spawn_blocking(Self::detect)
+            .await
+            .unwrap_or(Self {
+                speed: 0.0,
+                adaptive: true,
+            })
+    }
+
     /// Velocity-dependent acceleration factor, mirroring libinput's adaptive
     /// pointer acceleration (slow movements stay 1:1 so fine control works,
     /// fast movements get the same boost the relative path receives).
@@ -657,6 +666,7 @@ impl LibeiEmulation {
             error.clone(),
         );
         let ei_task = tokio::task::spawn_local(ei_handler);
+        let pointer_settings = PointerSettings::detect_async().await;
 
         Ok(Self {
             context,
@@ -673,7 +683,7 @@ impl LibeiEmulation {
             absolute_warned: false,
             clock: Instant::now(),
             absolute_sensitivity: 1.0,
-            pointer_settings: PointerSettings::detect(),
+            pointer_settings,
             last_motion_time: None,
             last_motion_arrival: None,
             absolute_env_scale: read_env_scale(),

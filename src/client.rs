@@ -478,6 +478,13 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn rtt_ms(&self, handle: ClientHandle) -> Option<u32> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, s)| s.rtt_ms)
+    }
+
     pub(crate) fn set_last_error(&self, handle: ClientHandle, error: Option<String>) {
         if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
             state.last_error = error;

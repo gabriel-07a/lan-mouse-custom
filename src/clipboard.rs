@@ -304,7 +304,7 @@ async fn run(
     let mut next_peer: PeerId = 1 << 63;
     let mut last_enabled = enabled.get();
 
-    let mut ticker = tokio::time::interval(Duration::from_millis(50));
+    let mut ticker = tokio::time::interval(Duration::from_millis(15));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
 

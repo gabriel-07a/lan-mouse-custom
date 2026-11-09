@@ -245,12 +245,35 @@ impl Capture {
     }
 }
 
-/// Retransmit `Enter` until the peer acknowledges it.
-const ENTER_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// Base cadence for checking `Enter` retransmission and connection grace expiry.
+const ENTER_RETRY_TICK: Duration = Duration::from_millis(25);
+/// Minimum adaptive `Enter` retransmission interval.
+const ENTER_RETRY_MIN: Duration = Duration::from_millis(25);
+/// Maximum adaptive `Enter` retransmission interval on high-RTT links.
+const ENTER_RETRY_MAX: Duration = Duration::from_millis(100);
+/// Default `Enter` retransmission interval before the first RTT sample arrives.
+const ENTER_RETRY_DEFAULT: Duration = Duration::from_millis(35);
+/// Maximum time a discrete event (`Button`, `Keyboard`, `Enter`) may wait for
+/// an in-flight connection attempt on a single capture loop iteration before
+/// falling back to the `disconnected_since` grace tracker.
+const DISCRETE_SEND_BUDGET: Duration = Duration::from_millis(15);
 /// Give up on a peer that never acknowledges `Enter` and release the grab.
 const ENTER_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the motion coalescing ratio is logged.
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Compute the adaptive `Enter` retransmission interval from the smoothed RTT.
+///
+/// Uses `clamp(2 * rtt, 25ms, 100ms)` when RTT is known and `35ms` otherwise so
+/// a lost `Enter` on a LAN/Wi-Fi link recovers quickly without flooding a slow
+/// or congested link with duplicate handoff packets.
+fn adaptive_enter_retry_interval(rtt_ms: Option<u32>) -> Duration {
+    match rtt_ms {
+        Some(rtt) => Duration::from_millis(u64::from(rtt).saturating_mul(2))
+            .clamp(ENTER_RETRY_MIN, ENTER_RETRY_MAX),
+        None => ENTER_RETRY_DEFAULT,
+    }
+}
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
 /// time since the previous execution is at least `$dur`.
@@ -280,13 +303,14 @@ struct EnterState {
     serial: u32,
     awaiting_ack: Option<u32>,
     deadline: Option<Instant>,
+    last_sent: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnterTick {
-    /// No `Enter` in flight.
+    /// No `Enter` in flight, or the retry interval has not elapsed yet.
     Idle,
-    /// An `Enter` is in flight and still within its deadline.
+    /// An `Enter` is in flight and due for retransmission.
     Retransmit,
     /// The peer never acknowledged in time.
     GiveUp,
@@ -298,6 +322,7 @@ impl EnterState {
         self.serial = self.serial.wrapping_add(1);
         self.awaiting_ack = Some(self.serial);
         self.deadline = Some(now + timeout);
+        self.last_sent = Some(now);
     }
 
     fn serial(&self) -> u32 {
@@ -313,25 +338,37 @@ impl EnterState {
         if self.awaiting_ack == Some(serial) {
             self.awaiting_ack = None;
             self.deadline = None;
+            self.last_sent = None;
             true
         } else {
             false
         }
     }
 
-    fn tick(&self, now: Instant) -> EnterTick {
+    fn tick(&mut self, now: Instant, retry_interval: Duration) -> EnterTick {
         if self.awaiting_ack.is_none() {
             return EnterTick::Idle;
         }
         match self.deadline {
             Some(deadline) if now >= deadline => EnterTick::GiveUp,
-            _ => EnterTick::Retransmit,
+            _ => {
+                let due = self
+                    .last_sent
+                    .is_none_or(|last| now.saturating_duration_since(last) >= retry_interval);
+                if due {
+                    self.last_sent = Some(now);
+                    EnterTick::Retransmit
+                } else {
+                    EnterTick::Idle
+                }
+            }
         }
     }
 
     fn reset(&mut self) {
         self.awaiting_ack = None;
         self.deadline = None;
+        self.last_sent = None;
     }
 }
 
@@ -493,7 +530,7 @@ impl CaptureTask {
         // Retransmit `Enter` until the peer acknowledges it. A single lost
         // `Enter` otherwise leaves the peer holding its own capture (or
         // never releasing it) until the next crossing.
-        let mut enter_retry = tokio::time::interval(ENTER_RETRY_INTERVAL);
+        let mut enter_retry = tokio::time::interval(ENTER_RETRY_TICK);
         enter_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         enter_retry.tick().await;
 
@@ -828,14 +865,50 @@ impl CaptureTask {
             },
         };
 
-        if let Err(e) = self.conn.send(event, handle).await {
-            const DUR: Duration = Duration::from_millis(500);
-            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            // Funnel through release_capture so the leave_hook
-            // fires and active_client is cleared (without this the
-            // active_client field would stay stale until the next
-            // Begin from a different handle).
-            self.release_capture(capture).await?;
+        // Scroll/axis events are high-frequency streams like pointer motion:
+        // waiting on a reconnect for each wheel tick would stall the capture
+        // select loop and replay a burst later. Send them non-blockingly and
+        // let `disconnected_since` handle prolonged outages.
+        if matches!(
+            event,
+            ProtoEvent::Input(Event::Pointer(
+                PointerEvent::Axis { .. }
+                    | PointerEvent::AxisDiscrete120 { .. }
+                    | PointerEvent::Motion { .. }
+            ))
+        ) {
+            self.send_unreliable(handle, event).await;
+            return Ok(());
+        }
+
+        // Discrete events (Enter, Button, Keyboard) wait for at most a short
+        // bounded budget (`DISCRETE_SEND_BUDGET`) per event so a transient
+        // socket glitch does not freeze the capture loop for the full 400ms
+        // grace window. If the link stays down past `self.grace`, the capture
+        // is released cleanly.
+        let budget = self.grace.min(DISCRETE_SEND_BUDGET);
+        match self.conn.send_with_grace(event, handle, budget).await {
+            Ok(()) => {
+                self.disconnected_since = None;
+            }
+            Err(e) => {
+                let now = Instant::now();
+                let since = *self.disconnected_since.get_or_insert(now);
+                self.conn.ensure_connected(handle);
+                if self.grace.is_zero() || now.saturating_duration_since(since) >= self.grace {
+                    const DUR: Duration = Duration::from_millis(500);
+                    debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                    // Funnel through release_capture so the leave_hook
+                    // fires and active_client is cleared (without this the
+                    // active_client field would stay stale until the next
+                    // Begin from a different handle).
+                    self.release_capture(capture).await?;
+                } else {
+                    log::debug!(
+                        "discrete send to client {handle} deferred ({e}); within grace window"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -883,17 +956,21 @@ impl CaptureTask {
             dx: motion.dx,
             dy: motion.dy,
         }));
-        // Never wait for a (re)connection here: a motion event that is a few
-        // hundred milliseconds old is useless, and blocking the capture loop
-        // on it queued up hundreds of events that then arrived in one jump.
-        // The capture is released after `grace` instead.
+        self.send_unreliable(handle, event).await
+    }
+
+    async fn send_unreliable(&mut self, handle: CaptureHandle, event: ProtoEvent) -> bool {
+        // Never wait for a (re)connection here: a motion/scroll event that is
+        // a few hundred milliseconds old is useless, and blocking the capture
+        // loop on it queued up hundreds of events that then arrived in one
+        // jump. The capture is released after `grace` instead.
         match self.conn.send_now(event, handle).await {
             Ok(()) => {
                 self.disconnected_since = None;
                 true
             }
             Err(e) => {
-                log::debug!("dropping motion for client {handle}: {e}");
+                log::debug!("dropping high-rate input for client {handle}: {e}");
                 if self.disconnected_since.is_none() {
                     self.disconnected_since = Some(Instant::now());
                 }
@@ -906,7 +983,10 @@ impl CaptureTask {
     /// Retransmit the current `Enter` until it is acknowledged, and release
     /// the capture if the peer never answers.
     async fn retransmit_enter(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
-        match self.enter.tick(Instant::now()) {
+        let retry_interval = adaptive_enter_retry_interval(
+            self.active_client.and_then(|h| self.conn.peer_rtt_ms(h)),
+        );
+        match self.enter.tick(Instant::now(), retry_interval) {
             EnterTick::Idle => return Ok(()),
             EnterTick::GiveUp => {
                 if let Some(handle) = self.active_client {
@@ -925,9 +1005,10 @@ impl CaptureTask {
         };
         let pos = to_proto_pos(pos.opposite());
         let serial = self.enter.serial();
+        let budget = self.grace.min(DISCRETE_SEND_BUDGET);
         if let Err(e) = self
             .conn
-            .send(ProtoEvent::Enter { pos, serial }, handle)
+            .send_with_grace(ProtoEvent::Enter { pos, serial }, handle, budget)
             .await
         {
             log::debug!("failed to retransmit Enter to client {handle}: {e}");
@@ -995,6 +1076,11 @@ impl CaptureTask {
             log::info!("sending Leave event to client {handle}");
             if let Err(e) = self.conn.send_now(ProtoEvent::Leave(0), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
+            } else {
+                // Send a second `Leave(0)` datagram so a single lost UDP packet
+                // on release does not leave the peer's remote-control state
+                // latched until its watchdog fires.
+                let _ = self.conn.send_now(ProtoEvent::Leave(0), handle).await;
             }
         }
         capture.release().await
@@ -1072,18 +1158,20 @@ mod enter_state_tests {
     use super::*;
 
     const TIMEOUT: Duration = Duration::from_millis(100);
+    const RETRY: Duration = Duration::from_millis(35);
 
     #[test]
     fn begin_increments_the_serial() {
         let mut state = EnterState::default();
         let now = Instant::now();
         assert_eq!(state.serial(), 0);
-        assert_eq!(state.tick(now), EnterTick::Idle);
+        assert_eq!(state.tick(now, RETRY), EnterTick::Idle);
 
         state.begin(now, TIMEOUT);
         assert_eq!(state.serial(), 1);
         assert_eq!(state.awaiting_ack(), Some(1));
-        assert_eq!(state.tick(now), EnterTick::Retransmit);
+        assert_eq!(state.tick(now, RETRY), EnterTick::Idle);
+        assert_eq!(state.tick(now + RETRY, RETRY), EnterTick::Retransmit);
 
         state.begin(now, TIMEOUT);
         assert_eq!(state.serial(), 2);
@@ -1110,27 +1198,46 @@ mod enter_state_tests {
         assert_eq!(state.awaiting_ack(), Some(1));
         assert!(state.ack(1));
         assert_eq!(state.awaiting_ack(), None);
-        assert_eq!(state.tick(now), EnterTick::Idle);
+        assert_eq!(state.tick(now + RETRY, RETRY), EnterTick::Idle);
     }
 
     #[test]
-    fn tick_retransmits_until_the_deadline_then_gives_up() {
+    fn tick_retransmits_after_interval_until_the_deadline_then_gives_up() {
         let mut state = EnterState::default();
         let now = Instant::now();
         state.begin(now, TIMEOUT);
 
-        assert_eq!(state.tick(now), EnterTick::Retransmit);
         assert_eq!(
-            state.tick(now + TIMEOUT / 2),
-            EnterTick::Retransmit,
-            "still inside the window"
+            state.tick(now + Duration::from_millis(10), RETRY),
+            EnterTick::Idle
         );
         assert_eq!(
-            state.tick(now + TIMEOUT),
+            state.tick(now + RETRY, RETRY),
+            EnterTick::Retransmit,
+            "due once retry interval elapsed"
+        );
+        assert_eq!(
+            state.tick(now + RETRY + Duration::from_millis(10), RETRY),
+            EnterTick::Idle,
+            "not due again before another retry interval"
+        );
+        assert_eq!(
+            state.tick(now + TIMEOUT, RETRY),
             EnterTick::GiveUp,
             "deadline is inclusive"
         );
-        assert_eq!(state.tick(now + TIMEOUT * 2), EnterTick::GiveUp);
+        assert_eq!(state.tick(now + TIMEOUT * 2, RETRY), EnterTick::GiveUp);
+    }
+
+    #[test]
+    fn adaptive_retry_interval_clamps_to_bounds() {
+        assert_eq!(adaptive_enter_retry_interval(None), ENTER_RETRY_DEFAULT);
+        assert_eq!(adaptive_enter_retry_interval(Some(2)), ENTER_RETRY_MIN);
+        assert_eq!(
+            adaptive_enter_retry_interval(Some(20)),
+            Duration::from_millis(40)
+        );
+        assert_eq!(adaptive_enter_retry_interval(Some(80)), ENTER_RETRY_MAX);
     }
 
     #[test]
@@ -1140,7 +1247,7 @@ mod enter_state_tests {
         state.begin(now, TIMEOUT);
         state.reset();
         assert_eq!(state.awaiting_ack(), None);
-        assert_eq!(state.tick(now + TIMEOUT * 2), EnterTick::Idle);
+        assert_eq!(state.tick(now + TIMEOUT * 2, RETRY), EnterTick::Idle);
         assert!(!state.ack(1), "a reset handoff cannot be acknowledged");
         assert_eq!(state.serial(), 1, "the serial is not reused");
     }

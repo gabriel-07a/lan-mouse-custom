@@ -21,6 +21,9 @@ use crate::{ClipboardSnapshot, Error, Format, Limits};
 pub const ACK_TIMEOUT: Duration = Duration::from_millis(120);
 /// Abort after this many windows without any progress.
 pub const MAX_WINDOW_ATTEMPTS: u8 = 10;
+/// Maximum number of chunks emitted in a single [`OutgoingTransfer::poll`]
+/// burst so bulk transfers do not flood the low-latency UDP socket at once.
+pub const MAX_CHUNKS_PER_BURST: usize = 6;
 /// Send an acknowledgement at least this often while chunks keep arriving.
 pub const ACK_EVERY_CHUNKS: u32 = 16;
 pub const ACK_EVERY: Duration = Duration::from_millis(10);
@@ -51,6 +54,9 @@ struct OutgoingItem {
     total_chunks: u32,
     acked: Vec<bool>,
     base: u32,
+    /// Next chunk index within the current window `[base, window_end)` to be
+    /// emitted on the next paced burst.
+    cursor: u32,
     attempts: u8,
     last_send: Option<Instant>,
 }
@@ -65,6 +71,7 @@ impl OutgoingTransfer {
                 acked: vec![false; chunk_count(data.len() as u32) as usize],
                 data: data.to_vec(),
                 base: 0,
+                cursor: 0,
                 attempts: 0,
                 last_send: None,
             })
@@ -85,7 +92,7 @@ impl OutgoingTransfer {
         self.serial
     }
 
-    /// Frames that should be sent now (offer and/or the current window).
+    /// Frames that should be sent now (offer and/or a paced slice of the current window).
     pub fn poll(&mut self, now: Instant) -> Vec<ClipboardFrame> {
         let mut out = Vec::new();
 
@@ -98,13 +105,18 @@ impl OutgoingTransfer {
             return out;
         }
 
-        let due = self.items[self.current]
+        let window_end =
+            (self.items[self.current].base + ACK_WINDOW).min(self.items[self.current].total_chunks);
+        let window_sweep_pending = self.items[self.current].cursor < window_end;
+        let timeout_due = self.items[self.current]
             .last_send
             .is_none_or(|last| now.duration_since(last) >= ACK_TIMEOUT);
 
         // The offer is re-sent until the peer acknowledges at least one chunk:
         // losing the single offer would otherwise stall the whole transfer.
-        if !self.acked_any && (!self.offer_sent || due) {
+        // While a window sweep is still in progress (`window_sweep_pending`),
+        // only send the offer once at the start of the transfer.
+        if !self.acked_any && (!self.offer_sent || (!window_sweep_pending && timeout_due)) {
             let items = self
                 .items
                 .iter()
@@ -119,14 +131,18 @@ impl OutgoingTransfer {
             self.offer_sent = true;
         }
 
-        if !due {
-            return out;
+        let item = &mut self.items[self.current];
+        if !window_sweep_pending {
+            if !timeout_due {
+                return out;
+            }
+            item.cursor = item.base;
         }
 
-        let item = &mut self.items[self.current];
-
-        let window_end = (item.base + ACK_WINDOW).min(item.total_chunks);
-        for index in item.base..window_end {
+        let mut sent_in_burst = 0usize;
+        while item.cursor < window_end && sent_in_burst < MAX_CHUNKS_PER_BURST {
+            let index = item.cursor;
+            item.cursor += 1;
             if item.acked[index as usize] {
                 continue;
             }
@@ -139,17 +155,27 @@ impl OutgoingTransfer {
                 total: item.data.len() as u32,
                 data: item.data[start..end].to_vec(),
             });
+            sent_in_burst += 1;
         }
 
-        item.last_send = Some(now);
-        item.attempts = item.attempts.saturating_add(1);
-        if item.attempts > MAX_WINDOW_ATTEMPTS {
-            log::warn!(
-                "clipboard transfer {}: no progress for {} attempts, aborting",
-                self.serial,
-                item.attempts
-            );
-            self.failed = true;
+        // Advance `cursor` past any trailing already-acked chunks in the window
+        // so we can immediately arm the retransmission timer once all unacked
+        // chunks in the window have been emitted.
+        while item.cursor < window_end && item.acked[item.cursor as usize] {
+            item.cursor += 1;
+        }
+
+        if item.cursor >= window_end {
+            item.last_send = Some(now);
+            item.attempts = item.attempts.saturating_add(1);
+            if item.attempts > MAX_WINDOW_ATTEMPTS {
+                log::warn!(
+                    "clipboard transfer {}: no progress for {} attempts, aborting",
+                    self.serial,
+                    item.attempts
+                );
+                self.failed = true;
+            }
         }
         out
     }
@@ -201,6 +227,7 @@ impl OutgoingTransfer {
             while item.base < item.total_chunks && item.acked[item.base as usize] {
                 item.base += 1;
             }
+            item.cursor = item.cursor.max(item.base);
             item.attempts = 0;
             item.last_send = None;
             self.acked_any = true;
@@ -672,5 +699,32 @@ mod tests {
         }
         assert!(receiver.is_complete());
         assert!(matches!(receiver.assemble(), Err(Error::Transfer(_))));
+    }
+
+    #[test]
+    fn large_window_is_paced_across_multiple_polls() {
+        let large = ClipboardSnapshot::from_items([(Format::Png, vec![0x42; CHUNK_SIZE * 20])]);
+        let mut sender = OutgoingTransfer::new(7, 1, &large);
+        let t0 = Instant::now();
+
+        let first = sender.poll(t0);
+        let first_chunks = first
+            .iter()
+            .filter(|f| matches!(f, ClipboardFrame::Chunk { .. }))
+            .count();
+        assert_eq!(first_chunks, MAX_CHUNKS_PER_BURST);
+
+        let second = sender.poll(t0 + Duration::from_millis(15));
+        let second_chunks = second
+            .iter()
+            .filter(|f| matches!(f, ClipboardFrame::Chunk { .. }))
+            .count();
+        assert_eq!(second_chunks, MAX_CHUNKS_PER_BURST);
+        assert!(
+            !second
+                .iter()
+                .any(|f| matches!(f, ClipboardFrame::Offer { .. })),
+            "offer should not be resent before ACK_TIMEOUT while sweeping the initial window"
+        );
     }
 }
