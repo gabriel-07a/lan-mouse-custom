@@ -2348,13 +2348,10 @@ impl Dashboard {
                             .text_sm()
                             .text_color(rgb(TEXT))
                             .child("✕")
-                            // Close-to-tray, exactly like the WM close button
-                            // (see `on_window_should_close` below): removing the
-                            // window would leave the process alive with a tray
-                            // whose "Open" cannot restore it — an invisible app
-                            // that must be killed. Minimize keeps the window
-                            // recoverable.
-                            .on_click(cx.listener(|_, _, window, _| window.minimize_window())),
+                            // Close the window but keep the process (and the
+                            // LAN connection) alive: the tray "Open" re-creates
+                            // it. "Quit Lan Mouse" is what stops everything.
+                            .on_click(cx.listener(|_, _, window, _| window.remove_window())),
                     ),
             )
     }
@@ -3932,6 +3929,26 @@ impl Dashboard {
     }
 }
 
+fn main_window_options(cx: &mut App) -> WindowOptions {
+    let bounds = Bounds::centered(None, size(px(980.0), px(720.0)), cx);
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(880.0), px(600.0))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Lan Mouse".into()),
+            appears_transparent: false,
+            traffic_light_position: None,
+        }),
+        app_id: Some("de.feschber.LanMouse".into()),
+        window_decorations: if cfg!(target_os = "linux") {
+            Some(WindowDecorations::Client)
+        } else {
+            None
+        },
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GpuiError {
     #[error("GPUI application exited unexpectedly")]
@@ -3952,33 +3969,13 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
     Application::new().run(move |cx: &mut App| {
         set_ui_scale(automatic_ui_scale(cx));
         log::info!("UI scale: {:.0}%", ui_scale() * 100.0);
-        let bounds = Bounds::centered(None, size(px(980.0), px(720.0)), cx);
         let dashboard: Entity<Dashboard> = cx.new(|cx| Dashboard::new(cx, local_commit));
-        let window_handle = match cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // A minimum size keeps the fixed sidebar plus the device cards
-                // usable; below this the old layout clipped and overlapped when
-                // the window was resized.
-                window_min_size: Some(size(px(880.0), px(600.0))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Lan Mouse".into()),
-                    appears_transparent: false,
-                    traffic_light_position: None,
-                }),
-                app_id: Some("de.feschber.LanMouse".into()),
-                window_decorations: if cfg!(target_os = "linux") {
-                    Some(WindowDecorations::Client)
-                } else {
-                    None
-                },
-                ..Default::default()
-            },
-            |window, _| {
-                window.set_rem_size(px(16.0));
-                dashboard
-            },
-        ) {
+        let reopen_dashboard = dashboard.clone();
+        let options = main_window_options(cx);
+        let _window_handle = match cx.open_window(options, |window, _| {
+            window.set_rem_size(px(16.0));
+            dashboard
+        }) {
             Ok(window_handle) => window_handle,
             Err(error) => {
                 // No compositor / GPU initialization failure: report it instead
@@ -3990,24 +3987,38 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
         };
         log::info!("GPUI window created in {:?}", startup.elapsed());
 
-        // Closing the window keeps the process alive in the tray: minimize
-        // instead of destroying the window, matching the GTK close-to-tray
-        // behavior until the native tray can hide/show the window directly.
-        let _ = window_handle.update(cx, |_, window, cx| {
-            window.on_window_should_close(cx, |window, _cx| {
-                window.minimize_window();
-                false
-            });
-        });
-
         let tray_rx = tray::spawn();
         cx.spawn(async move |cx| {
             while let Ok(command) = tray_rx.recv().await {
                 match command {
                     tray::Command::Open => {
-                        let _ = window_handle.update(cx, |_, window, _| {
-                            window.activate_window();
+                        let dashboard = reopen_dashboard.clone();
+                        let result = cx.update(|cx| {
+                            let mut windows = cx.windows();
+                            if let Some(handle) = windows.pop() {
+                                return handle.update(cx, |_, window, _| {
+                                    window.activate_window();
+                                });
+                            }
+                            // X closed the window; recreate it while the
+                            // process (and the LAN connection) keeps running.
+                            let options = main_window_options(cx);
+                            let opened = cx.open_window(options, |window, _| {
+                                window.set_rem_size(px(16.0));
+                                dashboard
+                            });
+                            match opened {
+                                Ok(_) => {
+                                    cx.activate(true);
+                                    Ok(())
+                                }
+                                Err(error) => {
+                                    log::error!("could not reopen the Lan Mouse window: {error:?}");
+                                    Err(error)
+                                }
+                            }
                         });
+                        let _ = result;
                     }
                     tray::Command::Quit => {
                         // Graceful quit: `Application::run` returns, main exits

@@ -177,3 +177,13 @@ No new frontend findings: the verifier re-checked GPUI LinkState/RowAction (appl
 | ID | Sev | Location | Symptom | Root cause | Fix |
 |---|---|---|---|---|---|
 | R-08 | P2 (UX) | lan-mouse-gpui (build.rs, tray) | The app icon did not appear in the Windows taskbar / pinned shortcut | only the launcher binary (lan-mouse.exe) embedded the icon resource; the visible window is created by lan-mouse-gpui.exe, and GPUI loads the window/taskbar icon from resource id 1 of its own executable, so it fell back to the generic Windows icon. The Windows tray icon was also a hard-coded solid placeholder | the frontend crate now has a build script that embeds assets/icon.ico (winresource, Windows-only build dependency) and the tray icon is loaded from the same embedded resource (Icon::from_resource(1, ...)), with the placeholder kept only as a fallback. Note: Windows caches shell icons, so a pin from a previous version must be unpinned/re-pinned (or Explorer restarted) to refresh |
+
+
+## R-16: the X button closes the window, the connection keeps running
+
+Reported: clicking X on Windows and Ubuntu only hid/minimized the app instead of closing it.
+
+The window close (custom titlebar X on Linux, WM close on Windows) now destroys the window while the
+process and the LAN connection keep running. The tray "Open Lan Mouse" action re-creates the window (and
+re-activates an existing one) using the same Dashboard entity, so live state continues where it was. The
+in-window and tray "Quit Lan Mouse" actions are unchanged and still stop everything, including the daemon.
