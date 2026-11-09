@@ -3399,9 +3399,6 @@ impl Dashboard {
         let mut rows = Vec::new();
         for device in devices {
             let fp = device.fingerprint.clone();
-            let allow_fp = fp.clone();
-            let incoming_fp = fp.clone();
-            let outgoing_fp = fp.clone();
             let deny_fp = fp.clone();
             let rename_fp = fp.clone();
             let rename_name = device.name.clone();
@@ -3433,10 +3430,9 @@ impl Dashboard {
                                         .child(device.name.clone()),
                                 )
                                 .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                    "{} · in:{} · out:{} · {}",
+                                    "{} · {} · {}",
                                     short_fingerprint(&device.fingerprint, 16),
                                     device.incoming.capabilities.summary(),
-                                    device.outgoing.capabilities.summary(),
                                     device.source
                                 ))),
                         )
@@ -3468,48 +3464,6 @@ impl Dashboard {
                         .flex()
                         .flex_wrap()
                         .gap_2()
-                        .child(self.action_button(
-                            "policy-both",
-                            "Both",
-                            0x1d2430,
-                            TEXT,
-                            cx,
-                            move |this, _, _, _| {
-                                this.set_policy(
-                                    allow_fp.clone(),
-                                    DirectionPolicy::allow_all(),
-                                    DirectionPolicy::allow_all(),
-                                )
-                            },
-                        ))
-                        .child(self.action_button(
-                            "policy-in",
-                            "Control me",
-                            0x1d2430,
-                            TEXT,
-                            cx,
-                            move |this, _, _, _| {
-                                this.set_policy(
-                                    incoming_fp.clone(),
-                                    DirectionPolicy::allow_all(),
-                                    DirectionPolicy::deny(),
-                                )
-                            },
-                        ))
-                        .child(self.action_button(
-                            "policy-out",
-                            "I control",
-                            0x1d2430,
-                            TEXT,
-                            cx,
-                            move |this, _, _, _| {
-                                this.set_policy(
-                                    outgoing_fp.clone(),
-                                    DirectionPolicy::deny(),
-                                    DirectionPolicy::allow_all(),
-                                )
-                            },
-                        ))
                         .child(self.action_button(
                             "policy-none",
                             "Block",
@@ -3555,7 +3509,7 @@ impl Dashboard {
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child(format!("Device permissions ({})", rows.len())),
+                    .child(format!("Devices ({})", rows.len())),
             )
             .when(rows.is_empty(), |this| {
                 this.child(
