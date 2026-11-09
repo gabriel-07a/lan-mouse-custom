@@ -267,6 +267,13 @@ jobs:
           Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse*" -ErrorAction SilentlyContinue | Out-File (Join-Path $dir "localappdata.txt")
           Write-Host "--- diagnostics ---"
           Get-Content (Join-Path $dir "*.txt") -ErrorAction SilentlyContinue | Write-Host
+          # The uninstaller removes the registry key and the firewall rule, so
+          # those native commands return a non-zero exit code on a successful
+          # run. GitHub appends an implicit "exit $LASTEXITCODE" to every pwsh
+          # step, which would fail this always() step (and therefore the whole
+          # release) even though diagnostics were collected fine.
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Upload smoke-test diagnostics
         if: always()
