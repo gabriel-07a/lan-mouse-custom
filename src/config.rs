@@ -765,6 +765,34 @@ fn write_config_atomic(path: &Path, contents: &str) -> io::Result<()> {
     result
 }
 
+/// Whether one config-file client entry asks for an automatic connection on
+/// startup.
+///
+/// Only the explicit activate_on_startup flag counts: the runtime active state
+/// is deliberately never persisted, so quitting/crashing while connected
+/// cannot make the next start reconnect by itself.
+fn client_requests_startup(
+    client: &TomlClient,
+    fingerprint: Option<&str>,
+    hostname: Option<&str>,
+    ips: &HashSet<IpAddr>,
+) -> bool {
+    let fingerprint_matches = match (client.fingerprint.as_deref(), fingerprint) {
+        (Some(configured), Some(current)) => crate::crypto::normalize_fingerprint(configured)
+            .is_some_and(|normalized| normalized.eq_ignore_ascii_case(current)),
+        _ => false,
+    };
+    let hostname_matches = hostname.is_some_and(|current| {
+        client.hostname.as_deref() == Some(current) || client.host_name.as_deref() == Some(current)
+    });
+    let ip_matches = client
+        .ips
+        .as_ref()
+        .is_some_and(|configured_ips| configured_ips.iter().any(|ip| ips.contains(ip)));
+    (fingerprint_matches || hostname_matches || ip_matches)
+        && client.activate_on_startup.unwrap_or(false)
+}
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -1158,6 +1186,25 @@ impl Config {
             .flatten()
             .map(From::<TomlClient>::from)
             .collect()
+    }
+
+    /// Whether the config file explicitly asks this peer to be connected on
+    /// startup (only activate_on_startup = true counts; runtime state is not
+    /// persisted).
+    pub fn activate_on_startup_for(
+        &self,
+        fingerprint: Option<&str>,
+        hostname: Option<&str>,
+        ips: &HashSet<IpAddr>,
+    ) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clients.as_ref())
+            .is_some_and(|clients| {
+                clients
+                    .iter()
+                    .any(|client| client_requests_startup(client, fingerprint, hostname, ips))
+            })
     }
 
     /// release bind for returning control to the host
@@ -1609,6 +1656,77 @@ mod tests {
         assert!(!client.active);
         assert_eq!(client.ips.len(), 1);
         assert_eq!(client.hostname.as_deref(), Some("peer"));
+    }
+
+    #[test]
+    fn only_explicit_activate_on_startup_triggers_startup_connection() {
+        let mut client = TomlClient {
+            hostname: Some("peer".into()),
+            host_name: None,
+            ips: Some(vec!["10.0.0.7".parse().expect("ip")]),
+            port: None,
+            position: None,
+            activate_on_startup: None,
+            enter_hook: None,
+            leave_hook: None,
+            sensitivity: None,
+            fingerprint: None,
+        };
+        let matching_ips = HashSet::from(["10.0.0.7".parse().expect("ip")]);
+        // absent flag: never auto-connect, even when the peer matches
+        assert!(!client_requests_startup(
+            &client,
+            None,
+            Some("peer"),
+            &matching_ips
+        ));
+        // explicit true: auto-connect
+        client.activate_on_startup = Some(true);
+        assert!(client_requests_startup(
+            &client,
+            None,
+            Some("peer"),
+            &matching_ips
+        ));
+        // explicit false: never
+        client.activate_on_startup = Some(false);
+        assert!(!client_requests_startup(
+            &client,
+            None,
+            Some("peer"),
+            &matching_ips
+        ));
+        // no relationship to the peer: no auto-connect
+        client.activate_on_startup = Some(true);
+        assert!(!client_requests_startup(
+            &client,
+            None,
+            Some("other"),
+            &HashSet::from(["10.0.0.9".parse().expect("ip")])
+        ));
+    }
+
+    #[test]
+    fn fingerprint_match_requests_startup_connection() {
+        let fingerprint = "ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89";
+        let client = TomlClient {
+            hostname: None,
+            host_name: None,
+            ips: None,
+            port: None,
+            position: None,
+            activate_on_startup: Some(true),
+            enter_hook: None,
+            leave_hook: None,
+            sensitivity: None,
+            fingerprint: Some(fingerprint.to_string()),
+        };
+        assert!(client_requests_startup(
+            &client,
+            Some(fingerprint),
+            None,
+            &HashSet::new()
+        ));
     }
 
     #[test]

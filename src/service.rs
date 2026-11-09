@@ -646,14 +646,30 @@ impl Service {
 
     fn save_config(&mut self) {
         let clients = self.client_manager.clients();
+        // Never persist the runtime active state: only an explicit
+        // activate_on_startup flag from the config file may reconnect on the
+        // next start. Otherwise quitting/crashing while connected made the app
+        // reconnect to the peer by itself - which must never happen.
+        let startup_flags: Vec<bool> = clients
+            .iter()
+            .map(|(c, _)| {
+                let ips: HashSet<_> = c.fix_ips.iter().copied().collect();
+                self.config.activate_on_startup_for(
+                    c.fingerprint.as_deref(),
+                    c.hostname.as_deref(),
+                    &ips,
+                )
+            })
+            .collect();
         let clients = clients
             .into_iter()
-            .map(|(c, s)| ConfigClient {
+            .zip(startup_flags)
+            .map(|((c, _s), startup)| ConfigClient {
                 ips: HashSet::from_iter(c.fix_ips),
                 hostname: c.hostname,
                 port: c.port,
                 pos: c.pos,
-                active: s.active,
+                active: startup,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
                 sensitivity: c.sensitivity,
