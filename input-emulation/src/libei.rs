@@ -132,6 +132,11 @@ pub(crate) struct LibeiEmulation {
 /// fires. The absolute tracker knows the exact position, so this can be tiny.
 const RETURN_MARGIN_PX: f64 = 3.0;
 
+/// Distance (logical px) the cursor starts inside the entry edge. Big enough
+/// that hand-off jitter cannot fire immediately, small enough that the cursor
+/// visibly appears on the side the peer came from.
+const EDGE_ANCHOR_INSET: f64 = 24.0;
+
 /// Largest per-event delta accepted from the wire. Bigger values are treated
 /// as corrupted packets: one bogus delta must not jump the cursor across the
 /// screen and trigger a false hand-off.
@@ -196,8 +201,16 @@ impl AbsoluteTracker {
             layout_min_y,
             layout_max_x,
             layout_max_y,
-            x: f64::from(entry.0 + (entry.2 - entry.0) / 2.0),
-            y: f64::from(entry.1 + (entry.3 - entry.1) / 2.0),
+            x: match edge {
+                PointerEdge::Left => f64::from(entry.0) + EDGE_ANCHOR_INSET,
+                PointerEdge::Right => f64::from(entry.2) - 1.0 - EDGE_ANCHOR_INSET,
+                _ => f64::from(entry.0 + (entry.2 - entry.0) / 2.0),
+            },
+            y: match edge {
+                PointerEdge::Top => f64::from(entry.1) + EDGE_ANCHOR_INSET,
+                PointerEdge::Bottom => f64::from(entry.3) - 1.0 - EDGE_ANCHOR_INSET,
+                _ => f64::from(entry.1 + (entry.3 - entry.1) / 2.0),
+            },
             fired: false,
         })
     }
@@ -969,22 +982,34 @@ mod absolute_tracker_tests {
     }
 
     #[test]
+    fn anchor_starts_at_the_entry_edge() {
+        assert_eq!(tracker(PointerEdge::Left).absolute(), (24.0, 800.0));
+        assert_eq!(
+            tracker(PointerEdge::Right).absolute(),
+            (W - 1.0 - 24.0, 800.0)
+        );
+        assert_eq!(tracker(PointerEdge::Top).absolute(), (1280.0, 24.0));
+        assert_eq!(
+            tracker(PointerEdge::Bottom).absolute(),
+            (1280.0, H - 1.0 - 24.0)
+        );
+    }
+
+    #[test]
     fn moving_inside_the_screen_never_returns() {
         let mut tracker = tracker(PointerEdge::Left);
         assert_eq!(tracker.apply(100.0, 0.0), None);
         assert_eq!(tracker.apply(50.0, 40.0), None);
         assert_eq!(tracker.apply(-80.0, -40.0), None);
-        assert_eq!(tracker.apply(-200.0, 0.0), None);
+        assert_eq!(tracker.apply(-40.0, 0.0), None);
         assert!(!tracker.fired);
     }
 
     #[test]
     fn pushing_past_the_entry_edge_fires_exactly_once() {
         let mut tracker = tracker(PointerEdge::Left);
-        // walk from the centre to the entry edge (x == 0)
-        assert_eq!(tracker.apply(-1280.0, 0.0), None);
-        // a single directional push past the margin: hand control back
-        assert_eq!(tracker.apply(-8.0, 0.0), Some(PointerEdge::Left));
+        // anchored 24 px inside; a push back past the edge hands control back
+        assert_eq!(tracker.apply(-30.0, 0.0), Some(PointerEdge::Left));
         // latched: a single hand-off per activation
         assert_eq!(tracker.apply(-50.0, 0.0), None);
     }
@@ -992,14 +1017,13 @@ mod absolute_tracker_tests {
     #[test]
     fn every_edge_uses_its_own_axis_and_direction() {
         let cases = [
-            (PointerEdge::Left, -1280.0, 0.0, -8.0, 0.0),
-            (PointerEdge::Right, 1280.0, 0.0, 8.0, 0.0),
-            (PointerEdge::Top, 0.0, -800.0, 0.0, -8.0),
-            (PointerEdge::Bottom, 0.0, 800.0, 0.0, 8.0),
+            (PointerEdge::Left, -30.0, 0.0),
+            (PointerEdge::Right, 30.0, 0.0),
+            (PointerEdge::Top, 0.0, -30.0),
+            (PointerEdge::Bottom, 0.0, 30.0),
         ];
-        for (edge, dx, dy, sx, sy) in cases {
+        for (edge, sx, sy) in cases {
             let mut tracker = tracker(edge);
-            let _ = tracker.apply(dx, dy);
             assert_eq!(tracker.apply(sx, sy), Some(edge), "{edge:?}");
         }
     }
@@ -1007,7 +1031,6 @@ mod absolute_tracker_tests {
     #[test]
     fn wrong_axis_does_not_fire() {
         let mut tracker = tracker(PointerEdge::Left);
-        assert_eq!(tracker.apply(-1280.0, 0.0), None);
         assert_eq!(tracker.apply(0.0, -800.0), None);
         assert_eq!(tracker.apply(0.0, 800.0), None);
         assert!(!tracker.fired);
@@ -1016,8 +1039,7 @@ mod absolute_tracker_tests {
     #[test]
     fn absolute_position_stays_valid_in_half_open_region_bounds() {
         let mut tracker = tracker(PointerEdge::Right);
-        let _ = tracker.apply(1280.0, 800.0);
-        assert_eq!(tracker.apply(8.0, 0.0), Some(PointerEdge::Right));
+        assert_eq!(tracker.apply(30.0, 0.0), Some(PointerEdge::Right));
         let (x, y) = tracker.absolute();
         assert!((0.0..=W - 1.0).contains(&x));
         assert!((0.0..=H - 1.0).contains(&y));
@@ -1026,8 +1048,8 @@ mod absolute_tracker_tests {
     #[test]
     fn pointer_can_cross_into_the_adjacent_monitor() {
         let mut tracker = AbsoluteTracker::new(PointerEdge::Left, 1, dual_regions(), 1.0).unwrap();
-        // anchor is the centre of the monitor that was entered (960, 540)
-        assert_eq!(tracker.absolute(), (960.0, 540.0));
+        // anchored at the left edge of the first monitor
+        assert_eq!(tracker.absolute(), (24.0, 540.0));
         assert_eq!(tracker.apply(2000.0, 0.0), None);
         let (x, _) = tracker.absolute();
         assert!(x > 1920.0, "cursor must reach the second monitor, got {x}");
@@ -1046,8 +1068,7 @@ mod absolute_tracker_tests {
     #[test]
     fn overrun_does_not_swallow_the_reverse_movement() {
         let mut tracker = tracker(PointerEdge::Left);
-        let _ = tracker.apply(-1280.0, 0.0);
-        assert_eq!(tracker.apply(-8.0, 0.0), Some(PointerEdge::Left));
+        assert_eq!(tracker.apply(-30.0, 0.0), Some(PointerEdge::Left));
         // cursor snapped to the edge; moving back inside moves it immediately
         let _ = tracker.apply(500.0, 0.0);
         let (x, _) = tracker.absolute();
@@ -1065,8 +1086,8 @@ mod absolute_tracker_tests {
 
     #[test]
     fn hidpi_scale_normalises_the_physical_speed() {
-        // display scale 1.6667: 100 physical-ish counts must move the logical
-        // cursor 60 px, matching the previous relative injection feel
+        // display scale 1.6667: 1000 physical-ish counts move the logical
+        // cursor 600 px, matching the previous relative injection feel
         let mut tracker = AbsoluteTracker::new(
             PointerEdge::Left,
             1,
@@ -1082,6 +1103,32 @@ mod absolute_tracker_tests {
             "expected ~600 px, got {}",
             x1 - x0
         );
+    }
+
+    #[test]
+    fn hole_between_monitors_does_not_fire_a_false_handoff() {
+        // L-shaped layout: A(0,0,1920x1080), B(1920,0,1920x1080),
+        // C(3840,1080,1920x1080); there is an empty lower-left quadrant.
+        let regions = vec![
+            (0.0, 0.0, 1920.0, 1080.0),
+            (1920.0, 0.0, 3840.0, 1080.0),
+            (3840.0, 1080.0, 5760.0, 2160.0),
+        ];
+        let mut tracker =
+            AbsoluteTracker::new(PointerEdge::Bottom, 1, regions, 1.0).expect("regions");
+        // anchor is at the bottom edge of C
+        assert_eq!(tracker.absolute(), (4800.0, 2135.0));
+        // push left into the empty quadrant: the real cursor is snapped to a
+        // monitor edge, so this must NOT hand off
+        assert_eq!(tracker.apply(-3000.0, 0.0), None);
+        assert!(!tracker.fired);
+        // more vertical push while still in the hole: still no hand-off
+        assert_eq!(tracker.apply(0.0, 600.0), None);
+        assert!(!tracker.fired);
+        // reach C again, then genuinely push past its bottom edge
+        let _ = tracker.apply(2500.0, 0.0);
+        let _ = tracker.apply(0.0, 500.0);
+        assert_eq!(tracker.apply(0.0, 700.0), Some(PointerEdge::Bottom));
     }
 
     #[test]
@@ -1118,36 +1165,9 @@ mod absolute_tracker_tests {
     }
 
     #[test]
-    fn hole_between_monitors_does_not_fire_a_false_handoff() {
-        // L-shaped layout: A(0,0,1920x1080), B(1920,0,1920x1080),
-        // C(3840,1080,1920x1080); there is an empty lower-left quadrant.
-        let regions = vec![
-            (0.0, 0.0, 1920.0, 1080.0),
-            (1920.0, 0.0, 3840.0, 1080.0),
-            (3840.0, 1080.0, 5760.0, 2160.0),
-        ];
-        let mut tracker =
-            AbsoluteTracker::new(PointerEdge::Bottom, 1, regions, 1.0).expect("regions");
-        // anchor is the centre of C, (4800, 1620)
-        assert_eq!(tracker.absolute(), (4800.0, 1620.0));
-        // push left into the empty quadrant: the real cursor is snapped to a
-        // monitor edge, so this must NOT hand off
-        assert_eq!(tracker.apply(-3000.0, 0.0), None);
-        assert!(!tracker.fired);
-        // more vertical push while still in the hole: still no hand-off
-        assert_eq!(tracker.apply(0.0, 600.0), None);
-        assert!(!tracker.fired);
-        // reach C again, then genuinely push past its bottom edge
-        let _ = tracker.apply(2500.0, 0.0);
-        let _ = tracker.apply(0.0, 500.0);
-        assert_eq!(tracker.apply(0.0, 700.0), Some(PointerEdge::Bottom));
-    }
-
-    #[test]
     fn fired_latch_rearms_after_returning_inside() {
         let mut tracker = tracker(PointerEdge::Left);
-        let _ = tracker.apply(-1280.0, 0.0);
-        assert_eq!(tracker.apply(-8.0, 0.0), Some(PointerEdge::Left));
+        assert_eq!(tracker.apply(-30.0, 0.0), Some(PointerEdge::Left));
         assert_eq!(tracker.apply(-8.0, 0.0), None);
         let _ = tracker.apply(200.0, 0.0);
         assert_eq!(tracker.apply(-1200.0, 0.0), Some(PointerEdge::Left));
