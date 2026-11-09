@@ -150,3 +150,7 @@ See capture.md R-02 and frontend.md R-03/R-04.
 - The emulation backend is created lazily now: the GNOME RemoteDesktop permission dialog is not requested at
   app startup any more. It appears at most once per run, when a peer actually connects (or when emulation is
   enabled explicitly); a cancelled dialog disables emulation until the user retries instead of looping.
+
+- No unsolicited portal dialogs: automatic emulation start requires a saved portal consent token. Without it the
+  backend stays off and no dialog is opened; enabling emulation once (UI button / cli enable-emulation) asks a
+  single time, and a cancelled dialog is never retried automatically (token removed, explicit enable required).

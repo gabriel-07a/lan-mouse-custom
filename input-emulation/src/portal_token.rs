@@ -80,6 +80,16 @@ pub(crate) fn read_named_token(name: &str) -> Option<String> {
     read_token_from(token_dir().as_deref(), legacy_token_dir().as_deref(), name)
 }
 
+/// Remove a persisted consent token (best effort).
+pub(crate) fn remove_named_token(name: &str) {
+    if let Some(dir) = token_dir() {
+        let _ = fs::remove_file(dir.join(name));
+    }
+    if let Some(dir) = legacy_token_dir() {
+        let _ = fs::remove_file(dir.join(name));
+    }
+}
+
 /// Save a consent token atomically with owner-only permissions.
 pub(crate) fn write_named_token(name: &str, token: &str) -> io::Result<()> {
     let dir = token_dir().ok_or_else(|| {

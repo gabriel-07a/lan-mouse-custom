@@ -1340,6 +1340,9 @@ impl Service {
         // the stuck-cursor case this recovers from. The peer's own watchdog
         // resets its capture when the session goes away.
         self.emulation.close_session(addr);
+        // The emulation backend must stop absolute tracking for this peer too,
+        // otherwise a stale tracker could keep firing return requests.
+        self.emulation.remote_leave();
         // Do not depend on the asynchronous Closed/Disconnected round-trip
         // for the local suppression: if that event were lost too, the cursor
         // would stay stuck, which is exactly the bug being fixed here.

@@ -37,6 +37,45 @@ mod subpixel;
 
 pub type EmulationHandle = u64;
 
+/// Whether a persisted RemoteDesktop consent token exists.
+///
+/// When no token is present the portal would show a permission dialog; the
+/// service uses this to distinguish "we may start emulation automatically"
+/// (consent already granted) from "only an explicit user action may ask".
+pub fn remote_desktop_consent_present() -> bool {
+    #[cfg(libei)]
+    {
+        crate::portal_token::read_named_token(crate::portal_token::REMOTE_DESKTOP_TOKEN_FILE)
+            .is_some()
+    }
+    #[cfg(not(libei))]
+    {
+        false
+    }
+}
+
+/// Whether starting this backend could show a portal permission dialog and
+/// therefore needs persisted consent to start automatically.
+pub fn backend_needs_portal_consent(backend: Option<Backend>) -> bool {
+    #[cfg(libei)]
+    {
+        matches!(backend, None | Some(Backend::Libei))
+    }
+    #[cfg(not(libei))]
+    {
+        let _ = backend;
+        false
+    }
+}
+
+/// Forget the stored RemoteDesktop consent (a cancelled/failed portal request
+/// invalidates it anyway; removing it prevents unsolicited dialogs on the next
+/// start).
+pub fn clear_remote_desktop_consent() {
+    #[cfg(libei)]
+    crate::portal_token::remove_named_token(crate::portal_token::REMOTE_DESKTOP_TOKEN_FILE);
+}
+
 /// Screen edge the remote pointer was pushed across while a peer drives this
 /// machine.
 ///

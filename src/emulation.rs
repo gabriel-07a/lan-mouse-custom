@@ -698,6 +698,7 @@ impl EmulationProxy {
             closed: Default::default(),
             next_id: 0,
             selected_backend,
+            pending_remote: None,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -798,6 +799,9 @@ struct EmulationTask {
     closed: std::collections::HashSet<SocketAddr>,
     next_id: EmulationHandle,
     selected_backend: Rc<Cell<Option<input_emulation::Backend>>>,
+    /// RemoteEnter/RemoteLeave received while the backend was still being
+    /// created: they must not be dropped (the service does not re-send Enter).
+    pending_remote: Option<PointerEdge>,
 }
 
 impl EmulationTask {
@@ -807,6 +811,18 @@ impl EmulationTask {
         // until the first input actually has to be injected (or until the user
         // explicitly enables emulation again).
         let mut warmup: Option<(Event, SocketAddr)> = None;
+        // Portal-backed backends only start automatically when consent was
+        // persisted by an earlier explicit approval. Without it, an automatic
+        // start would show a permission dialog on the user's screen; instead we
+        // stay off until the user explicitly enables emulation.
+        let needs_consent = input_emulation::backend_needs_portal_consent(self.backend);
+        let auto_start_allowed =
+            !needs_consent || input_emulation::remote_desktop_consent_present();
+        if !auto_start_allowed {
+            log::info!(
+                "input emulation is off: no saved portal consent - enable emulation once in the UI to grant it (no permission dialog is opened automatically)"
+            );
+        }
         // Wait for the first reason to start the backend. A cancelled portal
         // permission must never loop: only this initial start is automatic,
         // later attempts require an explicit "enable emulation" request (see
@@ -814,15 +830,22 @@ impl EmulationTask {
         loop {
             match self.request_rx.recv().await.expect("channel closed") {
                 ProxyRequest::Terminate => return,
-                ProxyRequest::Reenable | ProxyRequest::WarmUp => break,
-                ProxyRequest::Input(event, addr) => {
+                // explicit user request: always allowed to (re)try
+                ProxyRequest::Reenable => break,
+                ProxyRequest::WarmUp if auto_start_allowed => break,
+                ProxyRequest::Input(event, addr) if auto_start_allowed => {
                     warmup = Some((event, addr));
                     break;
                 }
-                ProxyRequest::Remove(..)
-                | ProxyRequest::Open(..)
-                | ProxyRequest::RemoteEnter(..)
-                | ProxyRequest::RemoteLeave => continue,
+                ProxyRequest::WarmUp | ProxyRequest::Input(..) => {
+                    // Stay silent: no automatic permission prompts.
+                    continue;
+                }
+                ProxyRequest::RemoteEnter(edge) => {
+                    self.pending_remote = Some(edge);
+                }
+                ProxyRequest::RemoteLeave => self.pending_remote = None,
+                ProxyRequest::Remove(..) | ProxyRequest::Open(..) => continue,
             }
         }
 
@@ -838,6 +861,12 @@ impl EmulationTask {
                     .send(EmulationEvent::EmulationDisabled)
                     .ok()
                     .unwrap_or_default();
+                if needs_consent {
+                    // A cancelled/failed portal request invalidates the token
+                    // anyway. Remove it so the next app start never opens an
+                    // unsolicited permission dialog.
+                    input_emulation::clear_remote_desktop_consent();
+                }
             }
             if self.exit_requested.get() {
                 break;
@@ -850,10 +879,11 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::WarmUp => { /* never retry a portal dialog automatically */ }
-                    ProxyRequest::Remove(..)
-                    | ProxyRequest::Open(..)
-                    | ProxyRequest::RemoteEnter(..)
-                    | ProxyRequest::RemoteLeave => { /* emulation inactive => ignore */ }
+                    ProxyRequest::RemoteEnter(edge) => self.pending_remote = Some(edge),
+                    ProxyRequest::RemoteLeave => self.pending_remote = None,
+                    ProxyRequest::Remove(..) | ProxyRequest::Open(..) => {
+                        /* emulation inactive => ignore */
+                    }
                 }
             }
         }
@@ -886,15 +916,41 @@ impl EmulationTask {
             .map_err(InputEmulationError::from)
     }
 
+    /// Create the emulation backend while preserving semantic requests that
+    /// arrive during the (possibly slow, portal-backed) creation.
+    async fn create_emulation(&mut self) -> Result<Option<InputEmulation>, InputEmulationError> {
+        let create = InputEmulation::new(self.backend);
+        tokio::pin!(create);
+        loop {
+            tokio::select! {
+                result = &mut create => return Ok(Some(result?)),
+                request = self.request_rx.recv() => match request.expect("channel closed") {
+                    ProxyRequest::Terminate => return Ok(None),
+                    ProxyRequest::RemoteEnter(edge) => self.pending_remote = Some(edge),
+                    ProxyRequest::RemoteLeave => self.pending_remote = None,
+                    ProxyRequest::Remove(addr) => {
+                        self.closed.insert(addr);
+                    }
+                    ProxyRequest::Open(addr) => {
+                        self.closed.remove(&addr);
+                    }
+                    ProxyRequest::WarmUp
+                    | ProxyRequest::Reenable
+                    | ProxyRequest::Input(..) => {
+                        // the start decision has already been made
+                    }
+                },
+            }
+        }
+    }
+
     async fn do_emulation(
         &mut self,
         warmup: Option<(Event, SocketAddr)>,
     ) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
-        let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend) => r?,
-            // allow termination event while requesting input emulation
-            _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+        let Some(mut emulation) = self.create_emulation().await? else {
+            return Ok(());
         };
         self.selected_backend.set(Some(emulation.backend()));
 
@@ -919,6 +975,12 @@ impl EmulationTask {
             return Err(e);
         }
 
+        // A peer may have entered while the portal was still coming up: replay
+        // the edge so absolute tracking arms for this session.
+        if let Some(edge) = self.pending_remote.take() {
+            emulation.begin_remote_control(edge).await;
+        }
+
         // The input that triggered the (lazy) backend start is injected first so
         // the hand-off does not lose the first motion.
         if let Some((event, addr)) = warmup {
@@ -940,11 +1002,8 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
-        for handle in self.handles.values() {
-            tokio::select! {
-                _ = emulation.create(*handle) => {},
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
-            }
+        for handle in self.handles.values().copied().collect::<Vec<_>>() {
+            emulation.create(handle).await;
         }
         Ok(())
     }
@@ -1026,21 +1085,6 @@ fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
         Position::Right => lan_mouse_ipc::Position::Right,
         Position::Top => lan_mouse_ipc::Position::Top,
         Position::Bottom => lan_mouse_ipc::Position::Bottom,
-    }
-}
-
-async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
-    loop {
-        match rx.recv().await.expect("channel closed") {
-            ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::Remove(_)
-            | ProxyRequest::Open(_)
-            | ProxyRequest::RemoteEnter(_)
-            | ProxyRequest::RemoteLeave
-            | ProxyRequest::WarmUp => continue,
-            ProxyRequest::Reenable => continue,
-        }
     }
 }
 
