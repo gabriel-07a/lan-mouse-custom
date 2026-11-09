@@ -18,10 +18,10 @@ use async_trait::async_trait;
 
 use reis::{
     ei::{
-        self, Button, Keyboard, Pointer, Scroll, button::ButtonState, handshake::ContextType,
-        keyboard::KeyState,
+        self, Button, Keyboard, Pointer, PointerAbsolute, Scroll, button::ButtonState,
+        handshake::ContextType, keyboard::KeyState,
     },
-    event::{self, Connection, DeviceCapability, DeviceEvent, EiEvent, SeatEvent},
+    event::{self, Connection, DeviceCapability, DeviceEvent, EiEvent, Region, SeatEvent},
     tokio::EiConvertEventStream,
 };
 
@@ -32,11 +32,29 @@ use crate::{
     portal_token::{REMOTE_DESKTOP_TOKEN_FILE, read_named_token, write_named_token},
 };
 
-use super::{Emulation, EmulationHandle, error::LibeiEmulationCreationError};
+use super::{
+    EdgeReturnNotifier, Emulation, EmulationHandle, PointerEdge, error::LibeiEmulationCreationError,
+};
+
+/// Absolute pointer device advertised by the compositor, with the EIS region
+/// that defines our coordinate space.
+#[derive(Clone)]
+struct AbsolutePointer {
+    device: ei::Device,
+    pointer: PointerAbsolute,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+}
 
 #[derive(Clone, Default)]
 struct Devices {
     pointer: Arc<RwLock<Option<(ei::Device, ei::Pointer)>>>,
+    /// set when the compositor exposes an absolute pointer device (libei
+    /// PI_ABSOLUTE): lets us position the pointer exactly and detect the
+    /// return hand-off at the entry edge
+    absolute: Arc<RwLock<Option<AbsolutePointer>>>,
     scroll: Arc<RwLock<Option<(ei::Device, ei::Scroll)>>>,
     button: Arc<RwLock<Option<(ei::Device, ei::Button)>>>,
     keyboard: Arc<RwLock<Option<(ei::Device, ei::Keyboard)>>>,
@@ -62,6 +80,18 @@ impl Devices {
         clear(&self.scroll, device);
         clear(&self.button, device);
         clear(&self.keyboard, device);
+        {
+            let mut absolute = self
+                .absolute
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if absolute
+                .as_ref()
+                .is_some_and(|stored| &stored.device == device)
+            {
+                *absolute = None;
+            }
+        }
     }
 }
 
@@ -74,6 +104,102 @@ pub(crate) struct LibeiEmulation {
     libei_error: Arc<AtomicBool>,
     _remote_desktop: RemoteDesktop,
     session: Session<RemoteDesktop>,
+    /// edge the peer entered through, while it drives this machine
+    remote_edge: Option<PointerEdge>,
+    /// exact absolute-position tracker once armed
+    absolute: Option<AbsoluteTracker>,
+    /// service notifier for the return hand-off
+    edge_return: Option<EdgeReturnNotifier>,
+}
+
+/// Pixels the pointer must be pushed past the entry edge before the hand-off
+/// fires. The absolute tracker knows the exact position, so this can be tiny.
+const RETURN_MARGIN_PX: f64 = 3.0;
+
+fn ei_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+/// Exact edge-return detector for absolute pointer injection.
+///
+/// The pointer is warped to a known anchor on entry and every injected motion
+/// delta updates the tracked position. Because the same position is sent to
+/// the compositor as an absolute motion event, the tracked position *is* the
+/// real cursor position: crossing the entry edge is unambiguous.
+#[derive(Clone, Copy, Debug)]
+struct AbsoluteTracker {
+    edge: PointerEdge,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    x: f64,
+    y: f64,
+    fired: bool,
+}
+
+impl AbsoluteTracker {
+    fn new(edge: PointerEdge, min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Self {
+        Self {
+            edge,
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            x: f64::from(min_x + (max_x - min_x) / 2.0),
+            y: f64::from(min_y + (max_y - min_y) / 2.0),
+            fired: false,
+        }
+    }
+
+    /// Apply one injected delta and report the hand-off edge once.
+    fn apply(&mut self, dx: f64, dy: f64) -> Option<PointerEdge> {
+        self.x += dx;
+        self.y += dy;
+        if self.fired {
+            return None;
+        }
+        let past_edge = match self.edge {
+            PointerEdge::Left => self.x < f64::from(self.min_x) - RETURN_MARGIN_PX,
+            PointerEdge::Right => self.x > f64::from(self.max_x) + RETURN_MARGIN_PX,
+            PointerEdge::Top => self.y < f64::from(self.min_y) - RETURN_MARGIN_PX,
+            PointerEdge::Bottom => self.y > f64::from(self.max_y) + RETURN_MARGIN_PX,
+        };
+        if past_edge {
+            self.fired = true;
+            return Some(self.edge);
+        }
+        None
+    }
+
+    /// The position to send to the compositor (clamped into the region: EIS
+    /// silently drops out-of-region absolute motion).
+    fn absolute(&self) -> (f32, f32) {
+        (
+            self.x.clamp(f64::from(self.min_x), f64::from(self.max_x)) as f32,
+            self.y.clamp(f64::from(self.min_y), f64::from(self.max_y)) as f32,
+        )
+    }
+}
+
+/// Union of the device regions, used as the absolute coordinate space.
+fn region_bounds(regions: &[Region]) -> Option<(f32, f32, f32, f32)> {
+    let mut iter = regions.iter().filter(|r| r.width > 0 && r.height > 0);
+    let first = iter.next()?;
+    let mut min_x = first.x as f32;
+    let mut min_y = first.y as f32;
+    let mut max_x = first.x.saturating_add(first.width) as f32;
+    let mut max_y = first.y.saturating_add(first.height) as f32;
+    for region in iter {
+        min_x = min_x.min(region.x as f32);
+        min_y = min_y.min(region.y as f32);
+        max_x = max_x.max(region.x.saturating_add(region.width) as f32);
+        max_y = max_y.max(region.y.saturating_add(region.height) as f32);
+    }
+    Some((min_x, min_y, max_x, max_y))
 }
 
 async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
@@ -119,6 +245,49 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
 }
 
 impl LibeiEmulation {
+    /// Warp the pointer to the centre of the EIS region and start tracking the
+    /// injected deltas from that known anchor.
+    ///
+    /// With absolute injection the tracked position is the real cursor
+    /// position, so crossing the entry edge can be detected exactly - this is
+    /// what makes the automatic return hand-off work on Wayland, where the
+    /// compositor does not report capture barriers for injected motion.
+    fn start_absolute_tracking(&mut self) -> bool {
+        let Some(edge) = self.remote_edge else {
+            return false;
+        };
+        let absolute = self
+            .devices
+            .absolute
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(pointer) = absolute else {
+            log::warn!(
+                "peer drives this machine through {edge:?} but the compositor has no absolute pointer; automatic edge return is disabled - use the release bind to take control back"
+            );
+            return false;
+        };
+        let tracker = AbsoluteTracker::new(
+            edge,
+            pointer.min_x,
+            pointer.min_y,
+            pointer.max_x,
+            pointer.max_y,
+        );
+        let (x, y) = tracker.absolute();
+        pointer.pointer.motion_absolute(x, y);
+        pointer.device.frame(self.conn.serial(), ei_time());
+        if let Err(e) = self.context.flush() {
+            log::warn!("failed to flush the absolute pointer warp: {e}");
+        }
+        log::info!(
+            "absolute pointer armed at ({x},{y}); push the cursor past the {edge:?} edge to hand control back"
+        );
+        self.absolute = Some(tracker);
+        true
+    }
+
     pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
         let (_remote_desktop, session, eifd) = get_ei_fd().await?;
         let stream = UnixStream::from(eifd);
@@ -149,6 +318,9 @@ impl LibeiEmulation {
             libei_error,
             _remote_desktop,
             session,
+            remote_edge: None,
+            absolute: None,
+            edge_return: None,
         })
     }
 }
@@ -161,6 +333,21 @@ impl Drop for LibeiEmulation {
 
 #[async_trait]
 impl Emulation for LibeiEmulation {
+    fn set_edge_return_notifier(&mut self, notifier: EdgeReturnNotifier) {
+        self.edge_return = Some(notifier);
+    }
+
+    async fn begin_remote_control(&mut self, edge: PointerEdge) {
+        self.remote_edge = Some(edge);
+        self.absolute = None;
+        self.start_absolute_tracking();
+    }
+
+    async fn end_remote_control(&mut self) {
+        self.remote_edge = None;
+        self.absolute = None;
+    }
+
     async fn consume(
         &mut self,
         event: Event,
@@ -185,6 +372,39 @@ impl Emulation for LibeiEmulation {
                     if !dx.is_finite() || !dy.is_finite() {
                         log::warn!("dropping non-finite motion: ({dx}, {dy})");
                         return Ok(());
+                    }
+                    // While a peer drives this machine and the compositor
+                    // offers an absolute pointer, move it absolutely from a
+                    // tracked position: that is exact (no acceleration/drift)
+                    // and makes the edge-return detection trustworthy.
+                    if self.remote_edge.is_some() {
+                        if self.absolute.is_none() {
+                            self.start_absolute_tracking();
+                        }
+                        if let Some(tracker) = self.absolute.as_mut() {
+                            let fired = tracker.apply(dx, dy);
+                            let (x, y) = tracker.absolute();
+                            let absolute = self
+                                .devices
+                                .absolute
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            if let Some(pointer) = absolute {
+                                pointer.pointer.motion_absolute(x, y);
+                                pointer.device.frame(self.conn.serial(), now);
+                                self.context
+                                    .flush()
+                                    .map_err(|e| io::Error::new(e.kind(), e))?;
+                            }
+                            if let Some(edge) = fired {
+                                log::info!("pushed past the {edge:?} edge; handing control back");
+                                if let Some(notifier) = &self.edge_return {
+                                    let _ = notifier.send(edge);
+                                }
+                            }
+                            return Ok(());
+                        }
                     }
                     // The wire carries f64 while EIS uses f32: a huge finite
                     // value would become infinity when narrowed.
@@ -393,6 +613,30 @@ async fn ei_event_handler(
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .replace((device.device().clone(), pointer));
                 }
+                if let Some(pointer) = e.device().interface::<PointerAbsolute>() {
+                    match region_bounds(e.device().regions()) {
+                        Some((min_x, min_y, max_x, max_y)) => {
+                            log::info!(
+                                "absolute pointer available: EIS region {min_x},{min_y}..{max_x},{max_y}; automatic edge return enabled"
+                            );
+                            devices
+                                .absolute
+                                .write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .replace(AbsolutePointer {
+                                    device: device.device().clone(),
+                                    pointer,
+                                    min_x,
+                                    min_y,
+                                    max_x,
+                                    max_y,
+                                });
+                        }
+                        None => log::warn!(
+                            "absolute pointer device has no usable region; automatic edge return disabled"
+                        ),
+                    }
+                }
                 if let Some(keyboard) = e.device().interface::<Keyboard>() {
                     devices
                         .keyboard
@@ -453,5 +697,100 @@ async fn ei_event_handler(
             }
         }
         context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
+    }
+}
+
+#[cfg(test)]
+mod absolute_tracker_tests {
+    use super::*;
+
+    const W: f32 = 2560.0;
+    const H: f32 = 1600.0;
+
+    fn tracker(edge: PointerEdge) -> AbsoluteTracker {
+        AbsoluteTracker::new(edge, 0.0, 0.0, W, H)
+    }
+
+    #[test]
+    fn moving_inside_the_screen_never_returns() {
+        let mut tracker = tracker(PointerEdge::Left);
+        assert_eq!(tracker.apply(100.0, 0.0), None);
+        assert_eq!(tracker.apply(50.0, 40.0), None);
+        assert_eq!(tracker.apply(-80.0, -40.0), None);
+        assert_eq!(tracker.apply(-200.0, 0.0), None);
+        assert!(!tracker.fired);
+    }
+
+    #[test]
+    fn pushing_past_the_entry_edge_fires_exactly_once() {
+        let mut tracker = tracker(PointerEdge::Left);
+        // walk from the centre to the entry edge (x == 0)
+        assert_eq!(tracker.apply(-1280.0, 0.0), None);
+        // a small overshoot is not enough
+        assert_eq!(tracker.apply(-2.0, 0.0), None);
+        // past the margin: hand the control back
+        assert_eq!(tracker.apply(-2.0, 0.0), Some(PointerEdge::Left));
+        // latched: a single hand-off per activation
+        assert_eq!(tracker.apply(-50.0, 0.0), None);
+    }
+
+    #[test]
+    fn every_edge_uses_its_own_axis_and_direction() {
+        let cases = [
+            (PointerEdge::Left, -1280.0, 0.0, -8.0, 0.0),
+            (PointerEdge::Right, 1280.0, 0.0, 8.0, 0.0),
+            (PointerEdge::Top, 0.0, -800.0, 0.0, -8.0),
+            (PointerEdge::Bottom, 0.0, 800.0, 0.0, 8.0),
+        ];
+        for (edge, dx, dy, sx, sy) in cases {
+            let mut tracker = tracker(edge);
+            // walk to that edge first
+            let _ = tracker.apply(dx, dy);
+            // pushing past the margin in that direction fires once
+            assert_eq!(tracker.apply(sx, sy), Some(edge), "{edge:?}");
+        }
+    }
+
+    #[test]
+    fn wrong_axis_does_not_fire() {
+        let mut tracker = tracker(PointerEdge::Left);
+        assert_eq!(tracker.apply(-1280.0, 0.0), None);
+        // moving only vertically at the edge is not a return
+        assert_eq!(tracker.apply(0.0, -800.0), None);
+        assert_eq!(tracker.apply(0.0, 800.0), None);
+        assert!(!tracker.fired);
+    }
+
+    #[test]
+    fn tracked_position_is_clamped_to_the_region_when_sent() {
+        let mut tracker = tracker(PointerEdge::Right);
+        assert_eq!(tracker.apply(5000.0, 5000.0), Some(PointerEdge::Right));
+        let (x, y) = tracker.absolute();
+        assert!((0.0..=W).contains(&x));
+        assert!((0.0..=H).contains(&y));
+    }
+
+    #[test]
+    fn region_bounds_use_the_union_of_regions() {
+        let regions = vec![
+            Region {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale: 1.0,
+                mapping_id: None,
+            },
+            Region {
+                x: 1920,
+                y: 0,
+                width: 1280,
+                height: 720,
+                scale: 1.0,
+                mapping_id: None,
+            },
+        ];
+        assert_eq!(region_bounds(&regions), Some((0.0, 0.0, 3200.0, 1080.0)));
+        assert_eq!(region_bounds(&[]), None);
     }
 }

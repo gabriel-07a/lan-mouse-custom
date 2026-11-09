@@ -806,6 +806,10 @@ impl Service {
                 // (lazily created) emulation backend exists so input can be
                 // injected and the capability is advertised back to the peer.
                 self.emulation.warm_up();
+                // Arm the absolute-pointer tracker: it warps the cursor to a
+                // known anchor and detects the exact moment the user pushes it
+                // back past this entry edge (the return hand-off).
+                self.emulation.remote_enter(pos);
                 // The peer is driving this machine: local barrier detection
                 // must not react to the injected pointer motion (ping-pong at
                 // the shared border). Knowing *which* edge the peer entered
@@ -855,6 +859,7 @@ impl Service {
                 }
                 if self.incoming_conns.is_empty() {
                     self.capture.set_remote_peer(None);
+                    self.emulation.remote_leave();
                 }
             }
             EmulationEvent::PortChanged(port) => match port {
@@ -892,6 +897,7 @@ impl Service {
                 // The peer confirmed it released its capture: the retried
                 // return hand-off is complete.
                 self.return_requests.confirmed(addr);
+                self.emulation.remote_leave();
                 self.peer_released(addr, &fingerprint);
             }
             EmulationEvent::AutoAuthorized {
@@ -2736,6 +2742,7 @@ impl Service {
         // The full teardown must run in that case too: otherwise closing the
         // connection on this machine left the peer controlling it.
         if let Some(addr) = self.client_manager.incoming_addr(handle) {
+            self.emulation.remote_leave();
             if let Some(addr) = self.remove_incoming(addr) {
                 self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
             }

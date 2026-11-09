@@ -145,6 +145,16 @@ impl InputEmulation {
         self.emulation.set_edge_return_notifier(notifier);
     }
 
+    /// Arm edge-return tracking for a peer that entered through \`edge\`.
+    pub async fn begin_remote_control(&mut self, edge: PointerEdge) {
+        self.emulation.begin_remote_control(edge).await;
+    }
+
+    /// Disarm edge-return tracking (peer released / disconnected).
+    pub async fn end_remote_control(&mut self) {
+        self.emulation.end_remote_control().await;
+    }
+
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
         if let Some(backend) = backend {
             let b = Self::with_backend(backend).await;
@@ -388,6 +398,17 @@ trait Emulation: Send {
     /// Backends that can observe the injected pointer at a screen edge report
     /// it here so the service can hand control back to the peer.
     fn set_edge_return_notifier(&mut self, _notifier: EdgeReturnNotifier) {}
+
+    /// A peer started driving this machine through \`edge\`.
+    ///
+    /// Backends that can position the pointer absolutely should warp it to a
+    /// known anchor and track the injected motion from there, which makes an
+    /// exact edge-return detector possible. Backends without absolute support
+    /// keep the default no-op.
+    async fn begin_remote_control(&mut self, _edge: PointerEdge) {}
+
+    /// The peer no longer drives this machine; stop absolute tracking.
+    async fn end_remote_control(&mut self) {}
 
     /// Whether this backend synthesizes key auto-repeat itself for a held key.
     ///

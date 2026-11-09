@@ -146,6 +146,11 @@ enum EmulationRequest {
     /// Create the (possibly portal-backed) emulation backend as soon as a peer
     /// session exists, instead of waiting for the first input. Idempotent.
     WarmUp,
+    /// A peer started driving this machine through this local screen edge: arm
+    /// absolute-pointer edge-return tracking.
+    RemoteEnter(lan_mouse_ipc::Position),
+    /// The peer no longer drives this machine.
+    RemoteLeave,
     ChangePort(u16),
     Terminate,
 }
@@ -259,6 +264,22 @@ impl Emulation {
     pub(crate) fn warm_up(&self) {
         self.request_tx
             .send(EmulationRequest::WarmUp)
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// A peer started driving this machine through the local screen edge \`pos\`.
+    pub(crate) fn remote_enter(&self, pos: lan_mouse_ipc::Position) {
+        self.request_tx
+            .send(EmulationRequest::RemoteEnter(pos))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// The peer no longer drives this machine.
+    pub(crate) fn remote_leave(&self) {
+        self.request_tx
+            .send(EmulationRequest::RemoteLeave)
             .ok()
             .unwrap_or_default();
     }
@@ -585,6 +606,10 @@ impl ListenTask {
                         self.listener.disconnect_fingerprint(&fingerprint).await;
                     }
                     EmulationRequest::WarmUp => self.emulation_proxy.reenable(),
+                    EmulationRequest::RemoteEnter(pos) => self
+                        .emulation_proxy
+                        .begin_remote_control(to_pointer_edge(pos)),
+                    EmulationRequest::RemoteLeave => self.emulation_proxy.end_remote_control(),
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -641,6 +666,11 @@ enum ProxyRequest {
     /// A new incoming session from this address started: queued input for it is
     /// valid again (a closed address is otherwise dropped, see Remove).
     Open(SocketAddr),
+    /// Arm absolute-pointer edge-return tracking for a peer that entered
+    /// through this local edge.
+    RemoteEnter(PointerEdge),
+    /// The peer released the machine.
+    RemoteLeave,
     Terminate,
     Reenable,
 }
@@ -710,6 +740,22 @@ impl EmulationProxy {
             .unwrap_or_default();
     }
 
+    /// Arm absolute-pointer edge-return tracking for a peer entering here.
+    fn begin_remote_control(&self, edge: PointerEdge) {
+        self.request_tx
+            .send(ProxyRequest::RemoteEnter(edge))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// The peer released the machine: stop edge tracking.
+    fn end_remote_control(&self) {
+        self.request_tx
+            .send(ProxyRequest::RemoteLeave)
+            .ok()
+            .unwrap_or_default();
+    }
+
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
@@ -757,7 +803,10 @@ impl EmulationTask {
                     warmup = Some((event, addr));
                     break;
                 }
-                ProxyRequest::Remove(..) | ProxyRequest::Open(..) => continue,
+                ProxyRequest::Remove(..)
+                | ProxyRequest::Open(..)
+                | ProxyRequest::RemoteEnter(..)
+                | ProxyRequest::RemoteLeave => continue,
             }
         }
 
@@ -783,9 +832,10 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Remove(..) | ProxyRequest::Open(..) => {
-                        /* emulation inactive => ignore */
-                    }
+                    ProxyRequest::Remove(..)
+                    | ProxyRequest::Open(..)
+                    | ProxyRequest::RemoteEnter(..)
+                    | ProxyRequest::RemoteLeave => { /* emulation inactive => ignore */ }
                 }
             }
         }
@@ -919,6 +969,12 @@ impl EmulationTask {
                     ProxyRequest::Open(addr) => {
                         self.closed.remove(&addr);
                     }
+                    ProxyRequest::RemoteEnter(edge) => {
+                        emulation.begin_remote_control(edge).await;
+                    }
+                    ProxyRequest::RemoteLeave => {
+                        emulation.end_remote_control().await;
+                    }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
                 },
@@ -936,6 +992,16 @@ fn edge_to_ipc_pos(edge: PointerEdge) -> lan_mouse_ipc::Position {
     }
 }
 
+/// Map the local entry edge to the libei pointer edge.
+fn to_pointer_edge(pos: lan_mouse_ipc::Position) -> PointerEdge {
+    match pos {
+        lan_mouse_ipc::Position::Left => PointerEdge::Left,
+        lan_mouse_ipc::Position::Right => PointerEdge::Right,
+        lan_mouse_ipc::Position::Top => PointerEdge::Top,
+        lan_mouse_ipc::Position::Bottom => PointerEdge::Bottom,
+    }
+}
+
 fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
     match pos {
         Position::Left => lan_mouse_ipc::Position::Left,
@@ -950,7 +1016,10 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::Remove(_) | ProxyRequest::Open(_) => continue,
+            ProxyRequest::Remove(_)
+            | ProxyRequest::Open(_)
+            | ProxyRequest::RemoteEnter(_)
+            | ProxyRequest::RemoteLeave => continue,
             ProxyRequest::Reenable => continue,
         }
     }
