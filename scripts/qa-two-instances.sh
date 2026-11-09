@@ -770,11 +770,10 @@ activate_on_startup = true"
     check_contains "trocar o lado no receptor mantém a sessão de entrada" "receiving-only" "$(first_status b)"
 }
 
-# Regression (user report): the controlled machine could not hand the cursor
-# back on Wayland/libei because only the Windows emulation backend reports
-# screen edges. The software tracker in crate::edge_return detects the return
-# from the injected 1:1 motion deltas, and a local Disconnect keeps the peer out
-# for a short grace window so a lost AuthRevoke cannot restore the session.
+# Regression (user report): a local Disconnect must be final. The controller no
+# longer re-dials an inactive client, a rejected reconnect is torn down at the
+# listener (no transport, no input), and the user can explicitly allow the
+# device again.
 
 scenario_grace() {
     say "### scenario grace: disconnect local bloqueia reconexão silenciosa"

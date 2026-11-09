@@ -128,11 +128,13 @@ See capture.md R-02 and frontend.md R-03/R-04.
   icon; the notification-area icon uses the same embedded Lan Mouse icon. Regression: packaging test
   windows_gpui_frontend_embeds_the_icon_resource.
 
-- The controlled machine can hand the cursor back on Wayland/libei again: a software tracker reconstructs
-  the pointer distance from the entry edge out of the injected deltas and requests the standard Leave
-  hand-off when the user pushes back out. Regression: scenario retorno.
-- Closing from either side is reliable: AuthRevoke is retransmitted and a 10 s local grace window tears
-  down racing reconnections (no "blink back"). Regression: scenarios close/grace.
+- The delta-based return gesture introduced in v0.2.10 was removed: on relative-only backends
+  (GNOME Wayland) it fired on ordinary cursor movement because the protocol has no absolute pointer
+  position. Return control with the release bind (Ctrl+Shift+Meta+Alt) on the machine that holds the
+  capture, or disconnect. The native Windows edge reporting is unchanged.
+- Closing from either side is reliable: AuthRevoke is retransmitted, the controller never re-dials an
+  inactive client, and the listener rejects reconnections of a locally disconnected identity until the
+  user allows it again (no "blink back"). Regression: scenarios close/grace.
 
 - A local Disconnect is final: the controller no longer re-dials an inactive client (capture-retry gate),
   AuthRevoke is retransmitted, and the receiver rejects reconnections of that identity at the handshake
