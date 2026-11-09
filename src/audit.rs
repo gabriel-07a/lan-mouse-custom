@@ -274,23 +274,30 @@ impl AuditLog {
         // Replace the previous rotation; losing an old audit file is better
         // than failing to record new events.
         let _ = fs::remove_file(&rotated);
-        if let Err(e) = fs::rename(&self.path, &rotated) {
-            log::debug!("could not rotate the audit log, will retry: {e}");
-            return;
+        match fs::rename(&self.path, &rotated) {
+            Ok(()) => self.after_rotation(&rotated),
+            Err(e) => log::debug!("could not rotate the audit log, will retry: {e}"),
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&rotated, fs::Permissions::from_mode(0o600));
-        }
+    }
+
+    /// Bookkeeping after a successful rotation.
+    ///
+    /// Kept as a separate function so the control flow does not depend on
+    /// cfg(unix): with the permission block compiled out on Windows, an early
+    /// return would otherwise be the last statement of rotate_if_needed and
+    /// trip clippy::needless_return (CI builds with -D warnings).
+    #[cfg(unix)]
+    fn after_rotation(&self, rotated: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(rotated, fs::Permissions::from_mode(0o600));
         // The next append recreates the log file with the process umask, so
         // the one-shot tightening must run again for the new file; otherwise
         // every record written after the first rotation would be 0644.
-        #[cfg(unix)]
-        {
-            self.state.borrow_mut().file_tightened = false;
-        }
+        self.state.borrow_mut().file_tightened = false;
     }
+
+    #[cfg(not(unix))]
+    fn after_rotation(&self, _rotated: &std::path::Path) {}
 
     /// Most recent records, newest first, capped at `limit`.
     ///

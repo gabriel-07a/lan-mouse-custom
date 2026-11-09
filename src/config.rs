@@ -2,7 +2,6 @@ use crate::capture_test::TestCaptureArgs;
 use crate::doctor::DoctorArgs;
 use crate::emulation_test::TestEmulationArgs;
 use clap::{Parser, Subcommand, ValueEnum};
-use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -873,12 +872,24 @@ impl Config {
                     continue;
                 }
             };
-            if !event.paths.contains(&self.config_path)
+            // Compare by file name: the watcher only covers the config
+            // directory (non-recursive) and the atomic-write temp file has a
+            // different name, so this cannot match an unrelated file. Exact
+            // path equality is unreliable across platforms (short/long paths,
+            // case, prefix forms).
+            let config_name = self.config_path.file_name();
+            let relevant_path = event
+                .paths
+                .iter()
+                .any(|path| path.file_name() == config_name);
+            // Accept every Modify flavour: Windows reports writes as
+            // Modify(Any)/Data while editors that save atomically report
+            // Create/Name events. The content comparison in read_from_disk
+            // keeps our own saves from triggering a reload.
+            if !relevant_path
                 || !matches!(
                     event.kind,
-                    EventKind::Create(_)
-                        | EventKind::Modify(ModifyKind::Data(_))
-                        | EventKind::Remove(_)
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 )
             {
                 continue;
@@ -1499,11 +1510,19 @@ mod tests {
         // The timeout alone would also pass if the watcher had been lost
         // entirely (the CFG-03 regression). Prove the watcher is still armed:
         // an external write must schedule a reload.
-        fs::write(config.config_path(), "port = 3\n").expect("external write");
-        tokio::time::timeout(std::time::Duration::from_secs(5), config.changed())
-            .await
-            .expect("an external config change must trigger a reload")
-            .expect("watcher error");
+        let mut reloaded = false;
+        for _ in 0..3 {
+            fs::write(config.config_path(), "port = 3\n").expect("external write");
+            match tokio::time::timeout(std::time::Duration::from_secs(3), config.changed()).await {
+                Ok(Ok(())) => {
+                    reloaded = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!("watcher error: {e}"),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+            }
+        }
+        assert!(reloaded, "an external config change must trigger a reload");
         let parsed: ConfigToml =
             toml::from_str(&fs::read_to_string(config.config_path()).expect("config contents"))
                 .expect("parse");
