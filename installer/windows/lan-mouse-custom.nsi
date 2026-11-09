@@ -39,7 +39,7 @@
 !include "FileFunc.nsh"
 
 !ifndef APPVERSION
-  !define APPVERSION "0.2.9"
+  !define APPVERSION "0.2.10"
 !endif
 
 !define APPNAME "Lan Mouse"
