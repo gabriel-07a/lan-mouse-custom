@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "lan-mouse"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "clap",
  "env_logger",

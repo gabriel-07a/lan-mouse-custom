@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "lan-mouse-gpui"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "async-channel 2.5.0",
  "env_logger",
