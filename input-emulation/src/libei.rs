@@ -128,88 +128,171 @@ pub(crate) struct LibeiEmulation {
 /// fires. The absolute tracker knows the exact position, so this can be tiny.
 const RETURN_MARGIN_PX: f64 = 3.0;
 
+/// Largest per-event delta accepted from the wire. Bigger values are treated
+/// as corrupted packets: one bogus delta must not jump the cursor across the
+/// screen and trigger a false hand-off.
+const MAX_DELTA_PX: f64 = 4096.0;
+
 /// Exact edge-return detector for absolute pointer injection.
 ///
 /// The pointer is warped to a known anchor on entry and every injected motion
 /// delta updates the tracked position. Because the same position is sent to
 /// the compositor as an absolute motion event, the tracked position *is* the
 /// real cursor position: crossing the entry edge is unambiguous.
-#[derive(Clone, Copy, Debug)]
+///
+/// The tracked position lives in the EIS layout coordinate space (all monitor
+/// regions share it), so the pointer can roam across monitors; only the entry
+/// edge of the region that was entered triggers the hand-off.
+#[derive(Clone, Debug)]
 struct AbsoluteTracker {
     edge: PointerEdge,
     /// absolute device generation this tracker was armed against
     generation: u64,
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
+    /// monitor regions in logical pixels: (x0, y0, x1, y1), half-open
+    regions: Vec<(f32, f32, f32, f32)>,
+    /// region touching the entry edge (anchor + return threshold)
+    entry: (f32, f32, f32, f32),
+    layout_min_x: f32,
+    layout_min_y: f32,
+    layout_max_x: f32,
+    layout_max_y: f32,
     x: f64,
     y: f64,
     fired: bool,
 }
 
 impl AbsoluteTracker {
-    fn new(
-        edge: PointerEdge,
-        generation: u64,
-        min_x: f32,
-        min_y: f32,
-        max_x: f32,
-        max_y: f32,
-    ) -> Self {
-        Self {
+    fn new(edge: PointerEdge, generation: u64, regions: Vec<(f32, f32, f32, f32)>) -> Option<Self> {
+        let entry = entry_region_bounds(&regions, edge)?;
+        let layout_min_x = regions.iter().map(|r| r.0).fold(f32::INFINITY, f32::min);
+        let layout_min_y = regions.iter().map(|r| r.1).fold(f32::INFINITY, f32::min);
+        let layout_max_x = regions
+            .iter()
+            .map(|r| r.2)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let layout_max_y = regions
+            .iter()
+            .map(|r| r.3)
+            .fold(f32::NEG_INFINITY, f32::max);
+        Some(Self {
             edge,
             generation,
-            min_x,
-            min_y,
-            max_x,
-            max_y,
-            x: f64::from(min_x + (max_x - min_x) / 2.0),
-            y: f64::from(min_y + (max_y - min_y) / 2.0),
+            regions,
+            entry,
+            layout_min_x,
+            layout_min_y,
+            layout_max_x,
+            layout_max_y,
+            x: f64::from(entry.0 + (entry.2 - entry.0) / 2.0),
+            y: f64::from(entry.1 + (entry.3 - entry.1) / 2.0),
             fired: false,
-        }
+        })
+    }
+
+    /// The entry region bounds (return threshold).
+    fn entry_bounds(&self) -> (f32, f32, f32, f32) {
+        self.entry
+    }
+
+    /// Clamp a real cursor position into the layout (half-open region bounds).
+    fn clamped(&self, x: f64, y: f64) -> (f64, f64) {
+        let max_x = f64::from(self.layout_max_x) - 1.0;
+        let max_y = f64::from(self.layout_max_y) - 1.0;
+        (
+            x.clamp(f64::from(self.layout_min_x), max_x),
+            y.clamp(f64::from(self.layout_min_y), max_y),
+        )
     }
 
     /// Apply one injected delta and report the hand-off edge once.
     fn apply(&mut self, dx: f64, dy: f64) -> Option<PointerEdge> {
-        self.x += dx;
-        self.y += dy;
+        if !dx.is_finite() || !dy.is_finite() {
+            return None;
+        }
+        // Corrupted single deltas would jump the tracked cursor anywhere; drop
+        // them instead of clamping (a clamp could still fire the hand-off).
+        if dx.abs() > MAX_DELTA_PX || dy.abs() > MAX_DELTA_PX {
+            log::debug!("dropping implausible absolute delta ({dx}, {dy})");
+            return None;
+        }
+        let raw_x = self.x + dx;
+        let raw_y = self.y + dy;
+        // The compositor clamps the real cursor into the layout; mirror that so
+        // overshooting an edge and coming back behaves correctly.
+        (self.x, self.y) = self.clamped(raw_x, raw_y);
+
         if self.fired {
-            // The peer may not release (lost Leave): re-arm once the pointer
-            // is back well inside the screen so a later push can hand off again.
+            // Re-arm when the pointer is well inside the entry screen area.
             let inset = 20.0;
-            let inside = self.x > f64::from(self.min_x) + inset
-                && self.x < f64::from(self.max_x) - inset
-                && self.y > f64::from(self.min_y) + inset
-                && self.y < f64::from(self.max_y) - inset;
-            if inside {
+            if self.x > f64::from(self.entry.0) + inset
+                && self.x < f64::from(self.entry.2) - inset
+                && self.y > f64::from(self.entry.1) + inset
+                && self.y < f64::from(self.entry.3) - inset
+            {
                 self.fired = false;
             }
             return None;
         }
+
+        let (x0, y0, x1, y1) = self.entry;
         let past_edge = match self.edge {
-            PointerEdge::Left => self.x < f64::from(self.min_x) - RETURN_MARGIN_PX,
-            PointerEdge::Right => self.x > f64::from(self.max_x) + RETURN_MARGIN_PX,
-            PointerEdge::Top => self.y < f64::from(self.min_y) - RETURN_MARGIN_PX,
-            PointerEdge::Bottom => self.y > f64::from(self.max_y) + RETURN_MARGIN_PX,
+            PointerEdge::Left => raw_x < f64::from(x0) - RETURN_MARGIN_PX,
+            PointerEdge::Right => raw_x > f64::from(x1) + RETURN_MARGIN_PX,
+            PointerEdge::Top => raw_y < f64::from(y0) - RETURN_MARGIN_PX,
+            PointerEdge::Bottom => raw_y > f64::from(y1) + RETURN_MARGIN_PX,
         };
         if past_edge {
             self.fired = true;
+            // Snap to the edge so reversing the push moves the cursor again
+            // immediately (the overrun distance must not be swallowed).
+            match self.edge {
+                PointerEdge::Left => self.x = f64::from(x0),
+                PointerEdge::Right => self.x = f64::from(x1) - 1.0,
+                PointerEdge::Top => self.y = f64::from(y0),
+                PointerEdge::Bottom => self.y = f64::from(y1) - 1.0,
+            }
             return Some(self.edge);
         }
         None
     }
 
-    /// The position to send to the compositor (clamped into the region: EIS
-    /// silently drops out-of-region absolute motion).
+    /// The position to send to the compositor.
+    ///
+    /// Absolute events are only valid inside a region (half-open bounds); a
+    /// position in a gap between monitors is clamped into the nearest region.
     fn absolute(&self) -> (f32, f32) {
-        (
-            self.x.clamp(f64::from(self.min_x), f64::from(self.max_x)) as f32,
-            self.y.clamp(f64::from(self.min_y), f64::from(self.max_y)) as f32,
-        )
+        let x = self.x;
+        let y = self.y;
+        for region in &self.regions {
+            let (x0, y0, x1, y1) = *region;
+            if x >= f64::from(x0)
+                && x < f64::from(x1) - 1.0
+                && y >= f64::from(y0)
+                && y < f64::from(y1) - 1.0
+            {
+                return (x as f32, y as f32);
+            }
+        }
+        // Not inside any region (gap/outside): snap into the nearest one.
+        let mut best: Option<((f32, f32), f64)> = None;
+        for region in &self.regions {
+            let (x0, y0, x1, y1) = *region;
+            let cx = x.clamp(f64::from(x0), f64::from(x1) - 1.0);
+            let cy = y.clamp(f64::from(y0), f64::from(y1) - 1.0);
+            let distance = (cx - x) * (cx - x) + (cy - y) * (cy - y);
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_distance)| distance < *best_distance)
+            {
+                best = Some(((cx as f32, cy as f32), distance));
+            }
+        }
+        best.map(|(position, _)| position)
+            .unwrap_or((self.layout_min_x, self.layout_min_y))
     }
 }
 
+/// Convert EIS regions into (x0, y0, x1, y1) logical-pixel boxes.
 /// Convert EIS regions into (x0, y0, x1, y1) logical-pixel boxes.
 fn region_boxes(regions: &[Region]) -> Vec<(f32, f32, f32, f32)> {
     regions
@@ -325,17 +408,18 @@ impl LibeiEmulation {
             log::debug!("absolute pointer paused by the compositor; waiting for resume");
             return false;
         }
-        let Some((min_x, min_y, max_x, max_y)) = entry_region_bounds(&pointer.regions, edge) else {
+        let Some(tracker) = AbsoluteTracker::new(edge, pointer.generation, pointer.regions.clone())
+        else {
             log::warn!("absolute pointer has no usable region; automatic edge return disabled");
             return false;
         };
-        let tracker = AbsoluteTracker::new(edge, pointer.generation, min_x, min_y, max_x, max_y);
         let (x, y) = tracker.absolute();
         pointer.pointer.motion_absolute(x, y);
         pointer.device.frame(self.conn.serial(), self.now_micros());
         if let Err(e) = self.context.flush() {
             log::warn!("failed to flush the absolute pointer warp: {e}");
         }
+        let (min_x, min_y, max_x, max_y) = tracker.entry_bounds();
         log::info!(
             "absolute pointer armed at ({x},{y}) region {min_x},{min_y}..{max_x},{max_y}; push the cursor past the {edge:?} edge to hand control back"
         );
@@ -467,7 +551,7 @@ impl Emulation for LibeiEmulation {
                             _ => None,
                         };
                         if let Some(pointer) = usable {
-                            let mut tracker = self.absolute.expect("checked above");
+                            let mut tracker = self.absolute.take().expect("checked above");
                             let fired = tracker.apply(dx, dy);
                             let (x, y) = tracker.absolute();
                             pointer.pointer.motion_absolute(x, y);
@@ -803,7 +887,11 @@ mod absolute_tracker_tests {
     const H: f32 = 1600.0;
 
     fn tracker(edge: PointerEdge) -> AbsoluteTracker {
-        AbsoluteTracker::new(edge, 1, 0.0, 0.0, W, H)
+        AbsoluteTracker::new(edge, 1, vec![(0.0, 0.0, W, H)]).expect("single region")
+    }
+
+    fn dual_regions() -> Vec<(f32, f32, f32, f32)> {
+        vec![(0.0, 0.0, 1920.0, 1080.0), (1920.0, 0.0, 3840.0, 1080.0)]
     }
 
     #[test]
@@ -821,10 +909,8 @@ mod absolute_tracker_tests {
         let mut tracker = tracker(PointerEdge::Left);
         // walk from the centre to the entry edge (x == 0)
         assert_eq!(tracker.apply(-1280.0, 0.0), None);
-        // a small overshoot is not enough
-        assert_eq!(tracker.apply(-2.0, 0.0), None);
-        // past the margin: hand the control back
-        assert_eq!(tracker.apply(-2.0, 0.0), Some(PointerEdge::Left));
+        // a single directional push past the margin: hand control back
+        assert_eq!(tracker.apply(-8.0, 0.0), Some(PointerEdge::Left));
         // latched: a single hand-off per activation
         assert_eq!(tracker.apply(-50.0, 0.0), None);
     }
@@ -839,9 +925,7 @@ mod absolute_tracker_tests {
         ];
         for (edge, dx, dy, sx, sy) in cases {
             let mut tracker = tracker(edge);
-            // walk to that edge first
             let _ = tracker.apply(dx, dy);
-            // pushing past the margin in that direction fires once
             assert_eq!(tracker.apply(sx, sy), Some(edge), "{edge:?}");
         }
     }
@@ -850,19 +934,59 @@ mod absolute_tracker_tests {
     fn wrong_axis_does_not_fire() {
         let mut tracker = tracker(PointerEdge::Left);
         assert_eq!(tracker.apply(-1280.0, 0.0), None);
-        // moving only vertically at the edge is not a return
         assert_eq!(tracker.apply(0.0, -800.0), None);
         assert_eq!(tracker.apply(0.0, 800.0), None);
         assert!(!tracker.fired);
     }
 
     #[test]
-    fn tracked_position_is_clamped_to_the_region_when_sent() {
+    fn absolute_position_stays_valid_in_half_open_region_bounds() {
         let mut tracker = tracker(PointerEdge::Right);
-        assert_eq!(tracker.apply(5000.0, 5000.0), Some(PointerEdge::Right));
+        let _ = tracker.apply(1280.0, 800.0);
+        assert_eq!(tracker.apply(8.0, 0.0), Some(PointerEdge::Right));
         let (x, y) = tracker.absolute();
-        assert!((0.0..=W).contains(&x));
-        assert!((0.0..=H).contains(&y));
+        assert!((0.0..=W - 1.0).contains(&x));
+        assert!((0.0..=H - 1.0).contains(&y));
+    }
+
+    #[test]
+    fn pointer_can_cross_into_the_adjacent_monitor() {
+        let mut tracker = AbsoluteTracker::new(PointerEdge::Left, 1, dual_regions()).unwrap();
+        // anchor is the centre of the monitor that was entered (960, 540)
+        assert_eq!(tracker.absolute(), (960.0, 540.0));
+        assert_eq!(tracker.apply(2000.0, 0.0), None);
+        let (x, _) = tracker.absolute();
+        assert!(x > 1920.0, "cursor must reach the second monitor, got {x}");
+        assert!(x <= 3839.0);
+    }
+
+    #[test]
+    fn pointer_can_cross_into_a_stacked_monitor() {
+        let regions = vec![(0.0, 0.0, 1920.0, 1080.0), (0.0, 1080.0, 1920.0, 2160.0)];
+        let mut tracker = AbsoluteTracker::new(PointerEdge::Top, 1, regions).unwrap();
+        assert_eq!(tracker.apply(0.0, 1500.0), None);
+        let (_, y) = tracker.absolute();
+        assert!(y > 1080.0, "cursor must reach the lower monitor, got {y}");
+    }
+
+    #[test]
+    fn overrun_does_not_swallow_the_reverse_movement() {
+        let mut tracker = tracker(PointerEdge::Left);
+        let _ = tracker.apply(-1280.0, 0.0);
+        assert_eq!(tracker.apply(-8.0, 0.0), Some(PointerEdge::Left));
+        // cursor snapped to the edge; moving back inside moves it immediately
+        let _ = tracker.apply(500.0, 0.0);
+        let (x, _) = tracker.absolute();
+        assert!((x - 500.0).abs() < 1.0, "expected x≈500, got {x}");
+    }
+
+    #[test]
+    fn implausible_single_delta_is_dropped() {
+        let mut tracker = tracker(PointerEdge::Left);
+        let before = tracker.absolute();
+        assert_eq!(tracker.apply(-1.0e12, 0.0), None);
+        assert!(!tracker.fired);
+        assert_eq!(tracker.absolute(), before);
     }
 
     #[test]
@@ -903,9 +1027,7 @@ mod absolute_tracker_tests {
         let mut tracker = tracker(PointerEdge::Left);
         let _ = tracker.apply(-1280.0, 0.0);
         assert_eq!(tracker.apply(-8.0, 0.0), Some(PointerEdge::Left));
-        // while outside the inset the latch stays fired
         assert_eq!(tracker.apply(-8.0, 0.0), None);
-        // coming back inside re-arms: a second outward push hands off again
         let _ = tracker.apply(200.0, 0.0);
         assert_eq!(tracker.apply(-1200.0, 0.0), Some(PointerEdge::Left));
     }
