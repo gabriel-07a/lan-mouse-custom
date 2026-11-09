@@ -29,9 +29,9 @@ jobs:
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
             libfontconfig1-dev libfreetype-dev librsvg2-bin imagemagick
       - name: Release build
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Build GPUI frontend
-        run: cargo build --release --manifest-path lan-mouse-gpui/Cargo.toml --target-dir target
+        run: cargo build --release --locked --manifest-path lan-mouse-gpui/Cargo.toml --target-dir target
       - name: Collect binaries
         run: |
           cp target/release/lan-mouse lan-mouse-linux-x86_64
@@ -72,6 +72,12 @@ jobs:
   windows-release-build:
     needs: windows-gpui-frontend
     runs-on: windows-latest
+    env:
+      # Optional Authenticode signing. Set both repository secrets to sign the
+      # shipped exes and the installer; when absent the steps are skipped and
+      # the release is published unsigned (SmartScreen will warn on first run).
+      WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+      WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - name: Download GPUI frontend
@@ -91,7 +97,7 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
       - name: Release build
         shell: msys2 {0}
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Create archive
         shell: msys2 {0}
         run: |
@@ -101,6 +107,28 @@ jobs:
             | awk '/\/ucrt64\/bin\// {print $3}' \
             | sort -u \
             | xargs -r cp -t lan-mouse-windows
+      - name: Sign Windows binaries (optional)
+        if: env.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64))
+          $pw = ConvertTo-SecureString -String $env:WINDOWS_CODESIGN_PFX_PASSWORD -Force -AsPlainText
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw | Out-Null
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if (-not $signtool) {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $signtool) { throw "signtool.exe not found; cannot sign the release binaries" }
+          foreach ($file in @("lan-mouse-windows\lan-mouse.exe", "lan-mouse-windows\lan-mouse-gpui.exe")) {
+            & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfx /p $env:WINDOWS_CODESIGN_PFX_PASSWORD $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for $file (exit $LASTEXITCODE)" }
+            Write-Host "signature: $file -> $((Get-AuthenticodeSignature $file).Status)"
+          }
+          Remove-Item $pfx -Force
+
       - name: Create zip
         shell: pwsh
         run: Compress-Archive -Path "lan-mouse-windows\*" -DestinationPath lan-mouse-windows-x86_64.zip
@@ -110,9 +138,30 @@ jobs:
           choco install nsis -y --no-progress
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           & "C:\Program Files (x86)\NSIS\makensis.exe" /DAPPVERSION=$version installer\windows\lan-mouse-custom.nsi
-      - name: Smoke test silent installer and doctor probe
+      - name: Sign the installer (optional)
+        if: env.WINDOWS_CODESIGN_PFX_BASE64 != ''
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64))
+          $pw = ConvertTo-SecureString -String $env:WINDOWS_CODESIGN_PFX_PASSWORD -Force -AsPlainText
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw | Out-Null
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if (-not $signtool) {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $signtool) { throw "signtool.exe not found; cannot sign the installer" }
+          & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfx /p $env:WINDOWS_CODESIGN_PFX_PASSWORD "lan-mouse-custom-setup-x86_64.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed for the installer (exit $LASTEXITCODE)" }
+          Write-Host "installer signature: $((Get-AuthenticodeSignature "lan-mouse-custom-setup-x86_64.exe").Status)"
+          Remove-Item $pfx -Force
+
+      - name: Smoke test - install (silent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           # Regression guard for the reported bug: installing a release over an
           # older build must NOT resurrect the old PCs/certificates/permissions.
           # Seed stale per-user data and assert the silent installer moves it to
@@ -125,42 +174,34 @@ jobs:
           Set-Content -Path (Join-Path $userData "lan-mouse.pem") -Value "stale certificate"
           Set-Content -Path (Join-Path $roamingData "config.toml") -Value "# stale roaming config"
           Set-Content -Path $unrelated -Value "must survive the clean install"
-          $p = Start-Process -FilePath ".\lan-mouse-custom-setup-x86_64.exe" -ArgumentList "/S" -Wait -PassThru
-          if ($p.ExitCode -ne 0) {
-            echo "::error::installer exit code $($p.ExitCode)"
-            throw "Installer failed with exit code $($p.ExitCode)"
-          }
-          if (Test-Path (Join-Path $userData "config.toml")) {
-            echo "::error::installer did not clean the stale configuration in $userData"
-            throw "Installer kept the stale user configuration in place"
-          }
+
+          $installer = Join-Path $env:GITHUB_WORKSPACE "lan-mouse-custom-setup-x86_64.exe"
+          if (-not (Test-Path $installer)) { throw "installer not found at $installer" }
+          # Redirect stdout/stderr to files: the NSIS installer is a GUI app and
+          # a plain pipe can lose its output when it fails.
+          $stdout = Join-Path $env:RUNNER_TEMP "installer.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "installer.stderr.log"
+          $p = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Write-Host "installer exit code: $($p.ExitCode)"
+          Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          if ($p.ExitCode -ne 0) { throw "Installer failed with exit code $($p.ExitCode) - see the smoke-test diagnostics artifact" }
+          if (Test-Path (Join-Path $userData "config.toml")) { throw "Installer did not move the stale configuration away from $userData" }
           $localBackups = @(Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)
-          if ($localBackups.Count -eq 0) {
-            echo "::error::installer did not create a lan-mouse.bak-* backup"
-            throw "Installer did not create a reversible backup"
-          }
-          if (-not (Get-ChildItem -Path $localBackups[0].FullName -Filter "config.toml" -ErrorAction SilentlyContinue)) {
-            echo "::error::backup $($localBackups[0].FullName) does not contain the stale config.toml"
-            throw "Installer backup is missing the stale configuration"
-          }
-          if (Test-Path (Join-Path $roamingData "config.toml")) {
-            echo "::error::installer did not back up the stale roaming configuration in $roamingData"
-            throw "Installer kept the stale roaming configuration in place"
-          }
-          if (-not (Test-Path $unrelated)) {
-            echo "::error::installer deleted an unrelated file: $unrelated"
-            throw "Installer must not delete unrelated files"
-          }
+          if ($localBackups.Count -eq 0) { throw "Installer did not create a reversible lan-mouse.bak-* backup" }
+          if (-not (Get-ChildItem -Path $localBackups[0].FullName -Filter "config.toml" -ErrorAction SilentlyContinue)) { throw "Installer backup $($localBackups[0].FullName) does not contain the stale config.toml" }
+          if (Test-Path (Join-Path $roamingData "config.toml")) { throw "Installer did not back up the stale roaming configuration in $roamingData" }
+          if (-not (Test-Path $unrelated)) { throw "Installer deleted an unrelated file: $unrelated" }
           $exe = "C:\Program Files\Lan Mouse\lan-mouse.exe"
-          if (-not (Test-Path $exe)) {
-            echo "::error::installed binary missing at $exe"
-            throw "Installed binary missing at $exe"
-          }
+          if (-not (Test-Path $exe)) { throw "Installed binary missing at $exe" }
           $frontend = "C:\Program Files\Lan Mouse\lan-mouse-gpui.exe"
-          if (-not (Test-Path $frontend)) {
-            echo "::error::installed GPUI frontend missing at $frontend"
-            throw "Installed GPUI frontend missing at $frontend"
-          }
+          if (-not (Test-Path $frontend)) { throw "Installed GPUI frontend missing at $frontend" }
+
+      - name: Smoke test - doctor probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "C:\Program Files\Lan Mouse\lan-mouse.exe"
           # The release binary is a GUI-subsystem executable. PowerShell's `&`
           # piping can miss its stdout; redirect through files instead so the
           # doctor JSON is reliably captured and failures are diagnosable.
@@ -170,62 +211,70 @@ jobs:
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
           Write-Host "doctor exit code: $($doctor.ExitCode)"
           Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-          if ($doctor.ExitCode -ne 0) {
-            echo "::error::doctor exited with $($doctor.ExitCode)"
-            throw "doctor exited with $($doctor.ExitCode)"
-          }
+          if ($doctor.ExitCode -ne 0) { throw "doctor exited with $($doctor.ExitCode) - see the smoke-test diagnostics artifact" }
           $raw = Get-Content $stdout -Raw
-          if ([string]::IsNullOrWhiteSpace($raw)) {
-            echo "::error::doctor produced no JSON (stdout empty)"
-            throw "doctor produced no JSON"
-          }
-          try {
-            $json = $raw | ConvertFrom-Json
-          } catch {
-            echo "::error::could not parse doctor JSON: $($raw.Substring(0, [Math]::Min(300, $raw.Length)))"
-            throw "could not parse doctor JSON"
-          }
-          if ($json.capture_probe.backend -ne "windows") {
-            echo "::error::unexpected capture probe: $($json.capture_probe | ConvertTo-Json -Compress)"
-            throw "Unexpected capture probe"
-          }
-          if ($json.emulation_probe.backend -ne "windows") {
-            echo "::error::unexpected emulation probe: $($json.emulation_probe | ConvertTo-Json -Compress)"
-            throw "Unexpected emulation probe"
-          }
-          $u = Start-Process -FilePath "C:\Program Files\Lan Mouse\uninstall.exe" -ArgumentList "/S" -Wait -PassThru
-          if ($u.ExitCode -ne 0) {
-            echo "::error::uninstaller exit code $($u.ExitCode)"
-            throw "Uninstaller failed with exit code $($u.ExitCode)"
-          }
+          if ([string]::IsNullOrWhiteSpace($raw)) { throw "doctor produced no JSON (stdout empty)" }
+          try { $json = $raw | ConvertFrom-Json } catch { throw "could not parse doctor JSON: $($raw.Substring(0, [Math]::Min(300, $raw.Length)))" }
+          if ($json.capture_probe.backend -ne "windows") { throw "Unexpected capture probe: $($json.capture_probe | ConvertTo-Json -Compress)" }
+          if ($json.emulation_probe.backend -ne "windows") { throw "Unexpected emulation probe: $($json.emulation_probe | ConvertTo-Json -Compress)" }
+
+      - name: Smoke test - uninstall (silent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $userData = Join-Path $env:LOCALAPPDATA "lan-mouse"
+          $roamingData = Join-Path $env:APPDATA "lan-mouse"
+          $unrelated = Join-Path $env:LOCALAPPDATA "lan-mouse-unrelated-keep.txt"
+          $uninstaller = "C:\Program Files\Lan Mouse\uninstall.exe"
+          if (-not (Test-Path $uninstaller)) { throw "uninstaller not found at $uninstaller" }
+          $stdout = Join-Path $env:RUNNER_TEMP "uninstaller.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "uninstaller.stderr.log"
+          $u = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Write-Host "uninstaller exit code: $($u.ExitCode)"
+          Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          if ($u.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($u.ExitCode) - see the smoke-test diagnostics artifact" }
           # The silent uninstaller moves the per-user data to a backup
-          # (recreated above by the doctor run); /KEEPUSERDATA keeps it in
-          # place and /PURGEUSERDATA deletes it.
-          if (Test-Path $userData) {
-            echo "::error::uninstaller left the user data directory $userData"
-            throw "Uninstaller left the user data directory in place"
-          }
-          if (Test-Path $roamingData) {
-            echo "::error::uninstaller left the roaming data directory $roamingData"
-            throw "Uninstaller left the roaming data directory in place"
-          }
+          # (recreated by the doctor run); /KEEPUSERDATA keeps it in place and
+          # /PURGEUSERDATA deletes it.
+          if (Test-Path $userData) { throw "Uninstaller left the user data directory $userData in place" }
+          if (Test-Path $roamingData) { throw "Uninstaller left the roaming data directory $roamingData in place" }
           $postUninstallBackups = @(Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)
-          if ($postUninstallBackups.Count -lt 2) {
-            echo "::error::expected backups from install and uninstall, found $($postUninstallBackups.Count)"
-            throw "Uninstaller did not keep the user data reversible"
-          }
-          if (-not (Test-Path $unrelated)) {
-            echo "::error::uninstaller deleted an unrelated file: $unrelated"
-            throw "Uninstaller must not delete unrelated files"
-          }
+          if ($postUninstallBackups.Count -lt 2) { throw "expected backups from install and uninstall, found $($postUninstallBackups.Count)" }
+          if (-not (Test-Path $unrelated)) { throw "Uninstaller deleted an unrelated file: $unrelated" }
           # The runner is disposable, but clean the backups we seeded anyway.
-          foreach ($backup in @(Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)) {
-            Remove-Item -Recurse -Force $backup.FullName
-          }
-          foreach ($backup in @(Get-ChildItem -Path $env:APPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)) {
-            Remove-Item -Recurse -Force $backup.FullName
-          }
+          foreach ($backup in @(Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)) { Remove-Item -Recurse -Force $backup.FullName }
+          foreach ($backup in @(Get-ChildItem -Path $env:APPDATA -Directory -Filter "lan-mouse.bak-*" -ErrorAction SilentlyContinue)) { Remove-Item -Recurse -Force $backup.FullName }
           Remove-Item -Force $unrelated -ErrorAction SilentlyContinue
+
+      - name: Collect smoke-test diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "lan-mouse-smoke-diagnostics"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $installLog = Join-Path $env:TEMP "lan-mouse-install.log"
+          if (Test-Path $installLog) { Copy-Item $installLog $dir -Force }
+          Copy-Item (Join-Path $env:RUNNER_TEMP "*.log") $dir -Force -ErrorAction SilentlyContinue
+          Copy-Item (Join-Path $env:RUNNER_TEMP "lan-mouse-doctor.*") $dir -Force -ErrorAction SilentlyContinue
+          if (Test-Path "C:\Program Files\Lan Mouse") { Get-ChildItem -Recurse "C:\Program Files\Lan Mouse" | Out-File (Join-Path $dir "installdir.txt") }
+          Get-AuthenticodeSignature "C:\Program Files\Lan Mouse\lan-mouse.exe" -ErrorAction SilentlyContinue | Out-File (Join-Path $dir "signature-lan-mouse.txt")
+          Get-AuthenticodeSignature "C:\Program Files\Lan Mouse\lan-mouse-gpui.exe" -ErrorAction SilentlyContinue | Out-File (Join-Path $dir "signature-lan-mouse-gpui.txt")
+          Get-AuthenticodeSignature (Join-Path $env:GITHUB_WORKSPACE "lan-mouse-custom-setup-x86_64.exe") -ErrorAction SilentlyContinue | Out-File (Join-Path $dir "signature-installer.txt")
+          & whoami /groups *> (Join-Path $dir "whoami-groups.txt")
+          & reg query "HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\de.feschber.LanMouse.Custom" *> (Join-Path $dir "uninstall-registry.txt")
+          & netsh advfirewall firewall show rule name="Lan Mouse" *> (Join-Path $dir "firewall-rule.txt")
+          Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter "lan-mouse*" -ErrorAction SilentlyContinue | Out-File (Join-Path $dir "localappdata.txt")
+          Write-Host "--- diagnostics ---"
+          Get-Content (Join-Path $dir "*.txt") -ErrorAction SilentlyContinue | Write-Host
+
+      - name: Upload smoke-test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lan-mouse-windows-smoke-diagnostics
+          path: ${{ runner.temp }}/lan-mouse-smoke-diagnostics
+          if-no-files-found: ignore
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -241,6 +290,12 @@ jobs:
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
+      - name: Generate SHA-256 checksums
+        run: |
+          set -euo pipefail
+          ( cd lan-mouse-linux-x86_64 && sha256sum * ) > SHA256SUMS.txt
+          ( cd lan-mouse-windows-x86_64 && sha256sum * ) >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - name: Get short SHA
         id: vars
         run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
@@ -260,6 +315,7 @@ jobs:
             lan-mouse-linux-x86_64/lan-mouse-custom_*.deb
             lan-mouse-windows-x86_64/lan-mouse-windows-x86_64.zip
             lan-mouse-windows-x86_64/lan-mouse-custom-setup-x86_64.exe
+            SHA256SUMS.txt
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -269,7 +325,9 @@ jobs:
           generate_release_notes: true
           files: |
             lan-mouse-linux-x86_64/lan-mouse-linux-x86_64
+            lan-mouse-linux-x86_64/lan-mouse-gpui-linux-x86_64
             lan-mouse-linux-x86_64/lan-mouse-custom-linux-x86_64.tar.gz
             lan-mouse-linux-x86_64/lan-mouse-custom_*.deb
             lan-mouse-windows-x86_64/lan-mouse-windows-x86_64.zip
             lan-mouse-windows-x86_64/lan-mouse-custom-setup-x86_64.exe
+            SHA256SUMS.txt

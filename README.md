@@ -38,17 +38,16 @@ Most current desktop environments and operating systems are fully supported, thi
 - GNOME >= 45
 - KDE Plasma >= 6.1
 - Most wlroots based compositors, including Sway (>= 1.8), Hyprland and Wayfire
-- X11
+- X11 (receive-only: input emulation and clipboard work, input capture is not implemented)
 - Windows
 
 
 ### Caveats / Known Issues
 
 > [!Important]
-> - **X11**: input capture and emulation are supported. Clipboard support on X11 covers text, HTML and small PNG images; payloads that require the X11 INCR protocol are skipped (not corrupted) and large X11 clipboard entries are not synchronized.
+> - **X11**: input emulation and clipboard are supported. Clipboard support on X11 covers text, HTML and PNG images, including large payloads through the X11 INCR protocol in both directions; XFixes is used to detect every selection change when available (polling otherwise). **Input capture is not implemented** in this fork: an X11 session can receive input from peers but cannot send its own input to them.
 >
-> - **Sway / wlroots**: Wlroots based compositors without libei support on the receiving end currently do not handle modifier events on the client side.
-> This results in CTRL / SHIFT / ALT / SUPER keys not working with a sending device that is NOT using the `layer-shell` backend
+> - **Sway / wlroots**: the wlroots emulation backend derives the compositor modifier state from the forwarded key events (and applies explicit modifier events when the sender provides them), so CTRL / SHIFT / ALT / SUPER work with any capture backend. If a modifier key still sticks on a wlroots receiver, report it with `LAN_MOUSE_LOG_LEVEL=debug` logs.
 >
 > - **Wayfire**: If you are using [Wayfire](https://github.com/WayfireWM/wayfire), make sure to use a recent version (must be newer than October 23rd) and **add `shortcuts-inhibit` to the list of plugins in your wayfire config!**
 > Otherwise input capture will not work.
@@ -138,15 +137,15 @@ Its clean-install behavior is described in
 
 First make sure to [install the necessary dependencies](#installing-dependencies-for-development--compiling-from-source).
 
-Precompiled release binaries for Windows and Linux are available in the [releases section](https://github.com/feschber/lan-mouse/releases).
+Precompiled release binaries for Windows and Linux are available in the [releases section](https://github.com/gabriel-07a/lan-mouse-custom/releases).
 For Windows, the depenedencies are included in the .zip file, for other operating systems see [Installing Dependencies](#installing-dependencies-for-development--compiling-from-source).
 
 Alternatively, the `lan-mouse` binary can be compiled from source (see below).
 
 ### Installing desktop file, app icon and firewall rules (optional)
 ```sh
-# install lan-mouse (replace path/to/ with the correct path)
-sudo cp path/to/lan-mouse /usr/local/bin/
+# install lan-mouse and its GPUI frontend (replace path/to/ with the correct path)
+sudo cp path/to/lan-mouse path/to/lan-mouse-gpui /usr/local/bin/
 
 # install app icon
 sudo mkdir -p /usr/local/share/icons/hicolor/scalable/apps
@@ -159,7 +158,9 @@ gtk-update-icon-cache /usr/local/share/icons/hicolor/
 sudo mkdir -p /usr/local/share/applications
 sudo cp de.feschber.LanMouse.desktop /usr/local/share/applications
 
-# when using firewalld: install firewall rule
+# when using firewalld: install the service definition (it opens UDP 4242 for
+# the DTLS transport and UDP 4245 for discovery; edit it if you changed the
+# ports in config.toml)
 sudo cp firewall/lan-mouse.xml /etc/firewalld/services
 # -> enable the service in firewalld settings
 ```
@@ -169,11 +170,14 @@ can be easily compiled via cargo or nix:
 
 ### Compiling and installing manually:
 ```sh
-# compile in release mode
+# compile the service/CLI and the GPUI frontend (both are required: the
+# service starts lan-mouse-gpui from next to its own binary)
 cargo build --release
+cargo build --release --manifest-path lan-mouse-gpui/Cargo.toml
 
-# install lan-mouse
-sudo cp target/release/lan-mouse /usr/local/bin/
+# install both binaries next to each other
+sudo install -Dm755 target/release/lan-mouse /usr/local/bin/lan-mouse
+sudo install -Dm755 target/release/lan-mouse-gpui /usr/local/bin/lan-mouse-gpui
 ```
 
 ### Compiling and installing via cargo:
@@ -184,7 +188,7 @@ cargo install lan-mouse
 
 ### Compiling and installing via nix:
 ```sh
-# you can find the executable in result/bin/lan-mouse
+# both binaries end up in result/bin/ (lan-mouse and lan-mouse-gpui)
 nix-build
 ```
 ### Conditional compilation
@@ -201,6 +205,8 @@ and `wlroots` emulation backend:
 cargo build --no-default-features --features layer_shell_capture,wlroots_emulation
 ```
 For a detailed list of available features, checkout the [Cargo.toml](./Cargo.toml)
+(note: the x11_capture feature is a stub in this fork - X11 only has input
+emulation; see the X11 caveat above).
 </details>
 
 
@@ -413,9 +419,9 @@ lan-mouse daemon
 ## Systemd Service
 
 In order to start lan-mouse with a graphical session automatically,
-the [systemd-service](service/lan-mouse.service) can be used:
-
-Copy the file to `~/.config/systemd/user/` and enable the service:
+the [systemd-service](service/lan-mouse.service) can be used. The `.deb`
+package already installs it (and both binaries); for a manual install, copy the
+file to `~/.config/systemd/user/` and enable the service:
 
 ```sh
 cp service/lan-mouse.service ~/.config/systemd/user
@@ -423,7 +429,9 @@ systemctl --user daemon-reload
 systemctl --user enable --now lan-mouse.service
 ```
 > [!Important]
-> Make sure to point `ExecStart=/usr/bin/lan-mouse daemon` to the actual `lan-mouse` binary (in case it is not under `/usr/bin`, e.g. when installed manually.
+> Make sure to point `ExecStart=/usr/bin/lan-mouse daemon` to the actual `lan-mouse` binary (in case it is not under `/usr/bin`, e.g. when installed manually).
+> The `daemon` subcommand runs the service only; it does not spawn the GPUI frontend.
+> The unit deliberately sets no `PrivateTmp`/`ProtectSystem` (the X11 socket lives in `/tmp/.X11-unix` and portals in `/run/user/$UID`); see the comments in the unit.
 
 
 ## Configuration
@@ -686,8 +694,9 @@ To let both machines control each other:
    - on PC B: `position = "left"` for PC A.
 3. Authorize each peer's certificate fingerprint on the receiving side
    (`authorized_fingerprints`, or approve the prompt in the frontend).
-4. Allow the same UDP port (default `4242`) through the firewall on both
-   machines.
+4. Allow the Lan Mouse UDP ports through the firewall on both machines:
+   `4242` for the DTLS transport and `4245` for discovery (both are
+   configurable in `config.toml`; see [firewall/lan-mouse.xml](firewall/lan-mouse.xml)).
 
 Only one side holds the input capture at a time: the machine whose cursor
 crossed the edge last takes control, and the other side releases its capture
@@ -723,13 +732,16 @@ Lan Mouse can synchronize the clipboard (plain text, HTML and PNG images)
 between authorized, connected peers.
 
 - Enabled by default. Toggle it in the frontend or with
-  `lan-mouse-cli clipboard enable|disable`; `--no-clipboard` disables it at
+  `lan-mouse cli clipboard enable|disable`; `--no-clipboard` disables it at
   startup.
 - Size limits are configurable under `[clipboard]` (defaults: 256 KiB text,
-  1 MiB HTML, 8 MiB image, 10 MiB per snapshot).
+  1 MiB HTML, 8 MiB image, 10 MiB per snapshot). Values are clamped to the
+  hard caps: 16 MiB per representation and 64 MiB per snapshot.
 - **Linux / Wayland (GNOME 50+)** uses the XDG desktop portal. The first run
   asks for **"Allow Clipboard Access"**; the consent is stored in
-  `~/.cache/lan-mouse/clipboard.token` (delete it to be asked again).
+  `$XDG_STATE_HOME/lan-mouse/clipboard.token` (`~/.local/state/lan-mouse/`;
+  delete it to be asked again). Tokens left in `~/.cache/lan-mouse/` by older
+  builds are migrated automatically.
 - **Windows** uses the native clipboard. Images are
   converted between the canonical PNG and `CF_DIB`/`CF_DIBV5`.
 - Content marked as secret by the source application (KDE password-manager hint, Windows
@@ -747,8 +759,10 @@ max_snapshot_bytes = 10485760
 ```
 
 Clipboard backends: GNOME/KDE use the XDG portal, wlroots compositors use
-`wlr-data-control`, and X11 uses the `CLIPBOARD` selection. The X11 backend
-handles text, HTML and small PNG images; large payloads (INCR) are skipped.
+`wlr-data-control`, and X11 uses the `CLIPBOARD` selection (text, HTML and PNG,
+INCR for large payloads in both directions). macOS support (NSPasteboard, PNG
+plus a TIFF-to-PNG fallback) exists only as dormant, unshipped code and is not
+part of the supported matrix.
 
 ### Pairing a new device
 
@@ -846,7 +860,9 @@ button in the GUI) — the daemon does not retry, so it will not spam the
 dialog.
 
 The emulation (`RemoteDesktop`, portal v2) and clipboard sessions store their
-restore tokens under `~/.cache/lan-mouse/`, so they are only approved once.
+restore tokens under `$XDG_STATE_HOME/lan-mouse/` (`~/.local/state/lan-mouse/`),
+so they are only approved once; legacy tokens in `~/.cache/lan-mouse/` are
+migrated on first use.
 
 ### Peers running an upstream release
 
@@ -878,7 +894,7 @@ and mouse; only the features above degrade to upstream behaviour.
 - [x] Libei Input Capture
 - [x] Windows Input Capture
 - [x] Encryption
-- [x] X11 Input Capture
+- [ ] X11 input capture (not implemented in this fork; X11 sessions are receive-only)
 - [x] Latency measurement and visualization (RTT per client)
 - [ ] Bandwidth usage measurement and visualization
 - [x] Clipboard support (text, HTML, PNG; portal + data-control + Windows/X11)
@@ -923,9 +939,9 @@ The following sections detail the emulation and capture backends provided by lan
 | Wayland (KDE)     | :heavy_check_mark: | :heavy_check_mark: |                    |                    |
 | Wayland (Gnome)   |                    | :heavy_check_mark: |                    |                    |
 | Windows           |                    |                    | :heavy_check_mark: |                    |
-| X11               |                    |                    |                    | :heavy_check_mark: |
+| X11               |                    |                    |                    |                    |
 
 - `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
 - `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
 - `windows`: Backend for input capture on Windows.
-- `x11`: Backend for X11 sessions (uses pointer barriers and the XTest extension).
+- `x11`: **not implemented in this fork** - the X11 capture backend is a stub, so an X11 session can only receive input. (The XTest-based X11 *emulation* backend is listed in the emulation table above.)

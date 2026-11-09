@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- for packaging: /usr/lib/firewalld/services/lan-mouse.xml -->
 <!-- configure manually: /etc/firewalld/services/lan-mouse.xml -->
+<!--
+  Lan Mouse is IPv4-only and uses UDP exclusively:
+    * 4242/udp - DTLS transport (default; configurable via config.toml 'port')
+    * 4245/udp - discovery beacons/probes (configurable via 'discovery_port')
+  If you change either port in config.toml, change it here as well.
+-->
 <service>
   <short>LAN Mouse</short>
   <description>mouse and keyboard sharing via LAN</description>
   <port port="4242" protocol="udp"/>
+  <port port="4245" protocol="udp"/>
 </service>

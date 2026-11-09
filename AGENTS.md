@@ -21,14 +21,14 @@ Lan Mouse is an open-source Software KVM sharing mouse/keyboard input across loc
 
 **Pipeline:** `input-capture` → `lan-mouse-ipc` → `input-emulation`
 
-- **input-capture:** Reads OS events into a `Stream<CaptureEvent>`. Backends tried in priority order (libei → layer-shell → X11 → fallback). Tracks `pressed_keys` to avoid stuck modifiers. `position_map` queues events when multiple clients share a screen edge.
+- **input-capture:** Reads OS events into a `Stream<CaptureEvent>`. Backends are tried in priority order: libei → layer-shell → X11 → Windows → macOS (each only when its `cfg`/feature is enabled; there is no dummy fallback, so `CaptureCreationError::NoAvailableBackend` is returned when none is available). Tracks `pressed_keys` to avoid stuck modifiers. `position_map` queues events when multiple clients share a screen edge.
 - **input-emulation:** Replays events via the `Emulation` trait (`consume`, `create`, `destroy`, `terminate`). Maintains `pressed_keys` and releases them on disconnect.
-- **lan-mouse-ipc / lan-mouse-proto:** Protocol glue and serialization. Events are UDP; connection requests are TCP on the same port. Version bumps required when serialization changes.
+- **lan-mouse-ipc / lan-mouse-proto:** Protocol glue and serialization. Transport is **DTLS over UDP on port 4242** (handshake and events); discovery announcements/probes are **UDP 4245**; IPv4-only. Optional extensions are capability-negotiated (legacy peers ignore them), so wire changes must be additive or gated by a capability bit; changing an existing layout requires a protocol version bump. Local IPC is line-delimited JSON (Unix socket / Windows loopback TCP) - additive variants and `#[serde(default)]` fields are safe.
 - **input-event:** Shared scancode enums and abstract event types—extend here, don't duplicate translations.
 
 ## Feature & cfg discipline
 
-- Feature flags live in root `Cargo.toml`. Gate OS-specific modules with the configs exported in build.rs (e.g., `cfg(layer_shell)`).
+- Feature flags live in root `Cargo.toml`. Gate OS-specific modules with the configs exported in build.rs (e.g., `cfg(layer_shell_capture)`; add new names to the `rustc-check-cfg` list there).
 - Prefer module-level gating over per-function cfgs to avoid empty stubs.
 - New backends: add feature in `Cargo.toml`, create gated module, log backend selection.
 

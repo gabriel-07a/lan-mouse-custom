@@ -1,12 +1,17 @@
 # Nix Flake Usage
 
+These instructions target the unofficial fork
+(`github:gabriel-07a/lan-mouse-custom`). The package installs both binaries
+(`lan-mouse` and `lan-mouse-gpui`); the service looks for the frontend next to
+itself.
+
 ## Run
 
 ```bash
-nix run github:feschber/lan-mouse
+nix run github:gabriel-07a/lan-mouse-custom
 
 # With params
-nix run github:feschber/lan-mouse -- --help
+nix run github:gabriel-07a/lan-mouse-custom -- --help
 
 ```
 
@@ -16,7 +21,7 @@ Add input:
 
 ```nix
 inputs = {
-    lan-mouse.url = "github:feschber/lan-mouse";
+    lan-mouse.url = "github:gabriel-07a/lan-mouse-custom";
 }
 ```
 

@@ -1,3 +1,10 @@
+# NOT MAINTAINED - NOT A RELEASE ARTIFACT.
+#
+# This Flatpak manifest predates the GPUI frontend split: it builds the service
+# in debug mode and installs only lan-mouse, so the resulting app cannot find
+# lan-mouse-gpui (the default frontend) at runtime. It is kept for reference /
+# future work only; the supported Linux packages are the .deb and the Nix
+# packages. Do not ship this file as-is.
 # yaml-language-server: $schema=https://raw.githubusercontent.com/flatpak/flatpak-builder/refs/heads/main/data/flatpak-manifest.schema.json
 app-id: de.feschber.LanMouse
 runtime: org.gnome.Platform

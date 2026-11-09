@@ -1,13 +1,28 @@
 [Unit]
 Description=Lan Mouse
+Documentation=https://github.com/gabriel-07a/lan-mouse-custom
 # lan mouse needs an active graphical session
 After=graphical-session.target
 # make sure the service terminates with the graphical session
 BindsTo=graphical-session.target
 
 [Service]
+Type=simple
+# 'daemon' runs the service only (no GPUI/GTK frontend is spawned).
 ExecStart=/usr/bin/lan-mouse daemon
+# Be explicit about the graceful stop path: SIGTERM makes the daemon release
+# pressed keys/the pointer, flush state and remove its IPC socket. A stop
+# therefore must not be escalated to SIGKILL by systemd before that ran.
+KillSignal=SIGTERM
+TimeoutStopSec=5
 Restart=on-failure
+RestartSec=1
+
+# Keep /tmp and the rest of the filesystem unisolated: the X11 socket lives in
+# /tmp/.X11-unix and the compositor/portals live in /run/user/$UID. Do not add
+# PrivateTmp/PrivateUsers/ProtectSystem here without testing X11 and Wayland
+# sessions; NoNewPrivileges is safe and limits setuid/setgid escalations.
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=graphical-session.target

@@ -25,11 +25,11 @@ exceptions and are deliberately not touched by reset/installer cleanup).
 
 | OS | Path | Contents | Source |
 | --- | --- | --- | --- |
-| Linux | `${XDG_CONFIG_HOME:-~/.config}/lan-mouse/` | `config.toml` (clients, devices, incoming/outgoing policies, `denied_fingerprints`, address rules, trusted IPs), `config.toml.bak`, `lan-mouse.pem` (certificate + private key) | `src/config.rs` (`default_path`, `CERT_FILE_NAME`) |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/lan-mouse/` | `config.toml` (clients, devices, incoming/outgoing policies, `denied_fingerprints`, address rules, trusted IPs), `config.toml.corrupt-<unix timestamp>` (only if the file could not be parsed; see below), `lan-mouse.pem` (certificate + private key) | `src/config.rs` (`default_path`, `CERT_FILE_NAME`, `backup_corrupt_config`) |
 | Linux | `${XDG_STATE_HOME:-~/.local/state}/lan-mouse/` | `audit.jsonl` (+ `.1`), `input-capture.token`, `remote-desktop.token`, `clipboard.token` (portal consent tokens, `0600`) | `src/audit.rs`, `src/doctor.rs`, `input-capture/src/libei.rs`, `input-emulation/src/libei.rs`, `input-clipboard/src/portal.rs` |
 | Linux | `${XDG_CACHE_HOME:-~/.cache}/lan-mouse/` | portal tokens written by older builds (migrated on next read, then removed) | legacy `token_dir` in the portal backends |
 | Linux | `~/Desktop/de.feschber.LanMouse.desktop` | desktop shortcut created by the `.deb` postinst | `scripts/package-deb.sh` |
-| Windows | `%LOCALAPPDATA%\lan-mouse\` | `config.toml`, `config.toml.bak`, `lan-mouse.pem`, `audit.jsonl` (+ `.1`) | `src/config.rs` (`default_path`), `src/audit.rs` |
+| Windows | `%LOCALAPPDATA%\lan-mouse\` | `config.toml`, `config.toml.corrupt-<unix timestamp>` (only if the file could not be parsed; see below), `lan-mouse.pem`, `audit.jsonl` (+ `.1`) | `src/config.rs` (`default_path`, `backup_corrupt_config`), `src/audit.rs` |
 | Windows | `%APPDATA%\lan-mouse\` | only from portable/older builds; current builds never write it, cleaned defensively | installer/uninstaller and `--reset-config` |
 | Windows | `%PROGRAMFILES64%\Lan Mouse\`, shortcuts, `HKLM\Software\de.feschber.LanMouse.Custom`, uninstall entry, firewall rule `Lan Mouse` | installation itself | `installer/windows/lan-mouse-custom.nsi` |
 | cross-OS | in-memory | pending approval requests, pairing window | not persisted; disappear on restart |
@@ -38,6 +38,14 @@ No SQLite database, keychain entry or registry value is used for devices or
 permissions: the `[[devices]]`, `[[address_rules]]`, `[authorized_fingerprints]`
 and `[[denied]]` state all live inside `config.toml`.
 
+There is **no `config.toml.bak` file**: a normal save replaces `config.toml` in
+place. If `config.toml` cannot be parsed at startup, `src/config.rs` copies the
+exact original bytes to a sibling `config.toml.corrupt-<unix timestamp>` (numeric
+suffix on collision) and keeps the original file untouched, so the user can
+repair it; the service then starts with defaults. Reset/installer cleanup moves
+the whole `lan-mouse` directory, so a corrupt-config backup travels with it.
+A corrupt config is never written back over the original.
+
 ## 2. Semantics: fresh install vs upgrade vs uninstall
 
 | Operation | Windows | Linux `.deb` | Linux tarball / manual |
@@ -45,7 +53,7 @@ and `[[denied]]` state all live inside `config.toml`.
 | First install on a clean machine | nothing to move | nothing to move | nothing to move | nothing to move |
 | Install over leftovers of older/test builds | interactive: prompt "start fresh? old configuration is MOVED to a backup" **default Yes**; silent (`/S`): move to backup by default | user data untouched (upgrade-safe); `apt purge` does not touch home data; reset explicitly | reset explicitly | reset explicitly |
 | Upgrade of a real installation | same prompt; **No** keeps the configuration in place (or pass `/KEEPUSERDATA`) | user data untouched by design | user data untouched | user data untouched |
-| Uninstall | GUI + daemon stopped (`taskkill /T /F`), per-user data **moved to a backup** (interactive asks, default Yes; silent moves too; `/KEEPUSERDATA` keeps in place, `/PURGEUSERDATA` deletes), old install dir wiped, shortcuts/firewall/registry removed | package files removed; **per-user data kept** (maintainer scripts never touch home dirs); `postrm purge` prints how to reset | move backups explicitly (`--reset-config` / helper script) | same |
+| Uninstall | GUI + daemon asked to shut down gracefully (`lan-mouse cli shutdown`) and force-killed with `taskkill /T /F` if that fails, per-user data **moved to a backup** (interactive asks, default Yes; silent moves too; `/KEEPUSERDATA` keeps in place, `/PURGEUSERDATA` deletes), old install dir wiped, shortcuts/firewall/registry removed | package files removed; **per-user data kept** (maintainer scripts never touch home dirs); `postrm purge` prints how to reset | move backups explicitly (`--reset-config` / helper script) | same |
 | Restore after a clean install | rename `%LOCALAPPDATA%\lan-mouse.bak-<time>` back to `lan-mouse` | `mv ~/.config/lan-mouse.bak-<ts> ~/.config/lan-mouse` (same for state/cache) | same | same |
 | Permanent cleanup | delete `lan-mouse.bak-*` manually, or use `/PURGEUSERDATA` | `--purge`, or delete the `.bak-*` directories | `--purge` / helper `--purge` | same |
 
@@ -88,16 +96,19 @@ lan-mouse --reset-config --purge     # delete them permanently
 
 Limitations: a custom `--config` / `--cert-path` outside the app directories is
 not touched; on Windows the installed binaries, shortcuts, firewall rule and
-registry are removed by the uninstaller, not by this flag.
-(accessibility/input-monitoring) grants are OS-managed; backups accumulate
-until deleted manually.
+registry are removed by the uninstaller, not by this flag. OS-level permission
+grants (portal consent, Windows firewall) are managed by the OS and are not
+revoked by a reset; backups accumulate until deleted manually.
 
 ### 3.2 Windows installer / uninstaller (`installer/windows/lan-mouse-custom.nsi`)
 
-* install: `taskkill /F /T /IM lan-mouse.exe` (GUI **and** the daemon it
-  spawned), then, if `%LOCALAPPDATA%\lan-mouse` or `%APPDATA%\lan-mouse` has
-  content, **rename** it to `lan-mouse.bak-<yyyyMMdd-HHmmss>` before extracting
-  the new binaries;
+* install: the running GUI and the daemon it spawned are first asked to shut
+  down gracefully (`lan-mouse.exe cli shutdown` over the local IPC; the daemon
+  then releases pressed keys/the pointer and removes its socket), then
+  force-killed with `taskkill /F /T /IM lan-mouse.exe` filtered to the
+  installing user if the graceful stop did not complete within ~3 s; then, if
+  `%LOCALAPPDATA%\lan-mouse` or `%APPDATA%\lan-mouse` has content, **rename** it
+  to `lan-mouse.bak-<yyyyMMdd-HHmmss>` before extracting the new binaries;
   * interactive prompt, default **Yes** ("Yes: move it to the backup and start
     fresh (recommended) / No: keep it in place (upgrade)");
   * silent: clean by default; `/KEEPUSERDATA` keeps the data in place,
@@ -112,7 +123,8 @@ until deleted manually.
   shortcuts, firewall rule, registry keys and `$INSTDIR`.
 * guarantees: only paths below `%LOCALAPPDATA%\lan-mouse`,
   `%APPDATA%\lan-mouse`, their `.bak-*` siblings, `$INSTDIR`, the Start
-  Menu/Desktop/Startup shortcuts and the two registry keys are touched.
+  Menu/Desktop/Startup shortcuts, the two registry keys and the diagnostics log
+  `%TEMP%\lan-mouse-install.log` are touched.
 
 ### 3.3 Linux helper (`scripts/install-clean.sh`)
 
@@ -122,8 +134,7 @@ to `<path>.bak-<unix timestamp>` (`mv`, atomic within the same parent);
 `--purge` deletes permanently; `--dry-run` lists only; `--yes` skips the
 prompt; `--no-kill` skips stopping a running `lan-mouse` (stopped by default
 so files are not in use). Validates every path (absolute, ends in
-`/lan-mouse`, not below `/`), prints the list and asks before acting. Also
-
+`/lan-mouse`, not below `/`), prints the list and asks before acting.
 
 ### 3.4 Debian package (`scripts/package-deb.sh`)
 
@@ -194,8 +205,8 @@ moves them to a reversible backup, `--purge` deletes; helper script
   input capture / remote desktop consent again on the next start. That is the
   intended consequence of a fresh install; the backups still contain the old
   tokens (bearer capabilities) until the user deletes the backup directories.
-  prompts reappear, but a previously granted grant may remain until revoked in
-  System Settings (a reset does not and cannot revoke it).
+  Portal prompts reappear, but an already granted permission may remain valid
+  in the OS settings until revoked there (a reset cannot revoke it).
 * **Antivirus / locked files.** If the daemon is still running, Windows may keep
   the `.pem`/`config.toml` locked and the rename fails; both the installer and
   `--reset-config` stop/refuse first, and the installer aborts with a clear

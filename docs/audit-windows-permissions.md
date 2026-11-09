@@ -85,6 +85,13 @@ SmartScreen sem assinatura/reputação e o UAC da instalação per-machine.
   comparação `-ne "windows"` não é a causa provável**; a falha está antes (instalador/exe/abort/stdout)
   ou no uninstaller.
 
+> **Atualização (QA final, passe cross-OS):** a premissa acima não vale mais para a
+> captura. WindowsInputCapture::new / EventThread agora são falíveis e o probe do
+> doctor reporta erros reais de setup, então o resultado do probe pode divergir
+> legitimamente (inclusive o .backend pode faltar por erro de setup, não só por
+> falta de JSON). A emulação continua Ok por construção. O restante desta seção é
+> o registro histórico da investigação naquele commit.
+
 ### 3.2 Hipóteses ordenadas (hipótese, não fato) + como confirmar
 1. **H1 — `doctor` release termina sem imprimir JSON (mais provável).** (a) **GUI subsystem +
    stdout**: `windows_subsystem="windows"` (`src/main.rs:1-5`) + `release.yml:101` captura via

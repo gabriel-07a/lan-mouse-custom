@@ -14,7 +14,7 @@ members = [
 [package]
 name = "lan-mouse"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gabriel-07a/lan-mouse-custom"
@@ -40,7 +40,11 @@ lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
 lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
 lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
-shadow-rs = { version = "1.2.0", features = ["metadata"] }
+# The generated shadow.rs only needs the `shadow!` macro and `formatcp!`
+# re-export, so the runtime dependency takes no default features (shadow-rs
+# documents this setup). Keeping the defaults here pulled git2/libgit2-sys and
+# tzdb into the shipped binary's dependency graph for no runtime benefit.
+shadow-rs = { version = "1.2.0", default-features = false, features = ["metadata"] }
 
 toml = "0.8"
 toml_edit = { version = "0.22", features = ["serde"] }
@@ -100,6 +104,9 @@ default = [
 gtk = ["dep:lan-mouse-gtk"]
 gpui = []
 layer_shell_capture = ["input-capture/layer_shell"]
+# NOTE: the X11 *capture* backend is a stub in this fork (always
+# NotImplemented); X11 sessions are receive-only. X11 output is provided by
+# x11_emulation. Kept for upstream parity/feature completeness.
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
 libei_emulation = ["input-event/libei", "input-emulation/libei"]
@@ -107,13 +114,4 @@ wlroots_emulation = ["input-emulation/wlroots"]
 x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
-[package.metadata.bundle]
-name = "Lan Mouse"
-icon = ["target/icon.icns", "lan-mouse-gtk/resources/de.feschber.LanMouse.svg"]
-identifier = "de.feschber.LanMouse"
-deb_depends = [ "libadwaita-1-0" ]
-resources = ["target/menubar-template.png"]
-
-[package.metadata.bundle.osx]
-info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 

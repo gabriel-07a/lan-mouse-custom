@@ -1,30 +1,33 @@
 #!/usr/bin/env bash
 # QA harness: two lan-mouse instances on one Linux host, fully isolated state.
 #
-# Reproduces/regression-tests the reported peer identity bugs:
-#   1. one peer shown twice (IPv4 + IPv6) and/or address family flapping
+# Reproduces/regression-tests the reported peer identity bugs. The product is
+# deliberately IPv4-only (see README/DOC), so every scenario here is IPv4:
+#   1. one peer shown twice or with a flapping active address
 #   2. duplicate/reverse clients with the wrong port (false "connected")
-#   3. IPv6-only peers still work after the identity fix
+#   3. HISTORICAL/SKIPPED: IPv6-only peers. IPv6 is never dialed by this fork;
+#      the old scenario is kept for context and always reports SKIP.
 #   4. peer-down recovery: a dead peer must stop being reported as connected
 #   5. stale config is honoured by the app (precondition for the installer fix)
 #
 # Every instance gets its own XDG_CONFIG_HOME/STATE/CACHE/RUNTIME and HOME, so
 # they do not share config, certificate, audit log or the IPC socket. Backends
 # are "dummy", so no real input devices are needed. Communications happen over
-# loopback IPv4 and IPv6.
+# loopback IPv4 only: an IPv6 address is never dialed (IPv4-only product).
 #
 # Usage:
 #   scripts/qa-two-instances.sh                 # run all scenarios
 #   scripts/qa-two-instances.sh dual duplicate  # run selected scenarios
 #   QA_KEEP=1 scripts/qa-two-instances.sh       # keep dirs/logs for inspection
 #   QA_PORT_A=43421 QA_PORT_B=43422 ...         # custom ports
+#   scripts/qa-two-instances.sh ipv6_only       # historical: prints SKIP
 #
-# Exit code: number of failed checks (0 = everything that should hold today
-# holds). Before the task-17/18/19 fixes land, the "duplicate" scenario is
-# expected to fail; the output says which check and prints the exact CLI lines.
+# Exit code: number of failed checks (0 = everything that should hold at the
+# current HEAD holds). The duplicate scenario is a regression criterion again:
+# it must pass now that the service identity fixes landed.
 #
-# Requirements: bash, coreutils, a Linux host with IPv4 and IPv6 loopback
-# enabled. The binary is built headless (no GTK):
+# Requirements: bash, coreutils, a Linux host with IPv4 loopback (127.0.0.0/8 is
+# local; no extra address setup needed). The binary is built headless (no GTK):
 #   cargo build -p lan-mouse --no-default-features
 set -u
 
@@ -111,7 +114,9 @@ write_config() {
         # Loopback is pre-trusted so the two local instances do not need GUI
         # pairing approval; this is the same address-rule mechanism a LAN
         # deployment can use, not a test-only code path.
-        printf 'trusted_ips = ["127.0.0.1", "::1"]\n'
+        # IPv4 loopback only (IPv4-only product). trusted_ips is the legacy key
+        # and is migrated to a full-access address rule on load.
+        printf 'trusted_ips = ["127.0.0.1"]\n'
         printf '\n'
         local client
         for client in "$@"; do
@@ -189,7 +194,10 @@ first_status() {
 first_addr() {
     local status
     status="$(first_status "$1")"
-    printf '%s' "$status" | sed -n 's/^connected (to \([^)]*\)).*/\1/p'
+    printf '%s' "$status" | sed -n \
+        -e 's/^connected (to \([^)]*\)).*/\1/p' \
+        -e 's/^connected (bidirectional: out=\([^,]*\),.*/\1/p' \
+        -e 's/^reconnecting (\([^)]*\)).*/\1/p'
 }
 
 wait_connected() {
@@ -267,16 +275,18 @@ scenario_no_spin() {
 
 # --- scenarios --------------------------------------------------------------
 
-# One configured client with two addresses (IPv4 + IPv6) for the same peer.
-# The initiator must keep one row and one stable active address.
+# One configured client with two IPv4 loopback addresses for the same peer
+# (127.0.0.1 + 127.0.0.2; the old IPv4+IPv6 variant is historical because the
+# product is IPv4-only). The initiator must keep one row and one stable active
+# address.
 scenario_dual() {
     say ""
-    say "### scenario dual: client com dois endereços (127.0.0.1 + ::1)"
+    say "### scenario dual: client com dois endereços IPv4 (127.0.0.1 + 127.0.0.2)"
     start_pair || return 0
     write_config a "$PORT_A" \
         "[[clients]]
 position = \"right\"
-ips = [\"127.0.0.1\", \"::1\"]
+ips = [\"127.0.0.1\", \"127.0.0.2\"]
 port = $PORT_B
 activate_on_startup = true"
     restart_daemon a
@@ -305,7 +315,7 @@ activate_on_startup = true"
     fi
 
     # Reconnect: the peer restarts (same cert/config); A must keep one row and
-    # come back on the same address family (last-good preference, task-17).
+    # come back on the same address (last-good preference, task-17).
     stop_daemon b
     sleep 0.5
     start_daemon b || return 0
@@ -320,37 +330,47 @@ activate_on_startup = true"
     if [ "$KEEP" = 1 ]; then note "logs: $(inst_dir a)/daemon.log $(inst_dir b)/daemon.log"; fi
 }
 
-# The bug report case: the same peer is reachable on IPv4 and IPv6, the two
-# sides configured different families, and the service creates a reverse
-# client for the "unknown" family: two devices connected for one peer, the
-# reverse client dialling the default port 4242 instead of the peer's port.
+# Regression case for the reported duplicate: both sides configure each other
+# over IPv4 loopback. A dials B and B dials A; the incoming session must attach
+# to the single configured row on each side (no reverse client created for a
+# second address family, no dial to the default port 4242). The old
+# IPv4-vs-IPv6 variant cannot happen anymore because the product is IPv4-only;
+# the duplicate/reverse-client invariant is the criterion.
 scenario_duplicate() {
     say ""
-    say "### scenario duplicate: mesmo peer em famílias diferentes"
+    say "### scenario duplicate: peer IPv4 nos dois lados (sem linha reversa extra)"
     start_pair || return 0
     write_config a "$PORT_A" \
         "[[clients]]
 position = \"right\"
-ips = [\"127.0.0.1\"]
+ips = [\"127.0.0.1\", \"127.0.0.2\"]
 port = $PORT_B
 activate_on_startup = true"
     write_config b "$PORT_B" \
         "[[clients]]
 position = \"left\"
-ips = [\"::1\"]
+ips = [\"127.0.0.1\", \"127.0.0.2\"]
 port = $PORT_A
 activate_on_startup = true"
     restart_daemon a
     restart_daemon b
     enable_emulation a
     enable_emulation b
-    sleep 3
-    say "  --- A (esperado: 1 linha; bug atual: 2) ---"
+    wait_connected a 15 || fail "A não conectou ao peer"
+    wait_connected b 15 || fail "B não conectou ao peer"
+    sleep 1
+    say "  --- A (esperado: 1 linha configurada) ---"
     client_lines a | sed 's/^/    /'
-    say "  --- B (esperado: 1 linha; bug atual: 2) ---"
+    say "  --- B (esperado: 1 linha configurada) ---"
     client_lines b | sed 's/^/    /'
     check_eq "A tem uma única linha para o peer" 1 "$(client_count a)"
     check_eq "B tem uma única linha para o peer" 1 "$(client_count b)"
+    # The single row must carry both directions: the configured outgoing link
+    # plus the incoming session attached to it (no separate adopted row).
+    check_contains "A: linha configurada conectada" "connected" "$(first_status a)"
+    check_contains "B: linha configurada conectada" "connected" "$(first_status b)"
+    check_contains "A: sessão de entrada anexada à linha" "bidirectional" "$(first_status a)"
+    check_contains "B: sessão de entrada anexada à linha" "bidirectional" "$(first_status b)"
     # wrong-port symptom: an auto-added reverse client dialling DEFAULT_PORT
     if client_lines a | grep -q ':4242 '; then
         fail "A criou cliente reverso no port default 4242"
@@ -362,31 +382,22 @@ activate_on_startup = true"
     else
         pass "B não criou cliente reverso no port default 4242"
     fi
+    # ... and the connected addresses use the custom peer ports, not 4242.
+    check_contains "A conectou na porta custom do peer" ":$PORT_B" "$(first_addr a)"
+    check_contains "B conectou na porta custom do peer" ":$PORT_A" "$(first_addr b)"
 }
 
-# IPv6-only must keep working (the identity fix must not force IPv4).
+# HISTORICAL / SKIPPED: the product is deliberately IPv4-only (README: "Lan
+# Mouse is IPv4-only"), so an IPv6-only client is never dialed and this cannot
+# be a pass/fail criterion anymore. Kept so the old regression scenario is
+# documented and callable; it always reports SKIP and never fails the run.
 scenario_ipv6_only() {
     say ""
-    say "### scenario ipv6-only: client só com ::1"
-    start_pair || return 0
-    write_config a "$PORT_A" \
-        "[[clients]]
-position = \"right\"
-ips = [\"::1\"]
-port = $PORT_B
-activate_on_startup = true"
-    restart_daemon a
-    enable_emulation a
-    if wait_connected a 10; then
-        pass "A conectou via IPv6"
-        check_eq "A tem uma única linha" 1 "$(client_count a)"
-        case "$(first_addr a)" in
-            \[*) pass "active_addr é IPv6 (bracket)" ;;
-            *) fail "active_addr não é IPv6: $(first_addr a)" ;;
-        esac
-    else
-        fail "A não conectou via IPv6 (regressão IPv6-only)"
-    fi
+    say "### scenario ipv6-only: HISTORICAL/SKIPPED (produto é IPv4-only)"
+    note "IPv6 não é discado por decisão de produto; nada a validar aqui."
+    note "a matriz de aceitação atual é IPv4-only (docs/qa-repro-matrix.md, E1)."
+    note "veja os cenários dual/duplicate para o comportamento esperado em IPv4."
+    return 0
 }
 
 # Discovery + explicit disconnect + reconnect across two real service
@@ -405,9 +416,11 @@ ips = [\"127.0.0.1\"]
 port = $PORT_B
 activate_on_startup = true"
     write_config b "$PORT_B"
-    # Start B first so it owns the shared discovery port: A's beacon binding
-    # fails (same host), but A's scan can still probe the loopback alias. The
-    # extra-host hook is test-only and does not affect normal builds.
+    # Start B first so it owns the shared discovery port 4245: on a single host
+    # both instances cannot bind UDP 4245, so A's beacon binding fails. That is
+    # expected in this sandboxed setup (not a product bug); A's explicit scan
+    # can still probe the loopback alias. The extra-host hook is test-only and
+    # does not affect normal builds.
     start_daemon b || return 0
     export LAN_MOUSE_DISCOVERY_EXTRA_HOSTS=127.0.0.1
     start_daemon a || return 0
@@ -623,7 +636,7 @@ fi
 
 SCENARIOS=("$@")
 if [ "${#SCENARIOS[@]}" -eq 0 ]; then
-    SCENARIOS=(dual duplicate ipv6_only peer_down disconnect stale_config reset_config no_spin isolation)
+    SCENARIOS=(dual duplicate peer_down disconnect stale_config reset_config no_spin isolation)
 fi
 
 say "lan-mouse QA two-instances (repo: $REPO_ROOT, bin: $BIN, base: $BASE)"
@@ -643,7 +656,8 @@ for scenario in "${SCENARIOS[@]}"; do
         isolation) scenario_isolation ;;
         *)
             say "cenário desconhecido: $scenario"
-            say "use: dual duplicate ipv6_only peer_down stale_config reset_config no_spin isolation"
+            say "use: dual duplicate ipv6_only peer_down disconnect stale_config reset_config no_spin isolation"
+            say "(ipv6_only é histórico e sempre reporta SKIP; o produto é IPv4-only)"
             exit 2
             ;;
     esac
@@ -653,8 +667,8 @@ cleanup
 say ""
 say "resultado: $((CHECKS - FAILS))/$CHECKS checks OK, $FAILS falha(s)"
 if [ "$FAILS" -gt 0 ]; then
-    say "antes das correções (task-17/18/19/20), falhas nos cenários duplicate/stale_config são esperadas;"
-    say "rode de novo depois que as correções entrarem no working tree."
+    say "falha acima é regressão: os cenários duplicate/stale_config são critérios e"
+    say "devem passar no HEAD atual (o produto é IPv4-only; ipv6_only é histórico/SKIP)."
     exit "$FAILS"
 fi
 exit 0

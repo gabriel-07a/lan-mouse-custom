@@ -19,6 +19,11 @@ graph TD
     G -->|Windows Event| J[Windows Backend]
 ```
 
+> **Note (this fork):** the X11 box in the input path is historical. X11 input
+> *capture* is not implemented here (the backend is a stub that always returns
+> NotImplemented); X11 only provides input *emulation* (the dispatcher path). An
+> X11 session can receive input from peers but cannot send its own input to them.
+
 ### Input
 The input component is responsible for translating inputs from a given backend
 to a standardized format and passing them to the event emitter.
@@ -130,7 +135,12 @@ OS integration:
 - GNOME 50+ / Wayland: `org.freedesktop.portal.Clipboard` (requires a one-time
   consent, persisted with a restore token).
 - Windows: `CF_UNICODETEXT`, `CF_HTML`, `PNG`/`CF_DIB`.
-- wlroots/X11: not implemented yet.
+- wlroots: `wlr-data-control` (`input-clipboard/src/wayland.rs`).
+- X11: `CLIPBOARD` selection (`input-clipboard/src/x11.rs`) with INCR support in
+  both directions for large payloads; XFixes for reliable owner-change
+  notifications when available (polling fallback otherwise).
+- macOS (dormant, untested, unshipped): `NSPasteboard` with PNG and a
+  TIFF-to-PNG fallback (`input-clipboard/src/macos.rs`).
 
 ## Windows capture internals
 
@@ -179,7 +189,6 @@ visually "moves" to the other screen instead of staying parked on the edge.
   `ShowCursor(FALSE)` is used because the display counter is global and an
   unbalanced call (crash, kill) can leave the cursor hidden system-wide, while
   the overlay is owned by the capture thread and disappears with the process.
-  already.
 - **Wayland wlroots/layer-shell**: the pointer cursor is set to `NULL` on
   grab; restoring it after release is compositor-dependent and should be
   validated on Sway/Hyprland. GNOME/Wayland (libei) has no API to hide the
@@ -245,8 +254,7 @@ renaming it back. Permanent deletion requires an explicit `--purge` /
   as root and cannot know which users ran the app). `postrm purge` prints the
   per-user paths and how to reset; `scripts/install-clean.sh`
   (`--dry-run`/`--yes`/`--purge`) is the scripted equivalent for Linux and
-  and also defaults to a reversible backup.
-  are managed by the OS and only reset in System Settings / with `tccutil`.
+  also defaults to a reversible backup.
 
 See [docs/audit-fresh-install.md](docs/audit-fresh-install.md) for the exact
 path table, the fresh-install/upgrade/uninstall matrix and the remaining risks
@@ -261,7 +269,7 @@ Testing combinations across Linux, Windows 10, and Windows 11 uses three layers:
 2. **Real Windows kernel & session CI (`.github/workflows/rust.yml` and `release.yml`):**
    - Runs on both `windows-2022` (Windows 10 / Server 2022 kernel) and `windows-2025` (Windows 11 24H2 / Server 2025 kernel) using MSYS2 `UCRT64`.
    - `tests/windows_input.rs` exercises real `SendInput`, `GetCursorPos`, `WH_MOUSE_LL`, and `WH_KEYBOARD_LL` hooks on the runner's desktop session, and checks that the local pointer is hidden while a capture is active and restored after release (`GetCursorInfo`).
-   - `release.yml` runs a silent install (`/S`) of the NSIS installer, verifies `lan-mouse.exe doctor --probe --json` reports `windows` for both capture and emulation, and runs the silent uninstaller.
+   - `release.yml` runs the silent install (`/S`), the `lan-mouse.exe doctor --probe --json` probe and the silent uninstaller in separate steps, checks every exit code, uploads stdout/stderr plus the installer log as diagnostics, and publishes SHA-256 checksums for all artifacts.
 3. **Local KVM/QEMU lab (`scripts/vm-test-lab.sh`):**
    - Generates `quickemu`/QEMU configurations for Windows 10 and Windows 11 (with virtual TPM 2.0, Secure Boot, and QXL multi-head virtual monitors for mixed-DPI testing) plus pre-paired `config.toml` files using `trusted_ips`.
 

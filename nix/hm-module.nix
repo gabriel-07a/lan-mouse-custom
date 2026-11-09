@@ -42,17 +42,26 @@ in {
   config = mkIf cfg.enable {
     systemd.user.services.lan-mouse = lib.mkIf cfg.systemd {
       Unit = {
-        Description = "Systemd service for Lan Mouse";
+        Description = "Systemd user service for Lan Mouse";
         Requires = ["graphical-session.target"];
+        After = ["graphical-session.target"];
       };
       Service = {
         Type = "simple";
         ExecStart = "${cfg.package}/bin/lan-mouse daemon";
+        # Graceful stop: the daemon releases pressed keys / the pointer and
+        # removes its IPC socket on SIGTERM before systemd escalates.
+        KillSignal = "SIGTERM";
+        TimeoutStopSec = "5s";
+        Restart = "on-failure";
+        RestartSec = "1s";
       };
-      Install.WantedBy = [
-        (lib.mkIf config.wayland.windowManager.hyprland.systemd.enable "hyprland-session.target")
-        (lib.mkIf config.wayland.windowManager.sway.systemd.enable "sway-session.target")
-      ];
+      # A conditional element must not be an mkIf inside the list (the list
+      # type is list of string); use lib.optional instead.
+      Install.WantedBy =
+        ["graphical-session.target"]
+        ++ lib.optional config.wayland.windowManager.hyprland.systemd.enable "hyprland-session.target"
+        ++ lib.optional config.wayland.windowManager.sway.systemd.enable "sway-session.target";
     };
 
     home.packages = [

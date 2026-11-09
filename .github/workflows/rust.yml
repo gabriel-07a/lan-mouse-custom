@@ -1,6 +1,13 @@
 name: Rust
 
 on:
+  # Run on pushes to main and on pull requests so the README badge and the
+  # checks reflect the tree. The expensive multi-OS frontend/release workflows
+  # stay manual or tag-gated on purpose (see their on: blocks).
+  push:
+    branches:
+      - main
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -75,7 +82,10 @@ jobs:
       - name: cargo check (Windows)
         if: runner.os == 'Windows' && matrix.job == 'check'
         shell: msys2 {0}
-        run: cargo check --workspace --all-targets
+        # lan-mouse-gtk is the legacy Linux-only GTK4 frontend; it remains a
+        # workspace member, so it must be excluded when checking the workspace
+        # on Windows (GTK4 is not available in this MSYS2 setup).
+        run: cargo check --workspace --all-targets --exclude lan-mouse-gtk
 
       - name: cargo test (Linux)
         if: runner.os == 'Linux' && matrix.job == 'test'
@@ -102,7 +112,7 @@ jobs:
           CARGO_TERM_COLOR: never
         run: |
           set +e
-          cargo test --workspace -- --test-threads=1 2>&1 | tee test.log
+          cargo test --workspace --exclude lan-mouse-gtk -- --test-threads=1 2>&1 | tee test.log
           status=${PIPESTATUS[0]}
           {
             echo "--- failing tests ---"
@@ -153,7 +163,7 @@ jobs:
           RUSTFLAGS: -D warnings
         run: |
           set +e
-          /ucrt64/bin/cargo.exe check --workspace --all-targets 2>&1 | tee clippy.log
+          /ucrt64/bin/cargo.exe check --workspace --all-targets --exclude lan-mouse-gtk 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
           {
             echo "--- diagnostics ---"

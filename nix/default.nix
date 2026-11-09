@@ -48,6 +48,8 @@ rustPlatform.buildRustPackage {
       The supported platforms are Linux (Wayland and X11) and Windows; macOS is no longer built, tested or supported by this fork.
     '';
     mainProgram = pname;
-    platforms = platforms.all;
+    # Linux only: the display backends are Linux/Windows, the GTK frontend is
+    # Linux-only and the GPUI frontend package (nix/gpui.nix) is Linux-only.
+    platforms = platforms.linux;
   };
 }

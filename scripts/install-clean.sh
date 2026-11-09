@@ -12,7 +12,7 @@
 # the backup back. Pass --purge to delete it permanently.
 #
 # This script only touches directories literally named "lan-mouse" below the
-# user's config/state/cache directories (plus the audit log directory on
+# user's config/state/cache directories (the audit log lives in the state one).
 # It never touches the rest of $HOME, system files or package files.
 #
 # Usage:
@@ -82,9 +82,6 @@ paths=(
     "$state_base/$app_dir_name"
     "$cache_base/$app_dir_name"
 )
-case "$(uname -s 2>/dev/null || echo unknown)" in
-esac
-
 # Validate every path before touching anything: absolute, final component
 # exactly "lan-mouse", not directly below the filesystem root, no "." / "..".
 validated=()
@@ -114,14 +111,20 @@ for path in "${paths[@]}"; do
     validated+=("$path")
 done
 
-if [ "$kill_running" -eq 1 ] && pgrep -x "$app_dir_name" >/dev/null 2>&1; then
+# The service/daemon and the GPUI frontend are separate processes; stop both.
+lan_mouse_running() {
+    pgrep -x "$app_dir_name" >/dev/null 2>&1 || pgrep -x "lan-mouse-gpui" >/dev/null 2>&1
+}
+
+if [ "$kill_running" -eq 1 ] && lan_mouse_running; then
     if [ "$dry_run" -eq 1 ]; then
         echo "Lan Mouse is running; it would be stopped first (--no-kill skips this)."
     else
-        echo "Stopping the running lan-mouse process ..."
+        echo "Stopping the running lan-mouse processes ..."
         pkill -x "$app_dir_name" 2>/dev/null || true
+        pkill -x "lan-mouse-gpui" 2>/dev/null || true
         sleep 1
-        if pgrep -x "$app_dir_name" >/dev/null 2>&1; then
+        if lan_mouse_running; then
             echo "install-clean.sh: lan-mouse is still running; quit it first or pass --no-kill" >&2
             exit 1
         fi
@@ -214,9 +217,4 @@ else
     echo "Restore a backup by renaming it back, e.g.:"
     echo "  mv <dir>.bak-<timestamp> <dir>"
 fi
-case "$(uname -s 2>/dev/null || echo unknown)" in
-
-    *)
-        echo "Note: the compositor will ask for portal permissions again on the next start."
-        ;;
-esac
+echo "Note: the compositor will ask for portal permissions again on the next start."

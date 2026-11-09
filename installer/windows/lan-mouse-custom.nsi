@@ -1,8 +1,9 @@
 ; NSIS installer for the unofficial Lan Mouse fork.
 ;
 ; Built by .github/workflows/release.yml on the Windows runner after
-; `lan-mouse-windows\` was populated with lan-mouse.exe and the GTK dlls.
-; The version is passed with /DAPPVERSION=<version>.
+; `lan-mouse-windows\` was populated with lan-mouse.exe, lan-mouse-gpui.exe
+; and the MinGW runtime DLLs they need. The version is passed with
+; /DAPPVERSION=<version> (keep the fallback below in sync with Cargo.toml).
 ;
 ; ---------------------------------------------------------------------------
 ; Per-user data / clean install
@@ -38,7 +39,7 @@
 !include "FileFunc.nsh"
 
 !ifndef APPVERSION
-  !define APPVERSION "0.2.4"
+  !define APPVERSION "0.2.6"
 !endif
 
 !define APPNAME "Lan Mouse"
@@ -66,12 +67,41 @@ Var /GLOBAL PurgeUserData   ; 1 = /PURGEUSERDATA was passed
 Var /GLOBAL HasOldUserData  ; 1 = per-user data from an older build exists
 Var /GLOBAL BackupStamp     ; yyyyMMdd-HHmmss suffix for the backup directory
 
+; --- Diagnostics ---------------------------------------------------------
+; Best-effort installer/uninstaller log. The release workflow uploads it when a
+; silent install/uninstall fails, so field failures are diagnosable. A %TEMP%
+; that cannot be written to must never abort the install (logging is silent).
+!define INSTALL_LOG "$TEMP\lan-mouse-install.log"
+
+; Append the line in $0 to the install log. Installer-side copy.
+Function LogInstallLine
+  FileOpen $R2 "${INSTALL_LOG}" a
+  IfErrors log_install_line_done
+  FileWrite $R2 "$0$\r$\n"
+  FileClose $R2
+  log_install_line_done:
+FunctionEnd
+
+; Uninstaller-side copy (uninstaller code cannot call installer functions).
+Function un.LogInstallLine
+  FileOpen $R2 "${INSTALL_LOG}" a
+  IfErrors un_log_install_line_done
+  FileWrite $R2 "$0$\r$\n"
+  FileClose $R2
+  un_log_install_line_done:
+FunctionEnd
+
 ; --- Modern UI -----------------------------------------------------------
 !define MUI_ICON "..\..\assets\icon.ico"
 !define MUI_UNICON "..\..\assets\icon.ico"
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN_TEXT "Launch Lan Mouse"
+; The installer runs elevated, and a process launched from here inherits the
+; elevated token - the GUI *and* the daemon would then run as administrator
+; without the user asking for it (the autostart shortcut is not elevated).
+; Keep the option, but leave it unchecked by default.
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${EXENAME}"
+!define MUI_FINISHPAGE_RUN_NOTCHECKED
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
@@ -84,9 +114,87 @@ Var /GLOBAL BackupStamp     ; yyyyMMdd-HHmmss suffix for the backup directory
 
 ; Stop the GUI (lan-mouse-gpui.exe) and the service/daemon it spawned
 ; (lan-mouse.exe); /T also terminates child processes.
-!macro StopLanMouse
-  nsExec::ExecToLog 'taskkill /F /T /IM "${EXENAME}"'
-  nsExec::ExecToLog 'taskkill /F /T /IM "${FRONTENDEXENAME}"'
+;
+; Only processes of the user that started the installer are stopped: a
+; per-machine install must not kill another logged-in user's daemon (that
+; would drop their input mid-gesture).
+;
+; Stop order:
+;   1. ask the running service to shut down gracefully via the local IPC
+;      (lan-mouse cli shutdown): the daemon then releases pressed keys / the
+;      pointer, flushes state and removes its IPC socket. This works when the
+;      installed build understands the command; an older daemon logs the
+;      unknown request and never answers, so the CLI exits non-zero after its
+;      5 s IPC timeout - that is the expected fallback path;
+;   2. wait up to ~3 s for the process to disappear;
+;   3. only then force-kill with taskkill (/F /T), filtered to the installing
+;      user, and remove the GPUI frontend process too.
+; Every step is logged to %TEMP%\lan-mouse-install.log by the caller-supplied
+; logging function (LogInstallLine for the installer, un.LogInstallLine for the
+; uninstaller).
+!macro StopLanMouse logfn
+  ReadEnvStr $R1 "USERNAME"
+
+  ; 1. graceful shutdown over the local IPC (Windows loopback TCP).
+  nsExec::ExecToStack '"$INSTDIR\${EXENAME}" cli shutdown'
+  Pop $0 ; exit code
+  Pop $1 ; combined output
+  StrCpy $R3 "$0"
+  StrCpy $0 "graceful shutdown attempt: exit=$R3 $1"
+  Call ${logfn}
+
+  ; 2. wait up to 6 x 500 ms for the daemon to exit. tasklist CSV output starts
+  ; with a quote only when a process matched (the "no tasks" message is
+  ; localized, so a prefix test on the message would not be portable).
+  StrCpy $R4 "0"
+  stop_lan_mouse_wait:
+  IntCmp $R4 6 stop_lan_mouse_kill
+  Sleep 500
+  IntOp $R4 $R4 + 1
+  StrCmp $R1 "" stop_lan_mouse_plain_check
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq ${EXENAME}" /FI "USERNAME eq $R1" /NH /FO CSV'
+  Goto stop_lan_mouse_check_result
+  stop_lan_mouse_plain_check:
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq ${EXENAME}" /NH /FO CSV'
+  stop_lan_mouse_check_result:
+  Pop $0
+  Pop $1
+  StrCpy $R5 "$1" 1
+  StrCmp $R5 "$\"" stop_lan_mouse_wait
+  StrCpy $0 "lan-mouse is no longer running (checked $R4 x 500 ms)"
+  Call ${logfn}
+  Goto stop_lan_mouse_done
+
+  ; 3. force-kill (filtered to the installing user when known).
+  stop_lan_mouse_kill:
+  StrCpy $0 "graceful shutdown did not complete; forcing taskkill"
+  Call ${logfn}
+  StrCmp $R1 "" stop_lan_mouse_plain
+  nsExec::ExecToStack 'taskkill /F /T /IM "${EXENAME}" /FI "USERNAME eq $R1"'
+  Pop $0
+  Pop $1
+  StrCpy $0 "taskkill ${EXENAME} (filtered): exit=$0 $1"
+  Call ${logfn}
+  nsExec::ExecToStack 'taskkill /F /T /IM "${FRONTENDEXENAME}" /FI "USERNAME eq $R1"'
+  Pop $0
+  Pop $1
+  StrCpy $0 "taskkill ${FRONTENDEXENAME} (filtered): exit=$0 $1"
+  Call ${logfn}
+  Goto stop_lan_mouse_done
+
+  stop_lan_mouse_plain:
+  nsExec::ExecToStack 'taskkill /F /T /IM "${EXENAME}"'
+  Pop $0
+  Pop $1
+  StrCpy $0 "taskkill ${EXENAME}: exit=$0 $1"
+  Call ${logfn}
+  nsExec::ExecToStack 'taskkill /F /T /IM "${FRONTENDEXENAME}"'
+  Pop $0
+  Pop $1
+  StrCpy $0 "taskkill ${FRONTENDEXENAME}: exit=$0 $1"
+  Call ${logfn}
+
+  stop_lan_mouse_done:
   Sleep 500
 !macroend
 
@@ -158,7 +266,9 @@ Var /GLOBAL BackupStamp     ; yyyyMMdd-HHmmss suffix for the backup directory
 !macroend
 
 Function .onInit
-  !insertmacro StopLanMouse
+  StrCpy $0 "=== Lan Mouse installer ${APPVERSION} ==="
+  Call LogInstallLine
+  !insertmacro StopLanMouse LogInstallLine
 
   ; --- command line flags (interactive/silent deployments) ---
   StrCpy $KeepUserData "0"
@@ -234,16 +344,38 @@ Section "Lan Mouse" SEC_MAIN
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPID}" "DisplayIcon" "$INSTDIR\${EXENAME}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPID}" "UninstallString" "$INSTDIR\uninstall.exe"
 
-  ; Inbound UDP for the DTLS listener, so the peer can reach this device
-  ; without a manual firewall prompt. Remove a stale rule first: upgrades
-  ; would otherwise accumulate duplicate rules pointing at old paths.
-  ; Public is included deliberately: Windows often marks a Wi-Fi LAN as a
-  ; "Public" network, and a private/domain-only rule silently drops the peer's
-  ; handshake (the UI then shows "connecting/waiting" on the other side with no
-  ; authorization prompt ever appearing here). The rule is program-scoped, so
-  ; it only opens this executable's inbound UDP.
-  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="Lan Mouse"'
-  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Lan Mouse" dir=in action=allow program="$INSTDIR\${EXENAME}" enable=yes profile=private,domain,public'
+  ; Inbound traffic for the DTLS transport (4242/udp) and the discovery
+  ; beacons (4245/udp), so a peer can reach this device without a manual
+  ; firewall prompt. The rule is program-scoped and protocol-agnostic, so both
+  ; UDP ports are covered (and stay covered if the ports are reconfigured in
+  ; config.toml). Remove stale rules first: upgrades would otherwise accumulate
+  ; duplicate rules pointing at old install paths. Public is included
+  ; deliberately: Windows often marks a Wi-Fi LAN as a "Public" network, and a
+  ; private/domain-only rule silently drops the peer's handshake (the UI then
+  ; shows "connecting/waiting" on the other side with no authorization prompt
+  ; ever appearing here).
+  ;
+  ; netsh failures are logged and surfaced as a warning instead of aborting the
+  ; install: the app still works and a policy-managed or manual rule can be
+  ; added later. The log path is %TEMP%\lan-mouse-install.log.
+  nsExec::ExecToStack 'netsh advfirewall firewall delete rule name="Lan Mouse"'
+  Pop $0 ; exit code ("0" on success)
+  Pop $1 ; combined output
+  StrCpy $R3 "$0"
+  StrCpy $0 "firewall delete: exit=$R3 $1"
+  Call LogInstallLine
+
+  nsExec::ExecToStack 'netsh advfirewall firewall add rule name="Lan Mouse" dir=in action=allow program="$INSTDIR\${EXENAME}" enable=yes profile=private,domain,public'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" lan_mouse_firewall_ok
+    StrCpy $R3 "$0"
+    StrCpy $0 "firewall add FAILED: exit=$R3 $1"
+    Call LogInstallLine
+    DetailPrint "Warning: could not add the Windows firewall rule (netsh exit $R3); inbound connections may be blocked."
+    IfSilent lan_mouse_firewall_ok
+    MessageBox MB_ICONEXCLAMATION|MB_OK "Could not add the Windows firewall rule for Lan Mouse.$\r$\n$\r$\nInbound connections may be blocked; allow $INSTDIR\${EXENAME} manually in Windows Defender Firewall.$\r$\n$\r$\nDetails were written to ${INSTALL_LOG}."
+  lan_mouse_firewall_ok:
 SectionEnd
 
 ; Checked by default: a KVM is only useful if it is running.
@@ -262,7 +394,7 @@ Function .onInstSuccess
 FunctionEnd
 
 Section "Uninstall"
-  !insertmacro StopLanMouse
+  !insertmacro StopLanMouse un.LogInstallLine
 
   ; --- per-user data ---
   ; Silent uninstall moves it to a timestamped backup; interactive uninstall
@@ -299,7 +431,14 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\Lan Mouse\Uninstall.lnk"
   RMDir "$SMPROGRAMS\Lan Mouse"
 
-  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="Lan Mouse"'
+  nsExec::ExecToStack 'netsh advfirewall firewall delete rule name="Lan Mouse"'
+  Pop $0 ; exit code ("0" on success)
+  Pop $1 ; combined output
+  StrCmp $0 "0" un_firewall_ok
+    StrCpy $R3 "$0"
+    StrCpy $0 "uninstall firewall delete FAILED: exit=$R3 $1"
+    Call un.LogInstallLine
+  un_firewall_ok:
 
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPID}"
   DeleteRegKey HKLM "Software\${APPID}"

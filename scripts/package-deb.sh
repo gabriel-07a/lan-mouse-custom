@@ -11,7 +11,8 @@ version="${1:?usage: package-deb.sh <version> [target-dir]}"
 target="${2:-target}"
 binary="$target/release/lan-mouse"
 frontend="$target/release/lan-mouse-gpui"
-out="lan-mouse-custom_${version}_amd64.deb"
+deb_arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+out="lan-mouse-custom_${version}_${deb_arch}.deb"
 
 [ -x "$binary" ] || {
     echo "missing $binary: run 'cargo build --release' first" >&2
@@ -37,6 +38,13 @@ for size in 32 48 128 256 512; do
         "$stage/usr/share/icons/hicolor/${size}x${size}/apps/de.feschber.LanMouse.png"
 done
 
+# systemd user unit: enable with `systemctl --user enable --now lan-mouse.service`.
+install -Dm644 service/lan-mouse.service \
+    "$stage/usr/lib/systemd/user/lan-mouse.service"
+# License text is required by Debian policy; upstream ships GPL-3.0-or-later.
+install -Dm644 LICENSE "$stage/usr/share/doc/lan-mouse/copyright"
+install -Dm644 NOTICE "$stage/usr/share/doc/lan-mouse/NOTICE"
+
 installed_size="$(du -sk "$stage" | cut -f1)"
 mkdir -p "$stage/DEBIAN"
 cat > "$stage/DEBIAN/control" <<EOF
@@ -44,9 +52,9 @@ Package: lan-mouse
 Version: $version
 Section: utils
 Priority: optional
-Architecture: amd64
-Depends: libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcb1, libfontconfig1, libfreetype6
-Recommends: gnome-shell-extension-appindicator
+Architecture: ${deb_arch}
+Depends: libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcb1, libfontconfig1, libfreetype6, libvulkan1
+Recommends: gnome-shell-extension-appindicator, mesa-vulkan-drivers
 Installed-Size: $installed_size
 Maintainer: Gabriel Arcanjo <gabrielarcanjo1907@gmail.com>
 Description: Software KVM switch (unofficial Lan Mouse fork)
@@ -96,7 +104,10 @@ cat > "$stage/DEBIAN/prerm" <<'PRERM'
 set -e
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
     pkill -f '/usr/bin/lan-mouse' >/dev/null 2>&1 || true
-    find /home -maxdepth 2 -name de.feschber.LanMouse.desktop -delete >/dev/null 2>&1 || true
+    # The shortcut was created as <Desktop>/de.feschber.LanMouse.desktop,
+    # i.e. depth 3 below /home; the previous -maxdepth 2 never matched it.
+    find /home -maxdepth 4 -type f -name de.feschber.LanMouse.desktop -delete >/dev/null 2>&1 || true
+    rm -f /root/Desktop/de.feschber.LanMouse.desktop >/dev/null 2>&1 || true
 fi
 exit 0
 PRERM
