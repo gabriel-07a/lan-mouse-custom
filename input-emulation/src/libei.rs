@@ -110,6 +110,8 @@ pub(crate) struct LibeiEmulation {
     absolute: Option<AbsoluteTracker>,
     /// service notifier for the return hand-off
     edge_return: Option<EdgeReturnNotifier>,
+    /// warning about a missing absolute pointer is logged once per activation
+    absolute_warned: bool,
 }
 
 /// Pixels the pointer must be pushed past the entry edge before the hand-off
@@ -263,9 +265,12 @@ impl LibeiEmulation {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let Some(pointer) = absolute else {
-            log::warn!(
-                "peer drives this machine through {edge:?} but the compositor has no absolute pointer; automatic edge return is disabled - use the release bind to take control back"
-            );
+            if !self.absolute_warned {
+                self.absolute_warned = true;
+                log::warn!(
+                    "peer drives this machine through {edge:?} but the compositor has no absolute pointer; automatic edge return is disabled - use the release bind to take control back"
+                );
+            }
             return false;
         };
         let tracker = AbsoluteTracker::new(
@@ -321,6 +326,7 @@ impl LibeiEmulation {
             remote_edge: None,
             absolute: None,
             edge_return: None,
+            absolute_warned: false,
         })
     }
 }
@@ -340,12 +346,14 @@ impl Emulation for LibeiEmulation {
     async fn begin_remote_control(&mut self, edge: PointerEdge) {
         self.remote_edge = Some(edge);
         self.absolute = None;
+        self.absolute_warned = false;
         self.start_absolute_tracking();
     }
 
     async fn end_remote_control(&mut self) {
         self.remote_edge = None;
         self.absolute = None;
+        self.absolute_warned = false;
     }
 
     async fn consume(
