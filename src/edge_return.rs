@@ -20,10 +20,16 @@ use std::net::SocketAddr;
 use input_event::{Event, PointerEvent};
 use lan_mouse_ipc::Position;
 
-/// How far (in pixels) the pointer has to be pushed back past the entry edge
-/// before the hand-off fires. Small enough to feel immediate, large enough to
-/// ignore delta rounding noise at the border.
-const RETURN_OVERSHOOT_PX: f64 = 6.0;
+/// How far (in pixels) the pointer has to be pushed outward, in one unbroken
+/// push, before the hand-off fires.
+///
+/// The protocol carries relative motion only and never transfers the receiver's
+/// absolute pointer position, so this tracker cannot know how far the cursor is
+/// from the screen edge. Requiring a sustained outward push (a deliberate
+/// gesture; ordinary navigation back-and-forth reverses long before this)
+/// distinguishes "the user is pushing the pointer out through the edge" from a
+/// normal cursor movement.
+const RETURN_PUSH_PX: f64 = 250.0;
 
 /// The pointer must first travel this far into the screen before a return can
 /// be detected. This swallows jitter right at the moment of entering, when the
@@ -40,6 +46,8 @@ struct Session {
     edge: Position,
     /// Signed distance from the entry edge into the screen (positive = inward).
     inward: f64,
+    /// Length of the current unbroken outward push (resets on inward motion).
+    outward_push: f64,
     /// Set once the pointer moved far enough inward to make a return deliberate.
     armed: bool,
 }
@@ -52,6 +60,7 @@ impl EdgeReturnTracker {
             Session {
                 edge,
                 inward: 0.0,
+                outward_push: 0.0,
                 armed: false,
             },
         );
@@ -85,7 +94,14 @@ impl EdgeReturnTracker {
         if session.inward >= ARM_DISTANCE_PX {
             session.armed = true;
         }
-        if session.armed && session.inward <= -RETURN_OVERSHOOT_PX {
+        if inward_delta < 0.0 {
+            session.outward_push += -inward_delta;
+        } else {
+            // Any inward motion interrupts the push: an ordinary reversal must
+            // not be mistaken for pushing the pointer out through the edge.
+            session.outward_push = (session.outward_push - inward_delta).max(0.0);
+        }
+        if session.armed && session.outward_push >= RETURN_PUSH_PX {
             let edge = session.edge;
             self.sessions.remove(&addr);
             return Some(edge);
@@ -124,9 +140,9 @@ mod tests {
         // Move around inside the screen.
         assert_eq!(tracker.observe(addr(1), &motion(40.0, 25.0)), None);
         assert_eq!(tracker.observe(addr(1), &motion(0.0, -25.0)), None);
-        // Push back left: the sum crosses the overshoot threshold.
+        // A deliberate, unbroken push back out through the edge.
         let mut returned = None;
-        for _ in 0..20 {
+        for _ in 0..40 {
             if let Some(edge) = tracker.observe(addr(1), &motion(-10.0, 0.0)) {
                 returned = Some(edge);
                 break;
@@ -135,6 +151,19 @@ mod tests {
         assert_eq!(returned, Some(Position::Left));
         // The session is consumed: further motion does not fire again.
         assert_eq!(tracker.observe(addr(1), &motion(-10.0, 0.0)), None);
+    }
+
+    #[test]
+    fn an_ordinary_reversal_does_not_return() {
+        let mut tracker = EdgeReturnTracker::default();
+        tracker.enter(addr(6), Position::Left);
+        // Arm the tracker, then move around normally: reversals interrupt the
+        // outward push long before the deliberate threshold.
+        assert_eq!(tracker.observe(addr(6), &motion(200.0, 0.0)), None);
+        for _ in 0..20 {
+            assert_eq!(tracker.observe(addr(6), &motion(-10.0, 0.0)), None);
+            assert_eq!(tracker.observe(addr(6), &motion(10.0, 3.0)), None);
+        }
     }
 
     #[test]
@@ -165,7 +194,7 @@ mod tests {
                 "{edge:?} inward"
             );
             let mut returned = None;
-            for _ in 0..20 {
+            for _ in 0..40 {
                 if let Some(found) =
                     tracker.observe(addr(2), &motion(outward.0 * 10.0, outward.1 * 10.0))
                 {

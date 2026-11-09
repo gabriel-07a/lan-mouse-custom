@@ -326,6 +326,13 @@ impl ListenTask {
     /// (the Disconnect button appeared to blink back), so send a few copies
     /// with short spacing before closing the transport.
     async fn explicit_disconnect(&mut self, addr: SocketAddr) {
+        // Stop applying anything already queued for this session before the
+        // transport closes (those datagrams predate the disconnect).
+        self.emulation_proxy.remove(addr);
+        self.event_tx
+            .send(EmulationEvent::ReleaseNotify)
+            .ok()
+            .unwrap_or_default();
         for copy in 0..5 {
             self.listener
                 .reply(
@@ -364,6 +371,7 @@ impl ListenTask {
                                     self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
                                 } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     last_enter.record(addr, serial);
+                                    self.emulation_proxy.open(addr);
                                     #[cfg(not(target_os = "windows"))]
                                     self.edge_return.enter(addr, to_ipc_pos(pos));
                                     log::info!("releasing capture: {addr} entered this device");
@@ -571,6 +579,9 @@ impl ListenTask {
                         // No AuthRevoke: a forced "user disconnect" would make
                         // the peer deactivate the device until it is manually
                         // re-enabled - far worse than the recovery this is for.
+                        self.emulation_proxy.remove(addr);
+                        #[cfg(not(target_os = "windows"))]
+                        self.edge_return.leave(addr);
                         self.listener.disconnect(addr).await
                     }
                     EmulationRequest::DisconnectFingerprint(fingerprint) => {
@@ -647,6 +658,9 @@ pub(crate) struct EmulationProxy {
 enum ProxyRequest {
     Input(Event, SocketAddr),
     Remove(SocketAddr),
+    /// A new incoming session from this address started: queued input for it is
+    /// valid again (a closed address is otherwise dropped, see Remove).
+    Open(SocketAddr),
     Terminate,
     Reenable,
 }
@@ -666,6 +680,7 @@ impl EmulationProxy {
             request_rx,
             event_tx,
             handles: Default::default(),
+            closed: Default::default(),
             next_id: 0,
             selected_backend,
         };
@@ -707,6 +722,14 @@ impl EmulationProxy {
             .unwrap_or_default();
     }
 
+    /// Mark a new incoming session from this address as active.
+    fn open(&self, addr: SocketAddr) {
+        self.request_tx
+            .send(ProxyRequest::Open(addr))
+            .ok()
+            .unwrap_or_default();
+    }
+
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
@@ -730,6 +753,9 @@ struct EmulationTask {
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
+    /// addresses whose session was explicitly closed: input datagrams that were
+    /// already queued in the channel must not be injected after the close
+    closed: std::collections::HashSet<SocketAddr>,
     next_id: EmulationHandle,
     selected_backend: Rc<Cell<Option<input_emulation::Backend>>>,
 }
@@ -749,7 +775,9 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Remove(..) | ProxyRequest::Open(..) => {
+                        /* emulation inactive => ignore */
+                    }
                 }
             }
         }
@@ -831,6 +859,12 @@ impl EmulationTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
+                        if self.closed.contains(&addr) {
+                            // The session was closed explicitly: datagrams that
+                            // were already queued before the close must not be
+                            // injected after it.
+                            continue;
+                        }
                         let handle = match self.handles.get(&addr) {
                             Some(&handle) => handle,
                             None => {
@@ -844,9 +878,13 @@ impl EmulationTask {
                         emulation.consume(event, handle).await?;
                     },
                     ProxyRequest::Remove(addr) => {
+                        self.closed.insert(addr);
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
                         }
+                    }
+                    ProxyRequest::Open(addr) => {
+                        self.closed.remove(&addr);
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
@@ -879,7 +917,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::Remove(_) => continue,
+            ProxyRequest::Remove(_) | ProxyRequest::Open(_) => continue,
             ProxyRequest::Reenable => continue,
         }
     }

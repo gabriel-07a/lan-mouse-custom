@@ -17,7 +17,7 @@ use lan_mouse_ipc::{DirectionPolicy, PendingView};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -211,7 +211,11 @@ pub(crate) struct DeviceStore {
     /// machine. Their next handshake is rejected until the user allows the
     /// device again (explicit activation or a device policy change). Kept in
     /// memory only: restarting the app clears it.
-    reconnect_suppressed: HashSet<String>,
+    reconnect_suppressed: HashMap<String, IpAddr>,
+    /// one-shot handshake limiter budget granted when the user explicitly
+    /// allows a device again: the rejected retries of the blocked peer must not
+    /// delay the deliberate reconnect by the 60 s per-IP window.
+    handshake_budget: HashMap<IpAddr, u32>,
     pending: HashMap<String, PendingDevice>,
 }
 
@@ -235,17 +239,36 @@ impl DeviceStore {
     }
 
     /// Refuse reconnections of a device the local user just disconnected.
-    pub(crate) fn suppress_reconnect(&mut self, fingerprint: String) {
-        self.reconnect_suppressed.insert(fingerprint);
+    pub(crate) fn suppress_reconnect(&mut self, fingerprint: String, addr: IpAddr) {
+        self.reconnect_suppressed.insert(fingerprint, addr);
+    }
+
+    /// Grant a few handshake attempts to an IP after the user explicitly
+    /// allowed a blocked device again (bypasses the per-IP rate limiter once).
+    pub(crate) fn grant_handshake_budget(&mut self, addr: IpAddr) {
+        let entry = self.handshake_budget.entry(addr).or_insert(0);
+        *entry = (*entry).max(4);
+    }
+
+    /// Consume one granted handshake attempt, if any.
+    pub(crate) fn take_handshake_budget(&mut self, addr: IpAddr) -> bool {
+        match self.handshake_budget.get_mut(&addr) {
+            Some(budget) if *budget > 0 => {
+                *budget -= 1;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn is_reconnect_suppressed(&self, fingerprint: &str) -> bool {
-        self.reconnect_suppressed.contains(fingerprint)
+        self.reconnect_suppressed.contains_key(fingerprint)
     }
 
-    /// Lift the post-disconnect block (explicit user action).
-    pub(crate) fn allow_reconnect(&mut self, fingerprint: &str) {
-        self.reconnect_suppressed.remove(fingerprint);
+    /// Lift the post-disconnect block (explicit user action). Returns the
+    /// peer's last known address so the caller can grant a handshake budget.
+    pub(crate) fn allow_reconnect(&mut self, fingerprint: &str) -> Option<IpAddr> {
+        self.reconnect_suppressed.remove(fingerprint)
     }
 
     pub(crate) fn device(&self, fingerprint: &str) -> Option<&Device> {
@@ -266,6 +289,7 @@ impl DeviceStore {
     /// Grant a device for the current session only. The record is never
     /// persisted and is dropped when the peer disconnects.
     pub(crate) fn put_ephemeral(&mut self, device: Device) {
+        self.reconnect_suppressed.remove(&device.fingerprint);
         self.denied.remove(&device.fingerprint);
         self.ephemeral.insert(device.fingerprint.clone());
         self.devices.insert(device.fingerprint.clone(), device);
@@ -668,21 +692,32 @@ mod tests {
         store.put(Device::new(fp(1), "peer".into()));
         assert!(!store.is_reconnect_suppressed(&fp(1)));
 
-        store.suppress_reconnect(fp(1));
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        store.suppress_reconnect(fp(1), ip);
         assert!(store.is_reconnect_suppressed(&fp(1)));
 
         // An explicit policy update (Devices page / CLI allow) lifts the block.
         store.put(Device::new(fp(1), "peer".into()));
         assert!(!store.is_reconnect_suppressed(&fp(1)));
 
-        // So does an explicit allow request.
-        store.suppress_reconnect(fp(2));
+        // So does an explicit allow request, which returns the peer address so
+        // the caller can grant one-shot handshake budget.
+        store.suppress_reconnect(fp(2), ip);
         assert!(store.is_reconnect_suppressed(&fp(2)));
-        store.allow_reconnect(&fp(2));
+        assert_eq!(store.allow_reconnect(&fp(2)), Some(ip));
         assert!(!store.is_reconnect_suppressed(&fp(2)));
 
+        // The granted budget bypasses the per-IP limiter a few times and is
+        // consumed.
+        store.grant_handshake_budget(ip);
+        assert!(store.take_handshake_budget(ip));
+        assert!(store.take_handshake_budget(ip));
+        assert!(store.take_handshake_budget(ip));
+        assert!(store.take_handshake_budget(ip));
+        assert!(!store.take_handshake_budget(ip));
+
         // Suppression is per identity.
-        store.suppress_reconnect(fp(1));
+        store.suppress_reconnect(fp(1), ip);
         assert!(!store.is_reconnect_suppressed(&fp(2)));
     }
 

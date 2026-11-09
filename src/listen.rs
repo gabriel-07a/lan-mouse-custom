@@ -328,6 +328,7 @@ impl LanMouseListener {
             let trusted = trusted_nets.clone();
             let pairing = pairing_until.clone();
             let devices = devices.clone();
+            let devices_for_limiter = devices.clone();
             let accept_incoming = accept_incoming.clone();
             spawn_local(async move {
                 // Bound the number of half-open handshakes so stray UDP
@@ -343,7 +344,15 @@ impl LanMouseListener {
                                 if limiter.attempts.len() > 1024 {
                                     limiter.prune();
                                 }
-                                if !limiter.allow(addr.ip()) {
+                                // An explicit "allow again" after a local
+                                // disconnect grants a few handshake attempts so
+                                // the per-IP limiter cannot delay the user's
+                                // deliberate reconnect by its 60 s window.
+                                let budgeted = devices_for_limiter
+                                    .write()
+                                    .expect("lock")
+                                    .take_handshake_budget(addr.ip());
+                                if !budgeted && !limiter.allow(addr.ip()) {
                                     rate_limited = rate_limited.saturating_add(1);
                                     if rate_limited == 1 || rate_limited.is_multiple_of(100) {
                                         log::warn!(

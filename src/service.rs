@@ -1602,6 +1602,8 @@ impl Service {
             self.notify_frontend(FrontendEvent::Error(format!("invalid fingerprint: {fp}")));
             return;
         };
+        // An explicit authorization is the user allowing this identity again.
+        self.allow_device_reconnect(&fingerprint);
         let audit_name = if desc.trim().is_empty() {
             fingerprint.clone()
         } else {
@@ -1654,11 +1656,11 @@ impl Service {
             )));
             return;
         };
+        // Setting a policy is the user explicitly allowing the device again:
+        // lift the post-disconnect reconnect block (and grant handshake budget).
+        self.allow_device_reconnect(&fingerprint);
         {
             let mut store = self.devices.write().expect("lock");
-            // Setting a policy is the user explicitly allowing the device
-            // again: lift the post-disconnect reconnect block.
-            store.allow_reconnect(&fingerprint);
             if store.device(&fingerprint).is_none() {
                 let name = self
                     .client_manager
@@ -1827,6 +1829,8 @@ impl Service {
             self.notify_frontend(FrontendEvent::Error(format!("invalid fingerprint: {fp}")));
             return;
         };
+        // An explicit allow is the user lifting a post-disconnect block.
+        self.allow_device_reconnect(&fingerprint);
         let pending = self
             .devices
             .write()
@@ -2665,15 +2669,22 @@ impl Service {
         self.notify_frontend(FrontendEvent::Created(handle, c, s));
     }
 
+    /// Lift the post-disconnect reconnect block for an identity (explicit user
+    /// action) and grant a one-shot handshake budget so the deliberate
+    /// reconnect is not delayed by the per-IP handshake limiter.
+    fn allow_device_reconnect(&mut self, fingerprint: &str) {
+        let mut store = self.devices.write().expect("lock");
+        if let Some(addr) = store.allow_reconnect(fingerprint) {
+            store.grant_handshake_budget(addr);
+        }
+    }
+
     fn set_client_active(&mut self, handle: ClientHandle, active: bool) {
         if active {
             // The user explicitly asked for this client again: allow the
             // identity to reconnect (lift the post-disconnect block).
             if let Some(fingerprint) = self.client_manager.fingerprint(handle) {
-                self.devices
-                    .write()
-                    .expect("lock")
-                    .allow_reconnect(&fingerprint);
+                self.allow_device_reconnect(&fingerprint);
             }
             self.activate_client(handle);
         } else {
@@ -2700,9 +2711,9 @@ impl Service {
         log::debug!("explicitly disconnecting client {handle}");
         let fingerprint = self.client_manager.fingerprint(handle);
         // A peer that controls this machine uses a reverse (inactive) client
-        // entry; the full teardown below is what stops it, and the grace window
-        // then keeps a racing reconnect from silently restoring the session.
-        let had_incoming = self.client_manager.incoming_addr(handle).is_some();
+        // entry; the full teardown below is what stops it.
+        let incoming_addr = self.client_manager.incoming_addr(handle);
+        let had_incoming = incoming_addr.is_some();
         // Mark inactive first so the reconnect loop cannot revive the link.
         let was_active = self.client_manager.deactivate_client(handle);
         // Close the outgoing transport with an explicit AuthRevoke (only when
@@ -2738,10 +2749,13 @@ impl Service {
                     // that ignores the revoke (or lost it) must not be able to
                     // re-establish a session and inject input behind the UI's
                     // back. The user lifts this by allowing the device again.
+                    let peer_ip = incoming_addr
+                        .map(|addr| addr.ip())
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                     self.devices
                         .write()
                         .expect("lock")
-                        .suppress_reconnect(fingerprint.to_string());
+                        .suppress_reconnect(fingerprint.to_string(), peer_ip);
                     self.notify_frontend(FrontendEvent::Error(format!(
                         "device {} disconnected locally; allow it again in Devices to reconnect",
                         &fingerprint[..fingerprint.len().min(16)]
