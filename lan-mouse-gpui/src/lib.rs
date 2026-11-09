@@ -2931,6 +2931,55 @@ impl Dashboard {
                     }
                 )),
             ))
+            .child(
+                // Prominent live control: matching the controller's pointer
+                // speed is the only reliable way to remove the speed
+                // difference when crossing the screens.
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child("Incoming pointer speed"),
+                    )
+                    .child(self.action_button(
+                        "dev-sens-down",
+                        "-",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            let next = this.absolute_sensitivity.saturating_sub(5).max(10);
+                            this.send(FrontendRequest::SetAbsoluteSensitivity(next));
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(format!("{}%", self.absolute_sensitivity)),
+                    )
+                    .child(self.action_button(
+                        "dev-sens-up",
+                        "+",
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| {
+                            let next = (this.absolute_sensitivity + 5).min(500);
+                            this.send(FrontendRequest::SetAbsoluteSensitivity(next));
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("applies to the cursor when it enters from the other machine"),
+                    ),
+            )
             .when(self.add_dialog.is_some(), |this| {
                 this.child(self.render_add_dialog(cx))
             })
