@@ -1752,6 +1752,8 @@ impl Dashboard {
         div()
             .flex()
             .flex_col()
+            .w_full()
+            .overflow_hidden()
             .gap_3()
             .p_4()
             .rounded_lg()
@@ -1773,17 +1775,20 @@ impl Dashboard {
                                     .text_base()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
+                                    .truncate()
                                     .child(peer.name.clone()),
                             )
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(rgb(MUTED))
+                                    .truncate()
                                     .child(display_endpoint.clone()),
                             ),
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .px_2()
                             .py_1()
                             .rounded_full()
@@ -1796,43 +1801,66 @@ impl Dashboard {
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap_2()
+                    .flex_col()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        div().flex().items_center().gap_2().child(
+                            div()
+                                .id(SharedString::from(format!("toggle-{primary}")))
+                                .flex_shrink_0()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(match action {
+                                    RowAction::Connect => 0x1b2a3a,
+                                    _ => 0x2a2020,
+                                }))
+                                .text_color(rgb(match action {
+                                    RowAction::Connect => ACCENT,
+                                    _ => RED,
+                                }))
+                                .text_sm()
+                                .cursor_pointer()
+                                .child(action.label())
+                                .on_click(cx.listener(move |this, _, _, _| {
+                                    this.apply_row_action(&action_members, action)
+                                })),
+                        ),
+                    )
+                    // Long status lines get their own full-width row and are
+                    // truncated instead of pushing the card past the window
+                    // (resizing used to clip the whole row).
                     .child(
                         div()
-                            .id(SharedString::from(format!("toggle-{primary}")))
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(match action {
-                                RowAction::Connect => 0x1b2a3a,
-                                _ => 0x2a2020,
-                            }))
-                            .text_color(rgb(match action {
-                                RowAction::Connect => ACCENT,
-                                _ => RED,
-                            }))
-                            .text_sm()
-                            .cursor_pointer()
-                            .child(action.label())
-                            .on_click(cx.listener(move |this, _, _, _| {
-                                this.apply_row_action(&action_members, action)
-                            })),
+                            .w_full()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .truncate()
+                            .child(detail),
                     )
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(detail))
                     .when(version_mismatch, |this| {
                         this.child(
                             div()
+                                .w_full()
                                 .text_xs()
                                 .text_color(rgb(AMBER))
+                                .truncate()
                                 .child("build mismatch with this peer; update both machines"),
                         )
                     })
                     .when(peer.last_error.is_some(), |this| {
-                        this.child(div().text_xs().text_color(rgb(RED)).child(format!(
-                            "last error: {}",
-                            peer.last_error.clone().unwrap_or_default()
-                        )))
+                        this.child(
+                            div()
+                                .w_full()
+                                .text_xs()
+                                .text_color(rgb(RED))
+                                .truncate()
+                                .child(format!(
+                                    "last error: {}",
+                                    peer.last_error.clone().unwrap_or_default()
+                                )),
+                        )
                     }),
             )
             .child(
@@ -2087,6 +2115,7 @@ impl Render for Dashboard {
         }
         let sidebar = div()
             .w(px(220.0))
+            .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
@@ -2222,6 +2251,7 @@ impl Render for Dashboard {
             .flex()
             .flex_col()
             .size_full()
+            .overflow_hidden()
             .bg(rgb(BG))
             .when(cfg!(target_os = "linux"), |this| {
                 this.child(self.render_titlebar(window, cx))
@@ -3921,6 +3951,10 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
         let window_handle = match cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // A minimum size keeps the fixed sidebar plus the device cards
+                // usable; below this the old layout clipped and overlapped when
+                // the window was resized.
+                window_min_size: Some(size(px(880.0), px(600.0))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Lan Mouse".into()),
                     appears_transparent: false,
