@@ -134,6 +134,9 @@ enum CliSubcommand {
     SetPosition { id: ClientHandle, pos: Position },
     /// set the motion scale of a client in percent (100 = unchanged)
     SetSensitivity { id: ClientHandle, percent: u16 },
+    /// set the sensitivity of input received from peers through the absolute
+    /// pointer, in percent (100 = 1:1 after monitor-scale normalisation)
+    SetAbsoluteSensitivity { percent: u16 },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
     /// list known devices with their permissions
@@ -692,6 +695,12 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             tx.request(FrontendRequest::UpdateSensitivity(id, percent))
                 .await?;
             settle(&mut rx, Some(id)).await?;
+        }
+        CliSubcommand::SetAbsoluteSensitivity { percent } => {
+            let percent = validate_sensitivity(percent)?;
+            tx.request(FrontendRequest::SetAbsoluteSensitivity(percent))
+                .await?;
+            settle(&mut rx, None).await?;
         }
         CliSubcommand::Devices => {
             tx.request(FrontendRequest::ListDevices).await?;

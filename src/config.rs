@@ -20,6 +20,14 @@ use crate::devices::{Device, DeviceSource};
 use lan_mouse_cli::CliArgs;
 use lan_mouse_ipc::{DEFAULT_PORT, DirectionPolicy, Position};
 
+/// Default sensitivity of the absolute-pointer injection, in percent.
+///
+/// 100 % keeps the monitor-scale normalisation (one pointer count moves the
+/// physical distance the previous relative injection moved) and the mirrored
+/// libinput acceleration supplies the speed-dependent boost.  Lower it for a
+/// slower cursor, raise it for a faster one; values are clamped to 10..=500.
+pub const DEFAULT_ABSOLUTE_POINTER_SENSITIVITY: u16 = 100;
+
 use input_event::scancode::{
     self,
     Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
@@ -75,6 +83,9 @@ pub(crate) fn default_path() -> Result<PathBuf, VarError> {
 struct ConfigToml {
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
+    /// sensitivity of input received from peers through the absolute pointer,
+    /// in percent (167 compensates a 166% monitor scale)
+    absolute_pointer_sensitivity: Option<u16>,
     port: Option<u16>,
     /// UDP discovery/broadcast port (defaults to 4245)
     discovery_port: Option<u16>,
@@ -1117,6 +1128,16 @@ impl Config {
             .unwrap_or(DEFAULT_PORT)
     }
 
+    /// Sensitivity of input received from peers through the absolute pointer,
+    /// in percent. 100 = 1:1 after the monitor-scale normalisation.
+    pub fn absolute_pointer_sensitivity(&self) -> u16 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.absolute_pointer_sensitivity)
+            .unwrap_or(DEFAULT_ABSOLUTE_POINTER_SENSITIVITY)
+            .clamp(10, 500)
+    }
+
     /// UDP port used for discovery announcements/scans.
     pub fn discovery_port(&self) -> u16 {
         self.config_toml
@@ -1316,6 +1337,18 @@ impl Config {
         } else {
             Some(port)
         };
+    }
+
+    pub fn set_absolute_pointer_sensitivity(&mut self, percent: u16) {
+        let percent = percent.clamp(10, 500);
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml
+            .as_mut()
+            .expect("config")
+            .absolute_pointer_sensitivity =
+            (percent != DEFAULT_ABSOLUTE_POINTER_SENSITIVITY).then_some(percent);
     }
 }
 
@@ -1878,5 +1911,36 @@ address = "192.168.1.50"
             .into_rule()
             .expect("valid rule");
         assert_eq!(roundtripped, rule);
+    }
+}
+
+#[cfg(test)]
+mod absolute_pointer_sensitivity_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_neutral() {
+        assert_eq!(DEFAULT_ABSOLUTE_POINTER_SENSITIVITY, 100);
+    }
+
+    #[test]
+    fn config_toml_roundtrips_the_setting() {
+        let toml: ConfigToml = toml::from_str("absolute_pointer_sensitivity = 250").expect("parse");
+        assert_eq!(toml.absolute_pointer_sensitivity, Some(250));
+        let text = toml::to_string(&toml).expect("serialize");
+        assert!(
+            text.contains("absolute_pointer_sensitivity = 250"),
+            "serialized config must keep the value: {text}"
+        );
+    }
+
+    #[test]
+    fn clamping_keeps_values_in_a_usable_range() {
+        let clamp = |percent: u16| percent.clamp(10, 500);
+        assert_eq!(clamp(0), 10);
+        assert_eq!(clamp(5), 10);
+        assert_eq!(clamp(100), 100);
+        assert_eq!(clamp(500), 500);
+        assert_eq!(clamp(999), 500);
     }
 }

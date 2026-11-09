@@ -182,10 +182,21 @@ modified; there is no capability bit, version bump or mixed-version requirement 
 Also hardened after independent review: RemoteEnter/RemoteLeave are stashed while the backend is being created instead of being discarded; absolute tracking is ignored when the compositor replaces/pauses the device (falling back to relative injection); EI frame timestamps use CLOCK_MONOTONIC; the anchor/clamp uses one real EIS region touching the entry edge (no holes between monitors); the fired latch re-arms when the pointer returns inside.
 
 
-### R-12: absolute pointer sensitivity on HiDPI
+### R-12: resolution-independent absolute pointer feel
 
-The EIS absolute pointer region is expressed in logical pixels (e.g. 1536x960 for a 2560x1600 panel at
-166% scaling) while the peer's motion deltas are physical-ish. Injected deltas are therefore divided by the
-region scale reported by the compositor, so the physical cursor speed matches the previous relative
-injection; the value is logged in the "absolute pointer armed ... scale X" line.
-LAN_MOUSE_ABSOLUTE_SCALE (environment variable, multiplier) fine-tunes it without rebuilding.
+Absolute injection positions the cursor in logical pixels, so mapping peer counts 1:1 ignores the
+receiver's pointer acceleration (the relative path is accelerated by libinput). Result: the absolute
+pointer feels slow or inconsistent depending on the screen scale and mouse speed setting.
+
+Fix: the absolute tracker now mirrors the receiver's pointer acceleration. On backend creation the
+GNOME mouse settings are read (org.gnome.desktop.peripherals.mouse speed and accel-profile) and each
+motion delta is amplified by a libinput-like adaptation curve before being integrated, so slow motion
+stays 1:1 for fine control and fast motion gets the same boost the relative path had. The mapping is
+screen-relative (1 count = 1 logical pixel), which is independent of resolution and monitor scale.
+
+A persisted sensitivity percentage (default 100, clamped 10..500) scales the result for personal
+taste: config key absolute_pointer_sensitivity in config.toml or the live command
+"lan-mouse cli set-absolute-sensitivity <percent>" (applied immediately, saved to the config).
+The startup log line shows the effective gain:
+"absolute pointer armed at (x,y) region ... gain 1.00x (accel mirrored)".
+LAN_MOUSE_ABSOLUTE_SCALE still overrides the multiplier temporarily.

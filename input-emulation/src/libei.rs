@@ -47,8 +47,6 @@ struct AbsolutePointer {
     generation: u64,
     /// device regions in logical pixels (x0, y0, x1, y1)
     regions: Vec<(f32, f32, f32, f32)>,
-    /// logical-to-physical scale of each region (same order as regions)
-    scales: Vec<f32>,
 }
 
 #[derive(Clone, Default)]
@@ -126,11 +124,71 @@ pub(crate) struct LibeiEmulation {
     absolute_warned: bool,
     /// monotonic clock (EI frame timestamps must use CLOCK_MONOTONIC)
     clock: Instant,
+    /// user sensitivity multiplier for the absolute pointer (1.0 = 100%)
+    absolute_sensitivity: f64,
+    /// receiver pointer acceleration settings mirrored for absolute injection
+    pointer_settings: PointerSettings,
+    /// previous motion timestamp, used to estimate the pointer velocity
+    last_motion_time: Option<u32>,
 }
 
 /// Pixels the pointer must be pushed past the entry edge before the hand-off
 /// fires. The absolute tracker knows the exact position, so this can be tiny.
 const RETURN_MARGIN_PX: f64 = 3.0;
+
+/// Pointer settings of this Wayland session.
+///
+/// The relative injection path is accelerated by libinput; absolute injection
+/// is linear unless we mirror that acceleration. Mirroring it makes the
+/// absolute pointer feel like the previous relative path on any screen
+/// resolution or scale, because both apply the same velocity-dependent curve.
+#[derive(Clone, Copy, Debug)]
+struct PointerSettings {
+    /// GNOME mouse speed setting (-1.0 ..= 1.0)
+    speed: f64,
+    /// adaptive acceleration (default) or flat (speed only)
+    adaptive: bool,
+}
+
+impl PointerSettings {
+    fn detect() -> Self {
+        let speed = read_gsettings("org.gnome.desktop.peripherals.mouse", "speed")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .clamp(-1.0, 1.0);
+        let profile = read_gsettings("org.gnome.desktop.peripherals.mouse", "accel-profile")
+            .unwrap_or_else(|| "adaptive".to_string());
+        let adaptive = !profile.trim_matches('\'').eq_ignore_ascii_case("flat");
+        Self { speed, adaptive }
+    }
+
+    /// Velocity-dependent acceleration factor, mirroring libinput's adaptive
+    /// pointer acceleration (slow movements stay 1:1 so fine control works,
+    /// fast movements get the same boost the relative path receives).
+    fn acceleration(&self, velocity: f64) -> f64 {
+        let base = 2f64.powf(self.speed).clamp(0.3, 3.0);
+        if !self.adaptive {
+            return base;
+        }
+        // counts/millisecond; typical mice: slow ~0.05, fast ~2
+        const LOW: f64 = 0.10;
+        const HIGH: f64 = 2.0;
+        const MAX_BOOST: f64 = 2.2;
+        let ramp = ((velocity - LOW) / (HIGH - LOW)).clamp(0.0, 1.0);
+        base * (1.0 + (MAX_BOOST - 1.0) * ramp * ramp)
+    }
+}
+
+fn read_gsettings(schema: &str, key: &str) -> Option<String> {
+    let output = std::process::Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
 /// Distance (logical px) the cursor starts inside the entry edge. Big enough
 /// that hand-off jitter cannot fire immediately, small enough that the cursor
@@ -157,9 +215,11 @@ struct AbsoluteTracker {
     edge: PointerEdge,
     /// absolute device generation this tracker was armed against
     generation: u64,
-    /// multiplies incoming deltas: 1/monitor-scale so the physical speed
-    /// matches the previous relative injection (and a user override)
+    /// monitor-normalisation * user sensitivity; multiplied into deltas
     delta_scale: f64,
+    /// monitor normalisation only (1/display-scale); kept so a live
+    /// sensitivity change can recompute delta_scale without re-arming
+    base_scale: f64,
     /// monitor regions in logical pixels: (x0, y0, x1, y1), half-open
     regions: Vec<(f32, f32, f32, f32)>,
     /// region touching the entry edge (anchor + return threshold)
@@ -178,7 +238,8 @@ impl AbsoluteTracker {
         edge: PointerEdge,
         generation: u64,
         regions: Vec<(f32, f32, f32, f32)>,
-        delta_scale: f64,
+        base_scale: f64,
+        gain: f64,
     ) -> Option<Self> {
         let entry = entry_region_bounds(&regions, edge)?;
         let layout_min_x = regions.iter().map(|r| r.0).fold(f32::INFINITY, f32::min);
@@ -194,7 +255,8 @@ impl AbsoluteTracker {
         Some(Self {
             edge,
             generation,
-            delta_scale,
+            delta_scale: base_scale * gain,
+            base_scale,
             regions,
             entry,
             layout_min_x,
@@ -457,30 +519,25 @@ impl LibeiEmulation {
             log::debug!("absolute pointer paused by the compositor; waiting for resume");
             return false;
         }
-        let entry = entry_region_bounds(&pointer.regions, edge);
-        let entry_scale = entry
-            .and_then(|entry| {
-                pointer
-                    .regions
-                    .iter()
-                    .zip(pointer.scales.iter())
-                    .find(|(region, _)| **region == entry)
-                    .map(|(_, scale)| f64::from(*scale))
-            })
-            .filter(|scale| scale.is_finite() && *scale > 0.05)
-            .unwrap_or(1.0);
+        // Screen-relative mapping: one pointer count moves one logical pixel
+        // (the fraction of the screen traversed matches the controller,
+        // independent of resolution and monitor scale). The mirrored libinput
+        // acceleration adds the velocity-dependent boost the relative path had.
+        let base_scale = 1.0;
         // user override for fine tuning without recompiling
         let user_scale = std::env::var("LAN_MOUSE_ABSOLUTE_SCALE")
             .ok()
             .and_then(|value| value.parse::<f64>().ok())
             .filter(|value| value.is_finite() && *value > 0.05 && *value < 20.0)
             .unwrap_or(1.0);
-        let delta_scale = (1.0 / entry_scale).clamp(0.2, 5.0) * user_scale;
+        let gain = self.absolute_sensitivity * user_scale;
+        let delta_scale = base_scale * gain;
         let Some(tracker) = AbsoluteTracker::new(
             edge,
             pointer.generation,
             pointer.regions.clone(),
-            delta_scale,
+            base_scale,
+            gain,
         ) else {
             log::warn!("absolute pointer has no usable region; automatic edge return disabled");
             return false;
@@ -493,7 +550,7 @@ impl LibeiEmulation {
         }
         let (min_x, min_y, max_x, max_y) = tracker.entry_bounds();
         log::info!(
-            "absolute pointer armed at ({x},{y}) region {min_x},{min_y}..{max_x},{max_y} scale {delta_scale:.3}; push the cursor past the {edge:?} edge to hand control back"
+            "absolute pointer armed at ({x},{y}) region {min_x},{min_y}..{max_x},{max_y} gain {delta_scale:.2}x (accel mirrored); push the cursor past the {edge:?} edge to hand control back"
         );
         self.absolute = Some(tracker);
         true
@@ -502,6 +559,17 @@ impl LibeiEmulation {
     /// Monotonic microseconds for EI frame timestamps.
     fn now_micros(&self) -> u64 {
         self.clock.elapsed().as_micros() as u64
+    }
+
+    /// Milliseconds since the previous motion event (clamped); 8 ms fallback.
+    fn motion_dt(&mut self, time: u32) -> f64 {
+        let dt = self
+            .last_motion_time
+            .map(|previous| time.wrapping_sub(previous) as f64)
+            .filter(|dt| *dt > 0.0 && *dt < 100.0)
+            .unwrap_or(8.0);
+        self.last_motion_time = Some(time);
+        dt
     }
 
     pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
@@ -539,6 +607,9 @@ impl LibeiEmulation {
             edge_return: None,
             absolute_warned: false,
             clock: Instant::now(),
+            absolute_sensitivity: 1.0,
+            pointer_settings: PointerSettings::detect(),
+            last_motion_time: None,
         })
     }
 }
@@ -553,6 +624,13 @@ impl Drop for LibeiEmulation {
 impl Emulation for LibeiEmulation {
     fn set_edge_return_notifier(&mut self, notifier: EdgeReturnNotifier) {
         self.edge_return = Some(notifier);
+    }
+
+    fn set_absolute_sensitivity(&mut self, gain: f64) {
+        self.absolute_sensitivity = gain;
+        if let Some(tracker) = self.absolute.as_mut() {
+            tracker.delta_scale = tracker.base_scale * gain;
+        }
     }
 
     async fn begin_remote_control(&mut self, edge: PointerEdge) {
@@ -584,7 +662,7 @@ impl Emulation for LibeiEmulation {
         }
         match event {
             Event::Pointer(p) => match p {
-                PointerEvent::Motion { time: _, dx, dy } => {
+                PointerEvent::Motion { time, dx, dy } => {
                     // A non-finite delta (corrupted packet) must not be
                     // forwarded into the EIS device state.
                     if !dx.is_finite() || !dy.is_finite() {
@@ -624,7 +702,15 @@ impl Emulation for LibeiEmulation {
                         };
                         if let Some(pointer) = usable {
                             let mut tracker = self.absolute.take().expect("checked above");
-                            let fired = tracker.apply(dx, dy);
+                            // Mirror the receiver's pointer acceleration so
+                            // the physical feel matches the relative path on
+                            // every resolution/scale (slow = 1:1 fine control,
+                            // fast = accelerated like before).
+                            let dt = self.motion_dt(time);
+                            let velocity = (dx * dx + dy * dy).sqrt() / dt;
+                            let velocity = velocity.clamp(0.0, 1000.0);
+                            let accel = self.pointer_settings.acceleration(velocity);
+                            let fired = tracker.apply(dx * accel, dy * accel);
                             let (x, y) = tracker.absolute();
                             pointer.pointer.motion_absolute(x, y);
                             pointer.device.frame(self.conn.serial(), now);
@@ -859,13 +945,6 @@ async fn ei_event_handler(
                             "absolute pointer device has no usable region; automatic edge return disabled"
                         );
                     } else {
-                        let scales: Vec<f32> = e
-                            .device()
-                            .regions()
-                            .iter()
-                            .filter(|region| region.width > 0 && region.height > 0)
-                            .map(|region| region.scale)
-                            .collect();
                         let generation = devices
                             .absolute_generation
                             .fetch_add(1, Ordering::SeqCst)
@@ -883,7 +962,6 @@ async fn ei_event_handler(
                                 pointer,
                                 generation,
                                 regions,
-                                scales,
                             });
                     }
                 }
@@ -974,7 +1052,7 @@ mod absolute_tracker_tests {
     const H: f32 = 1600.0;
 
     fn tracker(edge: PointerEdge) -> AbsoluteTracker {
-        AbsoluteTracker::new(edge, 1, vec![(0.0, 0.0, W, H)], 1.0).expect("single region")
+        AbsoluteTracker::new(edge, 1, vec![(0.0, 0.0, W, H)], 1.0, 1.0).expect("single region")
     }
 
     fn dual_regions() -> Vec<(f32, f32, f32, f32)> {
@@ -1047,7 +1125,8 @@ mod absolute_tracker_tests {
 
     #[test]
     fn pointer_can_cross_into_the_adjacent_monitor() {
-        let mut tracker = AbsoluteTracker::new(PointerEdge::Left, 1, dual_regions(), 1.0).unwrap();
+        let mut tracker =
+            AbsoluteTracker::new(PointerEdge::Left, 1, dual_regions(), 1.0, 1.0).unwrap();
         // anchored at the left edge of the first monitor
         assert_eq!(tracker.absolute(), (24.0, 540.0));
         assert_eq!(tracker.apply(2000.0, 0.0), None);
@@ -1059,7 +1138,7 @@ mod absolute_tracker_tests {
     #[test]
     fn pointer_can_cross_into_a_stacked_monitor() {
         let regions = vec![(0.0, 0.0, 1920.0, 1080.0), (0.0, 1080.0, 1920.0, 2160.0)];
-        let mut tracker = AbsoluteTracker::new(PointerEdge::Top, 1, regions, 1.0).unwrap();
+        let mut tracker = AbsoluteTracker::new(PointerEdge::Top, 1, regions, 1.0, 1.0).unwrap();
         assert_eq!(tracker.apply(0.0, 1500.0), None);
         let (_, y) = tracker.absolute();
         assert!(y > 1080.0, "cursor must reach the lower monitor, got {y}");
@@ -1093,6 +1172,7 @@ mod absolute_tracker_tests {
             1,
             vec![(0.0, 0.0, 1536.0, 960.0)],
             1.0 / 1.66667,
+            1.0,
         )
         .expect("region");
         let (x0, _) = tracker.absolute();
@@ -1115,7 +1195,7 @@ mod absolute_tracker_tests {
             (3840.0, 1080.0, 5760.0, 2160.0),
         ];
         let mut tracker =
-            AbsoluteTracker::new(PointerEdge::Bottom, 1, regions, 1.0).expect("regions");
+            AbsoluteTracker::new(PointerEdge::Bottom, 1, regions, 1.0, 1.0).expect("regions");
         // anchor is at the bottom edge of C
         assert_eq!(tracker.absolute(), (4800.0, 2135.0));
         // push left into the empty quadrant: the real cursor is snapped to a
@@ -1162,6 +1242,100 @@ mod absolute_tracker_tests {
             Some((1920.0, 0.0, 3200.0, 720.0))
         );
         assert_eq!(entry_region_bounds(&[], PointerEdge::Left), None);
+    }
+
+    #[test]
+    fn flat_profile_ignores_velocity() {
+        let settings = PointerSettings {
+            speed: 0.0,
+            adaptive: false,
+        };
+        assert!((settings.acceleration(0.01) - 1.0).abs() < 1e-9);
+        assert!((settings.acceleration(10.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adaptive_profile_keeps_slow_motion_linear_and_boosts_fast_motion() {
+        let settings = PointerSettings {
+            speed: 0.0,
+            adaptive: true,
+        };
+        let slow = settings.acceleration(0.05);
+        assert!(
+            (slow - 1.0).abs() < 1e-9,
+            "slow motion must stay 1:1, got {slow}"
+        );
+        let medium = settings.acceleration(1.0);
+        let fast = settings.acceleration(5.0);
+        assert!(medium > 1.0, "medium motion must be accelerated");
+        assert!(fast > medium, "faster motion must accelerate more");
+        assert!(fast <= 2.2 + 1e-9, "boost must stay bounded");
+    }
+
+    #[test]
+    fn speed_setting_scales_the_acceleration() {
+        let default = PointerSettings {
+            speed: 0.0,
+            adaptive: true,
+        };
+        let faster = PointerSettings {
+            speed: 0.5,
+            adaptive: true,
+        };
+        let slower = PointerSettings {
+            speed: -0.5,
+            adaptive: true,
+        };
+        assert!(faster.acceleration(1.0) > default.acceleration(1.0));
+        assert!(slower.acceleration(1.0) < default.acceleration(1.0));
+        assert!(slower.acceleration(1.0) > 0.0);
+    }
+
+    #[test]
+    fn acceleration_is_monotonic() {
+        let settings = PointerSettings {
+            speed: 0.0,
+            adaptive: true,
+        };
+        let mut previous = 0.0;
+        for step in 0..200 {
+            let velocity = step as f64 * 0.05;
+            let current = settings.acceleration(velocity);
+            assert!(current >= previous - 1e-9, "not monotonic at {velocity}");
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn screen_scale_and_sensitivity_are_independent() {
+        // physical 1 count must become 1/scale logical pixels at 100%
+        let scaled = AbsoluteTracker::new(
+            PointerEdge::Left,
+            1,
+            vec![(0.0, 0.0, 1536.0, 960.0)],
+            1.0 / 1.66667,
+            1.0,
+        )
+        .expect("region");
+        let mut scaled = scaled;
+        let (x0, _) = scaled.absolute();
+        let _ = scaled.apply(1000.0, 0.0);
+        let (x1, _) = scaled.absolute();
+        assert!((x1 - x0 - 600.0).abs() < 2.0);
+
+        // doubling the user sensitivity doubles the logical movement
+        let mut sensitive = AbsoluteTracker::new(
+            PointerEdge::Left,
+            1,
+            vec![(0.0, 0.0, 1536.0, 960.0)],
+            1.0 / 1.66667,
+            2.0,
+        )
+        .expect("region");
+        let (x0, _) = sensitive.absolute();
+        let _ = sensitive.apply(1000.0, 0.0);
+        let (x1, _) = sensitive.absolute();
+        assert!((x1 - x0 - 1200.0).abs() < 4.0);
     }
 
     #[test]

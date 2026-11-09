@@ -762,6 +762,9 @@ pub enum FrontendRequest {
     UpdatePosition(ClientHandle, Position),
     /// update the motion scale of a client, in percent
     UpdateSensitivity(ClientHandle, u16),
+    /// update the sensitivity of input received from peers through the
+    /// absolute pointer (also used by backends that use absolute injection)
+    SetAbsoluteSensitivity(u16),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// pin (or clear) the expected certificate fingerprint of a client

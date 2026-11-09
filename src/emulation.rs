@@ -151,6 +151,8 @@ enum EmulationRequest {
     RemoteEnter(lan_mouse_ipc::Position),
     /// The peer no longer drives this machine.
     RemoteLeave,
+    /// Update the absolute-pointer sensitivity (percent).
+    SetAbsoluteSensitivity(u16),
     ChangePort(u16),
     Terminate,
 }
@@ -272,6 +274,14 @@ impl Emulation {
     pub(crate) fn remote_enter(&self, pos: lan_mouse_ipc::Position) {
         self.request_tx
             .send(EmulationRequest::RemoteEnter(pos))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Update the absolute-pointer sensitivity (percent) live.
+    pub(crate) fn set_absolute_sensitivity(&self, percent: u16) {
+        self.request_tx
+            .send(EmulationRequest::SetAbsoluteSensitivity(percent))
             .ok()
             .unwrap_or_default();
     }
@@ -610,6 +620,9 @@ impl ListenTask {
                         .emulation_proxy
                         .begin_remote_control(to_pointer_edge(pos)),
                     EmulationRequest::RemoteLeave => self.emulation_proxy.end_remote_control(),
+                    EmulationRequest::SetAbsoluteSensitivity(percent) => self
+                        .emulation_proxy
+                        .set_absolute_sensitivity(percent as f64 / 100.0),
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -671,6 +684,8 @@ enum ProxyRequest {
     RemoteEnter(PointerEdge),
     /// The peer released the machine.
     RemoteLeave,
+    /// Set the absolute-pointer sensitivity gain (1.0 = 100%).
+    SetAbsoluteSensitivity(f64),
     Terminate,
     /// Automatic wake-up (peer session exists). Only starts the backend if no
     /// previous permission request was cancelled/failed.
@@ -702,6 +717,7 @@ impl EmulationProxy {
             selected_backend,
             pending_remote: None,
             allow_portal,
+            absolute_sensitivity: 1.0,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -766,6 +782,14 @@ impl EmulationProxy {
             .unwrap_or_default();
     }
 
+    /// Update the absolute-pointer sensitivity live.
+    fn set_absolute_sensitivity(&self, gain: f64) {
+        self.request_tx
+            .send(ProxyRequest::SetAbsoluteSensitivity(gain))
+            .ok()
+            .unwrap_or_default();
+    }
+
     /// The peer released the machine: stop edge tracking.
     fn end_remote_control(&self) {
         self.request_tx
@@ -808,6 +832,9 @@ struct EmulationTask {
     /// Whether the portal-backed backend may be selected (persisted consent or
     /// an explicit user enable).
     allow_portal: bool,
+    /// absolute-pointer sensitivity gain (1.0 = 100%), applied on creation and
+    /// on every live update
+    absolute_sensitivity: f64,
 }
 
 impl EmulationTask {
@@ -843,6 +870,9 @@ impl EmulationTask {
                     self.pending_remote = Some(edge);
                 }
                 ProxyRequest::RemoteLeave => self.pending_remote = None,
+                ProxyRequest::SetAbsoluteSensitivity(gain) => {
+                    self.absolute_sensitivity = gain;
+                }
                 ProxyRequest::Remove(..) | ProxyRequest::Open(..) => continue,
             }
         }
@@ -884,6 +914,9 @@ impl EmulationTask {
                     ProxyRequest::WarmUp => { /* never retry a portal dialog automatically */ }
                     ProxyRequest::RemoteEnter(edge) => self.pending_remote = Some(edge),
                     ProxyRequest::RemoteLeave => self.pending_remote = None,
+                    ProxyRequest::SetAbsoluteSensitivity(gain) => {
+                        self.absolute_sensitivity = gain;
+                    }
                     ProxyRequest::Remove(..) | ProxyRequest::Open(..) => {
                         /* emulation inactive => ignore */
                     }
@@ -937,6 +970,9 @@ impl EmulationTask {
                     ProxyRequest::Open(addr) => {
                         self.closed.remove(&addr);
                     }
+                    ProxyRequest::SetAbsoluteSensitivity(gain) => {
+                        self.absolute_sensitivity = gain;
+                    }
                     ProxyRequest::WarmUp
                     | ProxyRequest::Reenable
                     | ProxyRequest::Input(..) => {
@@ -971,6 +1007,9 @@ impl EmulationTask {
             EmulationEvent::EmulationEnabled,
             EmulationEvent::EmulationDisabled,
         );
+
+        // Apply the persisted absolute-pointer sensitivity before any input.
+        emulation.set_absolute_sensitivity(self.absolute_sensitivity);
 
         // create active handles
         if let Err(e) = self.create_clients(&mut emulation).await {
@@ -1059,6 +1098,10 @@ impl EmulationTask {
                     ProxyRequest::RemoteLeave => {
                         self.pending_remote = None;
                         emulation.end_remote_control().await;
+                    }
+                    ProxyRequest::SetAbsoluteSensitivity(gain) => {
+                        self.absolute_sensitivity = gain;
+                        emulation.set_absolute_sensitivity(gain);
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable | ProxyRequest::WarmUp => continue,

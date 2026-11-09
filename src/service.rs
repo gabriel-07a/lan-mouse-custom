@@ -227,6 +227,7 @@ impl Service {
             clipboard_from_listener_tx,
             Some(devices.clone()),
         );
+        emulation.set_absolute_sensitivity(config.absolute_pointer_sensitivity());
         let clipboard_enabled_initial = config.clipboard_enabled();
         let clipboard_enabled = Rc::new(Cell::new(clipboard_enabled_initial));
         let clipboard_limits = Rc::new(Cell::new(config.clipboard_limits()));
@@ -553,6 +554,10 @@ impl Service {
             }
             FrontendRequest::UpdateSensitivity(handle, sensitivity) => {
                 self.update_sensitivity(handle, sensitivity);
+                self.save_config();
+            }
+            FrontendRequest::SetAbsoluteSensitivity(percent) => {
+                self.set_absolute_sensitivity(percent);
                 self.save_config();
             }
             FrontendRequest::UpdateFingerprint(handle, fingerprint) => {
@@ -2980,6 +2985,12 @@ impl Service {
             self.capture.connect(handle);
         }
         self.broadcast_client(handle);
+    }
+
+    fn set_absolute_sensitivity(&mut self, percent: u16) {
+        let percent = percent.clamp(10, 500);
+        self.config.set_absolute_pointer_sensitivity(percent);
+        self.emulation.set_absolute_sensitivity(percent);
     }
 
     fn update_sensitivity(&mut self, handle: ClientHandle, sensitivity: u16) {

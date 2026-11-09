@@ -198,6 +198,11 @@ impl InputEmulation {
         self.emulation.set_edge_return_notifier(notifier);
     }
 
+    /// Adjust the absolute-pointer sensitivity (1.0 = 100%) live.
+    pub fn set_absolute_sensitivity(&mut self, gain: f64) {
+        self.emulation.set_absolute_sensitivity(gain);
+    }
+
     /// Arm edge-return tracking for a peer that entered through \`edge\`.
     pub async fn begin_remote_control(&mut self, edge: PointerEdge) {
         self.emulation.begin_remote_control(edge).await;
@@ -473,6 +478,11 @@ trait Emulation: Send {
     /// Backends that can observe the injected pointer at a screen edge report
     /// it here so the service can hand control back to the peer.
     fn set_edge_return_notifier(&mut self, _notifier: EdgeReturnNotifier) {}
+
+    /// Adjust the sensitivity multiplier of the absolute pointer injection
+    /// (1.0 = 100%). Takes effect live; backends without absolute injection
+    /// ignore it.
+    fn set_absolute_sensitivity(&mut self, _gain: f64) {}
 
     /// A peer started driving this machine through \`edge\`.
     ///
