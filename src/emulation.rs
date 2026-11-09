@@ -605,7 +605,7 @@ impl ListenTask {
                         // identity but not yet in the emulation map.
                         self.listener.disconnect_fingerprint(&fingerprint).await;
                     }
-                    EmulationRequest::WarmUp => self.emulation_proxy.reenable(),
+                    EmulationRequest::WarmUp => self.emulation_proxy.warm_up(),
                     EmulationRequest::RemoteEnter(pos) => self
                         .emulation_proxy
                         .begin_remote_control(to_pointer_edge(pos)),
@@ -672,6 +672,11 @@ enum ProxyRequest {
     /// The peer released the machine.
     RemoteLeave,
     Terminate,
+    /// Automatic wake-up (peer session exists). Only starts the backend if no
+    /// previous permission request was cancelled/failed.
+    WarmUp,
+    /// Explicit user request to (re)start the backend; overrides a blocked
+    /// automatic start.
     Reenable,
 }
 
@@ -740,6 +745,15 @@ impl EmulationProxy {
             .unwrap_or_default();
     }
 
+    /// Automatic wake-up: create the backend only if no permission request
+    /// was cancelled before (never loops on a portal dialog).
+    fn warm_up(&self) {
+        self.request_tx
+            .send(ProxyRequest::WarmUp)
+            .ok()
+            .unwrap_or_default();
+    }
+
     /// Arm absolute-pointer edge-return tracking for a peer entering here.
     fn begin_remote_control(&self, edge: PointerEdge) {
         self.request_tx
@@ -791,14 +805,16 @@ impl EmulationTask {
         // Creating the emulation backend can present a portal permission dialog
         // (libei/RemoteDesktop on Wayland). Never ask at service startup: wait
         // until the first input actually has to be injected (or until the user
-        // explicitly enables emulation again). Otherwise every app launch or
-        // reconnect would queue another permission dialog, even when nothing is
-        // being controlled.
+        // explicitly enables emulation again).
         let mut warmup: Option<(Event, SocketAddr)> = None;
+        // Wait for the first reason to start the backend. A cancelled portal
+        // permission must never loop: only this initial start is automatic,
+        // later attempts require an explicit "enable emulation" request (see
+        // the second loop below).
         loop {
             match self.request_rx.recv().await.expect("channel closed") {
                 ProxyRequest::Terminate => return,
-                ProxyRequest::Reenable => break,
+                ProxyRequest::Reenable | ProxyRequest::WarmUp => break,
                 ProxyRequest::Input(event, addr) => {
                     warmup = Some((event, addr));
                     break;
@@ -813,7 +829,7 @@ impl EmulationTask {
         loop {
             if let Err(e) = self.do_emulation(warmup.take()).await {
                 log::warn!(
-                    "input emulation could not start ({e}); enable emulation again to retry"
+                    "input emulation could not start ({e}); automatic retries are disabled - enable emulation again to retry"
                 );
                 // Tell the frontend/peers the truth: input cannot be injected
                 // until the user enables emulation again (a denied portal
@@ -826,12 +842,14 @@ impl EmulationTask {
             if self.exit_requested.get() {
                 break;
             }
-            // wait for reenable request
+            // wait for an explicit enable request (automatic wake-ups are
+            // deliberately dropped while blocked)
             loop {
                 match self.request_rx.recv().await.expect("channel closed") {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::WarmUp => { /* never retry a portal dialog automatically */ }
                     ProxyRequest::Remove(..)
                     | ProxyRequest::Open(..)
                     | ProxyRequest::RemoteEnter(..)
@@ -976,7 +994,7 @@ impl EmulationTask {
                         emulation.end_remote_control().await;
                     }
                     ProxyRequest::Terminate => break Ok(()),
-                    ProxyRequest::Reenable => continue,
+                    ProxyRequest::Reenable | ProxyRequest::WarmUp => continue,
                 },
             }
         }
@@ -1019,7 +1037,8 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Remove(_)
             | ProxyRequest::Open(_)
             | ProxyRequest::RemoteEnter(_)
-            | ProxyRequest::RemoteLeave => continue,
+            | ProxyRequest::RemoteLeave
+            | ProxyRequest::WarmUp => continue,
             ProxyRequest::Reenable => continue,
         }
     }
