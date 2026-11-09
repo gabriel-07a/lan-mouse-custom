@@ -109,3 +109,17 @@ src/client.rs, docs/qa/session.md.
 | RT-08 | P3 | service.rs ReturnHandoff::request | a new crossing could inherit an almost-exhausted retry budget | attempts incremented for the same entry regardless of serial | reset attempts when the serial (episode) changes; accumulate only for same-serial retries |
 
 Note: the earlier statement in this ledger about the exhaustion latch is superseded by RT-07.
+
+
+## Post-release round (v0.2.6 user report) — R-01 fixed
+
+| ID | Sev | Location | Symptom | Root cause | Fix |
+|---|---|---|---|---|---|
+| R-01 | P1 | src/service.rs disconnect_fingerprint, src/listen.rs, src/emulation.rs | Closing the connection on the receiving side (GPUI revoke/deny with disconnect) left the peer "connected" with its physical mouse frozen: the incoming DTLS session stayed alive (UDP still established, peer kept refreshing permissions every 30s) and the controller never received AuthRevoke, so its capture/cursor stayed latched | disconnect_fingerprint only closed addresses present in incoming_conn_info (capture zones). A connected peer that had not started controlling this machine has no zone there, so the listener session was never closed | new LanMouseListener::disconnect_fingerprint (identity -> logical address) and EmulationRequest::DisconnectFingerprint; the emulation loop sends AuthRevoke and closes every session of that fingerprint, and the service calls it in addition to the capture-zone loop. Both revoke and deny paths use it. |
+
+Regression coverage: scripts/qa-two-instances.sh scenario "revoke" (starts two isolated
+instances over IPv4 loopback, connects A->B, revokes B's peer, asserts A becomes
+disconnected, B has no live session and the device is denied) + unit test
+emulation::tests::session_addrs_match_by_full_fingerprint_identity.
+Also verified manually: closing on the controller side (deactivate) already tore the
+receiver's session down correctly.

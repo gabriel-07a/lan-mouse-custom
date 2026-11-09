@@ -109,6 +109,25 @@ pub(crate) enum EmulationEvent {
     PeerAuthRevoked { addr: SocketAddr, reason: u8 },
 }
 
+/// Addresses of every live incoming session of \`fingerprint\`.
+///
+/// Used by revoke/deny-with-disconnect: a peer's session must be closed by its
+/// certificate identity, not only when a capture zone already exists (peers
+/// that are connected but not currently controlling this machine have no zone
+/// in the service). Kept pure so the identity matching is unit-tested.
+fn session_addrs_for_fingerprint(
+    fingerprints: &HashMap<SocketAddr, String>,
+    fingerprint: &str,
+) -> Vec<SocketAddr> {
+    let mut addrs: Vec<SocketAddr> = fingerprints
+        .iter()
+        .filter(|(_, fp)| fp.as_str() == fingerprint)
+        .map(|(addr, _)| *addr)
+        .collect();
+    addrs.sort();
+    addrs
+}
+
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr, u32),
@@ -120,6 +139,10 @@ enum EmulationRequest {
     /// hand-off cannot be confirmed (a lost datagram must not force the user
     /// to re-enable the device on the other machine).
     CloseSession(SocketAddr),
+    /// close every live incoming session of a device identity (revoke/deny
+    /// with disconnect), including sessions that never registered a capture
+    /// zone
+    DisconnectFingerprint(String),
     ChangePort(u16),
     Terminate,
 }
@@ -201,6 +224,19 @@ impl Emulation {
     pub(crate) fn close_session(&self, addr: SocketAddr) {
         self.request_tx
             .send(EmulationRequest::CloseSession(addr))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Close every live incoming session of \`fingerprint\` (revoke/deny).
+    ///
+    /// The peer is told this was an explicit user disconnect, so it deactivates
+    /// its client instead of reconnecting.
+    pub(crate) fn disconnect_fingerprint(&self, fingerprint: &str) {
+        self.request_tx
+            .send(EmulationRequest::DisconnectFingerprint(
+                fingerprint.to_string(),
+            ))
             .ok()
             .unwrap_or_default();
     }
@@ -491,6 +527,32 @@ impl ListenTask {
                         // the peer deactivate the device until it is manually
                         // re-enabled - far worse than the recovery this is for.
                         self.listener.disconnect(addr).await
+                    }
+                    EmulationRequest::DisconnectFingerprint(fingerprint) => {
+                        // Close every session of this identity, not only the
+                        // ones that already registered a capture zone: a revoke
+                        // of a connected peer used to leave its DTLS session
+                        // alive (peer stayed active with the cursor captured).
+                        let addrs =
+                            session_addrs_for_fingerprint(&self.fingerprints, &fingerprint);
+                        for addr in addrs {
+                            log::info!(
+                                "closing incoming session from {addr}: device {fingerprint} revoked"
+                            );
+                            self.listener
+                                .reply(
+                                    addr,
+                                    ProtoEvent::AuthRevoke {
+                                        session_id: 0,
+                                        reason: 1,
+                                    },
+                                )
+                                .await;
+                            self.listener.disconnect(addr).await;
+                        }
+                        // Also ask the listener to close sessions known by
+                        // identity but not yet in the emulation map.
+                        self.listener.disconnect_fingerprint(&fingerprint).await;
                     }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
@@ -892,5 +954,35 @@ mod edge_return_guard_tests {
         .await;
         assert!(result.is_ok(), "the loop should yield, not spin");
         assert_eq!(arm_polls, 0, "a closed notifier must be disabled");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_addrs_match_by_full_fingerprint_identity() {
+        let mut map = HashMap::new();
+        let a: SocketAddr = "127.0.0.1:1000".parse().expect("addr");
+        let b: SocketAddr = "127.0.0.2:2000".parse().expect("addr");
+        let c: SocketAddr = "127.0.0.3:3000".parse().expect("addr");
+        map.insert(a, "aa:bb".to_string());
+        map.insert(b, "aa:bb".to_string());
+        map.insert(c, "cc:dd".to_string());
+
+        assert_eq!(
+            session_addrs_for_fingerprint(&map, "aa:bb"),
+            vec![a, b],
+            "every live session of the identity must be returned"
+        );
+        assert_eq!(session_addrs_for_fingerprint(&map, "cc:dd"), vec![c]);
+        assert!(
+            session_addrs_for_fingerprint(&map, "aa").is_empty(),
+            "a fingerprint prefix must not match"
+        );
+        assert!(session_addrs_for_fingerprint(&map, "aa:bb:cc").is_empty());
+        assert!(session_addrs_for_fingerprint(&map, "").is_empty());
+        assert!(session_addrs_for_fingerprint(&HashMap::new(), "aa:bb").is_empty());
     }
 }

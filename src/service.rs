@@ -1548,6 +1548,11 @@ impl Service {
         for addr in live {
             self.emulation.disconnect(addr);
         }
+        // Sessions that never registered a capture zone are not in
+        // incoming_conn_info; close them by identity too, otherwise a revoke or
+        // deny of a connected peer leaves its DTLS session alive (the peer
+        // keeps its client active and its cursor captured).
+        self.emulation.disconnect_fingerprint(fingerprint);
     }
 
     /// Push the outgoing policy of a device to the capture task and stop the

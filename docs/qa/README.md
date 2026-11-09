@@ -98,3 +98,11 @@ Linux feature matrix, and cargo check for the changed crates on x86_64-pc-window
 x86_64-pc-windows-gnu and x86_64-apple-darwin. Binary E2E re-run: IPC socket 0600, CLI create with an
 invalid fingerprint now exits 1 instead of printing success, graceful cli shutdown and SIGTERM teardown
 (exit 0, socket removed).
+
+
+## Post-release fix (v0.2.7)
+
+User report after v0.2.6: closing the connection on the receiving side left the peer
+connected with the physical mouse frozen (cursor still captured). Root cause and fix in
+session.md row R-01: session teardown by certificate identity, including sessions that
+never registered a capture zone. Regression: scripts/qa-two-instances.sh revoke.

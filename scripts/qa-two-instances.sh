@@ -634,9 +634,49 @@ if true; then
     }
 fi
 
+# Regression (post-release report): closing the connection on the receiving
+# side must tear down the live incoming DTLS session by certificate identity,
+# not only when a capture zone already exists. Before the fix a revoke left the
+# peer "connected" with its cursor still captured (physical mouse frozen).
+scenario_revoke() {
+    say "### scenario revoke: revogar no receptor derruba a sessão e libera o controlador"
+    start_pair || return 1
+    write_config a "$PORT_A" "[[clients]]
+hostname = \"b\"
+ips = [\"127.0.0.1\"]
+port = $PORT_B
+position = \"right\"
+activate_on_startup = true"
+    restart_daemon a || return 1
+    if ! wait_connected a 10; then
+        fail "A não conectou a B antes do revoke"
+        return 1
+    fi
+    pass "A conectado a B"
+    local fp waited
+    fp="$(cli b history --limit 5 | grep -oE 'fp=[0-9a-f:]+' | head -1 | cut -d= -f2)"
+    if [ -z "$fp" ]; then
+        fail "não foi possível obter o fingerprint do peer no receptor"
+        return 1
+    fi
+    note "fingerprint do peer: $fp"
+    cli b revoke "$fp" >/dev/null || note "revoke retornou erro"
+    waited=0
+    while [ "$waited" -lt 50 ]; do
+        case "$(first_status a)" in
+            disconnected*) break ;;
+        esac
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    check_contains "controlador liberado após o revoke" "disconnected" "$(first_status a)"
+    check_contains "receptor sem sessão ativa após o revoke" "disconnected" "$(first_status b)"
+    check_contains "receptor negou o dispositivo" "no devices known yet" "$(cli b devices)"
+}
+
 SCENARIOS=("$@")
 if [ "${#SCENARIOS[@]}" -eq 0 ]; then
-    SCENARIOS=(dual duplicate peer_down disconnect stale_config reset_config no_spin isolation)
+    SCENARIOS=(dual duplicate peer_down disconnect revoke stale_config reset_config no_spin isolation)
 fi
 
 say "lan-mouse QA two-instances (repo: $REPO_ROOT, bin: $BIN, base: $BASE)"
@@ -649,6 +689,9 @@ for scenario in "${SCENARIOS[@]}"; do
         duplicate) scenario_duplicate ;;
         ipv6_only) scenario_ipv6_only ;;
         peer_down) scenario_peer_down ;;
+        revoke)
+            scenario_revoke
+            ;;
         disconnect) scenario_disconnect ;;
         stale_config) scenario_stale_config ;;
         reset_config) scenario_reset_config ;;

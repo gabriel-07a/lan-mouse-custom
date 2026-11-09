@@ -665,6 +665,28 @@ impl LanMouseListener {
         }
     }
 
+    /// Close the live incoming session of \`fingerprint\`, if any.
+    ///
+    /// Identity is the certificate fingerprint, so this also covers sessions
+    /// that never registered a capture zone: the service only tracks zones for
+    /// peers that actually started controlling this machine, and a revoke of a
+    /// connected-but-not-yet-capturing peer used to leave its DTLS session
+    /// alive (the peer kept its cursor captured and its client active).
+    /// Returns the closed logical address(es) for diagnostics and tests.
+    pub(crate) async fn disconnect_fingerprint(&self, fingerprint: &str) -> Vec<SocketAddr> {
+        let addrs: Vec<SocketAddr> = self
+            .sessions
+            .borrow()
+            .iter()
+            .filter(|(fp, _)| fp.as_str() == fingerprint)
+            .map(|(_, meta)| meta.logical_addr)
+            .collect();
+        for addr in &addrs {
+            self.disconnect(*addr).await;
+        }
+        addrs
+    }
+
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
         let conn = self.conns.borrow().get(&addr).cloned()?;
         let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
