@@ -119,3 +119,7 @@ See capture.md R-02 and frontend.md R-03/R-04.
 
 - (v0.2.8) Peer side is now an explicit selector on the card and can be changed live on both the
   controller and the receiving side without disconnecting. Regression: qa-two-instances.sh side.
+
+- Closing the connection on ANY machine now completely closes it (outgoing transport, incoming session,
+  AuthRevoke to the peer, local suppression cleared). Side edits no longer move a live incoming capture
+  zone. Regression: qa-two-instances.sh scenario close.

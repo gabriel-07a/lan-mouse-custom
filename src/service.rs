@@ -158,11 +158,6 @@ pub struct Service {
     /// A frontend asked the service to shut down (CLI/installer upgrade path).
     /// The run loop breaks and the regular teardown runs once.
     shutdown_requested: bool,
-    /// Peer currently driving this machine (addr, entry edge), if any.
-    ///
-    /// Needed to move the capture suppression edge when the user changes the
-    /// peer's side while it is already connected/controlling.
-    active_remote_peer: Option<(SocketAddr, Position)>,
 }
 
 #[derive(Debug)]
@@ -307,7 +302,6 @@ impl Service {
             return_serial: 0,
             peer_permissions_seen: Default::default(),
             shutdown_requested: false,
-            active_remote_peer: None,
         };
         Ok(service)
     }
@@ -803,7 +797,6 @@ impl Service {
                 // through also lets the capture side still detect the return
                 // hand-off at exactly that edge.
                 self.capture.set_remote_peer(Some(pos));
-                self.active_remote_peer = Some((addr, pos));
                 // Resolve the client entry before the fingerprint is moved
                 // into the session registry below.
                 let handle = self.client_for_peer(addr, &fingerprint);
@@ -844,11 +837,6 @@ impl Service {
                 }
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
-                }
-                if let Some((active, _)) = self.active_remote_peer {
-                    if active == addr {
-                        self.active_remote_peer = None;
-                    }
                 }
                 if self.incoming_conns.is_empty() {
                     self.capture.set_remote_peer(None);
@@ -1348,7 +1336,6 @@ impl Service {
         }
         if self.incoming_conns.is_empty() {
             self.capture.set_remote_peer(None);
-            self.active_remote_peer = None;
         }
     }
 
@@ -2679,15 +2666,36 @@ impl Service {
     fn deactivate_client_and_peer(&mut self, handle: ClientHandle) {
         log::debug!("explicitly disconnecting client {handle}");
         let fingerprint = self.client_manager.fingerprint(handle);
-        if self.client_manager.deactivate_client(handle) {
+        // Mark inactive first so the reconnect loop cannot revive the link.
+        let was_active = self.client_manager.deactivate_client(handle);
+        // Close the outgoing transport with an explicit AuthRevoke (only when
+        // there was one; a receiving-only client has no outgoing transport).
+        if was_active {
             self.capture.disconnect(handle);
-            if let Some(fingerprint) = fingerprint {
+        }
+        // A live incoming session can exist for a client that is itself
+        // inactive (the peer controls us; our configured client points back).
+        // The full teardown must run in that case too: otherwise closing the
+        // connection on this machine left the peer controlling it.
+        if let Some(addr) = self.client_manager.incoming_addr(handle) {
+            if let Some(addr) = self.remove_incoming(addr) {
+                self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
+            }
+        }
+        if let Some(fingerprint) = fingerprint {
+            if !fingerprint.is_empty() {
+                // Closes every remaining live session of this identity (and
+                // sends AuthRevoke to the peer).
                 self.disconnect_fingerprint(&fingerprint);
             }
-            self.capture.destroy(handle);
-            self.broadcast_client(handle);
-            log::info!("explicitly disconnected client {handle}");
         }
+        self.capture.destroy(handle);
+        self.client_manager.set_incoming_addr(handle, None);
+        if self.incoming_conns.is_empty() {
+            self.capture.set_remote_peer(None);
+        }
+        self.broadcast_client(handle);
+        log::info!("explicitly disconnected client {handle}");
     }
 
     /// Deactivate every configured/local client entry belonging to `fingerprint`.
@@ -2843,19 +2851,13 @@ impl Service {
             self.broadcast_client(handle);
             return;
         }
-        // A live incoming session uses the client's position as its capture
-        // zone: move the zone now so changing the side while the peer is
-        // connected takes effect without disconnecting/reconnecting.
-        if let Some(addr) = self.client_manager.incoming_addr(handle) {
-            let fingerprint = self.client_manager.fingerprint(handle).unwrap_or_default();
-            self.update_incoming(addr, pos, fingerprint);
-            if matches!(self.active_remote_peer, Some((active, _)) if active == addr) {
-                self.active_remote_peer = Some((addr, pos));
-                // Follow the peer's new entry edge for local-input suppression
-                // and for the return hand-off.
-                self.capture.set_remote_peer(Some(pos));
-            }
-        }
+        // Only the OUTGOING capture barrier follows this client position.
+        //
+        // A live incoming session's entry edge is decided by the peer
+        // (ProtoEvent::Enter carries the peer's own configuration). Moving the
+        // incoming capture zone from a local position edit broke the return
+        // hand-off: the injected pointer then arrived through an edge with no
+        // matching zone, so the cursor stayed trapped on this machine.
         // Move the outgoing capture barrier in place. The transport must stay
         // up: deactivating/reactivating the client cleared active_addr and the
         // UI fell back to "waiting approval" even though the link was alive.

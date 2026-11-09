@@ -704,9 +704,70 @@ activate_on_startup = true"
     check_contains "controlador não caiu com a troca do receptor" "connected" "$(first_status a)"
 }
 
+# Regression (user report): closing the connection on ANY machine must end
+# control on both sides and close the transport completely - the peer must not
+# keep controlling this machine, and the link must not come back by itself.
+scenario_close() {
+    say "### scenario close: fechar em qualquer lado encerra o controle dos dois lados"
+    start_pair || return 1
+    write_config a "$PORT_A" "[[clients]]
+hostname = \"b\"
+ips = [\"127.0.0.1\"]
+port = $PORT_B
+position = \"right\"
+activate_on_startup = true"
+    restart_daemon a || return 1
+    if ! wait_connected a 10; then
+        fail "A não conectou a B antes do teste"
+        return 1
+    fi
+    check_contains "receptor vê a sessão de entrada" "receiving-only" "$(first_status b)"
+
+    cli b deactivate 0 >/dev/null 2>&1
+    local waited=0
+    while [ "$waited" -lt 50 ]; do
+        case "$(first_status a)" in
+            disconnected*) break ;;
+        esac
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    check_contains "fechar no receptor libera o controlador" "disconnected" "$(first_status a)"
+    check_contains "fechar no receptor encerra a sessão de entrada" "disconnected" "$(first_status b)"
+    sleep 2
+    check_contains "controlador não reconecta sozinho" "disconnected" "$(first_status a)"
+
+    cli a activate 0 >/dev/null 2>&1
+    if ! wait_connected a 10; then
+        fail "A não reconectou para o segundo caso"
+        return 1
+    fi
+    cli a deactivate 0 >/dev/null 2>&1
+    waited=0
+    while [ "$waited" -lt 50 ]; do
+        case "$(first_status b)" in
+            disconnected*) break ;;
+        esac
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    check_contains "fechar no controlador encerra a sessão do receptor" "disconnected" "$(first_status b)"
+    check_contains "fechar no controlador desconecta o controlador" "disconnected" "$(first_status a)"
+
+    cli a activate 0 >/dev/null 2>&1
+    if ! wait_connected a 10; then
+        fail "A não reconectou para o caso de lado"
+        return 1
+    fi
+    cli b set-position 0 bottom >/dev/null 2>&1
+    sleep 1
+    check_contains "trocar o lado no receptor mantém o controlador conectado" "connected" "$(first_status a)"
+    check_contains "trocar o lado no receptor mantém a sessão de entrada" "receiving-only" "$(first_status b)"
+}
+
 SCENARIOS=("$@")
 if [ "${#SCENARIOS[@]}" -eq 0 ]; then
-    SCENARIOS=(dual duplicate peer_down disconnect revoke side stale_config reset_config no_spin isolation)
+    SCENARIOS=(dual duplicate peer_down disconnect revoke side close stale_config reset_config no_spin isolation)
 fi
 
 say "lan-mouse QA two-instances (repo: $REPO_ROOT, bin: $BIN, base: $BASE)"
@@ -720,6 +781,7 @@ for scenario in "${SCENARIOS[@]}"; do
         ipv6_only) scenario_ipv6_only ;;
         peer_down) scenario_peer_down ;;
         side) scenario_side ;;
+        close) scenario_close ;;
         revoke)
             scenario_revoke
             ;;

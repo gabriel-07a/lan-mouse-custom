@@ -417,7 +417,11 @@ fn row_action(state: LinkState, active: bool) -> RowAction {
             RowAction::Disconnect
         }
         LinkState::Receiving if active => RowAction::Cancel,
-        LinkState::Receiving => RowAction::ConnectAlso,
+        // A peer that only receives input is controlled by the other machine;
+        // "Disconnect" must actually close that incoming session. It used to
+        // map to "Also connect", so clicking it did nothing and the peer kept
+        // controlling this machine.
+        LinkState::Receiving => RowAction::Disconnect,
     }
 }
 
@@ -1738,12 +1742,32 @@ impl Dashboard {
         let sensitivity = peer.sensitivity;
         let primary = peer.primary;
         let action_members = peer.members.clone();
+        let also_connect_members = peer.members.clone();
         let edit_members = peer.members.clone();
         let dns_members = peer.members.clone();
         let position_members = peer.members.clone();
         let sensitivity_down_members = peer.members.clone();
         let sensitivity_up_members = peer.members.clone();
         let delete_members = peer.members.clone();
+        // Optional secondary action: a receiving-only peer can still be asked
+        // to also connect back, while the primary action is now Disconnect.
+        let also_connect: Vec<gpui::AnyElement> = if state == LinkState::Receiving && !peer.active {
+            vec![
+                self.action_button(
+                    "connect-also",
+                    "Also connect",
+                    0x1d222a,
+                    TEXT,
+                    cx,
+                    move |this, _, _, _| {
+                        this.apply_row_action(&also_connect_members, RowAction::ConnectAlso)
+                    },
+                )
+                .into_any_element(),
+            ]
+        } else {
+            Vec::new()
+        };
         div()
             .flex()
             .flex_col()
@@ -1814,6 +1838,7 @@ impl Dashboard {
                                 this.apply_row_action(&action_members, action)
                             })),
                     )
+                    .children(also_connect)
                     .child(div().text_xs().text_color(rgb(MUTED)).child(detail))
                     .when(version_mismatch, |this| {
                         this.child(
@@ -4145,11 +4170,14 @@ mod tests {
                 assert_ne!(derived.badge(), "Connected");
             }
         }
+        // A receiving-only peer must be disconnectable: the primary action
+        // closes the incoming session (the reverse "Also connect" stays as a
+        // secondary button in the card).
         assert_eq!(
             row_action(LinkState::Receiving, false),
-            RowAction::ConnectAlso
+            RowAction::Disconnect
         );
-        assert!(row_action(LinkState::Receiving, false).wants_activation());
+        assert!(!row_action(LinkState::Receiving, false).wants_activation());
         assert_eq!(row_action(LinkState::Receiving, true), RowAction::Cancel);
         assert!(!row_action(LinkState::Receiving, true).wants_activation());
     }
