@@ -1,13 +1,32 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use futures::StreamExt;
 
-use std::{net::IpAddr, path::PathBuf, time::Duration};
+use std::{
+    net::IpAddr,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 use lan_mouse_ipc::{
-    Capabilities, ClientHandle, ConnectionError, DirectionPolicy, FrontendEvent, FrontendRequest,
-    IpcError, Position, connect_async,
+    AsyncFrontendEventReader, AsyncFrontendRequestWriter, Capabilities, ClientHandle,
+    ConnectionError, DirectionPolicy, FrontendEvent, FrontendRequest, IpcError, Position,
+    connect_async,
 };
+
+/// How long any single request/response exchange with the service may take
+/// before the CLI reports a timeout instead of hanging forever.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait for an asynchronous error after a request that the IPC
+/// protocol does not acknowledge explicitly (see [`settle`]).
+const SETTLE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Accepted range for the per-client motion sensitivity, in percent. Matches
+/// the clamp applied by the service (`src/service.rs`, `update_sensitivity`).
+const SENSITIVITY_RANGE: std::ops::RangeInclusive<u16> = 10..=500;
+
+/// How long `shutdown` waits for the service to close its IPC socket.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -20,6 +39,12 @@ pub enum CliError {
     InvalidArgument(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("the service did not answer within {0:?} - is it hung?")]
+    ResponseTimeout(Duration),
+    #[error("the service reported an error: {0}")]
+    ServiceError(String),
+    #[error("no client with id {0} (use `lan-mouse-cli list` to see the configured clients)")]
+    NoSuchClient(ClientHandle),
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -188,6 +213,12 @@ enum CliSubcommand {
         #[arg(value_enum)]
         action: ClipboardAction,
     },
+    /// ask the running service to shut down gracefully
+    ///
+    /// The service releases held keys/buttons, terminates capture, emulation,
+    /// clipboard and DNS, writes its configuration and removes the IPC socket
+    /// before exiting. Exits non-zero if the service does not go away in time.
+    Shutdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -215,17 +246,22 @@ fn parse_duration(spec: &str) -> Result<Option<u64>, CliError> {
             "invalid duration: {spec} (use 30m, 2h, 1d or forever)"
         ))
     })?;
-    let seconds = match unit {
-        "s" => value,
-        "m" => value * 60,
-        "h" => value * 60 * 60,
-        "d" => value * 24 * 60 * 60,
+    let unit_seconds: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
         _ => {
             return Err(CliError::InvalidArgument(format!(
                 "invalid duration: {spec} (use 30m, 2h, 1d or forever)"
             )));
         }
     };
+    // Checked multiplication: "18446744073709551615d" must be rejected, not
+    // panic (debug) or wrap into a tiny/negative-ish duration (release).
+    let seconds = value
+        .checked_mul(unit_seconds)
+        .ok_or_else(|| CliError::InvalidArgument(format!("duration too large: {spec}")))?;
     Ok(Some(seconds.max(1)))
 }
 
@@ -239,6 +275,146 @@ fn parse_policy(spec: &str) -> Result<DirectionPolicy, CliError> {
         None => Err(CliError::InvalidArgument(format!(
             "invalid capability list: {spec} (use pointer,keyboard,clipboard, all or none)"
         ))),
+    }
+}
+
+/// Validate a listen/peer port. Port 0 is never a usable peer port and the
+/// service would silently store it.
+fn validate_port(port: u16) -> Result<u16, CliError> {
+    if port == 0 {
+        Err(CliError::InvalidArgument(
+            "port 0 is not a valid port (use 1-65535)".to_string(),
+        ))
+    } else {
+        Ok(port)
+    }
+}
+
+/// Keep only IPv4 addresses: Lan Mouse is IPv4-only by product decision, so an
+/// IPv6 `--ips` value would be silently ignored by the service.
+fn validate_ips(ips: Vec<IpAddr>) -> Result<Vec<IpAddr>, CliError> {
+    let (v4, ignored): (Vec<_>, Vec<_>) = ips.into_iter().partition(|ip| ip.is_ipv4());
+    for ip in &ignored {
+        eprintln!("warning: ignoring IPv6 address {ip} (Lan Mouse uses IPv4 only)");
+    }
+    if v4.is_empty() && !ignored.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "no IPv4 address left after filtering (Lan Mouse uses IPv4 only)".to_string(),
+        ));
+    }
+    Ok(v4)
+}
+
+/// Validate the motion sensitivity against the range the service enforces.
+fn validate_sensitivity(percent: u16) -> Result<u16, CliError> {
+    if SENSITIVITY_RANGE.contains(&percent) {
+        Ok(percent)
+    } else {
+        Err(CliError::InvalidArgument(format!(
+            "sensitivity {percent} is out of range ({}..={}%)",
+            SENSITIVITY_RANGE.start(),
+            SENSITIVITY_RANGE.end()
+        )))
+    }
+}
+
+/// Read the next event, turning an asynchronous `Error` reply into a CLI
+/// error and enforcing a hard timeout.
+///
+/// `NoSuchClient` is not fatal here: it can be an unrelated state broadcast
+/// (a stale handle being updated) and command-specific call sites check it
+/// explicitly (`ensure_client_exists` / `settle`).
+async fn next_event(rx: &mut AsyncFrontendEventReader) -> Result<FrontendEvent, CliError> {
+    match rx.next_event(Some(RESPONSE_TIMEOUT)).await? {
+        Some(FrontendEvent::Error(message)) => Err(CliError::ServiceError(message)),
+        Some(event) => Ok(event),
+        None => Err(CliError::ResponseTimeout(RESPONSE_TIMEOUT)),
+    }
+}
+
+/// Fail before a command that targets a client handle when that handle does
+/// not exist.
+///
+/// Most `Activate`/`Deactivate`/`Delete` requests for an unknown handle are
+/// silently ignored by the service (no reply at all), which used to make the
+/// CLI exit 0 without doing anything. Enumerating first gives a truthful
+/// error; the small race with a concurrent delete is acceptable for a CLI.
+async fn ensure_client_exists(
+    rx: &mut AsyncFrontendEventReader,
+    tx: &mut AsyncFrontendRequestWriter,
+    id: ClientHandle,
+) -> Result<(), CliError> {
+    tx.request(FrontendRequest::Enumerate()).await?;
+    loop {
+        match next_event(rx).await? {
+            FrontendEvent::Enumerate(clients) => {
+                if clients.iter().any(|(handle, _, _)| *handle == id) {
+                    return Ok(());
+                }
+                return Err(CliError::NoSuchClient(id));
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Wait briefly for a service-side rejection after a request that has no
+/// explicit acknowledgement.
+///
+/// The IPC protocol replies with `Error`/`NoSuchClient` when a request is
+/// rejected, and with `State`/`Deleted` for handle updates. Consuming those
+/// before exiting makes the CLI exit non-zero on failure instead of printing
+/// success optimistically (e.g. `allow` with an invalid fingerprint).
+async fn settle(
+    rx: &mut AsyncFrontendEventReader,
+    handle: Option<ClientHandle>,
+) -> Result<(), CliError> {
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        match rx.next_event(Some(remaining)).await? {
+            None => return Ok(()),
+            Some(FrontendEvent::Error(message)) => return Err(CliError::ServiceError(message)),
+            Some(FrontendEvent::NoSuchClient(id)) => return Err(CliError::NoSuchClient(id)),
+            Some(FrontendEvent::State(id, ..))
+            | Some(FrontendEvent::Deleted(id))
+            | Some(FrontendEvent::Created(id, ..))
+                if handle == Some(id) =>
+            {
+                return Ok(());
+            }
+            Some(_) => continue,
+        }
+    }
+}
+
+/// Wait out the settle window for a rejection of an update batch.
+///
+/// Unlike the single-request settle, the first State event does not end the
+/// wait: a batch sends several updates and only the last one may be rejected
+/// (for example an invalid pinned fingerprint), so the CLI must keep reading
+/// until the window expires and surface the first Error/NoSuchClient.
+async fn settle_updates(
+    rx: &mut AsyncFrontendEventReader,
+    handle: ClientHandle,
+) -> Result<(), CliError> {
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        match rx.next_event(Some(remaining)).await? {
+            None => return Ok(()),
+            Some(FrontendEvent::Error(message)) => return Err(CliError::ServiceError(message)),
+            Some(FrontendEvent::NoSuchClient(id)) if id == handle => {
+                return Err(CliError::NoSuchClient(id));
+            }
+            Some(_) => continue,
+        }
     }
 }
 
@@ -260,119 +436,158 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             sensitivity,
             fingerprint,
         }) => {
+            let port = match port {
+                Some(port) => Some(validate_port(port)?),
+                None => None,
+            };
+            let sensitivity = match sensitivity {
+                Some(percent) => Some(validate_sensitivity(percent)?),
+                None => None,
+            };
+            let ips = match ips {
+                Some(ips) => Some(validate_ips(ips)?),
+                None => None,
+            };
+            // An empty hostname is not a name: treat it as "clear".
+            let hostname = hostname.filter(|name| !name.trim().is_empty());
             tx.request(FrontendRequest::Create).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::Created(handle, _, _) = e? {
-                    if let Some(hostname) = hostname {
-                        tx.request(FrontendRequest::UpdateHostname(handle, Some(hostname)))
-                            .await?;
-                    }
-                    if let Some(port) = port {
-                        tx.request(FrontendRequest::UpdatePort(handle, port))
-                            .await?;
-                    }
-                    if let Some(ips) = ips {
-                        tx.request(FrontendRequest::UpdateFixIps(handle, ips))
-                            .await?;
-                    }
-                    if let Some(position) = position {
-                        tx.request(FrontendRequest::UpdatePosition(handle, position))
-                            .await?;
-                    }
-                    if let Some(enter_hook) = enter_hook {
-                        tx.request(FrontendRequest::UpdateEnterHook(handle, Some(enter_hook)))
-                            .await?;
-                    }
-                    if let Some(leave_hook) = leave_hook {
-                        tx.request(FrontendRequest::UpdateLeaveHook(handle, Some(leave_hook)))
-                            .await?;
-                    }
-                    if let Some(sensitivity) = sensitivity {
-                        tx.request(FrontendRequest::UpdateSensitivity(handle, sensitivity))
-                            .await?;
-                    }
-                    if let Some(fingerprint) = fingerprint {
-                        tx.request(FrontendRequest::UpdateFingerprint(
-                            handle,
-                            Some(fingerprint),
-                        ))
+            loop {
+                let FrontendEvent::Created(handle, _, _) = next_event(&mut rx).await? else {
+                    continue;
+                };
+                if let Some(hostname) = hostname {
+                    tx.request(FrontendRequest::UpdateHostname(handle, Some(hostname)))
                         .await?;
-                    }
-                    if activate {
-                        tx.request(FrontendRequest::Activate(handle, true)).await?;
-                        println!(
-                            "client {handle} activated; if this device is not authorized on \
-                             the peer yet, approve the request on that machine"
-                        );
-                    }
-                    break;
                 }
+                if let Some(port) = port {
+                    tx.request(FrontendRequest::UpdatePort(handle, port))
+                        .await?;
+                }
+                if let Some(ips) = ips {
+                    tx.request(FrontendRequest::UpdateFixIps(handle, ips))
+                        .await?;
+                }
+                if let Some(position) = position {
+                    tx.request(FrontendRequest::UpdatePosition(handle, position))
+                        .await?;
+                }
+                if let Some(enter_hook) = enter_hook {
+                    tx.request(FrontendRequest::UpdateEnterHook(handle, Some(enter_hook)))
+                        .await?;
+                }
+                if let Some(leave_hook) = leave_hook {
+                    tx.request(FrontendRequest::UpdateLeaveHook(handle, Some(leave_hook)))
+                        .await?;
+                }
+                if let Some(sensitivity) = sensitivity {
+                    tx.request(FrontendRequest::UpdateSensitivity(handle, sensitivity))
+                        .await?;
+                }
+                if let Some(fingerprint) = fingerprint {
+                    tx.request(FrontendRequest::UpdateFingerprint(
+                        handle,
+                        Some(fingerprint),
+                    ))
+                    .await?;
+                }
+                // Surface a rejected update (for example an invalid pinned
+                // fingerprint) instead of claiming success: the first State
+                // event only proves the first update was accepted, so wait out
+                // the whole batch window before activating.
+                settle_updates(&mut rx, handle).await?;
+                if activate {
+                    tx.request(FrontendRequest::Activate(handle, true)).await?;
+                    settle(&mut rx, Some(handle)).await?;
+                    println!(
+                        "client {handle} activated; if this device is not authorized on \
+                         the peer yet, approve the request on that machine"
+                    );
+                }
+                break;
             }
         }
-        CliSubcommand::RemoveClient { id } => tx.request(FrontendRequest::Delete(id)).await?,
-        CliSubcommand::Activate { id } => tx.request(FrontendRequest::Activate(id, true)).await?,
+        CliSubcommand::RemoveClient { id } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            tx.request(FrontendRequest::Delete(id)).await?;
+            settle(&mut rx, Some(id)).await?;
+        }
+        CliSubcommand::Activate { id } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            tx.request(FrontendRequest::Activate(id, true)).await?;
+            settle(&mut rx, Some(id)).await?;
+        }
         CliSubcommand::Deactivate { id } => {
-            tx.request(FrontendRequest::Activate(id, false)).await?
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            tx.request(FrontendRequest::Activate(id, false)).await?;
+            settle(&mut rx, Some(id)).await?;
         }
         CliSubcommand::List => {
             tx.request(FrontendRequest::Enumerate()).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::Enumerate(clients) = e? {
-                    for (handle, config, state) in clients {
-                        let host = config.hostname.unwrap_or("unknown".to_owned());
-                        let port = config.port;
-                        let pos = config.pos;
-                        let active = state.active;
-                        let ips = state.ips;
-                        let status = match (
-                            state.active,
-                            state.active_addr,
-                            state.alive,
-                            state.incoming_addr,
-                        ) {
-                            (true, Some(out), true, Some(inc)) => {
-                                format!("connected (bidirectional: out={out}, in={inc})")
-                            }
-                            (true, Some(out), true, None) => format!("connected (to {out})"),
-                            (true, _, _, Some(inc)) => format!("connected (from {inc})"),
-                            (true, None, _, None) => "waiting-approval".to_string(),
-                            (true, Some(out), false, None) => format!("reconnecting ({out})"),
-                            (false, _, _, Some(inc)) => format!("receiving-only (from {inc})"),
-                            (false, _, _, None) => "disconnected".to_string(),
-                        };
-                        let rtt = state
-                            .rtt_ms
-                            .map(|ms| format!(", rtt: {ms}ms"))
-                            .unwrap_or_default();
-                        println!(
-                            "id {handle}: {host}:{port} ({pos}) active: {active}, status: {status}{rtt}, ips: {ips:?}"
-                        );
-                    }
-                    break;
+            loop {
+                let FrontendEvent::Enumerate(clients) = next_event(&mut rx).await? else {
+                    continue;
+                };
+                if clients.is_empty() {
+                    println!("no clients configured");
                 }
+                for (handle, config, state) in clients {
+                    let host = config.hostname.unwrap_or("unknown".to_owned());
+                    let port = config.port;
+                    let pos = config.pos;
+                    let active = state.active;
+                    let ips = state.ips;
+                    let status = match (
+                        state.active,
+                        state.active_addr,
+                        state.alive,
+                        state.incoming_addr,
+                    ) {
+                        (true, Some(out), true, Some(inc)) => {
+                            format!("connected (bidirectional: out={out}, in={inc})")
+                        }
+                        (true, Some(out), true, None) => format!("connected (to {out})"),
+                        (true, _, _, Some(inc)) => format!("connected (from {inc})"),
+                        (true, None, _, None) => "waiting-approval".to_string(),
+                        (true, Some(out), false, None) => format!("reconnecting ({out})"),
+                        (false, _, _, Some(inc)) => format!("receiving-only (from {inc})"),
+                        (false, _, _, None) => "disconnected".to_string(),
+                    };
+                    let rtt = state
+                        .rtt_ms
+                        .map(|ms| format!(", rtt: {ms}ms"))
+                        .unwrap_or_default();
+                    println!(
+                        "id {handle}: {host}:{port} ({pos}) active: {active}, status: {status}{rtt}, ips: {ips:?}"
+                    );
+                }
+                break;
             }
         }
         CliSubcommand::Scan => {
             tx.request(FrontendRequest::ScanNetwork).await?;
-            while let Some(event) = rx.next().await {
-                if let FrontendEvent::NetworkScan(devices) = event? {
-                    for device in devices {
-                        let name = device.hostname.unwrap_or_else(|| "-".to_string());
-                        let lm = if device.lan_mouse { "lan-mouse" } else { "-" };
-                        let configured = if device.configured { "configured" } else { "" };
-                        let version = device.version.unwrap_or_default();
-                        println!(
-                            "{:<15} {:<20} {:<8} {:<10} {:<8} {}",
-                            device.ip,
-                            name,
-                            device.link.to_string(),
-                            lm,
-                            version,
-                            configured
-                        );
-                    }
-                    break;
+            loop {
+                let FrontendEvent::NetworkScan(devices) = next_event(&mut rx).await? else {
+                    continue;
+                };
+                if devices.is_empty() {
+                    println!("no devices found on the local network");
                 }
+                for device in devices {
+                    let name = device.hostname.unwrap_or_else(|| "-".to_string());
+                    let lm = if device.lan_mouse { "lan-mouse" } else { "-" };
+                    let configured = if device.configured { "configured" } else { "" };
+                    let version = device.version.unwrap_or_default();
+                    println!(
+                        "{:<15} {:<20} {:<8} {:<10} {:<8} {}",
+                        device.ip,
+                        name,
+                        device.link.to_string(),
+                        lm,
+                        version,
+                        configured
+                    );
+                }
+                break;
             }
         }
         CliSubcommand::Trust {
@@ -388,6 +603,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 outgoing,
             })
             .await?;
+            settle(&mut rx, None).await?;
             println!(
                 "trusted {address}: incoming [{}], outgoing [{}]",
                 incoming.capabilities.summary(),
@@ -396,32 +612,33 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::Trusted => {
             tx.request(FrontendRequest::ListAddressRules).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::AddressRules(rules) = e? {
-                    if rules.is_empty() {
-                        println!("no address rules");
-                    }
-                    for rule in rules {
-                        println!(
-                            "{:<24} in [{}]{} out [{}]{}{}",
-                            rule.address,
-                            rule.incoming.capabilities.summary(),
-                            if rule.incoming.allowed {
-                                ""
-                            } else {
-                                " (disabled)"
-                            },
-                            rule.outgoing.capabilities.summary(),
-                            if rule.outgoing.allowed {
-                                ""
-                            } else {
-                                " (disabled)"
-                            },
-                            if rule.broad { " (broad!)" } else { "" }
-                        );
-                    }
-                    break;
+            loop {
+                let FrontendEvent::AddressRules(rules) = next_event(&mut rx).await? else {
+                    continue;
+                };
+                if rules.is_empty() {
+                    println!("no address rules");
                 }
+                for rule in rules {
+                    println!(
+                        "{:<24} in [{}]{} out [{}]{}{}",
+                        rule.address,
+                        rule.incoming.capabilities.summary(),
+                        if rule.incoming.allowed {
+                            ""
+                        } else {
+                            " (disabled)"
+                        },
+                        rule.outgoing.capabilities.summary(),
+                        if rule.outgoing.allowed {
+                            ""
+                        } else {
+                            " (disabled)"
+                        },
+                        if rule.broad { " (broad!)" } else { "" }
+                    );
+                }
+                break;
             }
         }
         CliSubcommand::Pair {
@@ -437,6 +654,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 outgoing,
             })
             .await?;
+            settle(&mut rx, None).await?;
             println!(
                 "pairing open for {seconds}s: incoming [{}], outgoing [{}]",
                 incoming.capabilities.summary(),
@@ -446,93 +664,108 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::Untrust { address } => {
             tx.request(FrontendRequest::UntrustAddress(address.clone()))
                 .await?;
+            settle(&mut rx, None).await?;
             println!("removed {address} from the allowlist");
         }
         CliSubcommand::SetHost { id, host } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            // An empty hostname means "clear".
+            let host = host.filter(|name| !name.trim().is_empty());
             tx.request(FrontendRequest::UpdateHostname(id, host))
-                .await?
+                .await?;
+            settle(&mut rx, Some(id)).await?;
         }
         CliSubcommand::SetPort { id, port } => {
-            tx.request(FrontendRequest::UpdatePort(id, port)).await?
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            let port = validate_port(port)?;
+            tx.request(FrontendRequest::UpdatePort(id, port)).await?;
+            settle(&mut rx, Some(id)).await?;
         }
         CliSubcommand::SetPosition { id, pos } => {
-            tx.request(FrontendRequest::UpdatePosition(id, pos)).await?
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            tx.request(FrontendRequest::UpdatePosition(id, pos)).await?;
+            settle(&mut rx, Some(id)).await?;
         }
         CliSubcommand::SetSensitivity { id, percent } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            let percent = validate_sensitivity(percent)?;
             tx.request(FrontendRequest::UpdateSensitivity(id, percent))
-                .await?
+                .await?;
+            settle(&mut rx, Some(id)).await?;
         }
         CliSubcommand::Devices => {
             tx.request(FrontendRequest::ListDevices).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::Devices(devices) = e? {
-                    if devices.is_empty() {
-                        println!("no devices known yet");
-                    }
-                    for device in devices {
-                        let short = device.fingerprint.chars().take(23).collect::<String>();
-                        println!(
-                            "{:<20} {:<26} {:<7} in:[{}]{} out:[{}]{} {}{}",
-                            device.name,
-                            short,
-                            device.position,
-                            device.incoming.capabilities.summary(),
-                            if device.incoming.allowed {
-                                ""
-                            } else {
-                                " (disabled)"
-                            },
-                            device.outgoing.capabilities.summary(),
-                            if device.outgoing.allowed {
-                                ""
-                            } else {
-                                " (disabled)"
-                            },
-                            device.source,
-                            if device.connected {
-                                " [connected]"
-                            } else if device.active {
-                                " [active]"
-                            } else {
-                                ""
-                            }
-                        );
-                    }
-                    break;
+            loop {
+                let FrontendEvent::Devices(devices) = next_event(&mut rx).await? else {
+                    continue;
+                };
+                if devices.is_empty() {
+                    println!("no devices known yet");
                 }
+                for device in devices {
+                    let short = device.fingerprint.chars().take(23).collect::<String>();
+                    println!(
+                        "{:<20} {:<26} {:<7} in:[{}]{} out:[{}]{} {}{}",
+                        device.name,
+                        short,
+                        device.position,
+                        device.incoming.capabilities.summary(),
+                        if device.incoming.allowed {
+                            ""
+                        } else {
+                            " (disabled)"
+                        },
+                        device.outgoing.capabilities.summary(),
+                        if device.outgoing.allowed {
+                            ""
+                        } else {
+                            " (disabled)"
+                        },
+                        device.source,
+                        if device.connected {
+                            " [connected]"
+                        } else if device.active {
+                            " [active]"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                break;
             }
         }
         CliSubcommand::Pending => {
             tx.request(FrontendRequest::ListPending).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::PendingRequests(pending) = e? {
-                    if pending.is_empty() {
-                        println!("no pending connection requests");
-                    }
-                    for request in pending {
-                        println!(
-                            "{:<26} from {}{} ({} attempt(s)) code={}{}",
-                            request.fingerprint,
-                            request.addr,
-                            request
-                                .name
-                                .as_deref()
-                                .map(|name| format!(" as {name}"))
-                                .unwrap_or_default(),
-                            request.attempts,
-                            request.sas,
-                            request
-                                .previous_fingerprint
-                                .as_deref()
-                                .map(|old| format!(
-                                    " WARNING: certificate changed (was {})",
-                                    old.chars().take(23).collect::<String>()
-                                ))
-                                .unwrap_or_default()
-                        );
-                    }
-                    break;
+            loop {
+                let FrontendEvent::PendingRequests(pending) = next_event(&mut rx).await? else {
+                    continue;
+                };
+                if pending.is_empty() {
+                    println!("no pending connection requests");
                 }
+                for request in pending {
+                    println!(
+                        "{:<26} from {}{} ({} attempt(s)) code={}{}",
+                        request.fingerprint,
+                        request.addr,
+                        request
+                            .name
+                            .as_deref()
+                            .map(|name| format!(" as {name}"))
+                            .unwrap_or_default(),
+                        request.attempts,
+                        request.sas,
+                        request
+                            .previous_fingerprint
+                            .as_deref()
+                            .map(|old| format!(
+                                " WARNING: certificate changed (was {})",
+                                old.chars().take(23).collect::<String>()
+                            ))
+                            .unwrap_or_default()
+                    );
+                }
+                break;
             }
         }
         CliSubcommand::Allow {
@@ -552,6 +785,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     incoming,
                 })
                 .await?;
+                settle(&mut rx, None).await?;
                 println!(
                     "granted session access to {fingerprint}: incoming [{}] (dropped on disconnect)",
                     incoming.capabilities.summary()
@@ -567,6 +801,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     outgoing: Some(outgoing),
                 })
                 .await?;
+                settle(&mut rx, None).await?;
                 println!(
                     "allowed {fingerprint}: incoming [{}], outgoing [{}]",
                     incoming.capabilities.summary(),
@@ -581,6 +816,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 expires_in,
             })
             .await?;
+            settle(&mut rx, None).await?;
             match expires_in {
                 Some(seconds) => println!("denied {fingerprint} for {seconds}s"),
                 None => println!("denied {fingerprint} permanently"),
@@ -592,72 +828,98 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 disconnect: true,
             })
             .await?;
+            settle(&mut rx, None).await?;
         }
         CliSubcommand::Rename { fingerprint, name } => {
             tx.request(FrontendRequest::RenameDevice { fingerprint, name })
                 .await?;
+            settle(&mut rx, None).await?;
         }
         CliSubcommand::History { limit } => {
-            tx.request(FrontendRequest::ListHistory { limit }).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::ConnectionHistory(history) = e? {
-                    if history.is_empty() {
-                        println!("no audit events recorded yet");
-                    }
-                    for entry in history {
-                        println!(
-                            "{} {}{}{}{}",
-                            entry.ts,
-                            entry.event,
-                            entry
-                                .name
-                                .as_deref()
-                                .map(|name| format!(" name={name}"))
-                                .unwrap_or_default(),
-                            entry
-                                .fingerprint
-                                .as_deref()
-                                .map(|fp| format!(" fp={fp}"))
-                                .unwrap_or_default(),
-                            entry
-                                .detail
-                                .as_deref()
-                                .map(|detail| format!(" {detail}"))
-                                .unwrap_or_default()
-                        );
-                    }
-                    break;
+            // The service clamps to 1..=500; mirror it so the output matches
+            // what was requested and a huge/zero value is not silently
+            // changed.
+            let effective = limit.clamp(1, 500);
+            if effective != limit {
+                eprintln!(
+                    "warning: history limit {limit} is out of range, using {effective} (1..=500)"
+                );
+            }
+            tx.request(FrontendRequest::ListHistory { limit: effective })
+                .await?;
+            loop {
+                let FrontendEvent::ConnectionHistory(history) = next_event(&mut rx).await? else {
+                    continue;
+                };
+                if history.is_empty() {
+                    println!("no audit events recorded yet");
                 }
+                for entry in history {
+                    println!(
+                        "{} {}{}{}{}",
+                        entry.ts,
+                        entry.event,
+                        entry
+                            .name
+                            .as_deref()
+                            .map(|name| format!(" name={name}"))
+                            .unwrap_or_default(),
+                        entry
+                            .fingerprint
+                            .as_deref()
+                            .map(|fp| format!(" fp={fp}"))
+                            .unwrap_or_default(),
+                        entry
+                            .detail
+                            .as_deref()
+                            .map(|detail| format!(" {detail}"))
+                            .unwrap_or_default()
+                    );
+                }
+                break;
             }
         }
         CliSubcommand::ExportPolicy { file } => {
             tx.request(FrontendRequest::ExportPolicy).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::PolicyExport { json } = e? {
-                    std::fs::write(&file, json)?;
-                    println!("policy exported to {}", file.display());
-                    break;
-                }
+            loop {
+                let FrontendEvent::PolicyExport { json } = next_event(&mut rx).await? else {
+                    continue;
+                };
+                std::fs::write(&file, json)?;
+                println!("policy exported to {}", file.display());
+                break;
             }
         }
         CliSubcommand::ImportPolicy { file } => {
             let json = std::fs::read_to_string(&file)?;
             tx.request(FrontendRequest::ImportPolicy { json }).await?;
+            settle(&mut rx, None).await?;
             println!("policy imported from {}", file.display());
         }
         CliSubcommand::SetFingerprint { id, fingerprint } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdateFingerprint(id, fingerprint.clone()))
                 .await?;
+            settle(&mut rx, Some(id)).await?;
             match fingerprint {
                 Some(fp) => println!("client {id}: pinned fingerprint {fp}"),
                 None => println!("client {id}: fingerprint cleared (trust on first use)"),
             }
         }
         CliSubcommand::SetIps { id, ips } => {
-            tx.request(FrontendRequest::UpdateFixIps(id, ips)).await?
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            let ips = validate_ips(ips)?;
+            tx.request(FrontendRequest::UpdateFixIps(id, ips)).await?;
+            settle(&mut rx, Some(id)).await?;
         }
-        CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
-        CliSubcommand::EnableEmulation => tx.request(FrontendRequest::EnableEmulation).await?,
+        CliSubcommand::EnableCapture => {
+            tx.request(FrontendRequest::EnableCapture).await?;
+            settle(&mut rx, None).await?;
+        }
+        CliSubcommand::EnableEmulation => {
+            tx.request(FrontendRequest::EnableEmulation).await?;
+            settle(&mut rx, None).await?;
+        }
         CliSubcommand::AuthorizeKey {
             description,
             sha256_fingerprint,
@@ -666,19 +928,22 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 description,
                 sha256_fingerprint,
             ))
-            .await?
+            .await?;
+            settle(&mut rx, None).await?;
         }
         CliSubcommand::AuthorizeDevice {
             sha256_fingerprint,
             name,
             position,
         } => {
+            let name = name.unwrap_or_default();
             tx.request(FrontendRequest::AuthorizeDevice {
                 fingerprint: sha256_fingerprint,
-                name: name.unwrap_or_default(),
+                name,
                 position,
             })
             .await?;
+            settle(&mut rx, None).await?;
             println!(
                 "device authorized; a client at position {position} is created and \
                  activated as soon as it connects"
@@ -686,29 +951,34 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::RemoveAuthorizedKey { sha256_fingerprint } => {
             tx.request(FrontendRequest::RemoveAuthorizedKey(sha256_fingerprint))
-                .await?
+                .await?;
+            settle(&mut rx, None).await?;
         }
-        CliSubcommand::SaveConfig => tx.request(FrontendRequest::SaveConfiguration).await?,
+        CliSubcommand::SaveConfig => {
+            tx.request(FrontendRequest::SaveConfiguration).await?;
+            settle(&mut rx, None).await?;
+        }
         CliSubcommand::Clipboard { action } => match action {
             ClipboardAction::Status => {
                 // `Sync` makes the service broadcast the current status.
                 tx.request(FrontendRequest::Sync).await?;
-                while let Some(event) = rx.next().await {
-                    if let FrontendEvent::ClipboardStatus(status) = event? {
-                        println!("enabled:   {}", status.enabled);
-                        println!(
-                            "backend:   {}",
-                            status.backend.unwrap_or_else(|| "-".into())
-                        );
-                        println!("available: {}", status.available);
-                        println!("received:  {} snapshot(s) from peers", status.applied);
-                        println!("detected:  {} local change(s)", status.detected);
-                        match status.last_error {
-                            Some(error) => println!("last error: {error}"),
-                            None => println!("last error: -"),
-                        }
-                        return Ok(());
+                loop {
+                    let FrontendEvent::ClipboardStatus(status) = next_event(&mut rx).await? else {
+                        continue;
+                    };
+                    println!("enabled:   {}", status.enabled);
+                    println!(
+                        "backend:   {}",
+                        status.backend.unwrap_or_else(|| "-".into())
+                    );
+                    println!("available: {}", status.available);
+                    println!("received:  {} snapshot(s) from peers", status.applied);
+                    println!("detected:  {} local change(s)", status.detected);
+                    match status.last_error {
+                        Some(error) => println!("last error: {error}"),
+                        None => println!("last error: -"),
                     }
+                    return Ok(());
                 }
             }
             action => {
@@ -716,9 +986,34 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     action,
                     ClipboardAction::Enable
                 )))
-                .await?
+                .await?;
+                settle(&mut rx, None).await?;
             }
         },
+        CliSubcommand::Shutdown => {
+            tx.request(FrontendRequest::Shutdown).await?;
+            // The service closes the IPC connection during its graceful
+            // teardown; waiting for that close lets scripts (and the Windows
+            // uninstaller) rely on the service being gone when this returns.
+            let deadline = Instant::now() + SHUTDOWN_WAIT;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(CliError::ResponseTimeout(SHUTDOWN_WAIT));
+                }
+                match rx.next_event(Some(remaining)).await {
+                    Ok(None) => return Err(CliError::ResponseTimeout(SHUTDOWN_WAIT)),
+                    Ok(Some(FrontendEvent::Error(message))) => {
+                        return Err(CliError::ServiceError(message));
+                    }
+                    // The connection closing is the success signal.
+                    Err(IpcError::Io(_)) => break,
+                    Err(e) => return Err(CliError::Ipc(e)),
+                    Ok(Some(_)) => continue,
+                }
+            }
+            println!("lan-mouse service is shutting down");
+        }
     }
     Ok(())
 }
@@ -831,6 +1126,34 @@ mod tests {
             }
         ));
         assert!(CliArgs::try_parse_from(["lan-mouse-cli", "clipboard", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn shutdown_subcommand_parses() {
+        let args = parse(&["lan-mouse-cli", "shutdown"]);
+        assert!(matches!(args.command, CliSubcommand::Shutdown));
+    }
+
+    #[test]
+    fn invalid_ports_and_sensitivities_are_rejected() {
+        assert!(validate_port(0).is_err());
+        assert_eq!(validate_port(4242).expect("valid port"), 4242);
+        assert!(validate_sensitivity(9).is_err());
+        assert!(validate_sensitivity(501).is_err());
+        assert_eq!(validate_sensitivity(100).expect("valid"), 100);
+        assert_eq!(validate_sensitivity(500).expect("valid"), 500);
+    }
+
+    #[test]
+    fn deny_durations_do_not_overflow() {
+        assert_eq!(parse_duration("forever").expect("forever"), None);
+        assert_eq!(parse_duration("30m").expect("30m"), Some(1800));
+        assert_eq!(parse_duration("2h").expect("2h"), Some(7200));
+        assert_eq!(parse_duration("1d").expect("1d"), Some(86400));
+        // Would overflow u64 when converted to seconds: must be rejected, not
+        // wrap or panic.
+        assert!(parse_duration("18446744073709551615d").is_err());
+        assert!(parse_duration("999999999999999999999999s").is_err());
     }
 
     #[test]

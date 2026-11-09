@@ -87,6 +87,9 @@ impl<S: FrameSink> ClipboardSync<S> {
     pub fn reset(&mut self) {
         self.outgoing.clear();
         self.incoming.clear();
+        // The peer may have missed the last local copy while sync was off, so
+        // the same content must be offered again when it comes back.
+        self.last_sent = None;
     }
 
     pub fn clear_error(&mut self) {
@@ -317,6 +320,11 @@ impl<S: FrameSink> ClipboardSync<S> {
     /// written to the local clipboard.
     pub fn on_applied(&mut self, snapshot: &ClipboardSnapshot) {
         self.last_applied = Some(snapshot.hash());
+        // The local clipboard no longer holds the content we last sent: a later
+        // copy of that same content (e.g. re-copying an older snippet after the
+        // peer overwrote our clipboard) must be offered again instead of being
+        // mistaken for a duplicate owner-change event.
+        self.last_sent = None;
         self.applied += 1;
         log::info!(
             "clipboard: applied {} bytes in {} format(s) from a peer",
@@ -443,6 +451,39 @@ mod tests {
         h.run_until_applied(0, 5_000).await;
         assert_eq!(h.clip_b.current(), snapshot());
         assert_eq!(h.b.applied_count(), 1);
+    }
+
+    /// After a remote snapshot replaced the local clipboard, copying the
+    /// content this machine sent earlier must be offered again: otherwise the
+    /// peer keeps the newer remote content and the two clipboards stay out of
+    /// sync until the user copies something different.
+    #[tokio::test]
+    async fn recopying_previously_sent_content_is_offered_after_a_remote_apply() {
+        let mut h = Harness::new();
+        h.a.on_local_change(snapshot(), h.now);
+        h.run_until_applied(0, 5_000).await;
+
+        // The peer copies something else; it becomes the local clipboard.
+        let replacement = ClipboardSnapshot::from_items([(Format::Text, b"from b".to_vec())]);
+        h.b.on_local_change(replacement.clone(), h.now);
+        for _ in 0..5_000 {
+            h.step(0).await;
+            if h.a.applied_count() > 0 {
+                break;
+            }
+        }
+        assert_eq!(h.clip_a.current(), replacement);
+
+        // The user now re-copies the older content on this machine.
+        h.wire.borrow_mut().clear();
+        h.a.on_local_change(snapshot(), h.now);
+        assert!(
+            h.wire
+                .borrow()
+                .iter()
+                .any(|(_, _, frame)| matches!(frame, ClipboardFrame::Offer { .. })),
+            "previously sent content must be offered again after a remote apply"
+        );
     }
 
     #[tokio::test]
@@ -626,6 +667,79 @@ mod dedupe_tests {
         sync.add_peer(2);
         sync.on_local_change(snapshot(), now);
         assert_eq!(offers(&wire), 1, "the pending copy must be offered");
+    }
+
+    /// Disabling and re-enabling clipboard sync must retry the same content.
+    #[test]
+    fn reset_allows_reoffering_the_same_content() {
+        let wire: Wire = Default::default();
+        let mut sync = sync_with_peer(&wire);
+        let now = Instant::now();
+        sync.on_local_change(snapshot(), now);
+        assert_eq!(offers(&wire), 1);
+        sync.reset();
+        sync.on_local_change(snapshot(), now);
+        assert_eq!(offers(&wire), 2);
+    }
+
+    /// Garbage from a misbehaving (but authenticated) peer must not panic or
+    /// poison the sync state.
+    #[test]
+    fn hostile_frames_are_ignored_without_panicking() {
+        use lan_mouse_proto::clipboard::MIME_TEXT;
+
+        let wire: Wire = Default::default();
+        let mut sync = sync_with_peer(&wire);
+        let now = Instant::now();
+        // Ack without a transfer, impossible ack base, unknown chunk, cancel
+        // and an offer that exceeds the limits.
+        sync.handle_frame(
+            2,
+            ClipboardFrame::Ack {
+                serial: 99,
+                mime: MIME_TEXT,
+                base: u32::MAX,
+                bitmap: u32::MAX,
+            },
+            now,
+        );
+        sync.handle_frame(
+            2,
+            ClipboardFrame::Chunk {
+                serial: 1,
+                mime: MIME_TEXT,
+                offset: u32::MAX,
+                total: u32::MAX,
+                data: vec![0; 4],
+            },
+            now,
+        );
+        sync.handle_frame(2, ClipboardFrame::Cancel { serial: 1234 }, now);
+        sync.handle_frame(
+            2,
+            ClipboardFrame::Offer {
+                serial: 1,
+                origin: 7,
+                hash: [0; 32],
+                items: vec![(MIME_TEXT, u32::MAX)],
+            },
+            now,
+        );
+        sync.handle_frame(
+            999,
+            ClipboardFrame::Offer {
+                serial: 2,
+                origin: 7,
+                hash: [0; 32],
+                items: vec![(MIME_TEXT, 3)],
+            },
+            now,
+        );
+        assert!(sync.tick(now).is_none());
+        assert!(
+            sync.last_error().is_some(),
+            "the oversized offer is reported"
+        );
     }
 
     /// If a transfer dies (peer never acknowledges), copying the same content

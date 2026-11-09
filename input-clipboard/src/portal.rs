@@ -258,7 +258,6 @@ impl Clipboard for PortalClipboard {
         if snapshot.get(Format::Text).is_some() {
             mimes.push("text/plain");
         }
-        *self.shared.borrow_mut() = Some(snapshot.clone());
         self.clipboard
             .set_selection(
                 &self.session,
@@ -266,6 +265,10 @@ impl Clipboard for PortalClipboard {
             )
             .await
             .map_err(|e| Error::Backend(format!("set portal selection: {e}")))?;
+        // Only serve the snapshot once the selection really points at us;
+        // publishing it earlier would answer transfer requests for content the
+        // portal never accepted.
+        *self.shared.borrow_mut() = Some(snapshot.clone());
         Ok(())
     }
 
@@ -403,7 +406,15 @@ async fn read_fd(fd: OwnedFd, limit: usize) -> Result<Vec<u8>, Error> {
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::from(fd);
         let mut out = Vec::new();
-        file.take(limit as u64).read_to_end(&mut out)?;
+        // Read one byte past the limit to distinguish "exactly the limit" from
+        // an oversized payload that must not be forwarded truncated.
+        file.take((limit as u64).saturating_add(1))
+            .read_to_end(&mut out)?;
+        if out.len() > limit {
+            return Err(std::io::Error::other(format!(
+                "clipboard payload exceeds {limit} bytes"
+            )));
+        }
         Ok::<_, std::io::Error>(out)
     })
     .await

@@ -14,10 +14,10 @@
 //!    which then wins over our guess.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use lan_mouse_ipc::{DiscoveredDevice, LinkKind};
@@ -42,6 +42,103 @@ pub const ANNOUNCE_MAGIC: &[u8; 8] = b"LMANNC01";
 
 /// How often a running instance announces itself.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Minimum time between two beacon replies to the same source address.
+///
+/// The beacon is unauthenticated and answers an 8-byte probe with a
+/// ~200-byte payload, so without a limit it is a UDP reflector. Replies are
+/// also needed for discovery bursts (unicast sweep followed by a broadcast
+/// probe), which are seconds apart, so 100 ms is not a functional limit.
+const BEACON_REPLY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Minimum time between two unsolicited announcements accepted from one
+/// source address.
+const ANNOUNCE_PER_SOURCE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum number of announcements forwarded to the service per second.
+///
+/// Bounds the work and memory a spoofed-announcement flood can cause in the
+/// service (every forwarded announcement triggers a device-table rebuild).
+const ANNOUNCE_BUDGET_PER_SECOND: u32 = 20;
+
+/// Maximum number of source addresses tracked by a [`SourceRateLimiter`].
+const RATE_LIMIT_ENTRIES: usize = 256;
+
+/// Per-source rate limiter with a bounded map.
+///
+/// Used to keep the unauthenticated discovery port from being turned into a
+/// reflector/amplifier or a way to flood the service with fake devices.
+#[derive(Debug)]
+struct SourceRateLimiter {
+    interval: Duration,
+    seen: HashMap<Ipv4Addr, Instant>,
+}
+
+impl SourceRateLimiter {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            seen: HashMap::new(),
+        }
+    }
+
+    fn allow(&mut self, source: Ipv4Addr) -> bool {
+        self.allow_at(source, Instant::now())
+    }
+
+    fn allow_at(&mut self, source: Ipv4Addr, now: Instant) -> bool {
+        if let Some(previous) = self.seen.get(&source) {
+            if now.duration_since(*previous) < self.interval {
+                return false;
+            }
+        } else if self.seen.len() >= RATE_LIMIT_ENTRIES {
+            // Bounded memory: forget expired entries, and if the map is still
+            // full fail closed instead of growing without bound.
+            let cutoff = now.checked_sub(self.interval).unwrap_or(now);
+            self.seen.retain(|_, previous| *previous > cutoff);
+            if self.seen.len() >= RATE_LIMIT_ENTRIES {
+                return false;
+            }
+        }
+        self.seen.insert(source, now);
+        true
+    }
+}
+
+/// Simple per-second packet budget.
+#[derive(Debug)]
+struct PerSecondBudget {
+    window_start: Instant,
+    remaining: u32,
+    per_second: u32,
+}
+
+impl PerSecondBudget {
+    fn new(per_second: u32) -> Self {
+        Self {
+            window_start: Instant::now(),
+            remaining: per_second,
+            per_second,
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        self.allow_at(Instant::now())
+    }
+
+    fn allow_at(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.remaining = self.per_second;
+        }
+        if self.remaining == 0 {
+            false
+        } else {
+            self.remaining -= 1;
+            true
+        }
+    }
+}
 
 /// Payload a discovering fork sends back.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -87,8 +184,12 @@ impl LocalInterface {
         let local = u32::from(self.addr);
         let network = local & mask;
         let broadcast = network | !mask;
-        let start = network.saturating_add(1).max(local.saturating_sub(127));
-        let end = broadcast.saturating_sub(1).min(start.saturating_add(253));
+        // Sweep the whole (at most /24) subnet, not just a window around the
+        // local address: the old formula started at `local - 127`, which hid
+        // every host below that on a /24 when the interface address' last
+        // octet was >= 128.
+        let start = network.saturating_add(1);
+        let end = broadcast.saturating_sub(1);
         (start..=end)
             .filter(|ip| *ip != local)
             .map(Ipv4Addr::from)
@@ -351,7 +452,13 @@ fn device_from_probe(ip: Ipv4Addr, outcome: HostProbe) -> DiscoveredDevice {
 async fn probe_host(ip: Ipv4Addr, discovery_port: u16) -> Option<HostProbe> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
     sock.connect((ip, discovery_port)).await.ok()?;
-    sock.send(MAGIC).await.ok()?;
+    match sock.send(MAGIC).await {
+        Ok(_) => {}
+        // Windows surfaces an ICMP port-unreachable as an error on the send
+        // itself; a refused port still proves that the host is up.
+        Err(e) if is_unreachable(&e) => return Some(HostProbe::HostOnly),
+        Err(_) => return None,
+    }
 
     let mut buf = [0u8; 1024];
     match timeout(PROBE_TIMEOUT, sock.recv(&mut buf)).await {
@@ -471,17 +578,29 @@ pub async fn beacon_task(
         }
     };
 
-    let own_addresses: HashSet<Ipv4Addr> = local_interfaces().into_iter().map(|i| i.addr).collect();
+    let mut own_addresses: HashSet<Ipv4Addr> =
+        local_interfaces().into_iter().map(|i| i.addr).collect();
     let mut announce_interval = tokio::time::interval(ANNOUNCE_INTERVAL);
     // Announce immediately: a peer that is already running should learn about
     // this machine without waiting for the next scan.
     announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // The discovery port is unauthenticated: bound how often one source can
+    // make us answer (reflection) and how many announcements reach the
+    // service (fake-device flood), see docs/qa/protocol.md DISC-02.
+    let mut reply_limiter = SourceRateLimiter::new(BEACON_REPLY_INTERVAL);
+    let mut announce_limiter = SourceRateLimiter::new(ANNOUNCE_PER_SOURCE_INTERVAL);
+    let mut announce_budget = PerSecondBudget::new(ANNOUNCE_BUDGET_PER_SECOND);
 
     let mut buf = [0u8; 1024];
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = announce_interval.tick() => {
+                // DHCP/roaming can change our addresses at runtime; refresh
+                // the self-detection set so our own announcements are never
+                // listed as a remote device.
+                own_addresses = local_interfaces().into_iter().map(|i| i.addr).collect();
                 for target in broadcast_targets() {
                     if let Err(e) = sock.send_to(&announce, (target, discovery_port)).await {
                         log::debug!("could not announce to {target}: {e}");
@@ -489,9 +608,24 @@ pub async fn beacon_task(
                 }
             }
             received = sock.recv_from(&mut buf) => {
-                let Ok((n, from)) = received else { continue };
+                let (n, from) = match received {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // A persistent socket error (on Windows an ICMP
+                        // port-unreachable surfaces as WSAECONNRESET) must not
+                        // turn this loop into a busy spin.
+                        log::debug!("discovery receive error: {e}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
                 let packet = &buf[..n];
                 if packet.starts_with(MAGIC.as_slice()) {
+                    let IpAddr::V4(source) = from.ip() else { continue };
+                    if !reply_limiter.allow(source) {
+                        log::trace!("rate limiting discovery reply to {source}");
+                        continue;
+                    }
                     let reply = with_link_for(&payload, from.ip());
                     if let Err(e) = sock.send_to(&reply, from).await {
                         log::debug!("could not answer discovery probe from {from}: {e}");
@@ -499,6 +633,10 @@ pub async fn beacon_task(
                 } else if let Some(reply) = parse_announce(packet) {
                     let IpAddr::V4(ip) = from.ip() else { continue };
                     if own_addresses.contains(&ip) {
+                        continue;
+                    }
+                    if !announce_limiter.allow(ip) || !announce_budget.allow() {
+                        log::trace!("rate limiting announcement from {ip}");
                         continue;
                     }
                     let device = device_from_probe(ip, HostProbe::LanMouse(reply));
@@ -669,6 +807,75 @@ mod tests {
         assert_eq!(link_kind_of("Wi-Fi"), LinkKind::Wireless);
         assert_eq!(link_kind_of("enp3s0"), LinkKind::Wired);
         assert_eq!(link_kind_of("Ethernet"), LinkKind::Wired);
+    }
+
+    #[test]
+    fn host_range_covers_the_whole_subnet_when_the_host_is_high_in_it() {
+        // Regression: the sweep used to start at `local - 127`, so a host at
+        // 192.168.1.200 never probed 192.168.1.1 ..= 192.168.1.72.
+        let iface = LocalInterface {
+            name: "test0".into(),
+            addr: Ipv4Addr::new(192, 168, 1, 200),
+            prefix: 24,
+            link: LinkKind::Wired,
+        };
+        let hosts = iface.host_range();
+        assert!(hosts.contains(&Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(hosts.contains(&Ipv4Addr::new(192, 168, 1, 72)));
+        assert!(hosts.contains(&Ipv4Addr::new(192, 168, 1, 254)));
+        assert_eq!(
+            hosts.len(),
+            253,
+            "a /24 has 254 host addresses minus this machine"
+        );
+    }
+
+    #[test]
+    fn source_rate_limiter_allows_one_reply_per_interval() {
+        let mut limiter = SourceRateLimiter::new(Duration::from_millis(100));
+        let source = Ipv4Addr::new(192, 168, 1, 5);
+        let now = Instant::now();
+        assert!(limiter.allow_at(source, now));
+        assert!(!limiter.allow_at(source, now + Duration::from_millis(50)));
+        assert!(limiter.allow_at(source, now + Duration::from_millis(100)));
+        // Other sources have their own budget.
+        assert!(limiter.allow_at(
+            Ipv4Addr::new(192, 168, 1, 6),
+            now + Duration::from_millis(150)
+        ));
+    }
+
+    #[test]
+    fn source_rate_limiter_memory_is_bounded() {
+        let mut limiter = SourceRateLimiter::new(Duration::from_millis(100));
+        let now = Instant::now();
+        for i in 0..(RATE_LIMIT_ENTRIES as u32 * 2) {
+            let source = Ipv4Addr::from(i + 1);
+            let _ = limiter.allow_at(source, now);
+        }
+        assert!(
+            limiter.seen.len() <= RATE_LIMIT_ENTRIES,
+            "the limiter map must stay bounded, got {}",
+            limiter.seen.len()
+        );
+        // Fail closed while the map is full ...
+        assert!(!limiter.allow_at(Ipv4Addr::new(255, 255, 255, 254), now));
+        // ... but expired entries are pruned after the interval.
+        let later = now + Duration::from_millis(101);
+        assert!(limiter.allow_at(Ipv4Addr::new(255, 255, 255, 253), later));
+        assert!(limiter.seen.len() <= RATE_LIMIT_ENTRIES);
+    }
+
+    #[test]
+    fn per_second_budget_resets_each_second() {
+        let mut budget = PerSecondBudget::new(2);
+        let now = Instant::now();
+        assert!(budget.allow_at(now));
+        assert!(budget.allow_at(now));
+        assert!(!budget.allow_at(now + Duration::from_millis(500)));
+        assert!(budget.allow_at(now + Duration::from_secs(1)));
+        assert!(budget.allow_at(now + Duration::from_secs(1)));
+        assert!(!budget.allow_at(now + Duration::from_secs(1)));
     }
 
     #[test]

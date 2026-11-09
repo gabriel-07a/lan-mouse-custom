@@ -9,31 +9,32 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
-use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
-    EnumDisplayDevicesW, EnumDisplaySettingsW, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::{
-    GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
-    RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
+    GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE,
+    RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos, GetMessageW, HOOKPROC, HWND_MESSAGE, HWND_TOPMOST,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLMHF_INJECTED, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT,
-    PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SetCursor, SetCursorPos, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetMessageW, HOOKPROC, HWND_MESSAGE, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+    LLKHF_INJECTED, LLMHF_INJECTED, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
+    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SetCursor, SetCursorPos, SetWindowPos, SetWindowsHookExW,
+    ShowWindow, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSW, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{BOOL, w};
 
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
@@ -57,14 +58,16 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(
+        event_tx: Sender<(Position, CaptureEvent)>,
+    ) -> Result<Self, crate::CaptureCreationError> {
         let request_buffer = Default::default();
-        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
-        Self {
+        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer))?;
+        Ok(Self {
             request_buffer,
             thread: Some(thread),
             thread_id,
-        }
+        })
     }
 
     pub(crate) fn release_capture(&self) {
@@ -91,42 +94,71 @@ impl EventThread {
         self.client_update(ClientUpdate::Destroy(pos));
     }
 
-    fn exit(&self) {
-        self.signal(RequestType::Exit);
+    /// Ask the capture thread to exit. Returns whether the message could be
+    /// delivered (the thread may already be gone).
+    fn exit(&self) -> bool {
+        self.signal(RequestType::Exit)
     }
 
     fn client_update(&self, request: ClientUpdate) {
         {
-            let mut requests = self.request_buffer.lock().unwrap();
+            let mut requests = self.request_buffer.lock().expect("request buffer");
             requests.push(request);
         }
         self.signal(RequestType::ClientUpdate);
     }
 
-    fn signal(&self, event_type: RequestType) {
-        let id = self.thread_id;
-        // The thread id is published before the message loop starts, so a
-        // request posted immediately after construction can race with the
-        // creation of the thread's message queue. Panicking here aborted the
-        // whole process (`panic = "abort"` in release, e.g. during the
-        // `doctor --probe` smoke test); retry briefly instead and give up with
-        // a log instead of crashing.
+    fn signal(&self, event_type: RequestType) -> bool {
+        // A post to a thread that has no message queue (or already exited) fails
+        // with ERROR_INVALID_THREAD_ID. The thread id is only published after
+        // the queue exists, so this is only a shutdown race; give up and log
+        // rather than sleeping/looping forever or panicking: the release
+        // profile aborts on panics, and this path runs during teardown.
+        if self
+            .thread
+            .as_ref()
+            .is_none_or(|thread| thread.is_finished())
+        {
+            return false;
+        }
         let request = event_type as usize;
         for _ in 0..50 {
-            let posted = unsafe { PostThreadMessageW(id, WM_USER, WPARAM(request), LPARAM(0)) };
+            let posted =
+                unsafe { PostThreadMessageW(self.thread_id, WM_USER, WPARAM(request), LPARAM(0)) };
             if posted.is_ok() {
-                return;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        log::error!("could not post a message to the capture thread (id {id})");
+        log::error!(
+            "could not post a message to the capture thread (id {})",
+            self.thread_id
+        );
+        false
     }
 }
 
 impl Drop for EventThread {
     fn drop(&mut self) {
-        self.exit();
-        let _ = self.thread.take().expect("thread").join();
+        // Post the Exit message BEFORE taking the handle: `signal()` consults
+        // `self.thread` to avoid posting into a thread that is already gone,
+        // so taking the handle first made the post fail unconditionally (the
+        // thread was then always detached and leaked).
+        let notified = self.exit();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        if notified {
+            let _ = thread.join();
+        } else if thread.is_finished() {
+            // Nothing to do: the thread already returned, just reap it.
+            let _ = thread.join();
+        } else {
+            // Never block shutdown on a thread that cannot be reached: it is
+            // wedged before its message loop (which is why the id was not
+            // published yet). Detaching leaks it, but hanging the app is worse.
+            log::error!("capture thread did not acknowledge shutdown; detaching it");
+        }
     }
 }
 
@@ -252,8 +284,14 @@ thread_local! {
     static DPI_SCALE: Cell<f64> = const { Cell::new(1.0) };
     /// previous mouse position (out-of-bounds fallback detector only)
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
-    /// displays and generation counter
-    static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// previous absolute raw position of an absolute pointing device (tablet,
+    /// digitizer, some remote-desktop sessions), converted to deltas
+    static PREV_ABS_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
+    /// display rectangles, generation counter and the primary monitor rect
+    /// (needed to map absolute input: MOUSE_VIRTUAL_DESKTOP selects the whole
+    /// virtual desktop vs. the primary monitor)
+    static DISPLAYS: RefCell<(Vec<RECT>, i32, Option<RECT>)> =
+        const { RefCell::new((Vec::new(), 0, None)) };
     /// whether raw input (WM_INPUT) was registered successfully
     static RAW_INPUT_OK: Cell<bool> = const { Cell::new(false) };
     /// time of the last capture release, used for the re-entry cooldown
@@ -279,43 +317,68 @@ fn get_msg() -> Option<MSG> {
         match ret.0 {
             0 => None,
             x if x > 0 => Some(msg),
-            _ => panic!("error in GetMessageW"),
+            // GetMessageW returns -1 on error. Treat it like WM_QUIT: the
+            // message loop cannot make progress anymore. Panicking here would
+            // abort the process (release profile uses panic = "abort").
+            _ => {
+                log::error!("GetMessageW failed: {}", std::io::Error::last_os_error());
+                None
+            }
         }
     }
+}
+
+/// Handshake slot between the capture thread and its creator: the thread id is
+/// only published once the thread owns a message queue, so a request posted by
+/// [`EventThread::signal`] can never race the queue creation (that race made
+/// `PostThreadMessageW` fail and, previously, the process abort).
+type Handshake = Arc<(Condvar, Mutex<Option<Result<u32, String>>>)>;
+
+fn announce_ready(handshake: &Handshake, result: Result<u32, String>) {
+    let (cond, slot) = &**handshake;
+    *slot.lock().expect("capture handshake lock") = Some(result);
+    cond.notify_one();
 }
 
 fn start(
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
-) -> (thread::JoinHandle<()>, u32) {
-    /* condition variable to wait for thead id */
-    let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
-    let thread_id_ = Arc::clone(&thread_id);
+) -> Result<(thread::JoinHandle<()>, u32), crate::CaptureCreationError> {
+    let handshake: Handshake = Arc::new((Condvar::new(), Mutex::new(None)));
+    let handshake_thread = Arc::clone(&handshake);
 
-    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_tx, request_buffer));
+    let msg_thread = thread::Builder::new()
+        .name("lan-mouse-capture".to_owned())
+        .spawn(move || start_routine(handshake_thread, event_tx, request_buffer))
+        .map_err(|e| {
+            log::error!("could not spawn the windows capture thread: {e}");
+            crate::CaptureCreationError::Windows
+        })?;
 
-    /* wait for thread to set its id */
-    let (cond, thread_id) = &*thread_id;
-    let mut thread_id = thread_id.lock().unwrap();
-    while (*thread_id).is_none() {
-        thread_id = cond.wait(thread_id).expect("channel closed");
+    let (cond, slot) = &*handshake;
+    let mut slot = slot.lock().expect("capture handshake lock");
+    while slot.is_none() {
+        slot = cond.wait(slot).expect("capture handshake wait");
     }
-    (msg_thread, thread_id.expect("thread id"))
+    let result = slot.take().expect("capture handshake result");
+    drop(slot);
+
+    match result {
+        Ok(thread_id) => Ok((msg_thread, thread_id)),
+        Err(e) => {
+            log::error!("could not start the windows capture thread: {e}");
+            let _ = msg_thread.join();
+            Err(crate::CaptureCreationError::Windows)
+        }
+    }
 }
 
 fn start_routine(
-    ready: Arc<(Condvar, Mutex<Option<u32>>)>,
+    handshake: Handshake,
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
-    /* communicate thread id */
-    {
-        let (cnd, mtx) = &*ready;
-        let mut ready = mtx.lock().unwrap();
-        *ready = Some(unsafe { GetCurrentThreadId() });
-        cnd.notify_one();
-    }
 
     // Without this the coordinates seen by the low level hooks are
     // virtualized by DPI scaling, which shifts every delta when the two
@@ -343,9 +406,11 @@ fn start_routine(
         }
     }
 
-    let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else {
-        log::error!("could not get the module handle");
-        return;
+    let instance = match unsafe { GetModuleHandleW(None) } {
+        Ok(instance) => instance,
+        Err(e) => {
+            return announce_ready(&handshake, Err(format!("GetModuleHandleW failed: {e}")));
+        }
     };
     let instance = instance.into();
     let window_class: WNDCLASSW = WNDCLASSW {
@@ -364,13 +429,23 @@ fn start_routine(
         unsafe {
             let ret = RegisterClassW(&window_class);
             if ret == 0 {
-                panic!("RegisterClassW");
+                // Allow a later backend creation (e.g. after the user
+                // reenables capture) to retry instead of permanently
+                // believing the class exists.
+                WINDOW_CLASS_REGISTERED.store(false, Ordering::SeqCst);
+                return announce_ready(
+                    &handshake,
+                    Err(format!(
+                        "RegisterClassW failed: {}",
+                        std::io::Error::last_os_error()
+                    )),
+                );
             }
         }
     }
 
-    /* message-only window: WM_DISPLAYCHANGE + WM_INPUT (raw mouse) */
-    let hwnd = unsafe {
+    /* message-only window: receives the raw mouse input (WM_INPUT) */
+    let hwnd = match unsafe {
         CreateWindowExW(
             Default::default(),
             w!("lan-mouse-message-window-class"),
@@ -385,10 +460,45 @@ fn start_routine(
             Some(instance),
             None,
         )
+    } {
+        Ok(hwnd) => hwnd,
+        Err(e) => {
+            return announce_ready(
+                &handshake,
+                Err(format!("could not create the capture message window: {e}")),
+            );
+        }
     };
-    let Ok(hwnd) = hwnd else {
-        log::error!("could not create the capture message window");
-        return;
+
+    // A message-only window does not receive broadcast messages, so
+    // WM_DISPLAYCHANGE/WM_DPICHANGED never reached the capture thread. This
+    // hidden top-level window exists only to receive them; raw input stays on
+    // the message-only window above. It is never shown, so it has no taskbar
+    // entry, and it is destroyed together with the thread.
+    let _display_window = match unsafe {
+        CreateWindowExW(
+            Default::default(),
+            w!("lan-mouse-message-window-class"),
+            w!("lan-mouse-display-window"),
+            WINDOW_STYLE::default(),
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(instance),
+            None,
+        )
+    } {
+        Ok(hwnd) => Some(hwnd),
+        Err(e) => {
+            log::warn!(
+                "could not create the display-change window ({e}); display hotplug \
+                 while capturing will not be picked up until the next capture"
+            );
+            None
+        }
     };
 
     // 1x1 topmost window that hides the local pointer while a capture is
@@ -448,6 +558,15 @@ fn start_routine(
             ),
         }
     }
+
+    // Force the thread message queue into existence before publishing the
+    // thread id: PostThreadMessageW fails while a thread has no queue, which
+    // used to race teardown/release requests and abort release builds.
+    unsafe {
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+    }
+    announce_ready(&handshake, Ok(unsafe { GetCurrentThreadId() }));
 
     /* run message loop */
     while let Some(msg) = get_msg() {
@@ -511,7 +630,7 @@ fn release_active_client() {
 fn activate(pos: Position, at: (i32, i32)) {
     ACTIVE_CLIENT.replace(Some(pos));
     let entry_point = DISPLAYS
-        .with_borrow(|(displays, _)| display_util::clamp_to_display_bounds(displays, at, at));
+        .with_borrow(|(displays, _, _)| display_util::clamp_to_display_bounds(displays, at, at));
     ENTRY_POINT.replace(entry_point);
     // Physical pixels per logical pixel on the monitor the pointer is pinned
     // to. Raw counts are proportional to physical pixels at the default
@@ -579,8 +698,8 @@ unsafe fn try_activate_by_raw(dx: i32, dy: i32) {
     if unsafe { GetCursorPos(&mut cursor) }.is_err() {
         return;
     }
-    let entered = DISPLAYS.with_borrow_mut(|(displays, generation)| {
-        update_display_regions(displays, generation);
+    let entered = DISPLAYS.with_borrow_mut(|(displays, generation, primary)| {
+        update_display_regions(displays, generation, primary);
         display_util::outward_edge_crossing((cursor.x, cursor.y), (dx, dy), displays)
     });
     let Some(pos) = entered else {
@@ -616,8 +735,8 @@ unsafe fn try_activate_by_legacy(lparam: LPARAM) {
     let curr_pos = (mouse_low_level.pt.x, mouse_low_level.pt.y);
     let prev_pos = PREV_POS.get().unwrap_or(curr_pos);
     PREV_POS.replace(Some(curr_pos));
-    let entered = DISPLAYS.with_borrow_mut(|(displays, generation)| {
-        update_display_regions(displays, generation);
+    let entered = DISPLAYS.with_borrow_mut(|(displays, generation, primary)| {
+        update_display_regions(displays, generation, primary);
         display_util::entered_barrier(prev_pos, curr_pos, displays)
     });
     let Some(pos) = entered else {
@@ -665,15 +784,56 @@ unsafe fn process_raw_input(lparam: LPARAM) {
         return;
     }
     let mouse = unsafe { raw.data.mouse };
-    // Absolute pointing devices (tablets, some remote desktop clients) do not
-    // report relative counts; adding them as deltas would jump the pointer.
+    // Absolute pointing devices (tablets, some digitizers, some remote
+    // desktop sessions) do not report relative counts. Discarding them made
+    // the pointer freeze for those devices; consecutive absolute positions are
+    // converted into deltas instead.
     if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
+        let virtual_desktop = mouse.usFlags.0 & MOUSE_VIRTUAL_DESKTOP.0 != 0;
+        let Some(previous) = PREV_ABS_POS.replace(Some((mouse.lLastX, mouse.lLastY))) else {
+            // The first packet only establishes the reference position.
+            return;
+        };
+        // RAWMOUSE documentation: with MOUSE_MOVE_ABSOLUTE the coordinates are
+        // always normalized to 0..=65535; MOUSE_VIRTUAL_DESKTOP only selects
+        // whether they map over the whole virtual desktop or the primary
+        // monitor. Use the monitor rectangles (physical pixels) as the extent;
+        // GetSystemMetrics would be DPI-virtualized in this per-monitor aware
+        // thread and mix up the scales on mixed-DPI layouts.
+        let extent = DISPLAYS.with_borrow_mut(|(displays, generation, primary)| {
+            update_display_regions(displays, generation, primary);
+            display_util::mapping_extent(displays, *primary, virtual_desktop).or_else(|| {
+                // Unknown primary monitor (e.g. enumeration raced a hotplug):
+                // fall back to the virtual desktop rather than dropping input.
+                display_util::mapping_extent(displays, *primary, true)
+            })
+        });
+        let Some(extent) = extent else {
+            return;
+        };
+        let Some((dx, dy)) = display_util::absolute_mouse_delta(
+            (mouse.lLastX, mouse.lLastY),
+            Some(previous),
+            extent,
+        ) else {
+            return;
+        };
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        unsafe { handle_mouse_delta(dx, dy) };
         return;
     }
     let (dx, dy) = (mouse.lLastX, mouse.lLastY);
     if dx == 0 && dy == 0 {
         return;
     }
+    unsafe { handle_mouse_delta(dx, dy) };
+}
+
+/// Forward a relative mouse delta to the peer (capture active) or use it for
+/// barrier detection (idle).
+unsafe fn handle_mouse_delta(dx: i32, dy: i32) {
     match ACTIVE_CLIENT.get() {
         Some(pos) => {
             let scale = DPI_SCALE.get().max(0.1);
@@ -717,6 +877,19 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
+    // Buttons/wheel events injected by our own emulation while a peer drives
+    // this machine (racing the local capture release) must not be reflected
+    // back to the peer; pass them to the local applications instead. Only this
+    // narrow race is guarded: injected events while no peer drives us keep
+    // being forwarded (on-screen keyboards, macro tools, integration tests).
+    let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
+    if REMOTE_PEER.get().is_some()
+        && mouse_low_level.flags & LLMHF_INJECTED != 0
+        && input_event::injection::is_recent(REMOTE_GRACE_MS)
+    {
+        return unsafe { CallNextHookEx(None, ncode, wparam, lparam) };
+    }
+
     // Motion is forwarded from raw input; only block it from local apps here
     // (forwarding it too would double every movement).
     if wparam.0 == WM_MOUSEMOVE as usize {
@@ -733,10 +906,32 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Required by the hook contract: negative codes must be passed on.
+    if ncode < 0 {
+        return unsafe { CallNextHookEx(None, ncode, wparam, lparam) };
+    }
+
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
-        return CallNextHookEx(None, ncode, wparam, lparam);
+        return unsafe { CallNextHookEx(None, ncode, wparam, lparam) };
     };
+
+    // Key events injected by our own emulation (the peer drives this machine)
+    // must neither be forwarded back to the peer (feedback loop) nor blocked
+    // locally (the peer's input would be swallowed): pass them through. The
+    // marker distinguishes our injection from third-party tools (on-screen
+    // keyboard, macros), whose events keep being forwarded as before.
+    // Only guard the case where a peer is actually driving this machine; the
+    // existing behavior of forwarding injected keys while capturing must be
+    // kept (the Windows integration test relies on it, and third-party
+    // injectors such as on-screen keyboards are a valid input source).
+    let keyboard_low_level: KBDLLHOOKSTRUCT = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    if REMOTE_PEER.get().is_some()
+        && keyboard_low_level.flags.contains(LLKHF_INJECTED)
+        && input_event::injection::is_recent(REMOTE_GRACE_MS)
+    {
+        return unsafe { CallNextHookEx(None, ncode, wparam, lparam) };
+    }
 
     /* convert to key event */
     let Some(key_event) = to_key_event(wparam, lparam) else {
@@ -759,14 +954,21 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match uint {
         WM_DISPLAYCHANGE => {
-            log::debug!("display resolution changed");
+            log::debug!("display configuration changed");
             DISPLAY_RESOLUTION_GENERATION.fetch_add(1, Ordering::Release);
             if ACTIVE_CLIENT.get().is_some() {
-                // Keep the cursor hidden: the entry point may still be valid
-                // (resolution change on another monitor) but repositioning is
-                // cheap and keeps the overlay under the pinned pointer.
-                let (entry_x, entry_y) = ENTRY_POINT.get();
-                show_hidden_pointer((entry_x, entry_y));
+                sync_active_capture_to_displays();
+            }
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // A display scale change (or the pointer ending up on a
+            // differently scaled monitor) invalidates both the pinned entry
+            // point and the physical->logical pixel ratio.
+            log::debug!("display dpi changed");
+            DISPLAY_RESOLUTION_GENERATION.fetch_add(1, Ordering::Release);
+            if ACTIVE_CLIENT.get().is_some() {
+                sync_active_capture_to_displays();
             }
             LRESULT(0)
         }
@@ -779,59 +981,102 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+/// Re-read the display layout and, when a capture is active, move the pinned
+/// entry point (and the cursor overlay) into the new layout and refresh the
+/// physical->logical pixel ratio. Called on WM_DISPLAYCHANGE/WM_DPICHANGED.
+fn sync_active_capture_to_displays() {
+    let mut cursor = POINT::default();
+    let cursor_known = unsafe { GetCursorPos(&mut cursor) }.is_ok();
+    let (entry_x, entry_y) = DISPLAYS.with_borrow_mut(|(displays, generation, primary)| {
+        enumerate_displays(displays, primary);
+        *generation = DISPLAY_RESOLUTION_GENERATION.load(Ordering::Acquire);
+        let (ex, ey) = ENTRY_POINT.get();
+        let prev = if cursor_known {
+            (cursor.x, cursor.y)
+        } else {
+            (ex, ey)
+        };
+        display_util::clamp_to_display_bounds(displays, prev, (ex, ey))
+    });
+    ENTRY_POINT.replace((entry_x, entry_y));
+    DPI_SCALE.replace(unsafe { monitor_scale((entry_x, entry_y)) });
+    // Keep the overlay under the pinned pointer and re-pin the cursor to the
+    // (possibly clamped) entry point.
+    show_hidden_pointer((entry_x, entry_y));
+    unsafe {
+        let _ = SetCursorPos(entry_x, entry_y);
+    }
+    log::info!("capture pinned point refreshed after display change: ({entry_x}, {entry_y})");
+}
+
 static DISPLAY_RESOLUTION_GENERATION: AtomicI32 = AtomicI32::new(1);
 
-fn update_display_regions(displays: &mut Vec<RECT>, generation: &mut i32) {
+fn update_display_regions(
+    displays: &mut Vec<RECT>,
+    generation: &mut i32,
+    primary: &mut Option<RECT>,
+) {
     let global_generation = DISPLAY_RESOLUTION_GENERATION.load(Ordering::Acquire);
     if *generation != global_generation {
-        enumerate_displays(displays);
+        enumerate_displays(displays, primary);
         log::debug!("displays: {displays:?}");
         *generation = global_generation;
     }
 }
 
-fn enumerate_displays(display_rects: &mut Vec<RECT>) {
-    display_rects.clear();
-    unsafe {
-        let mut devices = vec![];
-        for i in 0.. {
-            let mut device: DISPLAY_DEVICEW = std::mem::zeroed();
-            device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-            let ret = EnumDisplayDevicesW(None, i, &mut device, EDD_GET_DEVICE_INTERFACE_NAME);
-            if ret == FALSE {
-                break;
-            }
-            if device
-                .StateFlags
-                .contains(DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
-            {
-                devices.push(device.DeviceName);
-            }
-        }
-        for device in devices {
-            let mut dev_mode: DEVMODEW = std::mem::zeroed();
-            dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-            let ret = EnumDisplaySettingsW(
-                PCWSTR::from_raw(&device as *const _),
-                ENUM_CURRENT_SETTINGS,
-                &mut dev_mode,
-            );
-            if ret == FALSE {
-                log::warn!("no display mode");
-            }
+/// Collect the monitor rectangles in virtual-desktop (physical pixel)
+/// coordinates.
+///
+/// Uses `EnumDisplayMonitors`/`GetMonitorInfoW`, the same source the emulation
+/// backend queries, so the capture barriers and the injected absolute cursor
+/// position agree even on mixed-DPI layouts. `EnumDisplaySettingsW` was used
+/// before, which reports per-display modes from a different code path.
+fn enumerate_displays(display_rects: &mut Vec<RECT>, primary: &mut Option<RECT>) {
+    unsafe extern "system" fn collect_monitor_with_primary(
+        monitor: HMONITOR,
+        hdc: HDC,
+        rect: *mut RECT,
+        user_data: LPARAM,
+    ) -> BOOL {
+        // SAFETY: same contract as `collect_monitor`; additionally read the
+        // primary flag from GetMonitorInfoW and report it through the tuple.
+        let state = unsafe { &mut *(user_data.0 as *mut (Vec<RECT>, Option<RECT>)) };
+        collect_monitor_inner(monitor, hdc, rect, &mut state.0, &mut state.1);
+        BOOL(1)
+    }
 
-            let pos = dev_mode.Anonymous1.Anonymous2.dmPosition;
-            let (x, y) = (pos.x, pos.y);
-            let (width, height) = (dev_mode.dmPelsWidth, dev_mode.dmPelsHeight);
-
-            display_rects.push(RECT {
-                left: x,
-                right: x + width as i32,
-                top: y,
-                bottom: y + height as i32,
-            });
+    unsafe fn collect_monitor_inner(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        rects: &mut Vec<RECT>,
+        primary: &mut Option<RECT>,
+    ) {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            if info.dwFlags & MONITORINFOF_PRIMARY != 0 {
+                *primary = Some(info.rcMonitor);
+            }
+            rects.push(info.rcMonitor);
+        } else {
+            log::warn!("could not query the info of an attached monitor");
         }
     }
+
+    let mut state = (std::mem::take(display_rects), None);
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor_with_primary),
+            LPARAM(&mut state as *mut (Vec<RECT>, Option<RECT>) as isize),
+        );
+    }
+    *display_rects = state.0;
+    *primary = state.1;
 }
 
 /// Physical pixels per logical (96 DPI) pixel on the monitor containing

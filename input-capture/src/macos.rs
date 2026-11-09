@@ -27,8 +27,9 @@ use once_cell::unsync::Lazy;
 use std::{
     collections::HashSet,
     ffi::{CString, c_char},
+    io,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     task::{Context, Poll, ready},
     thread::{self},
 };
@@ -101,17 +102,39 @@ impl InputCaptureState {
         None
     }
 
-    // Get the max bounds of all displays
+    // Recompute the union of all display bounds from scratch.
+    //
+    // Folding into the previous value with min/max (the previous
+    // implementation) only ever grew the bounds: unplugging or rearranging a
+    // monitor left a stale edge behind, so the barrier could be unreachable or
+    // the cursor warped into a region that no longer exists.
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
-        });
+        let mut bounds = Bounds {
+            xmin: f64::INFINITY,
+            xmax: f64::NEG_INFINITY,
+            ymin: f64::INFINITY,
+            ymax: f64::NEG_INFINITY,
+        };
+        let mut found = false;
+        for display in active_ids.iter() {
+            let display_bounds = CGDisplay::new(*display).bounds();
+            found = true;
+            bounds.xmin = bounds.xmin.min(display_bounds.origin.x);
+            bounds.xmax = bounds
+                .xmax
+                .max(display_bounds.origin.x + display_bounds.size.width);
+            bounds.ymin = bounds.ymin.min(display_bounds.origin.y);
+            bounds.ymax = bounds
+                .ymax
+                .max(display_bounds.origin.y + display_bounds.size.height);
+        }
+        if found {
+            self.bounds = bounds;
+        } else {
+            log::warn!("no active displays reported; keeping the previous bounds");
+        }
 
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
@@ -536,9 +559,20 @@ fn create_event_tap<'a>(
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
                 res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                // Mark the state captured synchronously: the producer task
+                // handles Grab asynchronously, and until it runs another
+                // MouseMoved would be treated as a fresh barrier crossing
+                // (duplicate Begin / grab requests).
+                state.current_pos = Some(new_pos);
+                if let Err(e) = state.hide_cursor() {
+                    log::warn!("failed to hide the cursor: {e}");
+                }
+                // A full/closed channel must not panic inside a C callback
+                // (panicking across the FFI boundary aborts the process); the
+                // synchronous state above is what matters.
+                if let Err(e) = notify_tx.blocking_send(ProducerEvent::Grab(new_pos)) {
+                    log::error!("failed to notify the capture task: {e}");
+                }
             }
         }
 
@@ -576,7 +610,7 @@ fn create_event_tap<'a>(
     let tap_source: CFRunLoopSource = tap
         .mach_port()
         .create_runloop_source(0)
-        .expect("Failed creating loop source");
+        .map_err(|_| MacosCaptureCreationError::EventTapCreation)?;
 
     unsafe {
         CFRunLoop::get_current().add_source(&tap_source, kCFRunLoopCommonModes);
@@ -597,12 +631,16 @@ fn event_tap_thread(
 
     let _tap = match create_event_tap(client_state, notify_tx, event_tx) {
         Err(e) => {
-            ready.send(Err(e)).expect("channel closed");
+            if let Err(send_error) = ready.send(Err(e)) {
+                log::error!("could not report the event tap error: {send_error}");
+            }
             return;
         }
         Ok(tap) => {
             let run_loop = CFRunLoop::get_current();
-            ready.send(Ok(run_loop)).expect("channel closed");
+            if let Err(send_error) = ready.send(Ok(run_loop)) {
+                log::error!("could not report the event tap readiness: {send_error}");
+            }
             tap
         }
     };
@@ -666,6 +704,12 @@ pub struct MacOSInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
+    /// Why the event tap died (permissions revoked, secure input, ...). The
+    /// stream must report this instead of silently going quiet: the service
+    /// would otherwise keep believing input capture still works.
+    fatal: Arc<StdMutex<Option<String>>>,
+    /// terminal state already reported once
+    finished: bool,
 }
 
 impl MacOSInputCapture {
@@ -696,8 +740,12 @@ impl MacOSInputCapture {
         });
 
         // wait for event tap creation result
-        let run_loop = ready_rx.recv().expect("channel closed")?;
+        let run_loop = ready_rx
+            .recv()
+            .map_err(|_| MacosCaptureCreationError::EventTapCreation)??;
 
+        let fatal: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let fatal_task = Arc::clone(&fatal);
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             loop {
                 tokio::select! {
@@ -706,9 +754,16 @@ impl MacOSInputCapture {
                             break;
                         };
                         let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
+                        if let Err(e) = state.handle_producer_event(producer_event).await {
                             log::error!("Failed to handle producer event: {e}");
-                        })
+                            // Surface the failure to the capture stream so the
+                            // service can recreate the backend instead of
+                            // running with a dead event tap.
+                            if let Ok(mut slot) = fatal_task.lock() {
+                                *slot = Some(e.to_string());
+                            }
+                            break;
+                        }
                     }
                     _ = &mut tap_exit_rx => break,
                 }
@@ -721,6 +776,8 @@ impl MacOSInputCapture {
             event_rx,
             notify_tx,
             run_loop,
+            fatal,
+            finished: false,
         })
     }
 }
@@ -795,6 +852,9 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
+        // Stop the CFRunLoop so the event-tap thread exits and the producer
+        // task can drain; Drop repeats this, it is idempotent.
+        self.run_loop.stop();
         Ok(())
     }
 }
@@ -803,8 +863,21 @@ impl Stream for MacOSInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        // The event tap can be disabled by macOS at any time (permission
+        // revoked, secure input). Report that as a capture error once.
+        let fatal = self.fatal.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(reason) = fatal {
+            self.finished = true;
+            return Poll::Ready(Some(Err(CaptureError::Io(io::Error::other(reason)))));
+        }
         match ready!(self.event_rx.poll_recv(cx)) {
-            None => Poll::Ready(None),
+            None => {
+                self.finished = true;
+                Poll::Ready(None)
+            }
             Some(e) => Poll::Ready(Some(Ok(e))),
         }
     }

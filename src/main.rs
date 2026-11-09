@@ -19,11 +19,9 @@ use lan_mouse_cli::CliError;
 #[cfg(feature = "gtk")]
 use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
-use std::{
-    future::Future,
-    io,
-    process::{self, Child},
-};
+#[cfg(any(feature = "gtk", feature = "gpui"))]
+use std::process::Child;
+use std::{future::Future, io, process};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -106,17 +104,11 @@ fn run() -> Result<(), LanMouseError> {
                     Some(start_service()?)
                 };
                 let res = run_gpui_frontend();
-                if let Some(ref mut service) = service {
-                    #[cfg(unix)]
-                    {
-                        let pid = service.id() as libc::pid_t;
-                        unsafe {
-                            libc::kill(pid, libc::SIGINT);
-                        }
-                        service.wait()?;
-                    }
-                    service.kill()?;
-                }
+                // Whatever the frontend returned, the daemon we started must
+                // be stopped and reaped before this process exits. Cleanup is
+                // infallible and bounded: a stuck daemon must never hang the
+                // window close.
+                shutdown_service(service.as_mut());
                 res?;
             }
             #[cfg(feature = "gtk")]
@@ -136,23 +128,18 @@ fn run() -> Result<(), LanMouseError> {
                 } else {
                     lan_mouse_gtk::run(config::local_commit()).map_err(LanMouseError::from)
                 };
-                if let Some(ref mut service) = service {
-                    #[cfg(unix)]
-                    {
-                        // on unix we give the service a chance to terminate gracefully
-                        let pid = service.id() as libc::pid_t;
-                        unsafe {
-                            libc::kill(pid, libc::SIGINT);
-                        }
-                        service.wait()?;
-                    }
-                    service.kill()?;
-                }
+                // Give the service a chance to terminate gracefully (SIGINT),
+                // but never block the window close on a stuck daemon and
+                // always reap the child.
+                shutdown_service(service.as_mut());
                 res?;
             }
-            #[cfg(not(feature = "gtk"))]
+            #[cfg(all(not(feature = "gtk"), not(feature = "gpui")))]
             {
-                // run daemon if gtk is diabled
+                // Headless build: run the daemon directly. With `gpui` or
+                // `gtk` enabled the frontend path above owns the lifecycle;
+                // falling through to this arm after the GUI exits would leave
+                // the process running as a daemon forever.
                 match run_async(run_service(config)) {
                     Err(LanMouseError::Service(ServiceError::IpcListen(
                         IpcListenerCreationError::AlreadyRunning,
@@ -227,6 +214,7 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
+#[cfg(any(feature = "gtk", feature = "gpui"))]
 fn start_service() -> Result<Child, io::Error> {
     let mut command = process::Command::new(std::env::current_exe()?);
     command.args(std::env::args().skip(1)).arg("daemon");
@@ -270,7 +258,69 @@ fn attach_parent_console() {
         if std::env::args_os().len() > 1 {
             use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
             unsafe {
-                let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+                // Fails when there is no parent console (Explorer, service,
+                // redirected stdio); there is nothing to restore then.
+                if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
+                    restore_console_std_handles();
+                }
+            }
+        }
+    }
+}
+
+/// Point the process standard handles at the console we just attached to.
+///
+/// `AttachConsole` attaches the Win32 console, but this GUI-subsystem process
+/// can still have absent std handles, so writes through `std::io::stdout`
+/// (and the CLI's `println!`) would be discarded. Reopening `CONOUT$` and
+/// installing it with `SetStdHandle` makes `lan-mouse doctor --json` and
+/// `lan-mouse cli` work when run from a terminal or a pipeline.
+///
+/// A handle that is already valid is left untouched: when the process was
+/// started with its stdout/stderr redirected (`> file`, a pipe,
+/// `-RedirectStandardOutput`), `AttachConsole` still succeeds because the
+/// parent has a console, and overwriting those handles would throw the
+/// redirection away (the file would stay empty and the output would go to the
+/// console instead).
+#[cfg(windows)]
+fn restore_console_std_handles() {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+
+    unsafe fn handle_is_absent(handle: windows::core::Result<HANDLE>) -> bool {
+        match handle {
+            Ok(handle) => handle.is_invalid() || handle.0.is_null(),
+            Err(_) => true,
+        }
+    }
+
+    // The opened device files must stay alive for the whole process lifetime:
+    // they become the std handles.
+    let stdout_absent = unsafe { handle_is_absent(GetStdHandle(STD_OUTPUT_HANDLE)) };
+    let stderr_absent = unsafe { handle_is_absent(GetStdHandle(STD_ERROR_HANDLE)) };
+    if stdout_absent || stderr_absent {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+            let handle = HANDLE(file.as_raw_handle() as *mut _);
+            std::mem::forget(file);
+            unsafe {
+                if stdout_absent {
+                    let _ = SetStdHandle(STD_OUTPUT_HANDLE, handle);
+                }
+                if stderr_absent {
+                    let _ = SetStdHandle(STD_ERROR_HANDLE, handle);
+                }
+            }
+        }
+    }
+    if unsafe { handle_is_absent(GetStdHandle(STD_INPUT_HANDLE)) } {
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open("CONIN$") {
+            let handle = HANDLE(file.as_raw_handle() as *mut _);
+            std::mem::forget(file);
+            unsafe {
+                let _ = SetStdHandle(STD_INPUT_HANDLE, handle);
             }
         }
     }
@@ -285,4 +335,144 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
     service.run().await?;
     log::info!("service exited!");
     Ok(())
+}
+
+/// How long the frontend waits for the daemon to exit after SIGINT before
+/// killing it.
+#[cfg(any(feature = "gtk", feature = "gpui"))]
+const SERVICE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Stop the daemon child this process started (if any) without ever blocking
+/// the frontend's exit.
+///
+/// A window close must not hang on a daemon that ignores SIGINT, and the child
+/// must be reaped so it does not linger as an orphan (and so its pid cannot be
+/// recycled while this process still holds it).
+#[cfg(any(feature = "gtk", feature = "gpui"))]
+fn shutdown_service(service: Option<&mut Child>) {
+    let Some(service) = service else { return };
+    shutdown_service_with_grace(service, SERVICE_SHUTDOWN_GRACE);
+}
+
+#[cfg(all(unix, any(feature = "gtk", feature = "gpui")))]
+fn shutdown_service_with_grace(service: &mut Child, grace: std::time::Duration) {
+    use std::time::Instant;
+
+    // The daemon may have exited on its own already (e.g. it failed to bind
+    // because another instance owns the IPC socket, or the frontend failed to
+    // launch). Never signal a pid we have not reaped yet: a dead child's pid
+    // may already belong to an unrelated process.
+    match service.try_wait() {
+        Ok(Some(_)) | Err(_) => return,
+        Ok(None) => {}
+    }
+
+    // SAFETY: kill(2) only takes a pid and a signal. The pid is our own child
+    // and has not been reaped, so it cannot have been recycled.
+    let pid = service.id() as libc::pid_t;
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < grace {
+        match service.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(e) => {
+                log::warn!("could not check daemon state: {e}");
+                break;
+            }
+        }
+    }
+    log::warn!("daemon did not exit within {grace:?}; killing it");
+    stop_child(service);
+}
+
+#[cfg(all(not(unix), any(feature = "gtk", feature = "gpui")))]
+fn shutdown_service_with_grace(service: &mut Child, _grace: std::time::Duration) {
+    // A Windows console-less child cannot receive our Ctrl-C; terminate it.
+    match service.try_wait() {
+        Ok(Some(_)) | Err(_) => return,
+        Ok(None) => {}
+    }
+    stop_child(service);
+}
+
+#[cfg(any(feature = "gtk", feature = "gpui"))]
+fn stop_child(service: &mut Child) {
+    if let Err(e) = service.kill() {
+        log::warn!("could not kill daemon: {e}");
+    }
+    if let Err(e) = service.wait() {
+        log::warn!("could not reap daemon: {e}");
+    }
+}
+
+#[cfg(all(test, unix, any(feature = "gtk", feature = "gpui")))]
+mod shutdown_tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    fn spawn_sleep() -> Child {
+        Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[test]
+    fn already_exited_child_is_reaped_without_signalling() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        shutdown_service(Some(&mut child));
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "the child must be reaped"
+        );
+    }
+
+    #[test]
+    fn cooperative_daemon_is_stopped_quickly() {
+        let mut child = spawn_sleep();
+        let start = Instant::now();
+        shutdown_service(Some(&mut child));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cooperative child took {:?}",
+            start.elapsed()
+        );
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    #[test]
+    fn stubborn_daemon_is_killed_after_the_grace_period() {
+        // SIGINT ignored: the bounded wait must give up and SIGKILL it.
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' INT; exec sleep 30"])
+            .spawn()
+            .expect("spawn sh");
+        // Let the shell install the ignored-SIGINT disposition before we
+        // signal it; otherwise the test races the exec and would pass for the
+        // wrong reason.
+        std::thread::sleep(Duration::from_millis(200));
+        let grace = Duration::from_millis(150);
+        let start = Instant::now();
+        shutdown_service_with_grace(&mut child, grace);
+        assert!(
+            start.elapsed() >= grace,
+            "should have waited the grace period, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "took too long: {:?}",
+            start.elapsed()
+        );
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
 }

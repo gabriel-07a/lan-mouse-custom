@@ -3,9 +3,6 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::{fs::File, io::BufReader};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use webrtc_dtls::crypto::Certificate;
@@ -77,9 +74,21 @@ pub fn normalize_fingerprint(input: &str) -> Option<String> {
     )
 }
 
+/// Largest key/certificate PEM file we are willing to read.
+///
+/// A self-signed PEM is ~2 KiB; the cap only exists so a corrupted or
+/// replaced file cannot make the service allocate unbounded memory at start.
+const MAX_PEM_LEN: u64 = 1024 * 1024;
+
 /// load certificate from file
 pub fn load_certificate(path: &Path) -> Result<Certificate, Error> {
     let f = File::open(path)?;
+    if f.metadata()?.len() > MAX_PEM_LEN {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("certificate file {path:?} is unexpectedly large"),
+        )));
+    }
 
     let mut reader = BufReader::new(f);
     let mut pem = String::new();
@@ -87,36 +96,117 @@ pub fn load_certificate(path: &Path) -> Result<Certificate, Error> {
     Ok(Certificate::from_pem(pem.as_str())?)
 }
 
-/// Best-effort ACL hardening for the private key on Windows.
+/// Restrict the private key file to the current user on Windows.
 ///
 /// `std` cannot set ACLs, so this shells out to `icacls` (present on every
 /// supported Windows release): inheritance is removed and the current user
-/// gets read-only access, mirroring the `0400` mode used on Unix. A failure
-/// is logged but never prevents the service from starting.
+/// gets read-only access, mirroring the `0400` mode used on Unix.
+///
+/// The ACL change is verified by reopening the file. `/inheritance:r` removes
+/// the inherited ACEs *before* the explicit grant is added, so a failed
+/// `/grant` (renamed/domain account, unusual user name, ...) would otherwise
+/// leave the file unreadable by its own owner and the next start would fail in
+/// [`load_or_generate_key_and_cert`]. On any failure the inherited ACL is
+/// restored (best effort) so a missing key never bricks the service; the
+/// problem is logged loudly for the `doctor`/manual review.
 #[cfg(windows)]
 fn restrict_windows_key_acl(path: &Path) {
+    use std::ffi::OsStr;
     use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    fn run_icacls(args: &[&OsStr]) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("icacls")
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+    }
+
+    let restore_inheritance = |why: &str| {
+        log::warn!("{why}; restoring inherited permissions for {path:?}");
+        let args: [&OsStr; 2] = [path.as_os_str(), OsStr::new("/inheritance:e")];
+        match run_icacls(&args) {
+            Ok(output) if output.status.success() => {
+                log::warn!(
+                    "restored inherited ACL on {path:?}; move the certificate to a private \
+                     directory or fix the ACL manually"
+                );
+            }
+            Ok(output) => {
+                log::warn!(
+                    "could not restore the inherited ACL on {path:?} ({})",
+                    output.status
+                )
+            }
+            Err(e) => log::warn!("could not run icacls to restore {path:?}: {e}"),
+        }
+    };
+
     let Ok(user) = std::env::var("USERNAME") else {
         log::warn!("could not determine the current user; key ACL not restricted");
         return;
     };
-    // Capture stdout/stderr: icacls prints "processed file: ..." on success,
-    // which would otherwise pollute the JSON output of `doctor --json` and
-    // the release smoke test's ConvertFrom-Json.
-    let result = std::process::Command::new("icacls")
-        .arg(path)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        .arg(format!("{user}:R"))
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output();
-    match result {
+    let grant = format!("{user}:R");
+    let restrict_args: [&OsStr; 4] = [
+        path.as_os_str(),
+        OsStr::new("/inheritance:r"),
+        OsStr::new("/grant:r"),
+        OsStr::new(grant.as_str()),
+    ];
+    match run_icacls(&restrict_args) {
         Ok(output) if output.status.success() => {
-            log::debug!("restricted private key ACL to {user}:R");
+            // Post-condition: the owner must still be able to read the key.
+            if std::fs::File::open(path).is_ok() {
+                log::debug!("restricted private key ACL to {user}:R");
+            } else {
+                restore_inheritance(
+                    "the current user cannot read the private key after the ACL change",
+                );
+            }
         }
-        Ok(output) => log::warn!("icacls failed for {path:?} ({})", output.status),
-        Err(e) => log::warn!("could not run icacls for {path:?}: {e}"),
+        Ok(output) => {
+            restore_inheritance(&format!("icacls failed for {path:?} ({})", output.status))
+        }
+        Err(e) => restore_inheritance(&format!("could not run icacls for {path:?}: {e}")),
     }
+}
+
+/// Create (or replace) the private key file without ever exposing the PEM
+/// bytes with a wider mode than intended.
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), Error> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The mode is applied atomically at creation: no window in which the
+        // private key exists with the process umask (e.g. 0644).
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .open(path)?
+    };
+    #[cfg(windows)]
+    let file = File::create(path)?;
+
+    let mut writer = BufWriter::new(file);
+    writer.write_all(contents)?;
+    writer.flush()?;
+    drop(writer);
+
+    // Defensive re-check: an existing file keeps its old mode when opened
+    // with `create(true)`, and some FUSE/network filesystems ignore the
+    // creation mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o400 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400))?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load_or_generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
@@ -130,28 +220,15 @@ pub(crate) fn load_or_generate_key_and_cert(path: &Path) -> Result<Certificate, 
 pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
     let cert = Certificate::generate_self_signed(["ignored".to_owned()])?;
     let serialized = cert.serialize_pem();
-    let parent = path.parent().expect("is a path");
-    fs::create_dir_all(parent)?;
-    let f = File::create(path)?;
-    #[cfg(unix)]
-    {
-        let mut perm = f.metadata()?.permissions();
-        perm.set_mode(0o400); /* r-- --- --- */
-        f.set_permissions(perm)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
     }
-    // On Windows the handle is reopened after creation so the ACL can be
-    // applied before the PEM bytes are written; on Unix the create handle is
-    // used directly.
-    #[cfg(windows)]
-    let f = {
-        drop(f);
-        File::options().append(true).open(path)?
-    };
+    write_private_file(path, serialized.as_bytes())?;
 
-    let mut writer = BufWriter::new(f);
-    writer.write_all(serialized.as_bytes())?;
-    drop(writer);
-
+    // Windows: harden the ACL once the PEM bytes are on disk, then verify
+    // that the owner can still read the key (see restrict_windows_key_acl).
     #[cfg(windows)]
     restrict_windows_key_acl(path);
 
@@ -272,5 +349,35 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o400);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_loose_key_file_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_path("loose");
+        std::fs::write(&path, b"stale contents").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+        generate_key_and_cert(&path).expect("regenerate over a loose file");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o400,
+            "an existing file must be re-tightened after regeneration"
+        );
+    }
+
+    #[test]
+    fn oversized_certificate_file_is_rejected() {
+        let path = unique_path("huge");
+        std::fs::write(&path, vec![b'x'; (MAX_PEM_LEN + 1) as usize]).expect("seed");
+        let result = load_certificate(&path);
+        assert!(
+            matches!(result, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::InvalidData),
+            "a huge PEM file must be rejected before reading it"
+        );
     }
 }

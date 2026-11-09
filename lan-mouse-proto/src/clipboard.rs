@@ -420,4 +420,74 @@ mod tests {
         }
         assert_eq!(offer().type_id(), FRAME_OFFER);
     }
+
+    #[test]
+    fn arbitrary_frames_never_panic() {
+        // Fuzz-style regression over the clipboard decoder: random bytes
+        // (any length up to a little above a full frame) must produce an
+        // error or a value, never a panic.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        };
+        for len in 0..=(MAX_CLIPBOARD_FRAME + 8) {
+            for _ in 0..32 {
+                let mut bytes = vec![0u8; len];
+                for byte in bytes.iter_mut() {
+                    *byte = next();
+                }
+                if let Ok(frame) = ClipboardFrame::decode(&bytes) {
+                    // Decoded frames must re-encode consistently.
+                    let encoded = frame.encode();
+                    assert_eq!(encoded.len(), frame.encoded_len());
+                    assert_eq!(ClipboardFrame::decode(&encoded), Ok(frame));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_chunk_and_empty_offer_roundtrip() {
+        let full = ClipboardFrame::Chunk {
+            serial: u32::MAX,
+            mime: MIME_TEXT,
+            offset: u32::MAX - CHUNK_SIZE as u32,
+            total: u32::MAX,
+            data: vec![0xff; CHUNK_SIZE],
+        };
+        let encoded = full.encode();
+        assert!(encoded.len() <= MAX_CLIPBOARD_FRAME);
+        assert_eq!(ClipboardFrame::decode(&encoded), Ok(full));
+
+        let empty = ClipboardFrame::Offer {
+            serial: 1,
+            origin: 0,
+            hash: [0u8; 32],
+            items: Vec::new(),
+        };
+        let encoded = empty.encode();
+        assert_eq!(ClipboardFrame::decode(&encoded), Ok(empty));
+    }
+
+    #[test]
+    fn over_maximum_item_count_is_rejected() {
+        // Manual offer with a fourth item: the decoder must reject it before
+        // allocating (the wire count is a single byte).
+        let mut encoded = vec![FRAME_OFFER];
+        encoded.extend_from_slice(&1u32.to_be_bytes()); // serial
+        encoded.extend_from_slice(&0u64.to_be_bytes()); // origin
+        encoded.extend_from_slice(&[0u8; 32]); // hash
+        encoded.push(4); // item count above the accepted maximum
+        for _ in 0..4 {
+            encoded.push(MIME_TEXT);
+            encoded.extend_from_slice(&1u32.to_be_bytes());
+        }
+        assert_eq!(
+            ClipboardFrame::decode(&encoded),
+            Err(FrameError::InvalidItemCount(4))
+        );
+    }
 }

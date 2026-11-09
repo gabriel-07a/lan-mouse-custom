@@ -44,6 +44,11 @@ pub enum IpcListenerCreationError {
     AlreadyRunning,
     #[error("failed to bind lan-mouse socket: `{0}`")]
     Bind(io::Error),
+    /// An existing socket path could not be probed for a live service (for
+    /// example because of file-descriptor exhaustion), so it was left in place
+    /// instead of being deleted and stolen from a possibly running service.
+    #[error("failed to probe the existing lan-mouse socket: `{0}`")]
+    Probe(io::Error),
 }
 
 #[derive(Debug, Error)]
@@ -836,6 +841,14 @@ pub enum FrontendRequest {
         incoming: DirectionPolicy,
         outgoing: DirectionPolicy,
     },
+    /// Ask the service to shut down gracefully.
+    ///
+    /// The service finishes the current work, terminates capture, emulation,
+    /// clipboard and DNS and removes its IPC socket. This is an additive
+    /// variant: a newer CLI can send it to a newer service, while older
+    /// services simply answer with an `Error` (or ignore the undecodable
+    /// line) and keep running, so callers must use a bounded wait.
+    Shutdown,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -1079,6 +1092,7 @@ mod tests {
         json_roundtrip(FrontendRequest::EnableCapture);
         json_roundtrip(FrontendRequest::SaveConfiguration);
         json_roundtrip(FrontendRequest::SetClipboardEnabled(true));
+        json_roundtrip(FrontendRequest::Shutdown);
     }
 
     #[test]
@@ -1445,5 +1459,339 @@ mod ipc_tests {
         for request in requests {
             assert_eq!(json_roundtrip(request.clone()), request);
         }
+    }
+
+    // ---- hardening regression tests: framing, caps, lifecycle ----
+
+    /// Encode a request as one JSON line.
+    fn request_line(request: &FrontendRequest) -> Vec<u8> {
+        let mut line = serde_json::to_vec(request).expect("serialize request");
+        line.push(b'\n');
+        line
+    }
+
+    async fn raw_connect(path: &std::path::Path) -> tokio::net::UnixStream {
+        tokio::net::UnixStream::connect(path)
+            .await
+            .expect("raw frontend connect")
+    }
+
+    async fn write_raw(stream: &mut tokio::net::UnixStream, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt as _;
+        stream.write_all(bytes).await.expect("write raw");
+        stream.flush().await.expect("flush raw");
+    }
+
+    /// Read listener requests until `predicate` matches, panicking on timeout.
+    async fn wait_for_request(
+        listener: &mut AsyncFrontendListener,
+        mut predicate: impl FnMut(&FrontendRequest) -> bool,
+    ) -> FrontendRequest {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for a request");
+            match tokio::time::timeout(remaining, listener.next()).await {
+                Ok(Some(Ok(request))) if predicate(&request) => return request,
+                Ok(Some(Ok(_))) | Ok(Some(Err(_))) => continue,
+                Ok(None) => panic!("listener closed"),
+                Err(_) => panic!("timed out waiting for a request"),
+            }
+        }
+    }
+
+    /// Poll the listener until `predicate` holds (drives accepts and cleanup
+    /// without requiring any particular item to be produced).
+    async fn drive_until(
+        listener: &mut AsyncFrontendListener,
+        mut predicate: impl FnMut(&AsyncFrontendListener) -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !predicate(listener) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "timed out driving the listener");
+            let _ = tokio::time::timeout(remaining.min(Duration::from_millis(20)), listener.next())
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_socket_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = socket_path("perms");
+        let listener = AsyncFrontendListener::new_at(path.clone())
+            .await
+            .expect("listener");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the IPC socket must not be group/world accessible"
+        );
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_line_does_not_kill_the_connection() {
+        let path = socket_path("badjson");
+        let mut listener = AsyncFrontendListener::new_at(path.clone())
+            .await
+            .expect("listener");
+        let mut raw = raw_connect(&path).await;
+        write_raw(&mut raw, b"this is not json\n").await;
+        write_raw(&mut raw, &request_line(&FrontendRequest::Enumerate())).await;
+
+        // The decode error is surfaced to the service (which logs it) ...
+        let error = wait_for_event(&mut listener, |result| {
+            matches!(result, Err(IpcError::Json(_)))
+        })
+        .await;
+        assert!(matches!(error, Err(IpcError::Json(_))));
+        // ...and the next line from the same connection is still consumed.
+        wait_for_request(&mut listener, |request| {
+            matches!(request, FrontendRequest::Enumerate())
+        })
+        .await;
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Read listener items until the predicate matches.
+    async fn wait_for_event(
+        listener: &mut AsyncFrontendListener,
+        mut predicate: impl FnMut(&Result<FrontendRequest, IpcError>) -> bool,
+    ) -> Result<FrontendRequest, IpcError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for a listener item"
+            );
+            match tokio::time::timeout(remaining, listener.next()).await {
+                Ok(Some(item)) if predicate(&item) => return item,
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("listener closed"),
+                Err(_) => panic!("timed out waiting for a listener item"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_frame_is_assembled_until_the_newline_arrives() {
+        let path = socket_path("partial");
+        let mut listener = AsyncFrontendListener::new_at(path.clone())
+            .await
+            .expect("listener");
+        let mut raw = raw_connect(&path).await;
+        let line = request_line(&FrontendRequest::Enumerate());
+        let split = line.len() / 2;
+        write_raw(&mut raw, &line[..split]).await;
+        // Nothing may be decoded before the newline arrives (the synthetic
+        // Sync for the new connection is the only allowed item).
+        if let Ok(Some(Ok(request))) =
+            tokio::time::timeout(Duration::from_millis(100), listener.next()).await
+        {
+            assert!(
+                matches!(request, FrontendRequest::Sync),
+                "a partial line must not be decoded early"
+            );
+        }
+        write_raw(&mut raw, &line[split..]).await;
+        wait_for_request(&mut listener, |request| {
+            matches!(request, FrontendRequest::Enumerate())
+        })
+        .await;
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_line_closes_only_that_connection() {
+        use tokio::io::AsyncReadExt as _;
+
+        let path = socket_path("utf8");
+        let mut listener = AsyncFrontendListener::new_at(path.clone())
+            .await
+            .expect("listener");
+        let mut bad = raw_connect(&path).await;
+        let mut good = raw_connect(&path).await;
+        write_raw(&mut bad, b"\xff\xfe not utf8\n").await;
+        write_raw(&mut good, &request_line(&FrontendRequest::ListDevices)).await;
+
+        wait_for_request(&mut listener, |request| {
+            matches!(request, FrontendRequest::ListDevices)
+        })
+        .await;
+        drive_until(&mut listener, |listener| listener.frontend_count() == 1).await;
+        assert_eq!(
+            listener.frontend_count(),
+            1,
+            "the broken connection is gone"
+        );
+        // One more poll lets `SelectAll` drop the finished stream, which closes
+        // the underlying socket.
+        let _ = tokio::time::timeout(Duration::from_millis(50), listener.next()).await;
+
+        // The broken peer observes a clean EOF; the healthy peer stays open.
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(5), bad.read(&mut buf))
+            .await
+            .expect("timeout waiting for EOF")
+            .expect("read");
+        assert_eq!(read, 0, "the broken frontend must see EOF");
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn oversized_line_closes_only_that_connection() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let path = socket_path("oversize");
+        let mut listener = AsyncFrontendListener::new_at(path.clone())
+            .await
+            .expect("listener");
+        let bad = raw_connect(&path).await;
+        let mut good = raw_connect(&path).await;
+        write_raw(&mut good, &request_line(&FrontendRequest::ListDevices)).await;
+
+        // One oversized line with no newline: the writer runs in the
+        // background because the service stops reading once the cap is hit.
+        let mut bad_stream = bad;
+        let writer = tokio::spawn(async move {
+            let oversized = vec![b'x'; crate::listen::MAX_MESSAGE_LINE + 16];
+            let _ = bad_stream.write_all(&oversized).await;
+            let _ = bad_stream.flush().await;
+            bad_stream
+        });
+
+        wait_for_request(&mut listener, |request| {
+            matches!(request, FrontendRequest::ListDevices)
+        })
+        .await;
+        drive_until(&mut listener, |listener| listener.frontend_count() == 1).await;
+        assert_eq!(
+            listener.frontend_count(),
+            1,
+            "only the oversized connection is dropped"
+        );
+        let _bad = writer.await.expect("writer task");
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn frontend_connection_cap_is_enforced_and_recoverable() {
+        let path = socket_path("cap");
+        let mut listener = AsyncFrontendListener::new_at(path.clone())
+            .await
+            .expect("listener");
+        let cap = crate::listen::MAX_FRONTENDS;
+        let mut clients = Vec::new();
+        for expected in 1..=cap {
+            clients.push(raw_connect(&path).await);
+            drive_until(&mut listener, |listener| {
+                listener.frontend_count() == expected
+            })
+            .await;
+        }
+        assert_eq!(listener.frontend_count(), cap);
+
+        // One more connection is rejected instead of growing the fd/thread
+        // usage without bound.
+        let extra = raw_connect(&path).await;
+        let _ = tokio::time::timeout(Duration::from_millis(100), listener.next()).await;
+        assert_eq!(listener.frontend_count(), cap, "the cap must hold");
+        drop(extra);
+
+        // Freeing a slot lets a new frontend in again.
+        drop(clients.remove(0));
+        drive_until(&mut listener, |listener| {
+            listener.frontend_count() == cap - 1
+        })
+        .await;
+        let mut fresh = raw_connect(&path).await;
+        write_raw(&mut fresh, &request_line(&FrontendRequest::ListDevices)).await;
+        wait_for_request(&mut listener, |request| {
+            matches!(request, FrontendRequest::ListDevices)
+        })
+        .await;
+        assert_eq!(listener.frontend_count(), cap);
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn broadcast_reaches_every_connected_frontend() {
+        let path = socket_path("broadcast");
+        let mut listener = AsyncFrontendListener::new_at(path.clone())
+            .await
+            .expect("listener");
+        let (mut first, _first_writer) = connect_async_at(&path, Some(Duration::from_secs(2)))
+            .await
+            .expect("first frontend");
+        let (mut second, _second_writer) = connect_async_at(&path, Some(Duration::from_secs(2)))
+            .await
+            .expect("second frontend");
+        drive_until(&mut listener, |listener| listener.frontend_count() == 2).await;
+
+        listener
+            .broadcast(FrontendEvent::PortChanged(4242, None))
+            .await;
+        for reader in [&mut first, &mut second] {
+            let event = reader
+                .next_event(Some(Duration::from_secs(5)))
+                .await
+                .expect("io")
+                .expect("event");
+            assert!(matches!(event, FrontendEvent::PortChanged(4242, None)));
+        }
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn async_reader_skips_unknown_events_and_times_out() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let path = socket_path("async-reader");
+        let server = tokio::net::UnixListener::bind(&path).expect("raw server");
+        let (mut reader, _writer) = connect_async_at(&path, Some(Duration::from_secs(2)))
+            .await
+            .expect("connect");
+        let (mut stream, _) = server.accept().await.expect("accept");
+
+        // No data yet: a missing answer must time out instead of hanging.
+        assert!(
+            reader
+                .next_event(Some(Duration::from_millis(50)))
+                .await
+                .expect("io")
+                .is_none()
+        );
+
+        stream
+            .write_all(b"{\"SomeFutureEvent\":{\"unknown\":true}}\n")
+            .await
+            .expect("write unknown event");
+        stream
+            .write_all(b"{\"PortChanged\":[4242,null]}\n")
+            .await
+            .expect("write known event");
+        let event = reader
+            .next_event(Some(Duration::from_secs(5)))
+            .await
+            .expect("io")
+            .expect("event");
+        assert!(matches!(event, FrontendEvent::PortChanged(4242, None)));
+        drop(stream);
+        drop(server);
+        let _ = std::fs::remove_file(&path);
     }
 }

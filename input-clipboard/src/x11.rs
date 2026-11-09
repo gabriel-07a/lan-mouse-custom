@@ -1,14 +1,14 @@
 //! X11 clipboard backend.
 //!
-//! X11 has no clipboard daemon: the owner of the `CLIPBOARD` selection serves
+//! X11 has no clipboard daemon: the owner of the CLIPBOARD selection serves
 //! data on request. This backend runs a small X connection on a dedicated
-//! thread, polls the selection owner for changes, serves `SelectionRequest`
-//! events when it owns the selection, and converts incoming selections into
-//! the canonical formats.
+//! thread, watches the selection owner (through the XFixes extension when
+//! available, polling otherwise), serves SelectionRequest events when it owns
+//! the selection, and converts incoming selections into the canonical formats.
 //!
-//! X11 property transfers are limited in size; images are therefore not
-//! propagated by this backend (the portal and native backends handle them).
-//! Text and HTML are supported.
+//! Payloads that do not fit into a single X11 property use the INCR protocol in
+//! both directions, so large text/images are neither silently dropped nor
+//! truncated. Everything is bounded by MAX_X11_PAYLOAD and a per-read timeout.
 
 use std::{
     collections::VecDeque,
@@ -24,13 +24,14 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use x11rb::{
     CURRENT_TIME,
-    connection::Connection,
+    connection::{Connection, RequestConnection},
     protocol::{
         Event,
+        xfixes::{self, ConnectionExt as _},
         xproto::{
-            Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode,
-            SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, SelectionRequestEvent, Window,
-            WindowClass,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux,
+            EventMask, PropMode, Property, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent,
+            SelectionRequestEvent, Window, WindowClass,
         },
     },
 };
@@ -52,10 +53,15 @@ x11rb::atom_manager! {
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const X11_POLL_SLEEP: Duration = Duration::from_millis(20);
-const MAX_X11_PAYLOAD: usize = 1024 * 1024;
-/// X11 requests larger than this need the INCR protocol, which this backend
-/// does not implement for writes yet.
+/// Largest incoming selection this backend buffers before giving up.
+const MAX_X11_PAYLOAD: usize = 16 * 1024 * 1024;
+/// Payloads up to this size are written into the requestor property directly;
+/// anything larger is transferred through INCR.
 const MAX_X11_PROPERTY: usize = 256 * 1024;
+/// Bytes handed to the requestor per INCR round trip.
+const INCR_CHUNK_SIZE: usize = 64 * 1024;
+/// A clipboard read (including a whole INCR transfer) must finish within this.
+const SELECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct X11Clipboard {
     commands: StdSender<Command>,
@@ -81,6 +87,9 @@ impl X11Clipboard {
             .spawn(move || {
                 let result = run(command_rx, change_tx, thread_last, ready_tx.clone());
                 if let Err(e) = result {
+                    // The ready channel is usually gone by now; log so a dead
+                    // clipboard thread is at least visible instead of silent.
+                    log::warn!("X11 clipboard thread stopped: {e}");
                     let _ = ready_tx.send(Err(e));
                 }
             })
@@ -118,6 +127,27 @@ struct Pending {
     awaiting_targets: bool,
     queue: VecDeque<(Atom, Format)>,
     snapshot: ClipboardSnapshot,
+    /// Active INCR transfer for the representation currently being read.
+    incr: Option<IncrRead>,
+    /// Absolute deadline for the whole selection read.
+    deadline: Instant,
+}
+
+struct IncrRead {
+    /// Property on our own window that carries the chunks.
+    property: Atom,
+    format: Format,
+    data: Vec<u8>,
+}
+
+/// Server side of an INCR transfer (large payload written to the requestor).
+struct IncrWrite {
+    requestor: Window,
+    property: Atom,
+    type_atom: Atom,
+    data: Vec<u8>,
+    offset: usize,
+    deadline: Instant,
 }
 
 fn run(
@@ -154,18 +184,50 @@ fn run(
         .reply()
         .map_err(|e| format!("X11 intern atoms: {e}"))?;
 
+    // XFixes reports every selection owner change, including a second copy in
+    // the application that is already the owner (X11 itself only sends
+    // SelectionClear to the previous owner). Without it, copying twice from the
+    // same application would leave the peer with stale content.
+    let xfixes_available = conn
+        .extension_information(xfixes::X11_EXTENSION_NAME)
+        .map_err(|e| format!("X11 extension query: {e}"))?
+        .is_some();
+    if xfixes_available {
+        let mask = xfixes::SelectionEventMask::SET_SELECTION_OWNER
+            | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+            | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE;
+        conn.xfixes_select_selection_input(window, atoms.CLIPBOARD, mask)
+            .map_err(|e| format!("X11 select selection input: {e}"))?
+            .check()
+            .map_err(|e| format!("X11 select selection input: {e}"))?;
+    }
+
     let _ = ready.send(Ok(()));
 
     let mut pending: Option<Pending> = None;
     let mut serve: Option<ClipboardSnapshot> = None;
+    let mut incr_write: Option<IncrWrite> = None;
     let mut owning = false;
     let mut last_owner: Window = 0;
     let mut last_poll = Instant::now();
+
+    // Push the clipboard that was copied before the service started.
+    match selection_owner(&conn, &atoms) {
+        Ok(owner) if owner != 0 && owner != window => {
+            match start_read(&conn, window, &atoms, owner) {
+                Ok(read) => pending = Some(read),
+                Err(e) => log::debug!("X11: could not read the initial clipboard: {e}"),
+            }
+        }
+        Ok(owner) => last_owner = owner,
+        Err(e) => log::debug!("X11: could not query the selection owner: {e}"),
+    }
 
     loop {
         loop {
             match commands.try_recv() {
                 Ok(Command::Write(snapshot)) => {
+                    incr_write = None;
                     if let Err(e) = set_owner(&conn, window, &atoms) {
                         log::warn!("X11: could not own the clipboard: {e}");
                     } else {
@@ -186,49 +248,158 @@ fn run(
         {
             match event {
                 Event::SelectionRequest(request) => {
-                    if let Err(e) =
-                        reply_to_request(&conn, window, &atoms, serve.as_ref(), &request)
-                    {
-                        log::warn!("X11: failed to answer a selection request: {e}");
+                    match reply_to_request(&conn, window, &atoms, serve.as_ref(), &request) {
+                        Ok(Some(transfer)) => {
+                            if incr_write.is_some() {
+                                log::debug!("X11: replacing an in-flight INCR write");
+                            }
+                            incr_write = Some(transfer);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!("X11: failed to answer a selection request: {e}");
+                        }
                     }
                 }
                 Event::SelectionNotify(notify) => {
                     if let Some(mut current) = pending.take() {
                         match handle_notify(&conn, window, &atoms, &mut current, notify) {
                             Ok(NotifyOutcome::Continue) => pending = Some(current),
-                            Ok(NotifyOutcome::Done) => {
-                                *last.lock().expect("lock") = Some(current.snapshot.clone());
-                                let _ = changes.send(current.snapshot);
-                            }
+                            Ok(NotifyOutcome::Done) => complete_read(&current, &last, &changes),
                             Ok(NotifyOutcome::Failed) => {}
                             Err(e) => log::warn!("X11: clipboard read failed: {e}"),
+                        }
+                    }
+                }
+                Event::PropertyNotify(notify) => {
+                    if notify.window == window {
+                        // INCR read: the owner writes one chunk per property
+                        // change after we delete the previous chunk.
+                        if notify.state == Property::NEW_VALUE {
+                            if let Some(mut current) = pending.take() {
+                                let is_incr = current
+                                    .incr
+                                    .as_ref()
+                                    .is_some_and(|incr| incr.property == notify.atom);
+                                let mut keep = true;
+                                if is_incr {
+                                    match consume_incr_chunk(&conn, window, &mut current) {
+                                        Ok(IncrOutcome::Chunk) => {}
+                                        Ok(IncrOutcome::Complete) => {
+                                            match advance(&conn, window, &atoms, &mut current) {
+                                                Ok(NotifyOutcome::Continue) => {}
+                                                Ok(NotifyOutcome::Done) => {
+                                                    complete_read(&current, &last, &changes);
+                                                    keep = false;
+                                                }
+                                                Ok(NotifyOutcome::Failed) => keep = false,
+                                                Err(e) => {
+                                                    log::warn!("X11: clipboard read failed: {e}");
+                                                    keep = false;
+                                                }
+                                            }
+                                        }
+                                        Ok(IncrOutcome::Failed) => keep = false,
+                                        Err(e) => {
+                                            log::warn!("X11: INCR clipboard read failed: {e}");
+                                            keep = false;
+                                        }
+                                    }
+                                }
+                                if keep {
+                                    pending = Some(current);
+                                }
+                            }
+                        }
+                    } else if let Some(write) = incr_write.as_mut() {
+                        // INCR write: the requestor deleted the previous chunk;
+                        // send the next one (or the terminating empty chunk).
+                        if write.requestor == notify.window
+                            && write.property == notify.atom
+                            && notify.state == Property::DELETE
+                        {
+                            match serve_incr_chunk(&conn, write) {
+                                Ok(true) => incr_write = None,
+                                Ok(false) => {}
+                                Err(e) => {
+                                    log::warn!("X11: INCR clipboard write failed: {e}");
+                                    incr_write = None;
+                                }
+                            }
                         }
                     }
                 }
                 Event::SelectionClear(clear) if clear.owner == window => {
                     owning = false;
                     serve = None;
+                    incr_write = None;
+                }
+                Event::XfixesSelectionNotify(notify) if notify.selection == atoms.CLIPBOARD => {
+                    last_owner = notify.owner;
+                    if notify.owner == 0 {
+                        // Selection cleared; nothing to read.
+                        pending = None;
+                    } else if notify.owner != window
+                        && notify.subtype == xfixes::SelectionEvent::SET_SELECTION_OWNER
+                    {
+                        match start_read(&conn, window, &atoms, notify.owner) {
+                            Ok(read) => pending = Some(read),
+                            Err(e) => log::debug!("X11: could not read the clipboard: {e}"),
+                        }
+                    }
                 }
                 _ => {}
             }
         }
 
-        if last_poll.elapsed() >= POLL_INTERVAL {
+        // Fallback for X servers without XFixes: poll the owner instead.
+        if !xfixes_available && last_poll.elapsed() >= POLL_INTERVAL {
             last_poll = Instant::now();
             if !owning {
-                let owner = selection_owner(&conn, &atoms)?;
-                if owner != last_owner {
-                    last_owner = owner;
-                    if owner != 0 && owner != window {
-                        pending = Some(start_read(&conn, window, &atoms, owner)?);
+                match selection_owner(&conn, &atoms) {
+                    Ok(owner) if owner != last_owner => {
+                        last_owner = owner;
+                        if owner != 0 && owner != window {
+                            match start_read(&conn, window, &atoms, owner) {
+                                Ok(read) => pending = Some(read),
+                                Err(e) => log::debug!("X11: could not read the clipboard: {e}"),
+                            }
+                        }
                     }
+                    Ok(_) => {}
+                    Err(e) => log::debug!("X11: could not query the selection owner: {e}"),
                 }
             }
+        }
+
+        let now = Instant::now();
+        if pending.as_ref().is_some_and(|read| now > read.deadline) {
+            log::debug!("X11: clipboard read timed out");
+            pending = None;
+        }
+        if incr_write
+            .as_ref()
+            .is_some_and(|write| now > write.deadline)
+        {
+            log::debug!("X11: INCR clipboard write timed out");
+            incr_write = None;
         }
 
         let _ = conn.flush();
         thread::sleep(X11_POLL_SLEEP);
     }
+}
+
+fn complete_read(
+    current: &Pending,
+    last: &Arc<Mutex<Option<ClipboardSnapshot>>>,
+    changes: &UnboundedSender<ClipboardSnapshot>,
+) {
+    if current.snapshot.is_empty() {
+        return;
+    }
+    *last.lock().expect("lock") = Some(current.snapshot.clone());
+    let _ = changes.send(current.snapshot.clone());
 }
 
 fn set_owner(
@@ -274,6 +445,8 @@ fn start_read(
         awaiting_targets: true,
         queue: VecDeque::new(),
         snapshot: ClipboardSnapshot::new(),
+        incr: None,
+        deadline: Instant::now() + SELECTION_TIMEOUT,
     })
 }
 
@@ -293,6 +466,7 @@ fn handle_notify(
     if notify.requestor != window || notify.selection != atoms.CLIPBOARD {
         return Ok(NotifyOutcome::Continue);
     }
+    pending.deadline = Instant::now() + SELECTION_TIMEOUT;
 
     if pending.awaiting_targets {
         if notify.property == 0 {
@@ -320,9 +494,17 @@ fn handle_notify(
     }
     let (type_atom, bytes) = read_bytes(conn, window, notify.property)?;
     if type_atom == atoms.INCR {
-        // The owner offers the data through the INCR protocol. Skip this
-        // representation instead of storing the size placeholder as data.
-        log::debug!("X11: skipping an INCR clipboard representation");
+        // The owner announced an INCR transfer; the chunks arrive as
+        // PropertyNotify(NewValue) events on our window.
+        if let Some(format) = format_for_target(notify.target, atoms) {
+            let property = notify.property;
+            pending.incr = Some(IncrRead {
+                property,
+                format,
+                data: Vec::new(),
+            });
+            return Ok(NotifyOutcome::Continue);
+        }
         return advance(conn, window, atoms, pending);
     }
     if let Some(format) = format_for_target(notify.target, atoms) {
@@ -331,6 +513,65 @@ fn handle_notify(
         }
     }
     advance(conn, window, atoms, pending)
+}
+
+enum IncrOutcome {
+    Chunk,
+    Complete,
+    Failed,
+}
+
+/// Read one INCR chunk from our window property. Deleting the property is what
+/// makes the owner write the next chunk.
+fn consume_incr_chunk(
+    conn: &x11rb::rust_connection::RustConnection,
+    window: Window,
+    current: &mut Pending,
+) -> Result<IncrOutcome, String> {
+    let Some(property) = current.incr.as_ref().map(|incr| incr.property) else {
+        return Ok(IncrOutcome::Failed);
+    };
+    let (type_atom, bytes) = take_property(conn, window, property)?;
+    current.deadline = Instant::now() + SELECTION_TIMEOUT;
+
+    if bytes.is_empty() {
+        let Some(done) = current.incr.take() else {
+            return Ok(IncrOutcome::Failed);
+        };
+        if done.data.is_empty() {
+            return Ok(IncrOutcome::Failed);
+        }
+        current.snapshot.insert(done.format, done.data);
+        return Ok(IncrOutcome::Complete);
+    }
+
+    if type_atom == 0 {
+        return Err("X11 INCR chunk has no type".into());
+    }
+    let incr = current.incr.as_mut().expect("checked above");
+    if incr.data.len().saturating_add(bytes.len()) > MAX_X11_PAYLOAD {
+        return Err("X11 clipboard payload exceeds the size limit".into());
+    }
+    incr.data.extend_from_slice(&bytes);
+    Ok(IncrOutcome::Chunk)
+}
+
+/// Read (and delete) a property in a single request. INCR chunks are always
+/// small enough for one property read.
+fn take_property(
+    conn: &x11rb::rust_connection::RustConnection,
+    window: Window,
+    property: Atom,
+) -> Result<(Atom, Vec<u8>), String> {
+    let reply = conn
+        .get_property(true, window, property, AtomEnum::ANY, 0, 65536)
+        .map_err(|e| format!("get_property: {e}"))?
+        .reply()
+        .map_err(|e| format!("get_property: {e}"))?;
+    if reply.bytes_after > 0 {
+        return Err("X11 INCR chunk does not fit in a single property read".into());
+    }
+    Ok((reply.type_, reply.value))
 }
 
 fn advance(
@@ -342,6 +583,8 @@ fn advance(
     let Some((target, _)) = pending.queue.pop_front() else {
         return Ok(NotifyOutcome::Done);
     };
+    pending.incr = None;
+    pending.deadline = Instant::now() + SELECTION_TIMEOUT;
     conn.convert_selection(
         window,
         atoms.CLIPBOARD,
@@ -437,15 +680,17 @@ fn format_for_target_ids(
     }
 }
 
+/// Answer one selection request. Returns a transfer to continue when the
+/// payload needs INCR.
 fn reply_to_request(
     conn: &x11rb::rust_connection::RustConnection,
     window: Window,
     atoms: &Atoms,
     snapshot: Option<&ClipboardSnapshot>,
     request: &SelectionRequestEvent,
-) -> Result<(), String> {
+) -> Result<Option<IncrWrite>, String> {
     if request.selection != atoms.CLIPBOARD || request.owner != window {
-        return Ok(());
+        return Ok(None);
     }
     let property = if request.property == 0 {
         request.target
@@ -473,22 +718,24 @@ fn reply_to_request(
         }
         (Some(snapshot), target) if target == atoms.UTF8_STRING || target == atoms.TEXT => {
             match snapshot.get(Format::Text) {
-                Some(bytes) if bytes.len() <= MAX_X11_PROPERTY => {
-                    (atoms.UTF8_STRING, 8, bytes.to_vec())
-                }
-                _ => return send_notify(conn, request, 0),
+                Some(bytes) => (atoms.UTF8_STRING, 8, bytes.to_vec()),
+                None => return send_notify(conn, request, 0).map(|_| None),
             }
         }
         (Some(snapshot), target) if target == atoms.HTML => match snapshot.get(Format::Html) {
-            Some(bytes) if bytes.len() <= MAX_X11_PROPERTY => (atoms.HTML, 8, bytes.to_vec()),
-            _ => return send_notify(conn, request, 0),
+            Some(bytes) => (atoms.HTML, 8, bytes.to_vec()),
+            None => return send_notify(conn, request, 0).map(|_| None),
         },
         (Some(snapshot), target) if target == atoms.PNG => match snapshot.get(Format::Png) {
-            Some(bytes) if bytes.len() <= MAX_X11_PROPERTY => (atoms.PNG, 8, bytes.to_vec()),
-            _ => return send_notify(conn, request, 0),
+            Some(bytes) => (atoms.PNG, 8, bytes.to_vec()),
+            None => return send_notify(conn, request, 0).map(|_| None),
         },
-        _ => return send_notify(conn, request, 0),
+        _ => return send_notify(conn, request, 0).map(|_| None),
     };
+
+    if data.len() > MAX_X11_PROPERTY {
+        return begin_incr_write(conn, atoms, request, property, type_atom, data).map(Some);
+    }
 
     let units = if format == 32 {
         (data.len() / 4) as u32
@@ -507,7 +754,94 @@ fn reply_to_request(
     .map_err(|e| format!("change_property: {e}"))?
     .check()
     .map_err(|e| format!("change_property: {e}"))?;
-    send_notify(conn, request, property)
+    send_notify(conn, request, property)?;
+    Ok(None)
+}
+
+/// Start an INCR transfer. The requestor deletes the property after consuming
+/// each chunk; those deletions arrive as PropertyNotify events on its window.
+fn begin_incr_write(
+    conn: &x11rb::rust_connection::RustConnection,
+    atoms: &Atoms,
+    request: &SelectionRequestEvent,
+    property: Atom,
+    type_atom: Atom,
+    data: Vec<u8>,
+) -> Result<IncrWrite, String> {
+    conn.change_window_attributes(
+        request.requestor,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )
+    .map_err(|e| format!("change_window_attributes: {e}"))?
+    .check()
+    .map_err(|e| format!("change_window_attributes: {e}"))?;
+
+    // The initial property carries a lower bound of the total size with type
+    // INCR; the actual bytes follow chunk by chunk.
+    let hint = (data.len() as u32).to_ne_bytes();
+    conn.change_property(
+        PropMode::REPLACE,
+        request.requestor,
+        property,
+        atoms.INCR,
+        32,
+        1,
+        &hint,
+    )
+    .map_err(|e| format!("change_property: {e}"))?
+    .check()
+    .map_err(|e| format!("change_property: {e}"))?;
+    send_notify(conn, request, property)?;
+    Ok(IncrWrite {
+        requestor: request.requestor,
+        property,
+        type_atom,
+        data,
+        offset: 0,
+        deadline: Instant::now() + SELECTION_TIMEOUT,
+    })
+}
+
+/// Write the next INCR chunk. Returns true when the terminating zero-length
+/// chunk was written.
+fn serve_incr_chunk(
+    conn: &x11rb::rust_connection::RustConnection,
+    write: &mut IncrWrite,
+) -> Result<bool, String> {
+    write.deadline = Instant::now() + SELECTION_TIMEOUT;
+    if write.offset < write.data.len() {
+        let end = (write.offset + INCR_CHUNK_SIZE).min(write.data.len());
+        let chunk = &write.data[write.offset..end];
+        conn.change_property(
+            PropMode::REPLACE,
+            write.requestor,
+            write.property,
+            write.type_atom,
+            8,
+            chunk.len() as u32,
+            chunk,
+        )
+        .map_err(|e| format!("change_property: {e}"))?
+        .check()
+        .map_err(|e| format!("change_property: {e}"))?;
+        write.offset = end;
+        Ok(false)
+    } else {
+        // A zero-length property terminates the transfer.
+        conn.change_property(
+            PropMode::REPLACE,
+            write.requestor,
+            write.property,
+            write.type_atom,
+            8,
+            0,
+            &[],
+        )
+        .map_err(|e| format!("change_property: {e}"))?
+        .check()
+        .map_err(|e| format!("change_property: {e}"))?;
+        Ok(true)
+    }
 }
 
 fn send_notify(
@@ -544,7 +878,6 @@ impl Clipboard for X11Clipboard {
         self.commands
             .send(Command::Write(snapshot.clone()))
             .map_err(|_| Error::Backend("the X11 clipboard thread stopped".into()))?;
-        *self.last.lock().expect("lock") = Some(snapshot.clone());
         Ok(())
     }
 

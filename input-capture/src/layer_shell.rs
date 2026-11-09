@@ -128,6 +128,8 @@ struct State {
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
+    /// the wayland connection is unusable; nothing more can be captured
+    fatal: bool,
 }
 
 struct Inner {
@@ -157,19 +159,28 @@ impl Window {
         output: &WlOutput,
         pos: Position,
         size: (i32, i32),
-    ) -> Window {
+    ) -> io::Result<Window> {
         log::debug!("creating window output: {output:?}, size: {size:?}");
         let g = &state.globals;
 
+        // A compositor that reports a non-positive or absurdly large logical
+        // output size must not make the integer arithmetic below overflow.
+        if size.0 <= 0 || size.1 <= 0 {
+            return Err(io::Error::other(format!(
+                "invalid output size {size:?} for position {pos}"
+            )));
+        }
         let (width, height) = match pos {
             Position::Left | Position::Right => (1, size.1 as u32),
             Position::Top | Position::Bottom => (size.0 as u32, 1),
         };
-        let mut file = tempfile::tempfile().unwrap();
-        draw(&mut file, (width, height));
-        let pool = g
-            .shm
-            .create_pool(file.as_fd(), (width * height * 4) as i32, qh, ());
+        let len = u64::from(width) * u64::from(height) * 4;
+        let len = i32::try_from(len).map_err(|_| {
+            io::Error::other(format!("output size {size:?} exceeds the shm buffer limit"))
+        })?;
+        let mut file = tempfile::tempfile()?;
+        draw(&mut file, (width, height))?;
+        let pool = g.shm.create_pool(file.as_fd(), len, qh, ());
         let buffer = pool.create_buffer(
             0,
             width as i32,
@@ -179,6 +190,11 @@ impl Window {
             qh,
             (),
         );
+        // The pool can be destroyed right after the buffer was created: the
+        // buffer keeps the underlying memory alive. Not destroying it leaked a
+        // server-side object (and the fd mapping) for every window, e.g. on
+        // every display reconfigure.
+        pool.destroy();
         let surface = g.compositor.create_surface(qh, ());
 
         let layer_surface = g.layer_shell.get_layer_surface(
@@ -202,12 +218,12 @@ impl Window {
         layer_surface.set_margin(0, 0, 0, 0);
         surface.set_input_region(None);
         surface.commit();
-        Window {
+        Ok(Window {
             pos,
             buffer,
             surface,
             layer_surface,
-        }
+        })
     }
 }
 
@@ -253,19 +269,20 @@ fn get_output_configuration(state: &State, pos: Position) -> Vec<Output> {
         .collect()
 }
 
-fn draw(f: &mut File, (width, height): (u32, u32)) {
-    let mut buf = BufWriter::new(f);
-    for _ in 0..height {
-        for _ in 0..width {
-            if env::var("LM_DEBUG_LAYER_SHELL").ok().is_some() {
-                // AARRGGBB
-                buf.write_all(&0xff11d116u32.to_ne_bytes()).unwrap();
-            } else {
-                // AARRGGBB
-                buf.write_all(&0x00000000u32.to_ne_bytes()).unwrap();
-            }
+fn draw(f: &mut File, (width, height): (u32, u32)) -> io::Result<()> {
+    if env::var_os("LM_DEBUG_LAYER_SHELL").is_some() {
+        let mut buf = BufWriter::new(f);
+        for _ in 0..width * height {
+            // AARRGGBB
+            buf.write_all(&0xff11d116u32.to_ne_bytes())?;
         }
+        buf.flush()?;
+    } else {
+        // Transparent ARGB8888; an all-zero sparse file is the same content
+        // without faulting in (and writing) every page.
+        f.set_len(u64::from(width) * u64::from(height) * 4)?;
     }
+    Ok(())
 }
 
 impl LayerShellInputCapture {
@@ -335,6 +352,7 @@ impl LayerShellInputCapture {
             pending_events: VecDeque::new(),
             outputs: vec![],
             scroll_discrete_pending: false,
+            fatal: false,
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -360,28 +378,38 @@ impl LayerShellInputCapture {
         Ok(LayerShellInputCapture(inner))
     }
 
-    fn add_client(&mut self, pos: Position) {
-        self.0.get_mut().state.add_client(pos);
+    fn add_client(&mut self, pos: Position) -> io::Result<()> {
+        self.0.get_mut().state.add_client(pos)
     }
 
     fn delete_client(&mut self, pos: Position) {
         let inner = self.0.get_mut();
         inner.state.active_positions.remove(&pos);
+        // Releasing the grab of the window that is about to be destroyed keeps
+        // the pointer lock/interactivity from outliving their surface.
+        if inner.state.focused.as_ref().is_some_and(|w| w.pos == pos) {
+            inner.state.ungrab();
+            inner.state.focused = None;
+        }
         // remove all windows corresponding to this client
         while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
             inner.state.active_windows.remove(i);
-            inner.state.focused = None;
+            if inner.state.focused.as_ref().is_some_and(|w| w.pos == pos) {
+                inner.state.focused = None;
+            }
         }
     }
 }
 
 impl State {
     fn update_output_info(&mut self, name: u32) {
-        let output = self
-            .outputs
-            .iter_mut()
-            .find(|o| o.global.name == name)
-            .expect("output not found");
+        // A global can be removed (monitor unplugged) before its pending
+        // wl_output/xdg_output events are dispatched; an event for an output we
+        // no longer track is stale, not a reason to abort the process.
+        let Some(output) = self.outputs.iter_mut().find(|o| o.global.name == name) else {
+            log::debug!("ignoring output event for unknown global {name}");
+            return;
+        };
         if output.has_xdg_info {
             output.info.replace(output.pending_info.clone());
             self.update_windows();
@@ -391,9 +419,13 @@ impl State {
     fn register_global(&mut self, global: Global) {
         if global.interface.as_str() == "wl_output" {
             log::debug!("new output global: wl_output {}", global.name);
+            // Bind to what the compositor advertises (capped at the version
+            // this client supports): binding a version above the advertised
+            // one is a protocol error that would kill the connection.
+            let version = global.version.min(4);
             let wl_output = self.global_list.registry().bind::<WlOutput, _, _>(
                 global.name,
-                4,
+                version,
                 &self.qh,
                 global.name,
             );
@@ -477,12 +509,6 @@ impl State {
     }
 
     fn ungrab(&mut self) {
-        // get focused client
-        let window = match self.focused.as_ref() {
-            Some(focused) => focused,
-            None => return,
-        };
-
         // NOTE: `grab` hides the cursor with `wl_pointer.set_cursor(None)`.
         // Restoring the compositor's default cursor on release has no
         // dedicated Wayland request; whether the pointer reappears when the
@@ -490,32 +516,32 @@ impl State {
         // needs validation on Sway/Hyprland. Do not add a speculative cursor
         // theme dependency here without that check.
 
-        // ungrab surface
-        window
-            .layer_surface
-            .set_keyboard_interactivity(KeyboardInteractivity::None);
-        window.surface.commit();
+        // ungrab surface if we still have one
+        if let Some(window) = self.focused.as_ref() {
+            window
+                .layer_surface
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            window.surface.commit();
+        }
 
-        // destroy pointer lock
-        if let Some(pointer_lock) = &self.pointer_lock {
+        // The grab objects must be destroyed even when there is no focused
+        // window: they may have been created for a window that was destroyed
+        // in the meantime (display reconfigure, capture teardown). Leaving
+        // them behind would make every later `grab` skip creating them and
+        // the capture would run without pointer lock / shortcut inhibition.
+        if let Some(pointer_lock) = self.pointer_lock.take() {
             pointer_lock.destroy();
-            self.pointer_lock = None;
         }
-
-        // destroy relative input
-        if let Some(rel_pointer) = &self.rel_pointer {
+        if let Some(rel_pointer) = self.rel_pointer.take() {
             rel_pointer.destroy();
-            self.rel_pointer = None;
         }
-
-        // destroy shortcut inhibitor
-        if let Some(shortcut_inhibitor) = &self.shortcut_inhibitor {
+        if let Some(shortcut_inhibitor) = self.shortcut_inhibitor.take() {
             shortcut_inhibitor.destroy();
-            self.shortcut_inhibitor = None;
         }
+        self.scroll_discrete_pending = false;
     }
 
-    fn add_client(&mut self, pos: Position) {
+    fn add_client(&mut self, pos: Position) -> io::Result<()> {
         self.active_positions.insert(pos);
         let outputs = get_output_configuration(self, pos);
 
@@ -530,13 +556,33 @@ impl State {
                     .unwrap_or("unknown output".to_owned()))
                 .collect::<Vec<_>>()
         );
-        outputs.iter().for_each(|o| {
-            if let Some(info) = o.info.as_ref() {
-                let window = Window::new(self, &self.qh, &o.wl_output, pos, info.size);
-                let window = Arc::new(window);
-                self.active_windows.push(window);
+        let mut first_error = None;
+        for output in outputs.iter() {
+            let Some(info) = output.info.as_ref() else {
+                continue;
+            };
+            match Window::new(self, &self.qh, &output.wl_output, pos, info.size) {
+                Ok(window) => self.active_windows.push(Arc::new(window)),
+                Err(e) => {
+                    log::warn!("could not create the capture window on {output}: {e}");
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
             }
-        });
+        }
+        // A position without a single window can never report input; report
+        // the failure instead of silently accepting the capture. The position
+        // must not stay registered: a later output hotplug would recreate
+        // windows for it and they could grab the pointer while no client
+        // exists to release it (InputCapture rolled its own bookkeeping back).
+        if self.active_windows.iter().all(|window| window.pos != pos) {
+            self.active_positions.remove(&pos);
+            return Err(first_error.unwrap_or_else(|| {
+                io::Error::other(format!("no capture window available for position {pos}"))
+            }));
+        }
+        Ok(())
     }
 
     fn update_windows(&mut self) {
@@ -545,98 +591,126 @@ impl State {
             log::info!(" * {output}");
         }
 
+        // Outputs were reconfigured (hotplug, resolution, arrangement change).
+        // The windows are about to be destroyed; release the grab first so the
+        // pointer lock / keyboard interactivity are not left attached to
+        // destroyed surfaces (which would also keep the next grab from being
+        // created).
+        self.ungrab();
         self.active_windows.clear();
+        self.focused = None;
 
         let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
         for pos in active_positions {
-            self.add_client(pos);
+            if let Err(e) = self.add_client(pos) {
+                log::warn!("could not recreate capture for position {pos}: {e}");
+            }
         }
     }
 }
 
 impl Inner {
-    fn read(&mut self) {
-        match self.state.read_guard.take().unwrap().read() {
-            Ok(_) => {}
-            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(WaylandError::Io(e)) => {
-                log::error!("error reading from wayland socket: {e}");
-            }
-            Err(WaylandError::Protocol(e)) => {
-                panic!("wayland protocol violation: {e}")
-            }
+    /// Read from the wayland socket.
+    ///
+    /// A non-`WouldBlock` IO error means the connection is gone (compositor
+    /// crashed or restarted). It used to be only logged, which made
+    /// [`LayerShellInputCapture::poll_next`] spin on the permanently readable
+    /// (EOF) socket and wedge the whole single-threaded runtime at 100% CPU.
+    fn read(&mut self) -> Result<(), CaptureError> {
+        let Some(guard) = self.state.read_guard.take() else {
+            return Err(CaptureError::Io(io::Error::other(
+                "wayland read guard missing",
+            )));
+        };
+        match guard.read() {
+            Ok(_) => Ok(()),
+            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(()),
+            Err(WaylandError::Io(e)) => Err(CaptureError::Io(e)),
+            Err(WaylandError::Protocol(e)) => Err(wayland_protocol_error(e)),
         }
     }
 
-    fn prepare_read(&mut self) -> io::Result<()> {
-        loop {
+    fn prepare_read(&mut self) -> Result<(), CaptureError> {
+        // `prepare_read` returns None while outgoing requests still have to be
+        // flushed. Dispatch what is buffered and retry a bounded number of
+        // times: if the send buffer is full the loop must return to the
+        // executor instead of spinning at 100% CPU.
+        for _ in 0..16 {
             if let Some(guard) = self.queue.prepare_read() {
                 self.state.read_guard = Some(guard);
-                break Ok(());
-            } else {
-                self.dispatch_events();
+                return Ok(());
             }
+            self.dispatch_events()?;
         }
+        Ok(())
     }
 
-    fn dispatch_events(&mut self) {
+    fn dispatch_events(&mut self) -> Result<(), CaptureError> {
         match self.queue.dispatch_pending(&mut self.state) {
-            Ok(_) => {}
-            Err(DispatchError::Backend(WaylandError::Io(e))) => {
-                log::error!("Wayland Error: {e}");
-            }
-            Err(DispatchError::Backend(e)) => {
-                panic!("backend error: {e}");
+            Ok(_) => Ok(()),
+            Err(DispatchError::Backend(WaylandError::Io(e))) => Err(CaptureError::Io(e)),
+            Err(DispatchError::Backend(WaylandError::Protocol(e))) => {
+                Err(wayland_protocol_error(e))
             }
             Err(DispatchError::BadMessage {
                 sender_id,
                 interface,
                 opcode,
-            }) => {
-                panic!("bad message {sender_id}, {interface} , {opcode}");
-            }
+            }) => Err(CaptureError::Io(io::Error::other(format!(
+                "wayland bad message {sender_id}, {interface}, {opcode}"
+            )))),
         }
     }
 
-    fn flush_events(&mut self) -> io::Result<()> {
-        // flush outgoing events
+    fn flush_events(&mut self) -> Result<bool, CaptureError> {
+        // Flush outgoing events. A full socket send buffer is transient (the
+        // compositor is busy or suspended): it must not be treated as a dead
+        // connection, or one slow moment would permanently disable capture.
+        // The caller retries on the next poll.
         match self.queue.flush() {
-            Ok(_) => (),
-            Err(e) => match e {
-                WaylandError::Io(e) => {
-                    return Err(e);
-                }
-                WaylandError::Protocol(e) => {
-                    panic!("wayland protocol violation: {e}")
-                }
-            },
+            Ok(()) => Ok(false),
+            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(true),
+            Err(WaylandError::Io(e)) => Err(CaptureError::Io(e)),
+            Err(WaylandError::Protocol(e)) => Err(wayland_protocol_error(e)),
         }
-        Ok(())
     }
+}
+
+/// A wayland protocol violation is fatal for this connection; surface it as a
+/// capture error so the service can recreate the backend instead of aborting
+/// the whole process from inside a dispatch callback.
+fn wayland_protocol_error(e: wayland_client::backend::protocol::ProtocolError) -> CaptureError {
+    CaptureError::Io(io::Error::other(format!("wayland protocol error: {e}")))
 }
 
 #[async_trait]
 impl Capture for LayerShellInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.add_client(pos);
+        self.add_client(pos)?;
         let inner = self.0.get_mut();
-        Ok(inner.flush_events()?)
+        // A temporarily full send buffer is not an error: the request reaches
+        // the compositor on a later flush.
+        inner.flush_events().map(|_| ())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.delete_client(pos);
         let inner = self.0.get_mut();
-        Ok(inner.flush_events()?)
+        inner.flush_events().map(|_| ())
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
         log::debug!("releasing pointer");
         let inner = self.0.get_mut();
         inner.state.ungrab();
-        Ok(inner.flush_events()?)
+        inner.flush_events().map(|_| ())
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
+        // Make sure a grab that is still active does not outlive the backend.
+        let inner = self.0.get_mut();
+        inner.state.ungrab();
+        let _ = inner.flush_events();
         Ok(())
     }
 }
@@ -645,6 +719,13 @@ impl Stream for LayerShellInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // The wayland connection died (compositor restart, socket EOF): the
+        // stream is over. Returning `Pending` here would spin forever because
+        // EOF keeps the fd readable.
+        if self.0.get_mut().state.fatal {
+            return Poll::Ready(None);
+        }
+
         if let Some(event) = self.0.get_mut().state.pending_events.pop_front() {
             return Poll::Ready(Some(Ok(event)));
         }
@@ -652,32 +733,37 @@ impl Stream for LayerShellInputCapture {
         loop {
             let mut guard = ready!(self.0.poll_read_ready_mut(cx))?;
 
-            {
+            let result = {
                 let inner = guard.get_inner_mut();
-
-                // read events
-                inner.read();
-
-                // dispatch the events
-                inner.dispatch_events();
-
-                // flush outgoing events
-                if let Err(e) = inner.flush_events() {
-                    if e.kind() != ErrorKind::WouldBlock {
-                        return Poll::Ready(Some(Err(e.into())));
-                    }
-                }
-
-                // prepare for the next read
-                match inner.prepare_read() {
-                    Ok(_) => {}
-                    Err(e) => return Poll::Ready(Some(Err(e.into()))),
-                }
-            }
+                inner
+                    .read()
+                    .and_then(|()| inner.dispatch_events())
+                    .and_then(|()| {
+                        // A transient WouldBlock means the compositor is not
+                        // draining our socket right now; return to the executor and
+                        // retry on the next readiness event instead of declaring
+                        // the whole connection dead.
+                        match inner.flush_events() {
+                            Ok(true) => Ok(false),
+                            Ok(false) => inner.prepare_read().map(|()| true),
+                            Err(e) => Err(e),
+                        }
+                    })
+            };
 
             // clear read readiness for tokio read guard
-            // guard.clear_ready_matching(Ready::READABLE);
             guard.clear_ready();
+
+            match result {
+                Ok(true) => {}
+                Ok(false) => return Poll::Pending,
+                Err(e) => {
+                    let inner = guard.get_inner_mut();
+                    inner.state.fatal = true;
+                    log::error!("layer-shell input capture connection lost: {e}");
+                    return Poll::Ready(Some(Err(e)));
+                }
+            }
 
             // if an event has been queued during dispatch_events() we return it
             match guard.get_inner_mut().state.pending_events.pop_front() {
@@ -708,10 +794,15 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 state.pointer.replace(seat.get_pointer(qh, ()));
             }
             if capabilities.contains(wl_seat::Capability::Keyboard) {
+                // Same lifetime rule as the pointer: release the previous
+                // wl_keyboard before creating a new one. The old code dropped
+                // the proxy without releasing it (leak) and left
+                // `state.keyboard` dead, so capability churn accumulated
+                // wl_keyboard objects and could forward duplicated key events.
                 if let Some(k) = state.keyboard.take() {
                     k.release();
                 }
-                seat.get_keyboard(qh, ());
+                state.keyboard.replace(seat.get_keyboard(qh, ()));
             }
         }
     }
@@ -734,20 +825,17 @@ impl Dispatch<WlPointer, ()> for State {
                 surface_y: _,
             } => {
                 // get client corresponding to the focused surface
-                {
-                    if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
-                        app.focused = Some(window.clone());
-                        app.grab(&surface, pointer, serial, qh);
-                    } else {
-                        return;
-                    }
-                }
-                let pos = app
+                let Some(window) = app
                     .active_windows
                     .iter()
                     .find(|w| w.surface == surface)
-                    .map(|w| w.pos)
-                    .unwrap();
+                    .cloned()
+                else {
+                    return;
+                };
+                let pos = window.pos;
+                app.focused = Some(window);
+                app.grab(&surface, pointer, serial, qh);
                 app.pending_events.push_back((pos, CaptureEvent::Begin));
             }
             wl_pointer::Event::Leave { .. } => {
@@ -762,6 +850,10 @@ impl Dispatch<WlPointer, ()> for State {
                     log::warn!("compositor released mouse");
                 }
                 app.ungrab();
+                // The capture is over for this surface. Keeping `focused`
+                // would attribute keyboard events that are still in flight to
+                // the old client after the release.
+                app.focused = None;
             }
             wl_pointer::Event::Button {
                 serial: _,
@@ -970,11 +1062,11 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let output = state
-            .outputs
-            .iter_mut()
-            .find(|o| o.global.name == *name)
-            .expect("output");
+        // A removed global (monitor unplugged) can still have events queued.
+        let Some(output) = state.outputs.iter_mut().find(|o| o.global.name == *name) else {
+            log::debug!("ignoring xdg_output event for unknown global {name}");
+            return;
+        };
 
         log::debug!("xdg_output {name} - {event:?}");
         match event {
@@ -998,7 +1090,9 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
                 output.pending_info.description = description;
                 output.has_xdg_info = true;
             }
-            _ => todo!(),
+            // A newer version of the protocol may add events; ignore them
+            // instead of panicking on a compositor that speaks them.
+            other => log::trace!("unhandled xdg_output event: {other:?}"),
         }
     }
 }

@@ -1,13 +1,12 @@
 use futures::{StreamExt, future};
 use std::{
-    env, fs, io,
+    io,
     os::{fd::OwnedFd, unix::net::UnixStream},
-    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::task::JoinHandle;
 
@@ -28,7 +27,10 @@ use reis::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-use crate::error::EmulationError;
+use crate::{
+    error::EmulationError,
+    portal_token::{REMOTE_DESKTOP_TOKEN_FILE, read_named_token, write_named_token},
+};
 
 use super::{Emulation, EmulationHandle, error::LibeiEmulationCreationError};
 
@@ -38,6 +40,29 @@ struct Devices {
     scroll: Arc<RwLock<Option<(ei::Device, ei::Scroll)>>>,
     button: Arc<RwLock<Option<(ei::Device, ei::Button)>>>,
     keyboard: Arc<RwLock<Option<(ei::Device, ei::Keyboard)>>>,
+}
+
+impl Devices {
+    /// Forget every interface belonging to a device the compositor removed.
+    ///
+    /// The EIS objects are destroyed with the device; sending events on a
+    /// destroyed object id is a protocol violation and can tear down the whole
+    /// EIS connection (all input emulation then fails). Fresh interfaces arrive
+    /// with the next `DeviceAdded`.
+    fn forget_device(&self, device: &ei::Device) {
+        fn clear<T>(slot: &RwLock<Option<(ei::Device, T)>>, device: &ei::Device) {
+            let mut slot = slot.write().unwrap_or_else(|e| e.into_inner());
+            // The high-level Device wrapper is keyed by the ei_device object,
+            // so equality is object identity.
+            if slot.as_ref().is_some_and(|(stored, _)| stored == device) {
+                *slot = None;
+            }
+        }
+        clear(&self.pointer, device);
+        clear(&self.scroll, device);
+        clear(&self.button, device);
+        clear(&self.keyboard, device);
+    }
 }
 
 pub(crate) struct LibeiEmulation {
@@ -51,114 +76,10 @@ pub(crate) struct LibeiEmulation {
     session: Session<RemoteDesktop>,
 }
 
-/// Name of the RemoteDesktop restore token file.
-///
-/// The token is the user's persisted consent ("Remember This Selection"). The
-/// portal invalidates it after every successful start and returns a
-/// replacement, so it is rewritten on each start.
-const REMOTE_DESKTOP_TOKEN_FILE: &str = "remote-desktop.token";
-
-/// Directory holding portal tokens: `$XDG_STATE_HOME/lan-mouse`, falling back
-/// to `~/.local/state/lan-mouse`.
-///
-/// State, not cache: cache directories are routinely purged by cleanup tools
-/// and losing the token makes the portal ask for permission again.
-fn token_dir() -> Option<PathBuf> {
-    let base = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
-    Some(base.join("lan-mouse"))
-}
-
-/// Token location used by builds that stored consent in the cache directory.
-fn legacy_token_dir() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("lan-mouse"))
-}
-
-fn read_token_file(path: &Path) -> Option<String> {
-    let token = fs::read_to_string(path).ok()?;
-    let token = token.trim();
-    (!token.is_empty()).then(|| token.to_string())
-}
-
-/// Read the saved consent token, migrating a token left in the legacy cache
-/// directory so an already-granted consent survives the move.
-fn read_token_from(state_dir: Option<&Path>, legacy_dir: Option<&Path>) -> Option<String> {
-    let state_dir = state_dir?;
-    let path = state_dir.join(REMOTE_DESKTOP_TOKEN_FILE);
-    if let Some(token) = read_token_file(&path) {
-        return Some(token);
-    }
-    let legacy_path = legacy_dir?.join(REMOTE_DESKTOP_TOKEN_FILE);
-    let token = read_token_file(&legacy_path)?;
-    log::info!(
-        "migrating RemoteDesktop restore token from {} to {}",
-        legacy_path.display(),
-        path.display()
-    );
-    if let Err(e) = write_token_to(state_dir, REMOTE_DESKTOP_TOKEN_FILE, &token) {
-        log::warn!("could not migrate the RemoteDesktop restore token: {e}");
-    } else if let Err(e) = fs::remove_file(&legacy_path) {
-        // Do not keep a world-readable copy of a bearer capability around.
-        log::debug!("could not remove the legacy restore token: {e}");
-    }
-    Some(token)
-}
-
-fn read_token() -> Option<String> {
-    read_token_from(token_dir().as_deref(), legacy_token_dir().as_deref())
-}
-
-/// Save the consent token atomically with owner-only permissions.
-///
-/// Tokens are bearer capabilities: whoever can read one can restore the
-/// portal session without a permission dialog, hence 0600 for the file and
-/// 0700 for the directory.
-fn write_token(token: &str) -> io::Result<()> {
-    let dir = token_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "neither XDG_STATE_HOME nor HOME is set",
-        )
-    })?;
-    write_token_to(&dir, REMOTE_DESKTOP_TOKEN_FILE, token)
-}
-
-fn write_token_to(dir: &Path, name: &str, token: &str) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-
-    let path = dir.join(name);
-    // Write next to the destination and rename: a crash mid-write must not
-    // leave a truncated token that would then be sent back to the portal.
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    // The mode above only applies when the file is created; tighten an
-    // existing file as well.
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(token.as_bytes())?;
-    file.sync_all()?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
     let remote_desktop = RemoteDesktop::new().await?;
 
-    let restore_token = read_token();
+    let restore_token = read_named_token(REMOTE_DESKTOP_TOKEN_FILE);
     log::debug!(
         "RemoteDesktop restore token: {}",
         if restore_token.is_some() {
@@ -186,7 +107,7 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
 
     // The restore token is only valid once, we need to re-save it each time
     if let Some(token_str) = start_response.restore_token() {
-        if let Err(e) = write_token(token_str) {
+        if let Err(e) = write_named_token(REMOTE_DESKTOP_TOKEN_FILE, token_str) {
             log::warn!("failed to save RemoteDesktop token: {}", e);
         }
     }
@@ -247,20 +168,38 @@ impl Emulation for LibeiEmulation {
     ) -> Result<(), EmulationError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as u64;
         if self.libei_error.load(Ordering::SeqCst) {
             // don't break sending additional events but signal error
-            if let Some(e) = self.error.lock().unwrap().take() {
+            let error = self.error.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(e) = error {
                 return Err(e);
             }
         }
         match event {
             Event::Pointer(p) => match p {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    let pointer_device = self.devices.pointer.read().unwrap();
+                    // A non-finite delta (corrupted packet) must not be
+                    // forwarded into the EIS device state.
+                    if !dx.is_finite() || !dy.is_finite() {
+                        log::warn!("dropping non-finite motion: ({dx}, {dy})");
+                        return Ok(());
+                    }
+                    // The wire carries f64 while EIS uses f32: a huge finite
+                    // value would become infinity when narrowed.
+                    let (dx, dy) = (dx as f32, dy as f32);
+                    if !dx.is_finite() || !dy.is_finite() {
+                        log::warn!("dropping out-of-range motion: ({dx}, {dy})");
+                        return Ok(());
+                    }
+                    let pointer_device = self
+                        .devices
+                        .pointer
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
                     if let Some((d, p)) = pointer_device.as_ref() {
-                        p.motion_relative(dx as f32, dy as f32);
+                        p.motion_relative(dx, dy);
                         d.frame(self.conn.serial(), now);
                     }
                 }
@@ -269,7 +208,11 @@ impl Emulation for LibeiEmulation {
                     button,
                     state,
                 } => {
-                    let button_device = self.devices.button.read().unwrap();
+                    let button_device = self
+                        .devices
+                        .button
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
                     if let Some((d, b)) = button_device.as_ref() {
                         b.button(
                             button,
@@ -286,22 +229,30 @@ impl Emulation for LibeiEmulation {
                     axis,
                     value,
                 } => {
-                    let scroll_device = self.devices.scroll.read().unwrap();
+                    let Some((dx, dy)) = scroll_deltas(axis, value) else {
+                        return Ok(());
+                    };
+                    let scroll_device = self
+                        .devices
+                        .scroll
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
                     if let Some((d, s)) = scroll_device.as_ref() {
-                        match axis {
-                            0 => s.scroll(0., value as f32),
-                            _ => s.scroll(value as f32, 0.),
-                        }
+                        s.scroll(dx, dy);
                         d.frame(self.conn.serial(), now);
                     }
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
-                    let scroll_device = self.devices.scroll.read().unwrap();
+                    let Some((dx, dy)) = discrete_scroll_deltas(axis, value) else {
+                        return Ok(());
+                    };
+                    let scroll_device = self
+                        .devices
+                        .scroll
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
                     if let Some((d, s)) = scroll_device.as_ref() {
-                        match axis {
-                            0 => s.scroll_discrete(0, value),
-                            _ => s.scroll_discrete(value, 0),
-                        }
+                        s.scroll_discrete(dx, dy);
                         d.frame(self.conn.serial(), now);
                     }
                 }
@@ -312,7 +263,11 @@ impl Emulation for LibeiEmulation {
                     key,
                     state,
                 } => {
-                    let keyboard_device = self.devices.keyboard.read().unwrap();
+                    let keyboard_device = self
+                        .devices
+                        .keyboard
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
                     if let Some((d, k)) = keyboard_device.as_ref() {
                         k.key(
                             key,
@@ -337,8 +292,44 @@ impl Emulation for LibeiEmulation {
     async fn destroy(&mut self, _: EmulationHandle) {}
 
     async fn terminate(&mut self) {
-        let _ = self.session.close().await;
+        // A hung portal must not hang app shutdown: close on a best-effort
+        // basis with a timeout, then abort the EIS task.
+        match tokio::time::timeout(Duration::from_secs(2), self.session.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("session.close(): {e}"),
+            Err(_) => log::warn!("session.close() timed out"),
+        }
         self.ei_task.abort();
+    }
+}
+
+/// Map a continuous scroll event to EIS (dx, dy) deltas.
+///
+/// Only the two axes the wire protocol defines are accepted; an unknown axis
+/// from a corrupted packet is dropped instead of being treated as horizontal.
+fn scroll_deltas(axis: u8, value: f64) -> Option<(f32, f32)> {
+    if !value.is_finite() {
+        return None;
+    }
+    let value = value as f32;
+    // Narrowing can turn a huge-but-finite f64 (e.g. 1e300 from a corrupted
+    // packet) into f32::INFINITY; EIS must never receive a non-finite delta.
+    if !value.is_finite() {
+        return None;
+    }
+    match axis {
+        0 => Some((0.0, value)),
+        1 => Some((value, 0.0)),
+        _ => None,
+    }
+}
+
+/// Map a discrete (120-unit) scroll event to EIS (dx, dy) deltas.
+fn discrete_scroll_deltas(axis: u8, value: i32) -> Option<(i32, i32)> {
+    match axis {
+        0 => Some((0, value)),
+        1 => Some((value, 0)),
+        _ => None,
     }
 }
 
@@ -355,7 +346,10 @@ async fn ei_task(
             Ok(()) => {}
             Err(e) => {
                 libei_error.store(true, Ordering::SeqCst);
-                error.lock().unwrap().replace(e);
+                error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(e);
                 // wait for termination -> otherwise we will loop forever
                 future::pending::<()>().await;
             }
@@ -396,33 +390,36 @@ async fn ei_event_handler(
                     devices
                         .pointer
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .replace((device.device().clone(), pointer));
                 }
                 if let Some(keyboard) = e.device().interface::<Keyboard>() {
                     devices
                         .keyboard
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .replace((device.device().clone(), keyboard));
                 }
                 if let Some(scroll) = e.device().interface::<Scroll>() {
                     devices
                         .scroll
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .replace((device.device().clone(), scroll));
                 }
                 if let Some(button) = e.device().interface::<Button>() {
                     devices
                         .button
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .replace((device.device().clone(), button));
                 }
             }
             EiEvent::DeviceRemoved(e) => {
                 log::debug!("device removed: {:?}", e.device().device_type());
+                // Never send events on the destroyed EIS objects again; a
+                // fresh interface set arrives with the next DeviceAdded.
+                devices.forget_device(e.device().device());
             }
             EiEvent::DevicePaused(e) => {
                 log::debug!("device paused: {:?}", e.device().device_type());
@@ -449,82 +446,12 @@ async fn ei_event_handler(
             // EiEvent::TouchDown(_) => { },
             // EiEvent::TouchUp(_) => { },
             // EiEvent::TouchMotion(_) => { },
-            _ => unreachable!("unexpected ei event"),
+            other => {
+                // Receiver-only or unknown events must never panic the
+                // service: an unexpected protocol event is not worth a crash.
+                log::debug!("ignoring unexpected eis event: {other:?}");
+            }
         }
         context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
-    }
-}
-
-#[cfg(test)]
-mod token_tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn scratch_dir(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!(
-            "lan-mouse-emulation-token-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        dir
-    }
-
-    #[test]
-    fn tokens_are_written_atomically_with_owner_only_permissions() {
-        let dir = scratch_dir("write");
-        write_token_to(&dir, REMOTE_DESKTOP_TOKEN_FILE, "token-value").unwrap();
-
-        let path = dir.join(REMOTE_DESKTOP_TOKEN_FILE);
-        assert_eq!(read_token_file(&path).as_deref(), Some("token-value"));
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        // The temporary file is renamed, not left behind.
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn empty_tokens_are_treated_as_missing() {
-        let dir = scratch_dir("empty");
-        write_token_to(&dir, REMOTE_DESKTOP_TOKEN_FILE, " \n\t").unwrap();
-        assert_eq!(read_token_file(&dir.join(REMOTE_DESKTOP_TOKEN_FILE)), None);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn legacy_cache_token_is_migrated_once() {
-        let state = scratch_dir("state");
-        let legacy = scratch_dir("legacy");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join(REMOTE_DESKTOP_TOKEN_FILE), "legacy-token").unwrap();
-
-        assert_eq!(
-            read_token_from(Some(&state), Some(&legacy)).as_deref(),
-            Some("legacy-token")
-        );
-        assert_eq!(
-            read_token_file(&state.join(REMOTE_DESKTOP_TOKEN_FILE)).as_deref(),
-            Some("legacy-token")
-        );
-        // The legacy copy is removed once migration succeeded.
-        assert!(!legacy.join(REMOTE_DESKTOP_TOKEN_FILE).exists());
-
-        // The migrated (state) token wins over a stale legacy one.
-        fs::write(state.join(REMOTE_DESKTOP_TOKEN_FILE), "current-token").unwrap();
-        fs::write(legacy.join(REMOTE_DESKTOP_TOKEN_FILE), "legacy-token").unwrap();
-        assert_eq!(
-            read_token_from(Some(&state), Some(&legacy)).as_deref(),
-            Some("current-token")
-        );
-
-        fs::remove_dir_all(&state).unwrap();
-        fs::remove_dir_all(&legacy).unwrap();
     }
 }

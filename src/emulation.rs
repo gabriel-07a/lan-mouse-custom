@@ -111,9 +111,15 @@ pub(crate) enum EmulationEvent {
 
 enum EmulationRequest {
     Reenable,
-    Release(SocketAddr),
-    /// close an active incoming connection (device revoked)
+    Release(SocketAddr, u32),
+    /// close an active incoming connection (device revoked): also tells the
+    /// peer this was an explicit user disconnect so it stops reconnecting
     Disconnect(SocketAddr),
+    /// close an active incoming connection without the explicit-disconnect
+    /// signal: the peer's own watchdog resets its capture. Used when a return
+    /// hand-off cannot be confirmed (a lost datagram must not force the user
+    /// to re-enable the device on the other machine).
+    CloseSession(SocketAddr),
     ChangePort(u16),
     Terminate,
 }
@@ -168,9 +174,14 @@ impl Emulation {
         self.selected_backend.get()
     }
 
-    pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
+    /// Ask the peer at `addr` to release its capture (return hand-off).
+    ///
+    /// A non-zero `serial` marks the request as retried: the peer answers it
+    /// again even if it already released, which is what lets the requester
+    /// recover from a lost `Leave`.
+    pub(crate) fn send_leave_request(&self, addr: SocketAddr, serial: u32) {
         self.request_tx
-            .send(EmulationRequest::Release(addr))
+            .send(EmulationRequest::Release(addr, serial))
             .ok()
             .unwrap_or_default();
     }
@@ -180,6 +191,16 @@ impl Emulation {
     pub(crate) fn disconnect(&self, addr: SocketAddr) {
         self.request_tx
             .send(EmulationRequest::Disconnect(addr))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Close the incoming connection from `addr` without the
+    /// explicit-disconnect signal, so the peer's watchdog (not a "user
+    /// disconnected" flag) resets its capture.
+    pub(crate) fn close_session(&self, addr: SocketAddr) {
+        self.request_tx
+            .send(EmulationRequest::CloseSession(addr))
             .ok()
             .unwrap_or_default();
     }
@@ -276,9 +297,16 @@ impl ListenTask {
                                 } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     last_enter.record(addr, serial);
                                     log::info!("releasing capture: {addr} entered this device");
+                                    // Publish the hand-off before the Ack gives the
+                                    // peer permission to start injecting input. The
+                                    // service must have installed the remote-peer
+                                    // suppression by then; otherwise the first
+                                    // injected motion can be mistaken for local
+                                    // input and both machines ping-pong control at
+                                    // the shared edge (the old enter/leave cycle).
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).ok().unwrap_or_default();
-                                    self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).ok().unwrap_or_default();
+                                    self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
                                 }
                             }
                             ProtoEvent::Leave(_) => {
@@ -441,7 +469,9 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release(addr, serial) => {
+                        self.listener.reply(addr, ProtoEvent::Leave(serial)).await
+                    }
                     EmulationRequest::Disconnect(addr) => {
                         // Tell the peer this is an explicit user disconnect so
                         // it deactivates its client instead of reconnecting.
@@ -456,6 +486,12 @@ impl ListenTask {
                             .await;
                         self.listener.disconnect(addr).await
                     }
+                    EmulationRequest::CloseSession(addr) => {
+                        // No AuthRevoke: a forced "user disconnect" would make
+                        // the peer deactivate the device until it is manually
+                        // re-enabled - far worse than the recovery this is for.
+                        self.listener.disconnect(addr).await
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -464,17 +500,25 @@ impl ListenTask {
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
-                    last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > EMULATION_TIMEOUT {
-                            log::warn!("releasing keys: {addr} not responding!");
-                            self.emulation_proxy.remove(addr);
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).ok().unwrap_or_default();
-                            last_enter.clear(addr);
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    // A peer that stops sending pings/input is gone: release
+                    // its held keys AND close the incoming transport. Before
+                    // this, the DTLS session was kept forever, so dirty
+                    // disconnects accumulated in the listener until the
+                    // connection cap rejected every new peer until restart.
+                    let now = Instant::now();
+                    let expired: Vec<SocketAddr> = last_response
+                        .iter()
+                        .filter(|(_, seen)| now.duration_since(**seen) > EMULATION_TIMEOUT)
+                        .map(|(addr, _)| *addr)
+                        .collect();
+                    for addr in expired {
+                        log::warn!("releasing keys: {addr} not responding!");
+                        self.emulation_proxy.remove(addr);
+                        last_response.remove(&addr);
+                        last_enter.clear(addr);
+                        self.listener.disconnect(addr).await;
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).ok().unwrap_or_default();
+                    }
                     // Rejected handshakes are deduplicated for a short window;
                     // drop old entries so a stream of random certificates cannot
                     // grow the map forever.

@@ -88,21 +88,14 @@ impl Display for PointerEvent {
                 time: _,
                 button,
                 state,
-            } => {
-                let str = match *button {
-                    BTN_LEFT => Some("left"),
-                    BTN_RIGHT => Some("right"),
-                    BTN_MIDDLE => Some("middle"),
-                    BTN_FORWARD => Some("forward"),
-                    BTN_BACK => Some("back"),
-                    _ => None,
-                };
-                if let Some(button) = str {
-                    write!(f, "button({button}, {state})")
-                } else {
-                    write!(f, "button({button}, {state}")
-                }
-            }
+            } => match *button {
+                BTN_LEFT => write!(f, "button(left, {state})"),
+                BTN_RIGHT => write!(f, "button(right, {state})"),
+                BTN_MIDDLE => write!(f, "button(middle, {state})"),
+                BTN_FORWARD => write!(f, "button(forward, {state})"),
+                BTN_BACK => write!(f, "button(back, {state})"),
+                button => write!(f, "button({button}, {state})"),
+            },
             PointerEvent::Axis {
                 time: _,
                 axis,
@@ -161,5 +154,26 @@ mod injection_tests {
         injection::mark();
         assert!(injection::is_recent(60_000));
         assert!(!injection::is_recent(0));
+    }
+
+    /// Regression: an unmapped button code used to be formatted without its
+    /// closing parenthesis ("button(272, 1"), breaking log grepping.
+    #[test]
+    fn button_display_is_well_formed() {
+        let known = super::Event::Pointer(super::PointerEvent::Button {
+            time: 0,
+            button: super::BTN_LEFT,
+            state: 1,
+        })
+        .to_string();
+        assert_eq!(known, "button(left, 1)");
+
+        let unknown = super::Event::Pointer(super::PointerEvent::Button {
+            time: 0,
+            button: 0x999,
+            state: 0,
+        })
+        .to_string();
+        assert_eq!(unknown, "button(2457, 0)");
     }
 }

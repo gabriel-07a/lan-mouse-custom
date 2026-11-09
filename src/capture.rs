@@ -70,6 +70,9 @@ enum CaptureRequest {
     Destroy(CaptureHandle),
     /// explicit user disconnect: revoke/close the outgoing transport
     Disconnect(CaptureHandle),
+    /// close the outgoing transport without notifying the peer (the client
+    /// entry was deleted/merged: the peer must not see an explicit disconnect)
+    DropTransport(CaptureHandle),
     /// reenable input capture
     Reenable,
     /// set release bind
@@ -202,6 +205,20 @@ impl Capture {
     pub(crate) fn disconnect(&self, handle: CaptureHandle) {
         self.request_tx
             .send(CaptureRequest::Disconnect(handle))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Close the outgoing transport of a client without telling the peer.
+    ///
+    /// Used when the client entry disappears (deleted, config reload, merged
+    /// duplicate): an explicit-disconnect notification would deactivate the
+    /// peer's own configured client for us, which is not what a local bookkeeping
+    /// change means. The service removes the client from the manager first, so
+    /// the connection layer sees it as inactive and does not reconnect.
+    pub(crate) fn drop_transport(&self, handle: CaptureHandle) {
+        self.request_tx
+            .send(CaptureRequest::DropTransport(handle))
             .ok()
             .unwrap_or_default();
     }
@@ -361,20 +378,28 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    // Position of a registered capture, if it still exists.
+    //
+    // A backend event can legitimately arrive for a handle that was destroyed
+    // in the meantime: when two captures share a screen edge (a Default one
+    // and the incoming EnterOnly one), InputCapture fans one backend event out
+    // to every id at that position and queues the copies; a Destroy request
+    // processed before the queued copy is consumed leaves the copy pointing at
+    // a dead handle. Dropping such an event is the only correct behaviour
+    // (panicking took the whole service down).
+    fn get_pos(&self, handle: CaptureHandle) -> Option<Position> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
+            .map(|(_, pos, _)| *pos)
     }
 
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
+    // Capture type of a registered capture, if it still exists.
+    fn get_type(&self, handle: CaptureHandle) -> Option<CaptureType> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+            .map(|(_, _, capture_type)| *capture_type)
     }
 
     async fn run(mut self) {
@@ -387,6 +412,7 @@ impl CaptureTask {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Connect(h) => self.conn.ensure_connected(h),
                         CaptureRequest::Disconnect(h) => self.conn.disconnect(h).await,
+                        CaptureRequest::DropTransport(h) => self.conn.drop_transport(h).await,
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
@@ -545,10 +571,28 @@ impl CaptureTask {
                                 );
                             }
                         }
-                        // client disconnected
-                        ProtoEvent::Leave(_) => {
-                            log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture).await?;
+                        // The peer asks us to release our capture (return
+                        // hand-off) or confirms that it already released its
+                        // own. A non-zero serial marks a request the peer
+                        // retries until it receives our confirmation, so if we
+                        // no longer hold a capture we answer it again instead
+                        // of silently dropping it (a single lost Leave used to
+                        // leave the peer's remote-control state latched, with
+                        // the cursor stuck on its screen).
+                        ProtoEvent::Leave(serial) => {
+                            if self.active_client == Some(handle) {
+                                log::info!("releasing capture: left remote client device region");
+                                self.release_capture(capture).await?;
+                            } else if serial != 0 {
+                                log::debug!(
+                                    "re-confirming capture release to {handle} (retried request {serial})"
+                                );
+                                if let Err(e) =
+                                    self.conn.send_now(ProtoEvent::Leave(0), handle).await
+                                {
+                                    log::debug!("failed to re-confirm release: {e}");
+                                }
+                            }
                         },
                         _ => {}
                     }
@@ -556,6 +600,7 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Connect(h) => self.conn.ensure_connected(h),
                     CaptureRequest::Disconnect(h) => self.conn.disconnect(h).await,
+                    CaptureRequest::DropTransport(h) => self.conn.drop_transport(h).await,
                     CaptureRequest::SetSensitivity(h, scale) => {
                         self.sensitivity.insert(h, scale);
                     }
@@ -590,7 +635,18 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                 },
-                _ = self.cancellation_token.cancelled() => break,
+                _ = self.cancellation_token.cancelled() => {
+                    // Ctrl-C / SIGTERM / GUI close while controlling a peer:
+                    // release the grab and send the synthesized key-ups and
+                    // Leave, otherwise the peer keeps phantom-held keys and a
+                    // grabbed pointer until its watchdog fires.
+                    if self.active_client.is_some() {
+                        if let Err(e) = self.release_capture(capture).await {
+                            log::warn!("failed to release the capture on shutdown: {e}");
+                        }
+                    }
+                    break;
+                },
             }
         }
         Ok(())
@@ -621,16 +677,20 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
+        // The capture may have been destroyed between the backend queueing the
+        // event and this task consuming it (see get_pos); ignore stale events
+        // instead of panicking.
+        let Some(capture_type) = self.get_type(handle) else {
+            log::debug!("dropping {event:?} for unknown capture handle {handle}");
+            return Ok(());
+        };
+
         // While a peer drives this machine, a barrier begin on an outgoing
         // capture is the injected pointer being pushed back toward the peer.
         // Only the incoming (EnterOnly) capture may act on it: it sends the
         // `Leave` that releases the peer's grab. Starting the outgoing capture
         // here would reflect the injected motion back to the peer and loop.
-        if is_suppressed_remote_begin(
-            self.remote_peer.map(to_capture_pos),
-            self.get_type(handle),
-            &event,
-        ) {
+        if is_suppressed_remote_begin(self.remote_peer.map(to_capture_pos), capture_type, &event) {
             log::debug!("ignoring outgoing capture begin while a peer drives this machine");
             // The capture backend may already have activated a capture for
             // this begin (Windows edge activation hides the pointer and sets
@@ -664,10 +724,13 @@ impl CaptureTask {
         }
 
         // enter only capture (for incoming connections)
-        if self.get_type(handle) == CaptureType::EnterOnly {
+        if capture_type == CaptureType::EnterOnly {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+            let Some(pos) = self.get_pos(handle) else {
+                return Ok(());
+            };
+            if !self.is_default_capture_at(pos) {
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -744,7 +807,10 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let Some(pos) = self.get_pos(handle) else {
+            return Ok(());
+        };
+        let opposite_pos = to_proto_pos(pos.opposite());
         let enter_serial = self.enter.serial();
 
         let event = match event {
@@ -853,7 +919,11 @@ impl CaptureTask {
         let Some(handle) = self.active_client else {
             return Ok(());
         };
-        let pos = to_proto_pos(self.get_pos(handle).opposite());
+        let Some(pos) = self.get_pos(handle) else {
+            // The capture was destroyed underneath us: nothing left to retry.
+            return Ok(());
+        };
+        let pos = to_proto_pos(pos.opposite());
         let serial = self.enter.serial();
         if let Err(e) = self
             .conn
@@ -1119,5 +1189,74 @@ mod enter_state_tests {
             CaptureType::Default,
             &motion
         ));
+    }
+}
+
+#[cfg(test)]
+mod capture_handle_tests {
+    use super::*;
+    use crate::client::ClientManager;
+
+    fn certificate() -> webrtc_dtls::crypto::Certificate {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join("lan-mouse-tests");
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("capture-cert-{}-{unique}.pem", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        crate::crypto::generate_key_and_cert(&path).expect("generate certificate")
+    }
+
+    fn capture_task(captures: Vec<(CaptureHandle, Position, CaptureType)>) -> CaptureTask {
+        let (event_tx, _event_rx) = channel();
+        let (_request_tx, request_rx) = channel();
+        CaptureTask {
+            active_client: None,
+            backend: Some(input_capture::Backend::Dummy),
+            cancellation_token: CancellationToken::new(),
+            captures,
+            coalescer: MotionCoalescer::new(0),
+            conn: LanMouseConnection::new(certificate(), ClientManager::default(), 1000),
+            enter: EnterState::default(),
+            sensitivity: HashMap::new(),
+            outgoing_caps: HashMap::new(),
+            remote_peer: None,
+            grace: Duration::from_millis(1000),
+            disconnected_since: None,
+            event_tx,
+            release_bind: Rc::new(RefCell::new(Vec::new())),
+            request_rx,
+            selected_backend: Default::default(),
+            state: State::default(),
+        }
+    }
+
+    #[test]
+    fn lookups_of_a_destroyed_capture_return_none() {
+        let task = capture_task(vec![(7, Position::Left, CaptureType::Default)]);
+        assert_eq!(task.get_pos(7), Some(Position::Left));
+        assert_eq!(task.get_type(7), Some(CaptureType::Default));
+        assert_eq!(task.get_pos(8), None);
+        assert_eq!(task.get_type(8), None);
+    }
+
+    /// Regression: an event queued for a capture that was destroyed in the
+    /// meantime used to panic with "no such capture" and take the service down.
+    /// Two captures can share a screen edge (Default + incoming EnterOnly), and
+    /// InputCapture fans a backend event out to both ids, so a Destroy can
+    /// overtake the queued copy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_event_for_a_destroyed_capture_is_ignored() {
+        let mut task = capture_task(vec![(7, Position::Left, CaptureType::Default)]);
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        capture.create(7, Position::Left).await.expect("create");
+        task.remove_capture(7);
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::Begin))
+            .await
+            .expect("a stale event must not fail or panic");
+        capture.terminate().await.expect("terminate");
     }
 }

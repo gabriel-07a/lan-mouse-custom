@@ -363,6 +363,10 @@ impl LanMouseListener {
                                 }
                                 let Ok(permit) = handshakes.clone().try_acquire_owned() else {
                                     log::warn!("too many handshakes in flight, dropping {addr}");
+                                    // Close the accepted transport like the
+                                    // other rejection paths: dropping it without
+                                    // closing leaked the socket/bookkeeping.
+                                    let _ = conn.close().await;
                                     continue;
                                 };
                                 let listen_tx = listen_tx.clone();
@@ -443,43 +447,89 @@ impl LanMouseListener {
                                                 // handshake actually succeeded, so
                                                 // a failed/aborted handshake
                                                 // cannot leave an orphaned pin.
+                                                let mut adoption = None;
+                                                let mut pairing_lost_race = false;
                                                 if let Some(source) =
                                                     auto_source.lock().expect("lock").take()
                                                 {
-                                                    let (description, incoming, outgoing) =
-                                                        match source {
-                                                            AutoSource::TrustedAddress {
-                                                                incoming,
-                                                                outgoing,
-                                                            } => (
+                                                    match source {
+                                                        AutoSource::TrustedAddress {
+                                                            incoming,
+                                                            outgoing,
+                                                        } => {
+                                                            adoption = Some((
                                                                 format!(
                                                                     "trusted {}",
                                                                     logical_addr.ip()
                                                                 ),
                                                                 incoming,
                                                                 outgoing,
-                                                            ),
-                                                            AutoSource::Pairing {
-                                                                incoming,
-                                                                outgoing,
-                                                            } => {
-                                                                // Single use: the
-                                                                // window allows exactly
-                                                                // one new device.
-                                                                let _ = pairing
-                                                                    .write()
-                                                                    .expect("lock")
-                                                                    .take();
-                                                                (
+                                                                false,
+                                                            ));
+                                                        }
+                                                        AutoSource::Pairing {
+                                                            incoming,
+                                                            outgoing,
+                                                        } => {
+                                                            // Single use: consume the
+                                                            // window atomically here,
+                                                            // after the handshake. Two
+                                                            // concurrent handshakes may
+                                                            // both have seen it open in
+                                                            // the verify callback; only
+                                                            // the one that takes it may
+                                                            // adopt the device.
+                                                            if pairing
+                                                                .write()
+                                                                .expect("lock")
+                                                                .take()
+                                                                .is_some()
+                                                            {
+                                                                adoption = Some((
                                                                     format!(
                                                                         "paired {}",
                                                                         logical_addr.ip()
                                                                     ),
                                                                     incoming,
                                                                     outgoing,
-                                                                )
+                                                                    true,
+                                                                ));
+                                                            } else {
+                                                                pairing_lost_race = true;
                                                             }
-                                                        };
+                                                        }
+                                                    }
+                                                }
+                                                if pairing_lost_race {
+                                                    // A concurrent handshake
+                                                    // consumed the window first:
+                                                    // this device was never
+                                                    // authorized (and may never
+                                                    // become a full-access pin).
+                                                    // Drop the transport and the
+                                                    // session bookkeeping.
+                                                    log::warn!(
+                                                        "rejecting {logical_addr} ({fingerprint}): pairing window already consumed"
+                                                    );
+                                                    let transport: ArcConn = dtls.clone();
+                                                    let _ = finish_session(
+                                                        &conns,
+                                                        &sessions,
+                                                        &fingerprint,
+                                                        logical_addr,
+                                                        generation,
+                                                        &transport,
+                                                    );
+                                                    let _ = dtls.close().await;
+                                                    return;
+                                                }
+                                                if let Some((
+                                                    description,
+                                                    incoming,
+                                                    outgoing,
+                                                    from_pairing,
+                                                )) = adoption
+                                                {
                                                     authorized
                                                         .write()
                                                         .expect("lock")
@@ -491,10 +541,7 @@ impl LanMouseListener {
                                                         ListenEvent::AutoAuthorized {
                                                             addr: logical_addr,
                                                             fingerprint: fingerprint.clone(),
-                                                            from_pairing: matches!(
-                                                                source,
-                                                                AutoSource::Pairing { .. }
-                                                            ),
+                                                            from_pairing,
                                                             incoming,
                                                             outgoing,
                                                         },

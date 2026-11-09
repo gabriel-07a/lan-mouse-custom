@@ -44,15 +44,15 @@ impl Capture for WindowsInputCapture {
 }
 
 impl WindowsInputCapture {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> Result<Self, super::CaptureCreationError> {
         // 1000 Hz mice deliver events faster than the capture thread can
         // forward them; a 10 slot buffer dropped movements.
         let (event_tx, event_rx) = channel(512);
-        let event_thread = EventThread::new(event_tx);
-        Self {
+        let event_thread = EventThread::new(event_tx)?;
+        Ok(Self {
             event_thread,
             event_rx,
-        }
+        })
     }
 }
 

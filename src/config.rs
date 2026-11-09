@@ -48,18 +48,28 @@ const CERT_FILE_NAME: &str = "lan-mouse.pem";
 pub(crate) fn default_path() -> Result<PathBuf, VarError> {
     #[cfg(unix)]
     let default_path = {
-        let xdg_config_home =
-            env::var("XDG_CONFIG_HOME").unwrap_or(format!("{}/.config", env::var("HOME")?));
-        format!("{xdg_config_home}/lan-mouse/")
+        // The XDG spec says relative base directories must be ignored, and a
+        // relative XDG_CONFIG_HOME would silently make the config location
+        // depend on the current working directory (reset would then refuse to
+        // touch it because it is not absolute).
+        let xdg_config_home = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .ok_or(VarError::NotPresent)?;
+        xdg_config_home.join("lan-mouse")
     };
 
     #[cfg(not(unix))]
     let default_path = {
-        let app_data =
-            env::var("LOCALAPPDATA").unwrap_or(format!("{}/.config", env::var("USERPROFILE")?));
-        format!("{app_data}\\lan-mouse\\")
+        let app_data = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".config")))
+            .ok_or(VarError::NotPresent)?;
+        app_data.join("lan-mouse")
     };
-    Ok(PathBuf::from(default_path))
+    Ok(default_path)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -103,14 +113,35 @@ struct ClipboardConfig {
     max_snapshot_bytes: Option<usize>,
 }
 
+/// Hard caps for the configurable clipboard limits.
+///
+/// The platform backends never produce a single representation larger than
+/// 16 MiB, while the transfer receiver allocates the whole declared size up
+/// front. A hand-edited config value above these caps must not turn a hostile
+/// or corrupted clipboard offer into a multi-gigabyte allocation.
+const MAX_CLIPBOARD_REPRESENTATION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CLIPBOARD_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
 impl ClipboardConfig {
     fn limits(&self) -> input_clipboard::Limits {
         let default = input_clipboard::Limits::default();
         input_clipboard::Limits {
-            max_text: self.max_text_bytes.unwrap_or(default.max_text),
-            max_html: self.max_html_bytes.unwrap_or(default.max_html),
-            max_image: self.max_image_bytes.unwrap_or(default.max_image),
-            max_snapshot: self.max_snapshot_bytes.unwrap_or(default.max_snapshot),
+            max_text: self
+                .max_text_bytes
+                .unwrap_or(default.max_text)
+                .min(MAX_CLIPBOARD_REPRESENTATION_BYTES),
+            max_html: self
+                .max_html_bytes
+                .unwrap_or(default.max_html)
+                .min(MAX_CLIPBOARD_REPRESENTATION_BYTES),
+            max_image: self
+                .max_image_bytes
+                .unwrap_or(default.max_image)
+                .min(MAX_CLIPBOARD_REPRESENTATION_BYTES),
+            max_snapshot: self
+                .max_snapshot_bytes
+                .unwrap_or(default.max_snapshot)
+                .min(MAX_CLIPBOARD_SNAPSHOT_BYTES),
         }
     }
 
@@ -507,6 +538,10 @@ pub struct Config {
     config_dir: PathBuf,
     /// the (optional) toml config and it's path
     config_toml: Option<ConfigToml>,
+    /// Parse error of config.toml at startup, if it could not be loaded.
+    /// Reported by the doctor and exposed to the frontends instead of silently
+    /// running with defaults that look like a pristine installation.
+    load_error: Option<String>,
     // filesystem watcher
     watcher: notify::RecommendedWatcher,
     // channel for filesystem events
@@ -620,6 +655,105 @@ const DEFAULT_MOTION_BATCH_MS: u64 = 2;
 /// instead of bouncing the cursor back to the local screen immediately.
 const DEFAULT_CONNECT_GRACE_MS: u64 = 400;
 
+/// Load config.toml, backing up an unparsable file.
+///
+/// Returning defaults for a corrupt file keeps the service startable, but the
+/// next save would overwrite whatever the user could still repair by hand, so
+/// the raw bytes are copied to a sibling config.toml.corrupt-<timestamp> file
+/// first. The original is left untouched.
+fn load_config(path: &Path) -> (Option<ConfigToml>, Option<String>) {
+    match ConfigToml::new(path) {
+        Ok(config) => (Some(config), None),
+        Err(e) => {
+            let message = e.to_string();
+            log::warn!("{path:?}: {message}");
+            log::warn!("Continuing without config file ...");
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default();
+            if let Some(backup) = backup_corrupt_config(path, timestamp) {
+                log::warn!(
+                    "the unparsable config was backed up to {backup:?}; the original file is kept"
+                );
+            }
+            (None, Some(message))
+        }
+    }
+}
+
+/// Copy an unparsable config file to a timestamped sibling.
+///
+/// A numeric suffix keeps repeated starts in the same second from overwriting
+/// an earlier backup.
+fn backup_corrupt_config(path: &Path, timestamp: u64) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let parent = path.parent()?;
+    let base = format!("{CONFIG_FILE_NAME}.corrupt-{timestamp}");
+    let mut candidate = parent.join(&base);
+    let mut suffix = 1u32;
+    while candidate.exists() {
+        candidate = parent.join(format!("{base}-{suffix}"));
+        suffix = suffix.checked_add(1)?;
+    }
+    match fs::copy(path, &candidate) {
+        Ok(_) => Some(candidate),
+        Err(e) => {
+            log::warn!("could not back up the unparsable config: {e}");
+            None
+        }
+    }
+}
+
+/// Atomically replace the config file.
+///
+/// The new contents are written to a sibling temporary file and renamed over
+/// the destination, so a crash, full disk or power loss can never leave a
+/// truncated config behind (which would make the next start fall back to
+/// defaults and lose every configured device on the following save).
+fn write_config_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the config path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(CONFIG_FILE_NAME);
+    let tmp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let result = (|| -> io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Keep the mode of the file being replaced; a new file gets the
+            // usual 0644 (the private key lives in its own certificate file).
+            let mode = fs::metadata(path)
+                .map(|meta| meta.permissions().mode())
+                .unwrap_or(0o644);
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        // Best effort: make the rename itself durable.
+        #[cfg(unix)]
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -639,14 +773,24 @@ impl Config {
             }
         }
 
-        // --config <file> overrules default location
-        let config_path = args
-            .config
-            .clone()
-            .unwrap_or(default_path()?.join(CONFIG_FILE_NAME));
+        // --config <file> overrules default location. Resolve a relative path
+        // now: the watcher and the atomic replace both need an absolute path
+        // (and watching an empty parent directory fails on every platform).
+        let config_path = match args.config.clone() {
+            Some(path) if path.is_relative() => env::current_dir()?.join(path),
+            Some(path) => path,
+            None => default_path()?.join(CONFIG_FILE_NAME),
+        };
+        // A user-supplied --config value like "/" has no parent; report it as
+        // an invalid path instead of panicking.
         let config_dir = config_path
             .parent()
-            .expect("config directory")
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid config path: {}", config_path.display()),
+                )
+            })?
             .to_path_buf();
 
         // Ensure the config directory exists and write a default config file
@@ -662,21 +806,26 @@ impl Config {
             fs::write(&config_path, default_toml)?;
         }
 
-        let config_toml = match ConfigToml::new(&config_path) {
-            Err(e) => {
-                log::warn!("{config_path:?}: {e}");
-                log::warn!("Continuing without config file ...");
-                None
-            }
-            Ok(c) => Some(c),
-        };
+        let (config_toml, load_error) = load_config(&config_path);
 
-        // --cert-path <file> overrules default location
-        let cert_path = args
-            .cert_path
-            .clone()
-            .or(config_toml.as_ref().and_then(|c| c.cert_path.clone()))
-            .unwrap_or(default_path()?.join(CERT_FILE_NAME));
+        // --cert-path <file> overrules default location; a relative path in
+        // the config file is resolved against the config directory so the
+        // certificate does not depend on the daemon's working directory.
+        let cert_path = match args.cert_path.clone() {
+            Some(path) if path.is_relative() => env::current_dir()?.join(path),
+            Some(path) => path,
+            None => config_toml
+                .as_ref()
+                .and_then(|c| c.cert_path.clone())
+                .map(|path| {
+                    if path.is_relative() {
+                        config_dir.join(path)
+                    } else {
+                        path
+                    }
+                })
+                .unwrap_or(default_path()?.join(CERT_FILE_NAME)),
+        };
 
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
         let watcher = RecommendedWatcher::new(
@@ -691,6 +840,7 @@ impl Config {
             config_path,
             config_dir,
             config_toml,
+            load_error,
             watcher,
             watch_rx,
         };
@@ -711,7 +861,11 @@ impl Config {
 
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
-            let event = self.watch_rx.recv().await.expect("channel closed");
+            let Some(event) = self.watch_rx.recv().await else {
+                // The watcher is gone; without it no change can be detected.
+                log::debug!("config watcher channel closed");
+                return Ok(());
+            };
             let event = match event {
                 Ok(event) => event,
                 Err(e) => {
@@ -719,16 +873,27 @@ impl Config {
                     continue;
                 }
             };
-            if event.paths.contains(&self.config_path)
-                && matches!(
+            if !event.paths.contains(&self.config_path)
+                || !matches!(
                     event.kind,
                     EventKind::Create(_)
                         | EventKind::Modify(ModifyKind::Data(_))
                         | EventKind::Remove(_)
                 )
-                && self.read_from_disk()?
             {
-                return Ok(());
+                continue;
+            }
+            // Editors save by replacing the file, so the Remove event can be
+            // delivered before the new file exists. Treat that as a transient
+            // condition: reporting it would make the service tear down and
+            // re-create every client for a config that did not actually change.
+            match self.read_from_disk() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    log::debug!("config file is being replaced: {e}");
+                }
+                Err(e) => log::warn!("could not re-read the config file: {e}"),
             }
         }
     }
@@ -1109,18 +1274,37 @@ impl Config {
 
         let _ = self.unwatch();
         /* write new config to file */
-        if let Some(p) = self.config_path().parent() {
-            fs::create_dir_all(p)?;
+        let result = write_config_atomic(&self.config_path, &new_config);
+        // Re-arm the watcher even when the write failed: a transient disk error
+        // must not silently disable live config reloads for the rest of the
+        // process lifetime.
+        if let Err(e) = self.watch() {
+            log::warn!("could not re-arm the config file watcher: {e}");
         }
-        {
-            let mut f = File::create(self.config_path())?;
-            f.write_all(new_config.as_bytes())?;
-            f.sync_all()?;
+        result
+    }
+
+    /// Parse error of the config file at startup, if it could not be loaded.
+    ///
+    /// The service keeps running with defaults in that case; diagnostics show
+    /// the cause instead of a misleading "fresh installation" picture.
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+
+    /// Persist the listen port.
+    ///
+    /// Called by the service after a successful port change; the default port
+    /// is stored as absent so the file only contains explicit overrides.
+    pub fn set_port(&mut self, port: u16) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
         }
-
-        let _ = self.watch();
-
-        Ok(())
+        self.config_toml.as_mut().expect("config").port = if port == DEFAULT_PORT {
+            None
+        } else {
+            Some(port)
+        };
     }
 }
 
@@ -1145,6 +1329,186 @@ mod tests {
             sensitivity: None,
             fingerprint: None,
         }
+    }
+
+    fn unique_config_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "lan-mouse-config-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn manual_config(dir: &Path, config_toml: Option<ConfigToml>) -> Config {
+        let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
+        let watcher = RecommendedWatcher::new(
+            move |res| {
+                let _ = tx.blocking_send(res);
+            },
+            notify::Config::default(),
+        )
+        .expect("watcher");
+        Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: dir.join(CERT_FILE_NAME),
+            config_path: dir.join(CONFIG_FILE_NAME),
+            config_dir: dir.to_path_buf(),
+            config_toml,
+            load_error: None,
+            watcher,
+            watch_rx,
+        }
+    }
+
+    #[test]
+    fn corrupt_config_is_backed_up_and_the_original_is_kept() {
+        let dir = unique_config_dir("corrupt");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let original = b"port = [not valid toml\n[[clients]\n";
+        fs::write(&path, original).expect("write");
+
+        let (config, error) = load_config(&path);
+        assert!(config.is_none(), "a corrupt file falls back to defaults");
+        assert!(error.is_some());
+
+        let backup = fs::read_dir(&dir)
+            .expect("dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("config.toml.corrupt-"))
+            .expect("a backup is created");
+        assert_eq!(
+            fs::read(dir.join(&backup)).expect("backup contents"),
+            original,
+            "the backup keeps the exact bytes"
+        );
+        assert_eq!(
+            fs::read(&path).expect("original contents"),
+            original,
+            "the original file is left untouched for the user to repair"
+        );
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn corrupt_config_backups_never_collide() {
+        let dir = unique_config_dir("corrupt-names");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, b"bad").expect("write");
+
+        let first = backup_corrupt_config(&path, 1_700_000_000).expect("first backup");
+        let second = backup_corrupt_config(&path, 1_700_000_000).expect("second backup");
+        assert_eq!(first, dir.join("config.toml.corrupt-1700000000"));
+        assert_eq!(second, dir.join("config.toml.corrupt-1700000000-1"));
+        assert!(path.exists(), "backing up never moves the original");
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_valid_config_is_never_backed_up() {
+        let dir = unique_config_dir("valid");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, "port = 4242\n").expect("write");
+
+        let (config, error) = load_config(&path);
+        assert!(config.is_some());
+        assert!(error.is_none());
+        assert_eq!(fs::read_dir(&dir).expect("dir").count(), 1);
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_file_and_keeps_its_mode() {
+        let dir = unique_config_dir("atomic");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, "port = 1\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
+        }
+
+        write_config_atomic(&path, "port = 2\n").expect("atomic write");
+        assert_eq!(fs::read_to_string(&path).expect("content"), "port = 2\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+                0o600,
+                "the replaced file keeps its permissions"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&dir).expect("dir").count(),
+            1,
+            "no temporary file is left behind"
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn set_port_stores_non_default_ports_only() {
+        let dir = unique_config_dir("port");
+        let mut config = manual_config(&dir, Some(ConfigToml::default()));
+        config.set_port(5000);
+        assert_eq!(config.port(), 5000);
+        assert_eq!(
+            config.config_toml.as_ref().expect("config").port,
+            Some(5000)
+        );
+        config.set_port(DEFAULT_PORT);
+        assert_eq!(config.port(), DEFAULT_PORT);
+        assert_eq!(
+            config.config_toml.as_ref().expect("config").port,
+            None,
+            "the default port is stored as an absent key"
+        );
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn our_own_save_does_not_look_like_an_external_change() {
+        let dir = unique_config_dir("watch");
+        let mut config = manual_config(
+            &dir,
+            Some(ConfigToml {
+                port: Some(2),
+                ..Default::default()
+            }),
+        );
+        fs::write(config.config_path(), "port = 1\n").expect("write");
+        config.watch().expect("watch");
+
+        config.write_back().expect("write config");
+        let reloaded =
+            tokio::time::timeout(std::time::Duration::from_millis(600), config.changed()).await;
+        assert!(
+            reloaded.is_err(),
+            "our own atomic save must not trigger a config reload"
+        );
+
+        // The timeout alone would also pass if the watcher had been lost
+        // entirely (the CFG-03 regression). Prove the watcher is still armed:
+        // an external write must schedule a reload.
+        fs::write(config.config_path(), "port = 3\n").expect("external write");
+        tokio::time::timeout(std::time::Duration::from_secs(5), config.changed())
+            .await
+            .expect("an external config change must trigger a reload")
+            .expect("watcher error");
+        let parsed: ConfigToml =
+            toml::from_str(&fs::read_to_string(config.config_path()).expect("config contents"))
+                .expect("parse");
+        assert_eq!(parsed.port, Some(3));
+        fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
@@ -1223,7 +1587,7 @@ mod tests {
     #[test]
     fn clipboard_config_parses_and_applies_custom_limits() {
         let config = parse(
-            "[clipboard]\nenabled = false\nmax_text_bytes = 10\nmax_html_bytes = 20\n             max_image_bytes = 30\nmax_snapshot_bytes = 40\n",
+            "[clipboard]\nenabled = false\nmax_text_bytes = 10\nmax_html_bytes = 20\nmax_image_bytes = 30\nmax_snapshot_bytes = 40\n",
         );
         let clipboard = config.clipboard.as_ref().expect("clipboard table");
         assert!(!clipboard.enabled());
@@ -1232,6 +1596,28 @@ mod tests {
         assert_eq!(limits.max_html, 20);
         assert_eq!(limits.max_image, 30);
         assert_eq!(limits.max_snapshot, 40);
+    }
+
+    #[test]
+    fn clipboard_limits_are_clamped_to_wire_sizes() {
+        // A hand-edited config could otherwise make the receive path allocate
+        // an arbitrary amount of memory for a hostile clipboard offer. TOML
+        // integers are i64, so use a value far above the caps rather than
+        // usize::MAX (which is not valid TOML).
+        let huge = 9_000_000_000_usize;
+        let config = parse(&format!(
+            "[clipboard]\nmax_text_bytes = {huge}\nmax_html_bytes = {huge}\nmax_image_bytes = {huge}\nmax_snapshot_bytes = {huge}\n"
+        ));
+        let limits = config.clipboard.as_ref().expect("clipboard").limits();
+        assert_eq!(limits.max_text, MAX_CLIPBOARD_REPRESENTATION_BYTES);
+        assert_eq!(limits.max_html, MAX_CLIPBOARD_REPRESENTATION_BYTES);
+        assert_eq!(limits.max_image, MAX_CLIPBOARD_REPRESENTATION_BYTES);
+        assert_eq!(limits.max_snapshot, MAX_CLIPBOARD_SNAPSHOT_BYTES);
+        // Explicitly small values are kept (0 still disables a format).
+        let config = parse("[clipboard]\nmax_text_bytes = 0\nmax_snapshot_bytes = 1\n");
+        let limits = config.clipboard.as_ref().expect("clipboard").limits();
+        assert_eq!(limits.max_text, 0);
+        assert_eq!(limits.max_snapshot, 1);
     }
 
     #[test]

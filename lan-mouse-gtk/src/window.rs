@@ -220,15 +220,26 @@ fn short_fingerprint(fingerprint: &str) -> String {
     short
 }
 
-/// One line status for a device row.
-fn device_subtitle(device: &DeviceView) -> String {
-    let state = if device.connected && device.active {
-        "Receiving"
-    } else if device.connected {
+/// One line link status for a device row.
+///
+/// `DeviceView::connected` aggregates `alive || incoming_addr` and is therefore
+/// optimistic/stale (see docs/client-connection-state.md R8): it never proves
+/// that the peer answers. Only a fresh round-trip proof may say "Connected",
+/// and `active` (the user's enable flag) proves nothing about input, so the old
+/// "Receiving" label was dropped.
+fn device_state_label(connected: bool, proof: LinkProof) -> &'static str {
+    if connected && proof.is_fresh() {
         "Connected"
+    } else if connected {
+        "Unconfirmed"
     } else {
         "Offline"
-    };
+    }
+}
+
+/// One line status for a device row.
+fn device_subtitle(device: &DeviceView, proof: LinkProof) -> String {
+    let state = device_state_label(device.connected, proof);
     let incoming = if device.incoming.allowed {
         device.incoming.capabilities.summary()
     } else {
@@ -326,6 +337,10 @@ impl Window {
         window.request(FrontendRequest::Hello {
             ipc_version: IPC_VERSION,
         });
+        // The service only pushes the client snapshot in response to this
+        // request; without it a restart shows an empty device list until an
+        // unrelated event happens to arrive.
+        window.request(FrontendRequest::Enumerate());
         // Device permissions and unauthorized connection requests are served
         // as idempotent snapshots, so ask for both right away instead of
         // waiting for the service to push them.
@@ -797,6 +812,25 @@ impl Window {
         }
     }
 
+    /// Best round-trip evidence for the configured client(s) pinned to
+    /// `fingerprint` (Devices panel: `DeviceView` is identified by fingerprint).
+    fn device_proof(&self, fingerprint: &str) -> LinkProof {
+        let identity = fingerprint.trim().to_ascii_lowercase();
+        let handles = self
+            .imp()
+            .peer_states
+            .borrow()
+            .iter()
+            .filter(|(_, (config, _))| peer_identity(config).as_deref() == Some(identity.as_str()))
+            .map(|(handle, _)| *handle)
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .fold(LinkProof::Pending, |best, handle| {
+                best.best(self.link_proof(handle))
+            })
+    }
+
     /// Best round-trip evidence across all configured clients of one peer.
     fn merged_proof(&self, primary: ClientHandle) -> LinkProof {
         self.peer_members(primary)
@@ -1158,14 +1192,29 @@ impl Window {
     }
 
     fn request_port_change(&self) {
-        let port = self
-            .imp()
-            .port_entry
-            .get()
-            .text()
-            .as_str()
-            .parse::<u16>()
-            .unwrap_or(DEFAULT_PORT);
+        let text = self.imp().port_entry.get().text().to_string();
+        let text = text.trim();
+        // An empty field is how the entry displays the default port (see
+        // `Window::set_port`), so treat it as DEFAULT_PORT instead of failing.
+        let port = if text.is_empty() {
+            DEFAULT_PORT
+        } else {
+            match text.parse::<u16>() {
+                Ok(port) => port,
+                Err(_) => {
+                    // Previously a typo silently fell back to 4242 and recreated
+                    // the UDP listener on the wrong port.
+                    self.show_toast("Port must be a number between 1 and 65535");
+                    return;
+                }
+            }
+        };
+        if port == self.imp().port.get() {
+            // Same port: the service would just answer PortChanged; clear the
+            // pending edit instead of asking it to recreate the listener.
+            self.imp().set_port(port);
+            return;
+        }
         self.request(FrontendRequest::ChangePort(port));
     }
 
@@ -1227,6 +1276,23 @@ impl Window {
     /// Ask the service for a fresh scan of the local network.
     pub(super) fn request_scan(&self) {
         self.request(FrontendRequest::ScanNetwork);
+    }
+
+    /// User-triggered network scan, rate-limited.
+    ///
+    /// Every `ScanNetwork` request spawns a fresh discovery task in the service;
+    /// repeated clicks would run concurrent scans and duplicate network traffic.
+    pub(super) fn request_user_scan(&self) {
+        let now = Instant::now();
+        {
+            let mut last = self.imp().scan_requested_at.borrow_mut();
+            if last.is_some_and(|at: Instant| now.duration_since(at) < Duration::from_secs(3)) {
+                return;
+            }
+            *last = Some(now);
+        }
+        self.show_toast("Scanning the local network…");
+        self.request_scan();
     }
 
     /// Render the network table.
@@ -1380,24 +1446,24 @@ impl Window {
             "" => "Unknown device".to_string(),
             name => name.to_string(),
         };
+        // Never claim a connection from the optimistic `DeviceView.connected`:
+        // only a fresh round-trip proof counts (same rule as the client row).
+        let proof = self.device_proof(&fingerprint);
+        let state_label = device_state_label(device.connected, proof);
 
         let row = adw::ExpanderRow::new();
         row.set_title(&glib::markup_escape_text(&format!(
             "{display_name} · {}",
             short_fingerprint(&fingerprint)
         )));
-        row.set_subtitle(&glib::markup_escape_text(&device_subtitle(device)));
+        row.set_subtitle(&glib::markup_escape_text(&device_subtitle(device, proof)));
 
-        let icon = gtk::Image::from_icon_name(if device.connected {
+        let icon = gtk::Image::from_icon_name(if state_label == "Connected" {
             "network-wired-symbolic"
         } else {
             "network-offline-symbolic"
         });
-        icon.set_tooltip_text(Some(if device.connected {
-            "connected"
-        } else {
-            "offline"
-        }));
+        icon.set_tooltip_text(Some(&state_label.to_lowercase()));
         row.add_prefix(&icon);
 
         // Direction presets: one click sets all six capability checkboxes.
@@ -1861,6 +1927,13 @@ impl Window {
         known_hostname: Option<String>,
         fingerprint: Option<String>,
     ) {
+        // One pending add at a time: `Create` has no request id, so a second
+        // request would race the first `Created` and both clients would apply
+        // the wrong address/config.
+        if self.imp().pending_add.borrow().is_some() {
+            self.show_toast("Waiting for the service to answer the previous add request");
+            return;
+        }
         let window = adw::Window::builder()
             .title("Add device")
             .modal(true)
@@ -1943,6 +2016,11 @@ impl Window {
         window.present();
     }
 
+    /// Drop a pending "add device" request (e.g. after the service rejected it).
+    pub(super) fn clear_pending_add(&self) {
+        self.imp().pending_add.borrow_mut().take();
+    }
+
     fn send_device_request(
         &self,
         address: String,
@@ -1986,8 +2064,11 @@ impl Window {
     }
 
     fn request(&self, request: FrontendRequest) {
-        let mut requester = self.imp().frontend_request_writer.borrow_mut();
-        let requester = requester.as_mut().unwrap();
+        let mut writer = self.imp().frontend_request_writer.borrow_mut();
+        let Some(requester) = writer.as_mut() else {
+            log::warn!("dropping frontend request (service connection not ready): {request:?}");
+            return;
+        };
         if let Err(e) = requester.request(request) {
             log::error!("error sending message: {e}");
         };
@@ -2369,5 +2450,26 @@ mod peer_merge_tests {
     #[test]
     fn merge_without_members_is_none() {
         assert_eq!(merge_peer_states(&[]), None);
+    }
+
+    #[test]
+    fn device_panel_never_claims_connected_without_round_trip_proof() {
+        // `DeviceView.connected` is optimistic/stale (R8): only a fresh reply
+        // may produce the "Connected" label, and the old "Receiving" claim is
+        // gone entirely (it never proved input was applied).
+        assert_eq!(device_state_label(false, LinkProof::Pending), "Offline");
+        assert_eq!(device_state_label(true, LinkProof::Pending), "Unconfirmed");
+        assert_eq!(
+            device_state_label(true, LinkProof::Stale { age_secs: 30 }),
+            "Unconfirmed"
+        );
+        assert_eq!(
+            device_state_label(true, LinkProof::Recent { age_secs: 1 }),
+            "Connected"
+        );
+        for proof in [LinkProof::Pending, LinkProof::Stale { age_secs: 9 }] {
+            assert_ne!(device_state_label(true, proof), "Receiving");
+            assert_ne!(device_state_label(true, proof), "Connected");
+        }
     }
 }

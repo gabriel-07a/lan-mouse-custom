@@ -63,7 +63,14 @@ impl DnsResolver {
 
     pub(crate) async fn terminate(&mut self) {
         self.cancellation_token.cancel();
-        self.task.take().expect("task").await.expect("join error");
+        // Idempotent: a second shutdown (or a task that already panicked)
+        // must not abort the process, which runs with `panic = "abort"` in
+        // release builds.
+        if let Some(task) = self.task.take() {
+            if let Err(e) = task.await {
+                log::warn!("dns resolver task did not shut down cleanly: {e}");
+            }
+        }
     }
 }
 
@@ -79,6 +86,12 @@ impl DnsTask {
     async fn do_dns(&mut self) {
         while let Some(dns_request) = self.request_rx.recv().await {
             let DnsRequest { handle, hostname } = dns_request;
+
+            // Finished resolutions of deleted clients would otherwise stay in
+            // the map for the whole service lifetime (handles are never
+            // reused by the slab allocator in a strict order, so this map
+            // could grow with every create/delete cycle).
+            self.active_tasks.retain(|_, task| !task.is_finished());
 
             /* abort previous dns task */
             let previous_task = self.active_tasks.remove(&handle);

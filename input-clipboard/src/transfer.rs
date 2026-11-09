@@ -168,6 +168,12 @@ impl OutgoingTransfer {
         if base < item.base {
             return false; // stale ack for a window we already advanced past
         }
+        // A cumulative count can never exceed the number of chunks. Rejecting
+        // impossible values also keeps `base + bit` below from overflowing on
+        // a hostile or corrupted acknowledgement.
+        if base > item.total_chunks {
+            return false;
+        }
 
         // `base` is cumulative: every chunk below it arrived, even when the
         // bitmap is zero (the common case for a single-chunk representation).
@@ -182,7 +188,9 @@ impl OutgoingTransfer {
             if bitmap & (1 << bit) == 0 {
                 continue;
             }
-            let index = base + bit;
+            let Some(index) = base.checked_add(bit) else {
+                continue;
+            };
             if index < item.total_chunks && !item.acked[index as usize] {
                 item.acked[index as usize] = true;
                 progress = true;
@@ -559,6 +567,20 @@ mod tests {
     }
 
     #[test]
+    fn sender_rejects_impossible_ack_bases_without_panicking() {
+        let source = snapshot();
+        let mut sender = OutgoingTransfer::new(9, 0, &source);
+        // A corrupted/hostile ack must not overflow `base + bit` (debug
+        // panic), must not fake progress and must not mark the transfer done.
+        assert!(!sender.on_ack(9, MIME_TEXT, u32::MAX, u32::MAX));
+        assert!(!sender.on_ack(9, MIME_TEXT, u32::MAX - 1, u32::MAX));
+        assert!(!sender.is_done());
+        // The highest valid cumulative base is accepted.
+        let text_chunks = (b"hello world".len() as u32).div_ceil(CHUNK_SIZE as u32);
+        assert!(sender.on_ack(9, MIME_TEXT, text_chunks, 0));
+    }
+
+    #[test]
     fn receiver_rejects_oversized_offers() {
         let limits = Limits {
             max_text: 10,
@@ -581,6 +603,41 @@ mod tests {
             IncomingTransfer::from_offer(1, 0, [0; 32], &[], &Limits::default(), Instant::now())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn receiver_ignores_malformed_chunks() {
+        let source = ClipboardSnapshot::from_items([(Format::Text, b"abc".to_vec())]);
+        let mut receiver = IncomingTransfer::from_offer(
+            1,
+            0,
+            source.hash(),
+            &source.wire_items(),
+            &Limits::default(),
+            Instant::now(),
+        )
+        .expect("offer");
+        // Offsets must be chunk aligned and totals must match the offer.
+        assert!(
+            receiver
+                .on_chunk(1, MIME_TEXT, 5, 3, b"abc", Instant::now())
+                .expect("ignored")
+                .is_none()
+        );
+        assert!(
+            receiver
+                .on_chunk(1, MIME_TEXT, 0, 99, b"abc", Instant::now())
+                .expect("ignored")
+                .is_none()
+        );
+        // A chunk larger than the wire limit is rejected, not written.
+        let oversized = vec![0u8; CHUNK_SIZE + 1];
+        assert!(
+            receiver
+                .on_chunk(1, MIME_TEXT, 0, 3, &oversized, Instant::now())
+                .is_err()
+        );
+        assert!(!receiver.is_complete());
     }
 
     #[test]

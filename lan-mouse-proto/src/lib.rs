@@ -935,4 +935,113 @@ mod extra_tests {
             );
         }
     }
+
+    /// Deterministic xorshift so failures reproduce.
+    struct FuzzRng(u64);
+
+    impl FuzzRng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn byte(&mut self) -> u8 {
+            (self.next_u64() >> 32) as u8
+        }
+    }
+
+    #[test]
+    fn arbitrary_datagrams_never_panic() {
+        // Fuzz-style regression: every byte sequence - including hostile and
+        // truncated ones - must decode to an error or a value, never panic.
+        let mut rng = FuzzRng(0x1234_5678_9abc_def0);
+        for len in 0..=64usize {
+            for _ in 0..200 {
+                let mut bytes = vec![0u8; len];
+                for byte in bytes.iter_mut() {
+                    *byte = rng.byte();
+                }
+                if let Ok(event) = ProtoEvent::try_from(bytes.as_slice()) {
+                    // A packet that decodes must be re-encodable (the encoder
+                    // must never overrun MAX_EVENT_SIZE).
+                    let (buf, encoded_len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+                    assert!(encoded_len <= MAX_EVENT_SIZE);
+                    assert_eq!(buf.len(), MAX_EVENT_SIZE);
+                    let _ = format!("{event}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_motion_values_are_carried_verbatim() {
+        // f64 payloads come straight off the wire; NaN/inf must not panic and
+        // must round-trip bit-exactly (the receiver sanitises them when it
+        // converts coordinates).
+        for dx in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.0,
+            f64::MIN,
+            f64::MAX,
+        ] {
+            let event = ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+                time: 1,
+                dx,
+                dy: -dx,
+            }));
+            let bytes = encode(event);
+            let decoded = ProtoEvent::try_from(bytes.as_slice()).expect("decode");
+            let ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion { dx: got, .. })) =
+                decoded
+            else {
+                panic!("expected a motion event");
+            };
+            assert_eq!(got.to_bits(), dx.to_bits(), "f64 payload changed");
+        }
+    }
+
+    #[test]
+    fn future_protocol_versions_and_capabilities_are_preserved_and_harmless() {
+        // A newer peer may send a version/capability combination this build
+        // does not know. Decoding must not panic and must keep the raw values
+        // so diagnostics can report the skew; feature gating is done by the
+        // caller through capability bits.
+        let mut bytes = vec![11u8]; // Hello
+        bytes.extend_from_slice(b"future!!");
+        bytes.push(255); // proto_version: far newer than PROTO_VERSION
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes()); // unknown capability bits
+        let decoded = ProtoEvent::try_from(bytes.as_slice()).expect("future hello");
+        match decoded {
+            ProtoEvent::Hello {
+                commit,
+                proto_version,
+                capabilities,
+            } => {
+                assert_eq!(&commit, b"future!!");
+                assert_eq!(proto_version, 255);
+                assert_eq!(capabilities, u32::MAX);
+            }
+            other => panic!("expected Hello, got {other}"),
+        }
+    }
+
+    #[test]
+    fn trailing_garbage_after_a_known_event_is_ignored_not_fatal() {
+        // Forward compatibility: a peer appending future fields must not make
+        // an older build reject the frame.
+        for id in [0u8, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
+            let mut event_bytes = vec![id];
+            // Enough zero bytes for the largest fixed-size event.
+            event_bytes.extend_from_slice(&[0u8; 32]);
+            let decoded = ProtoEvent::try_from(event_bytes.as_slice());
+            assert!(decoded.is_ok(), "event id {id} must decode despite padding");
+            let _ = format!("{}", decoded.expect("decoded"));
+        }
+    }
 }

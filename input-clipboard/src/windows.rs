@@ -5,13 +5,16 @@
 //! Images are converted between `CF_DIB`/`CF_DIBV5` and the canonical PNG
 //! representation by [`crate::dib`].
 
-use std::{sync::OnceLock, time::Duration};
+use std::{sync::Mutex, time::Duration};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use windows::{
     Win32::{
-        Foundation::{GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{
+            ERROR_CLASS_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND,
+            LPARAM, LRESULT, WPARAM,
+        },
         System::{
             DataExchange::{
                 AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
@@ -39,8 +42,14 @@ const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
 const CF_DIBV5: u32 = 17;
 const MAX_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
-static NOTIFY: OnceLock<UnboundedSender<()>> = OnceLock::new();
+/// Sender of the clipboard-change notification, set while the listener
+/// message window is alive.
+///
+/// A Mutex instead of a OnceLock so a listener that exits can be replaced: a
+/// failed startup or a dead message loop must stay retryable (F15).
+static NOTIFY: Mutex<Option<UnboundedSender<()>>> = Mutex::new(None);
 
 pub struct WindowsClipboard {
     changes: UnboundedReceiver<()>,
@@ -134,38 +143,66 @@ impl WindowsClipboard {
 #[async_trait(?Send)]
 impl Clipboard for WindowsClipboard {
     async fn read(&mut self) -> Result<ClipboardSnapshot, Error> {
-        let _guard = self.open().await?;
-        if unsafe { self.is_secret() } {
-            log::debug!("windows clipboard is marked as secret, skipping");
-            return Ok(ClipboardSnapshot::default());
-        }
+        // Copy the raw clipboard blocks while the clipboard is open, then
+        // release it: decoding a multi-megabyte DIB into PNG can take tens of
+        // milliseconds and holding the Win32 clipboard open blocks every other
+        // application (clipboard managers, Office, remote desktop) meanwhile.
+        let (text, html, png, dib) = {
+            let _guard = self.open().await?;
+            if unsafe { self.is_secret() } {
+                log::debug!("windows clipboard is marked as secret, skipping");
+                return Ok(ClipboardSnapshot::default());
+            }
+            let text = unsafe { self.clipboard_bytes(CF_UNICODETEXT) };
+            let html = unsafe { self.clipboard_bytes(self.formats.html) };
+            let mut png = unsafe { self.clipboard_bytes(self.formats.png) }
+                .map(|bytes| trim_png(&bytes))
+                .filter(|bytes| !bytes.is_empty());
+            // Some applications expose a registered "PNG" format without
+            // actually storing a PNG (it can be a container or padding); never
+            // forward that as image/png. Fall back to CF_DIB in that case.
+            if png
+                .as_ref()
+                .is_some_and(|bytes| !bytes.starts_with(&PNG_SIGNATURE))
+            {
+                log::debug!("windows clipboard: registered PNG format is not a PNG, ignoring");
+                png = None;
+            }
+            let dib = if png.is_none() {
+                unsafe { self.clipboard_bytes(CF_DIBV5) }
+                    .or_else(|| unsafe { self.clipboard_bytes(CF_DIB) })
+            } else {
+                None
+            };
+            (text, html, png, dib)
+        };
 
         let mut snapshot = ClipboardSnapshot::new();
 
-        if let Some(bytes) = unsafe { self.clipboard_bytes(CF_UNICODETEXT) } {
-            if let Some(text) = utf16_text(&bytes) {
-                let text = crlf_to_lf(&text);
-                if !text.is_empty() {
-                    snapshot.insert(Format::Text, text.into_bytes());
-                }
+        if let Some(text) = text.and_then(|bytes| utf16_text(&bytes)) {
+            let text = crlf_to_lf(&text);
+            if !text.is_empty() {
+                snapshot.insert(Format::Text, text.into_bytes());
             }
         }
 
-        if let Some(bytes) = unsafe { self.clipboard_bytes(self.formats.html) } {
-            let html = cf_html::parse(strip_nul(&bytes));
+        if let Some(html) = html {
+            let html = cf_html::parse(strip_nul(&html));
             if !html.is_empty() {
                 snapshot.insert(Format::Html, html);
             }
         }
 
-        let png = unsafe { self.clipboard_bytes(self.formats.png) }
-            .map(|bytes| trim_png(&bytes))
-            .filter(|bytes| !bytes.is_empty())
-            .or_else(|| {
-                unsafe { self.clipboard_bytes(CF_DIBV5) }
-                    .or_else(|| unsafe { self.clipboard_bytes(CF_DIB) })
-                    .and_then(|dib| dib::dib_to_png(&dib).ok())
-            });
+        let png = match png {
+            Some(png) => Some(png),
+            None => dib.and_then(|dib| match dib::dib_to_png(&dib) {
+                Ok(png) => Some(png),
+                Err(e) => {
+                    log::debug!("windows clipboard: could not convert the DIB to PNG: {e}");
+                    None
+                }
+            }),
+        };
         if let Some(png) = png {
             snapshot.insert(Format::Png, png);
         }
@@ -238,7 +275,7 @@ impl Drop for OpenGuard {
 }
 
 fn spawn_listener(sender: UnboundedSender<()>) -> Result<(), Error> {
-    if NOTIFY.set(sender).is_err() {
+    if NOTIFY.lock().expect("lock").is_some() {
         return Err(Error::Backend(
             "the Windows clipboard listener is already running".into(),
         ));
@@ -250,8 +287,24 @@ fn spawn_listener(sender: UnboundedSender<()>) -> Result<(), Error> {
             let result = unsafe { init_listener() };
             match result {
                 Ok(hwnd) => {
+                    // Publish the sender only once the message-only window is
+                    // live: a failed startup must stay retryable instead of
+                    // poisoning the singleton for the whole process.
+                    {
+                        let mut notify = NOTIFY.lock().expect("lock");
+                        if notify.is_some() {
+                            let _ = ready_tx.send(Err(Error::Backend(
+                                "the Windows clipboard listener is already running".into(),
+                            )));
+                            return;
+                        }
+                        *notify = Some(sender);
+                    }
                     let _ = ready_tx.send(Ok(()));
                     unsafe { message_loop(hwnd) };
+                    // The listener thread is exiting; allow a later backend
+                    // restart to install a fresh listener.
+                    *NOTIFY.lock().expect("lock") = None;
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -280,9 +333,15 @@ unsafe fn init_listener() -> Result<HWND, Error> {
         ..Default::default()
     };
     if unsafe { RegisterClassW(&class) } == 0 {
-        return Err(Error::Backend(
-            "could not register the clipboard window class".into(),
-        ));
+        // A previous failed attempt may have registered the class already; the
+        // class is per-process, so it is ours in any case.
+        let error = unsafe { GetLastError() };
+        if error != ERROR_CLASS_ALREADY_EXISTS {
+            return Err(Error::Backend(format!(
+                "could not register the clipboard window class: {}",
+                error.0
+            )));
+        }
     }
     let hwnd = unsafe {
         CreateWindowExW(
@@ -331,8 +390,10 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if message == WM_CLIPBOARDUPDATE {
-        if let Some(sender) = NOTIFY.get() {
-            let _ = sender.send(());
+        if let Ok(notify) = NOTIFY.lock() {
+            if let Some(sender) = notify.as_ref() {
+                let _ = sender.send(());
+            }
         }
         return LRESULT(0);
     }

@@ -28,7 +28,7 @@ windows = { version = "0.61.2", features = [
 ] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-x11rb = { version = "0.13.1", features = ["allow-unsafe-code"] }
+x11rb = { version = "0.13.1", features = ["allow-unsafe-code", "xfixes"] }
 wl-clipboard-rs = "0.9"
 ashpd = { version = "0.13.9", default-features = false, features = [
     "clipboard",
@@ -42,6 +42,8 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "NSBitmapImageRep",
+    "NSImageRep",
     "NSPasteboard",
 ] }
 

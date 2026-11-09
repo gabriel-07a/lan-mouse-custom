@@ -86,6 +86,81 @@ pub(crate) struct ClipboardTask {
     task: JoinHandle<()>,
 }
 
+/// Why the clipboard sync loop returned.
+enum RunExit {
+    /// The service (or the listener) is shutting down.
+    Shutdown,
+    /// The platform backend's change stream ended. The backend can be
+    /// recreated, e.g. after a portal session restart.
+    BackendStopped,
+}
+
+/// The channels fed by the listener and the connection tasks. Passed by
+/// reference so the backend can be recreated without losing queued frames.
+struct Channels {
+    from_listener: Receiver<(SocketAddr, ClipboardFrame)>,
+    from_connection: Receiver<(ClientHandle, ClipboardFrame)>,
+    peer_events: Receiver<SocketAddr>,
+}
+
+/// Wait until the user enables clipboard sync, dropping queued frames while
+/// waiting so a peer cannot grow the unbounded channels.
+async fn wait_for_enable(channels: &mut Channels, enabled: &Rc<Cell<bool>>) {
+    while !enabled.get() {
+        drain_frames(&mut channels.from_listener);
+        drain_frames(&mut channels.from_connection);
+        drain_frames(&mut channels.peer_events);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until the user disables clipboard sync (used after a backend failed,
+/// so a denied permission dialog is not re-opened in a loop).
+async fn wait_until_disabled(channels: &mut Channels, enabled: &Rc<Cell<bool>>) {
+    while enabled.get() {
+        drain_frames(&mut channels.from_listener);
+        drain_frames(&mut channels.from_connection);
+        drain_frames(&mut channels.peer_events);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Create the platform clipboard backend.
+///
+/// A backend that died is retried automatically (`retries > 0`); an initial
+/// failure (for example a denied portal consent) waits for the user to toggle
+/// clipboard sync off and on again instead of re-prompting in a loop.
+async fn create_backend(
+    channels: &mut Channels,
+    enabled: &Rc<Cell<bool>>,
+    status: &mut ClipboardStatus,
+    status_tx: &Sender<ClipboardStatus>,
+    retries: u32,
+) -> Box<dyn Clipboard> {
+    let mut retries = retries;
+    loop {
+        if !enabled.get() {
+            wait_for_enable(channels, enabled).await;
+        }
+        match input_clipboard::default_backend().await {
+            Ok(backend) => return backend,
+            Err(e) => {
+                status.enabled = enabled.get();
+                status.available = false;
+                status.last_error = Some(e.to_string());
+                log::info!("clipboard backend unavailable: {e}");
+                let _ = status_tx.send(status.clone());
+                if retries > 0 {
+                    retries -= 1;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                } else {
+                    wait_until_disabled(channels, enabled).await;
+                }
+            }
+        }
+    }
+}
+
 impl ClipboardTask {
     /// Spawn the clipboard task.
     ///
@@ -98,9 +173,9 @@ impl ClipboardTask {
         client_manager: ClientManager,
         sender: ConnectionSender,
         replies: Sender<ListenerCommand>,
-        mut from_listener: Receiver<(SocketAddr, ClipboardFrame)>,
-        mut from_connection: Receiver<(ClientHandle, ClipboardFrame)>,
-        mut peer_events: Receiver<SocketAddr>,
+        from_listener: Receiver<(SocketAddr, ClipboardFrame)>,
+        from_connection: Receiver<(ClientHandle, ClipboardFrame)>,
+        peer_events: Receiver<SocketAddr>,
         limits: Rc<Cell<Limits>>,
         enabled: Rc<Cell<bool>>,
         status_tx: Sender<ClipboardStatus>,
@@ -113,54 +188,54 @@ impl ClipboardTask {
             };
             let _ = status_tx.send(status.clone());
 
-            let backend = loop {
-                while !enabled.get() {
-                    drain_frames(&mut from_listener);
-                    drain_frames(&mut from_connection);
-                    drain_frames(&mut peer_events);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                match input_clipboard::default_backend().await {
-                    Ok(backend) => break backend,
-                    Err(e) => {
-                        status.enabled = enabled.get();
-                        status.available = false;
-                        status.last_error = Some(e.to_string());
-                        log::info!("clipboard backend unavailable: {e}");
-                        let _ = status_tx.send(status.clone());
-                        // Retry only after the user toggles the clipboard off
-                        // and on again, so a denied portal does not loop.
-                        while enabled.get() {
-                            drain_frames(&mut from_listener);
-                            drain_frames(&mut from_connection);
-                            drain_frames(&mut peer_events);
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            };
-            log::info!("using clipboard backend: {}", backend.backend_name());
-            status.backend = Some(backend.backend_name().to_string());
-            status.available = true;
-            status.enabled = enabled.get();
-            status.last_error = None;
-            let _ = status_tx.send(status.clone());
-
-            run(
-                backend,
-                client_manager,
-                sender,
-                replies,
+            let mut channels = Channels {
                 from_listener,
                 from_connection,
                 peer_events,
-                limits,
-                enabled,
-                status,
-                status_tx,
-                devices,
-            )
-            .await;
+            };
+            // The first creation failure waits for the user (a denied portal
+            // dialog must not loop); a backend that died later is restarted
+            // automatically, which is what recovers from a portal restart.
+            let mut restarted = false;
+
+            loop {
+                if !enabled.get() {
+                    wait_for_enable(&mut channels, &enabled).await;
+                }
+                let retries = if restarted { 3 } else { 0 };
+                let mut backend =
+                    create_backend(&mut channels, &enabled, &mut status, &status_tx, retries).await;
+                log::info!("using clipboard backend: {}", backend.backend_name());
+                status.backend = Some(backend.backend_name().to_string());
+                status.available = true;
+                status.enabled = enabled.get();
+                status.last_error = None;
+                let _ = status_tx.send(status.clone());
+                restarted = true;
+
+                match run(
+                    &mut backend,
+                    client_manager.clone(),
+                    sender.clone(),
+                    replies.clone(),
+                    &mut channels,
+                    limits.clone(),
+                    enabled.clone(),
+                    &mut status,
+                    &status_tx,
+                    devices.clone(),
+                )
+                .await
+                {
+                    RunExit::Shutdown => break,
+                    RunExit::BackendStopped => {
+                        status.available = false;
+                        status.last_error = Some("clipboard backend stopped; reconnecting".into());
+                        let _ = status_tx.send(status.clone());
+                        log::warn!("clipboard backend stopped, trying to restart it");
+                    }
+                }
+            }
         });
         Self { task }
     }
@@ -186,20 +261,18 @@ fn local_origin() -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run<C: Clipboard>(
-    mut backend: C,
+async fn run(
+    backend: &mut Box<dyn Clipboard>,
     client_manager: ClientManager,
     sender: ConnectionSender,
     replies: Sender<ListenerCommand>,
-    mut from_listener: Receiver<(SocketAddr, ClipboardFrame)>,
-    mut from_connection: Receiver<(ClientHandle, ClipboardFrame)>,
-    mut peer_events: Receiver<SocketAddr>,
+    channels: &mut Channels,
     limits: Rc<Cell<Limits>>,
     enabled: Rc<Cell<bool>>,
-    mut status: ClipboardStatus,
-    status_tx: Sender<ClipboardStatus>,
+    status: &mut ClipboardStatus,
+    status_tx: &Sender<ClipboardStatus>,
     devices: Arc<RwLock<DeviceStore>>,
-) {
+) -> RunExit {
     let routes: Rc<RefCell<HashMap<PeerId, Route>>> = Default::default();
     let (transport_tx, mut transport_rx) = channel::<(Route, Vec<u8>)>();
     let transport_sender = sender.clone();
@@ -348,16 +421,14 @@ async fn run<C: Clipboard>(
                     }
                     Ok(None) => {
                         log::debug!("clipboard: local change stream ended");
-                        status.last_error = Some("clipboard backend stopped".into());
-                        let _ = status_tx.send(status.clone());
-                        break;
+                        return RunExit::BackendStopped;
                     }
                     Err(e) => log::warn!("clipboard: local change error: {e}"),
                 }
             }
-            incoming = from_listener.recv() => {
+            incoming = channels.from_listener.recv() => {
                 let Some((addr, frame)) = incoming else {
-                    break;
+                    return RunExit::Shutdown;
                 };
                 if !enabled.get() {
                     continue;
@@ -381,23 +452,27 @@ async fn run<C: Clipboard>(
                 log::trace!("clipboard frame from incoming peer {addr}: {frame}");
                 sync.handle_frame(peer, frame, Instant::now());
             }
-            incoming = from_connection.recv() => {
+            incoming = channels.from_connection.recv() => {
                 let Some((handle, frame)) = incoming else {
-                    break;
+                    return RunExit::Shutdown;
                 };
                 if enabled.get() {
                     sync.handle_frame(handle, frame, Instant::now());
                 }
             }
-            event = peer_events.recv() => {
-                if let Some(addr) = event {
-                    if let Some(peer) = addr_peers.remove(&addr) {
-                        routes.borrow_mut().remove(&peer);
-                        sync.remove_peer(peer);
+            event = channels.peer_events.recv() => {
+                match event {
+                    Some(addr) => {
+                        if let Some(peer) = addr_peers.remove(&addr) {
+                            routes.borrow_mut().remove(&peer);
+                            sync.remove_peer(peer);
+                        }
                     }
+                    // The listener task is gone; the service is shutting down.
+                    None => return RunExit::Shutdown,
                 }
             }
-            else => break,
+            else => return RunExit::Shutdown,
         }
     }
 }

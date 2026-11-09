@@ -246,7 +246,13 @@ fn build_ui(app: &Application) {
     gio::spawn_blocking(move || {
         while let Some(result) = frontend_rx.next_event() {
             match result {
-                Ok(e) => sender.send_blocking(e).unwrap(),
+                Ok(e) => {
+                    // The GUI has quit: stop reading instead of panicking in a
+                    // gio worker thread when the receiver is gone.
+                    if sender.send_blocking(e).is_err() {
+                        break;
+                    }
+                }
                 // A line that fails to decode most likely comes from a
                 // service built with a different protocol version. Killing
                 // the reader would close the channel and exit the whole
@@ -334,7 +340,16 @@ fn build_ui(app: &Application) {
         window,
         async move {
             loop {
-                let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
+                let notify = match receiver.recv().await {
+                    Ok(notify) => notify,
+                    Err(_) => {
+                        // All event senders are gone: the service IPC stream
+                        // closed. Without the service the UI cannot do anything,
+                        // but leave a log line for support before exiting.
+                        log::error!("service IPC stream closed; exiting the GTK frontend");
+                        process::exit(1);
+                    }
+                };
                 match notify {
                     FrontendEvent::Hello { ipc_version } => {
                         let gui_version = lan_mouse_ipc::IPC_VERSION;
@@ -361,7 +376,12 @@ fn build_ui(app: &Application) {
                         window.update_client_state(handle, state);
                     }
                     FrontendEvent::NoSuchClient(_) => {}
-                    FrontendEvent::Error(e) => window.show_toast(e.as_str()),
+                    FrontendEvent::Error(e) => {
+                        // A failed create must not leave a stale pending add to
+                        // be applied to an unrelated client later.
+                        window.clear_pending_add();
+                        window.show_toast(e.as_str());
+                    }
                     FrontendEvent::Enumerate(clients) => window.update_client_list(clients),
                     FrontendEvent::PortChanged(port, msg) => window.update_port(port, msg),
                     FrontendEvent::CaptureStatus(s) => window.set_capture(s.into()),

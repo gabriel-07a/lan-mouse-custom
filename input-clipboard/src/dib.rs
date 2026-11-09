@@ -192,33 +192,30 @@ fn dib_to_rgba(dib: &[u8]) -> Result<(u32, u32, Vec<u8>), Error> {
         )));
     }
 
-    // Masks: inside the header for V4/V5, or three u32 right after a 40-byte
-    // header for BI_BITFIELDS.
-    let (red_mask, green_mask, blue_mask, alpha_mask) =
-        if matches!(compression, BI_BITFIELDS | BI_ALPHABITFIELDS) {
-            if header_size >= 108 {
-                (
-                    read_u32(40)?,
-                    read_u32(44)?,
-                    read_u32(48)?,
-                    if header_size >= 56 { read_u32(52)? } else { 0 },
-                )
-            } else {
-                let base = 40;
-                (
-                    read_u32(base)?,
-                    read_u32(base + 4)?,
-                    read_u32(base + 8)?,
-                    if dib.len() >= base + 16 {
-                        read_u32(base + 12)?
-                    } else {
-                        0
-                    },
-                )
-            }
+    // Colour masks are stored inside a BITMAPV4/V5 header (offsets 40..56),
+    // otherwise right after a 40-byte BITMAPINFOHEADER: three DWORDs for
+    // BI_BITFIELDS and four for BI_ALPHABITFIELDS (the fourth is alpha).
+    let needs_masks = matches!(compression, BI_BITFIELDS | BI_ALPHABITFIELDS);
+    let masks_in_header = needs_masks && header_size >= 52;
+    let (red_mask, green_mask, blue_mask, alpha_mask) = if needs_masks {
+        let base = if masks_in_header { 40 } else { header_size };
+        // Only BI_ALPHABITFIELDS carries an alpha mask. For BI_BITFIELDS the
+        // bytes after the three masks are pixel data, so reading a fourth mask
+        // there would corrupt the alpha channel with arbitrary image bytes.
+        let alpha = if compression == BI_ALPHABITFIELDS && (!masks_in_header || header_size >= 56) {
+            read_u32(base + 12)?
         } else {
-            (0, 0, 0, 0)
+            0
         };
+        (
+            read_u32(base)?,
+            read_u32(base + 4)?,
+            read_u32(base + 8)?,
+            alpha,
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
 
     let palette_entries = if bit_count <= 8 {
         let used = read_u32(32)? as usize;
@@ -226,11 +223,12 @@ fn dib_to_rgba(dib: &[u8]) -> Result<(u32, u32, Vec<u8>), Error> {
     } else {
         0
     };
-    let masks_size = if matches!(compression, BI_BITFIELDS | BI_ALPHABITFIELDS) && header_size == 40
-    {
-        12 // three masks; alpha mask is only present for BI_ALPHABITFIELDS and is optional
-    } else {
+    let masks_size = if !needs_masks || masks_in_header {
         0
+    } else if compression == BI_ALPHABITFIELDS {
+        16 // red, green, blue and alpha masks
+    } else {
+        12 // red, green and blue masks
     };
     let pixel_offset = header_size + masks_size + palette_entries * 4;
     if pixel_offset > dib.len() {
@@ -449,6 +447,55 @@ mod tests {
         dib[4..8].copy_from_slice(&100_000i32.to_le_bytes());
         dib[8..12].copy_from_slice(&100_000i32.to_le_bytes());
         assert!(dib_to_rgba(&dib).is_err());
+    }
+
+    /// 32bpp BI_BITFIELDS with the three masks after a 40-byte header.
+    /// The fourth DWORD after the header is pixel data, not an alpha mask.
+    fn dib_bitfields_40(width: i32) -> Vec<u8> {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&width.to_le_bytes());
+        dib.extend_from_slice(&1i32.to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&BI_BITFIELDS.to_le_bytes());
+        dib.extend_from_slice(&4u32.to_le_bytes());
+        dib.extend_from_slice(&[0; 16]);
+        // red, green and blue masks follow the header
+        dib.extend_from_slice(&0x00ff_0000u32.to_le_bytes());
+        dib.extend_from_slice(&0x0000_ff00u32.to_le_bytes());
+        dib.extend_from_slice(&0x0000_00ffu32.to_le_bytes());
+        // one BGRA pixel: blue=30, green=20, red=10, alpha byte 0x40
+        dib.extend_from_slice(&[30, 20, 10, 0x40]);
+        dib
+    }
+
+    #[test]
+    fn bitfields_40_byte_header_ignores_pixel_bytes_as_alpha_mask() {
+        let (_, _, rgba) = dib_to_rgba(&dib_bitfields_40(1)).expect("dib");
+        assert_eq!(rgba, vec![10, 20, 30, 0xff]);
+    }
+
+    /// 32bpp BI_ALPHABITFIELDS with four masks after a 40-byte header; the
+    /// pixel data starts at offset 56 (40 + 16), not 52 (40 + 12).
+    #[test]
+    fn alphabitfields_40_byte_header_uses_all_four_masks() {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&1i32.to_le_bytes());
+        dib.extend_from_slice(&1i32.to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&BI_ALPHABITFIELDS.to_le_bytes());
+        dib.extend_from_slice(&4u32.to_le_bytes());
+        dib.extend_from_slice(&[0; 16]);
+        dib.extend_from_slice(&0x00ff_0000u32.to_le_bytes()); // red
+        dib.extend_from_slice(&0x0000_ff00u32.to_le_bytes()); // green
+        dib.extend_from_slice(&0x0000_00ffu32.to_le_bytes()); // blue
+        dib.extend_from_slice(&0xff00_0000u32.to_le_bytes()); // alpha
+        dib.extend_from_slice(&[30, 20, 10, 0x40]);
+        let (_, _, rgba) = dib_to_rgba(&dib).expect("dib");
+        assert_eq!(rgba, vec![10, 20, 30, 0x40]);
     }
 
     #[test]

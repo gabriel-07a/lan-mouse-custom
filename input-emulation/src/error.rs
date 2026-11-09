@@ -139,6 +139,8 @@ pub enum XdpEmulationCreationError {
 pub enum X11EmulationCreationError {
     #[error("could not open display")]
     OpenDisplay,
+    #[error("the X server does not provide the XTEST extension")]
+    XTestNotAvailable,
 }
 
 #[cfg(target_os = "macos")]

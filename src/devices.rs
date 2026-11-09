@@ -461,9 +461,13 @@ impl DeviceStore {
         &self,
         address_rules: &[crate::trusted::AddressRule],
     ) -> PolicyBundle {
+        let mut devices = self.persistent_devices().collect::<Vec<_>>();
+        // HashMap iteration order is arbitrary; a stable export makes
+        // export-policy files diffable and reproducible.
+        devices.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
         PolicyBundle {
-            devices: self
-                .persistent_devices()
+            devices: devices
+                .into_iter()
                 .map(|device| PolicyDevice {
                     fingerprint: device.fingerprint.clone(),
                     name: device.name.clone(),

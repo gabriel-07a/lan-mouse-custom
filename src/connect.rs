@@ -109,8 +109,21 @@ struct ConnCtx {
     devices: Option<Arc<RwLock<DeviceStore>>>,
     /// permission session id per peer address, stable for a connection
     auth_sessions: Rc<RefCell<HashMap<SocketAddr, u128>>>,
+    /// Permission bits last announced to a peer address, with the time of the
+    /// announcement. AuthRequest is idempotent and the ping round runs every
+    /// ~2 s; repeating it on every Pong produced identical AuthRequest/
+    /// AuthResponse/PeerPermissions traffic (and an audit-log record) forever.
+    auth_announced: Rc<RefCell<HashMap<SocketAddr, AnnouncedPermissions>>>,
     /// how long a single `send` blocks waiting for a connection
     grace: Duration,
+}
+
+/// Permission bits last announced to one peer, and when.
+#[derive(Clone, Copy, Debug)]
+struct AnnouncedPermissions {
+    incoming: u8,
+    outgoing: u8,
+    sent_at: Instant,
 }
 
 impl ConnCtx {
@@ -237,6 +250,7 @@ impl ConnCtx {
         // the transport it belongs to.
         self.hello_sent.borrow_mut().remove(&active.addr);
         self.auth_sessions.borrow_mut().remove(&active.addr);
+        self.auth_announced.borrow_mut().remove(&active.addr);
         self.notify_connected(handle, false);
         let _ = active.conn.close().await;
         self.schedule_reconnect(handle);
@@ -313,6 +327,7 @@ impl LanMouseConnection {
             hello_sent: Default::default(),
             devices: None,
             auth_sessions: Default::default(),
+            auth_announced: Default::default(),
             grace: Duration::from_millis(connect_grace_ms),
         };
         Self {
@@ -368,6 +383,18 @@ impl LanMouseConnection {
         .into();
         let _ = self.sender.send_raw(handle, &buf[..len]).await;
         self.sender.ctx.disconnect(handle, active.generation).await;
+    }
+
+    /// Close the live outgoing transport of a client without notifying the
+    /// peer (used when the client entry is deleted or merged into another one).
+    ///
+    /// The service removes the client from the manager before calling this, so
+    /// the connection layer sees an inactive client and does not schedule a
+    /// reconnect.
+    pub(crate) async fn drop_transport(&self, handle: ClientHandle) {
+        if let Some(active) = self.sender.ctx.active(handle) {
+            self.sender.ctx.disconnect(handle, active.generation).await;
+        }
     }
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
@@ -952,6 +979,10 @@ fn auth_session(ctx: &ConnCtx, addr: SocketAddr) -> u128 {
 ///
 /// Only called after the peer advertised [`capabilities::PERMISSIONS`]:
 /// legacy peers close the connection on an unknown event id.
+/// How long an unchanged permission announcement is refreshed to recover from
+/// a lost datagram (DTLS application data is not retransmitted).
+const AUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 async fn send_auth_request(ctx: &ConnCtx, handle: ClientHandle, addr: SocketAddr, conn: &ArcConn) {
     let Some(devices) = &ctx.devices else {
         return;
@@ -966,13 +997,41 @@ async fn send_auth_request(ctx: &ConnCtx, handle: ClientHandle, addr: SocketAddr
             lan_mouse_ipc::DirectionPolicy::allow_all(),
         ),
     };
+    let caps = (incoming.capabilities.0, outgoing.capabilities.0);
+
+    // The ping round is ~2 s and this function is called for every Pong. The
+    // announcement is idempotent when nothing changed, so only send it on a
+    // change (or after a slow refresh window, in case one datagram was lost).
+    // Repeating it forever produced ~2 identical AuthRequest/AuthResponse and
+    // audit-log records per second per link on the user's live install.
+    {
+        let mut announced = ctx.auth_announced.borrow_mut();
+        if let Some(previous) = announced.get(&addr) {
+            if (previous.incoming, previous.outgoing) == caps
+                && previous.sent_at.elapsed() < AUTH_REFRESH_INTERVAL
+            {
+                return;
+            }
+        }
+        announced.insert(
+            addr,
+            AnnouncedPermissions {
+                incoming: caps.0,
+                outgoing: caps.1,
+                sent_at: Instant::now(),
+            },
+        );
+    }
+
     let event = ProtoEvent::AuthRequest {
         session_id: auth_session(ctx, addr),
-        incoming_caps: incoming.capabilities.0,
-        outgoing_caps: outgoing.capabilities.0,
+        incoming_caps: caps.0,
+        outgoing_caps: caps.1,
     };
     let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
     if let Err(e) = conn.send(&buf[..len]).await {
+        // Allow the next Pong to retry.
+        ctx.auth_announced.borrow_mut().remove(&addr);
         log::debug!("failed to announce permissions to {addr}: {e}");
     }
 }
@@ -1478,7 +1537,7 @@ mod tests {
                 // this fork added makes older releases drop the connection.
                 assert!(
                     !seen_hello,
-                    "a Hello must never be sent to a peer that did not                      advertise capabilities"
+                    "a Hello must never be sent to a peer that did not advertise capabilities"
                 );
 
                 // Input still flows: the peer reads the connection even
@@ -2864,6 +2923,176 @@ mod tests {
                 assert_eq!(event.0, Capabilities::POINTER.0);
                 assert_eq!(event.1, Capabilities::KEYBOARD.0);
                 assert_eq!(event.2, client_fp);
+            })
+            .await;
+    }
+
+    /// The permission announcement is edge-triggered: it used to be sent for
+    /// every received Pong (~4 per 2 s ping round), producing an identical
+    /// AuthRequest/AuthResponse/PeerPermissions cycle and an audit-log record
+    /// forever. Once announced, unchanged bits must stay quiet.
+    #[tokio::test(flavor = "current_thread")]
+    async fn permission_announcement_is_not_repeated_on_every_pong() {
+        use crate::devices::DeviceStore;
+        use std::sync::RwLock;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("auth-dedupe-listener");
+                let client_cert = unique_cert("auth-dedupe-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+                let (clipboard_tx, _clipboard_rx) = local_channel::mpsc::channel();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    listener,
+                    clipboard_tx,
+                    None,
+                );
+
+                let (manager, handle) = client_manager_for(port);
+                let mut conn = LanMouseConnection::new(client_cert, manager.clone(), 2000);
+                conn.set_device_store(Arc::new(RwLock::new(DeviceStore::default())));
+                conn.ensure_connected(handle);
+
+                // The first Pong makes the client announce its grants.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut announced = 0usize;
+                while Instant::now() < deadline && announced == 0 {
+                    if let Ok(EmulationEvent::PeerPermissions { .. }) =
+                        tokio::time::timeout(Duration::from_millis(250), emulation.event()).await
+                    {
+                        announced += 1;
+                    }
+                }
+                assert_eq!(
+                    announced, 1,
+                    "the client must announce its permissions once"
+                );
+
+                // Several more ping rounds: no repeated announcement.
+                let quiet_until = Instant::now() + Duration::from_millis(2500);
+                while Instant::now() < quiet_until {
+                    if let Ok(EmulationEvent::PeerPermissions { .. }) =
+                        tokio::time::timeout(Duration::from_millis(100), emulation.event()).await
+                    {
+                        announced += 1;
+                    }
+                }
+                assert_eq!(
+                    announced, 1,
+                    "unchanged permission bits must not be re-announced every Pong"
+                );
+
+                emulation.terminate().await;
+            })
+            .await;
+    }
+
+    /// The pairing window is single use: two unknown devices racing for it must
+    /// not both be authorized (the verify callback can see it open for both
+    /// concurrent handshakes; the consumption must be atomic).
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_pairing_adopts_at_most_one_device() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("pairing-race-listener");
+                let authorized: Arc<RwLock<HashMap<String, String>>> =
+                    Arc::new(RwLock::new(HashMap::new()));
+                let pairing: Arc<RwLock<Option<crate::listen::PairingWindow>>> =
+                    Arc::new(RwLock::new(Some(crate::listen::PairingWindow {
+                        until: Instant::now() + Duration::from_secs(60),
+                        incoming: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                        outgoing: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                    })));
+                let mut listener = LanMouseListener::new(
+                    port,
+                    listener_cert,
+                    authorized.clone(),
+                    Arc::new(RwLock::new(Vec::new())),
+                    pairing,
+                    Default::default(),
+                    Arc::new(RwLock::new(true)),
+                )
+                .await
+                .expect("listener");
+
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                let first = connect(
+                    addr,
+                    unique_cert("pairing-race-a"),
+                    Duration::from_secs(3),
+                    None,
+                );
+                let second = connect(
+                    addr,
+                    unique_cert("pairing-race-b"),
+                    Duration::from_secs(3),
+                    None,
+                );
+                let _ = tokio::join!(first, second);
+                // Give the accept tasks time to finish consuming/rejecting.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                assert!(
+                    authorized.read().expect("lock").len() <= 1,
+                    "a single-use pairing window adopted more than one device"
+                );
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// A silent incoming session must be closed after the emulation timeout.
+    /// Before this, dead DTLS sessions were never closed and accumulated in the
+    /// listener until its live-connection cap rejected every new incoming peer
+    /// (only a service restart recovered).
+    #[tokio::test(flavor = "current_thread")]
+    async fn silent_incoming_session_is_closed_after_the_timeout() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("silent-timeout-listener");
+                let client_cert = unique_cert("silent-timeout-client");
+                let fp = crypto::certificate_fingerprint(&client_cert);
+                let listener = listener_with_authorized(port, listener_cert, vec![fp]).await;
+                let (clipboard_tx, _clipboard_rx) = local_channel::mpsc::channel();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    listener,
+                    clipboard_tx,
+                    None,
+                );
+
+                // Handshake only: the peer never sends an event afterwards.
+                let client = raw_dtls_client(port, client_cert).await;
+                let start = Instant::now();
+                let disconnected = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let EmulationEvent::Disconnected { .. } = emulation.event().await {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    disconnected.is_ok(),
+                    "a silent incoming session must be closed (was kept until restart)"
+                );
+                assert!(
+                    start.elapsed() >= Duration::from_secs(2),
+                    "the session must not be closed immediately ({:?})",
+                    start.elapsed()
+                );
+
+                let _ = client;
+                emulation.terminate().await;
             })
             .await;
     }

@@ -44,9 +44,11 @@ impl ClientManager {
             sensitivity: config_client.sensitivity,
             fingerprint: config_client.fingerprint,
         };
+        // Lan Mouse is IPv4-only: an AAAA address in the config must not show up
+        // in the UI (see update_ips).
         let state = ClientState {
             active: config_client.active,
-            ips: HashSet::from_iter(config.fix_ips.iter().cloned()),
+            ips: HashSet::from_iter(config.fix_ips.iter().filter(|ip| ip.is_ipv4()).cloned()),
             ..Default::default()
         };
         let handle = self.add_client();
@@ -189,7 +191,8 @@ impl ClientManager {
     /// update the dns-ips of the client
     pub fn set_dns_ips(&self, handle: ClientHandle, dns_ips: Vec<IpAddr>) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.dns_ips = dns_ips
+            // IPv4-only product decision: never surface AAAA answers.
+            s.dns_ips = dns_ips.into_iter().filter(IpAddr::is_ipv4).collect();
         }
         self.update_ips(handle);
     }
@@ -681,6 +684,26 @@ mod tests {
             Some(SocketAddr::new(ip(10), 5000))
         );
         assert_eq!(manager.get_port(handle), Some(5000));
+    }
+
+    #[test]
+    fn ipv6_addresses_never_reach_the_client_state() {
+        // Lan Mouse is IPv4-only (product decision): a legacy config with an
+        // AAAA address must not make the UI/CLI show an IPv6 endpoint.
+        let mut config = config_client(Position::Left, true);
+        config.ips = HashSet::from([ip(10), "fd00::10".parse().expect("v6")]);
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config);
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert_eq!(state.ips, HashSet::from([ip(10)]));
+
+        manager.set_dns_ips(handle, vec!["fd00::11".parse().expect("v6"), ip(11)]);
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert_eq!(state.ips, HashSet::from([ip(10), ip(11)]));
+        assert!(
+            state.dns_ips.iter().all(IpAddr::is_ipv4),
+            "AAAA answers must be filtered before they reach the state"
+        );
     }
 
     #[test]

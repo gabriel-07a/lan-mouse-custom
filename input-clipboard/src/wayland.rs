@@ -154,13 +154,23 @@ fn read_offer(
             continue;
         };
         let mut data = Vec::new();
-        if reader
-            .take(MAX_MIME_BYTES as u64)
+        // Read one byte past the limit so an oversized payload is detected
+        // instead of being silently truncated (a truncated image would be
+        // forwarded and pasted as a corrupt file).
+        match reader
+            .take(MAX_MIME_BYTES as u64 + 1)
             .read_to_end(&mut data)
-            .is_ok()
-            && !data.is_empty()
         {
-            snapshot.insert(format, data);
+            Ok(_) if data.len() > MAX_MIME_BYTES => {
+                log::warn!(
+                    "wayland clipboard: {mime} exceeds {MAX_MIME_BYTES} bytes, skipping that format"
+                );
+            }
+            Ok(_) if !data.is_empty() => {
+                snapshot.insert(format, data);
+            }
+            Ok(_) => {}
+            Err(e) => log::debug!("wayland clipboard: could not read {mime}: {e}"),
         }
     }
     (!snapshot.is_empty()).then_some(snapshot)

@@ -29,6 +29,37 @@ pub struct AsyncFrontendRequestWriter {
     tx: WriteHalf<TcpStream>,
 }
 
+impl AsyncFrontendEventReader {
+    /// Read the next event, optionally giving up after `timeout`.
+    ///
+    /// Returns `Ok(None)` when the timeout elapses (not an error: the caller
+    /// decides whether that is a failure), and errors only for I/O problems.
+    /// Frames this build cannot decode are skipped with a warning, exactly
+    /// like the blocking [`crate::FrontendEventReader`], so a frontend keeps
+    /// working against a newer service.
+    pub async fn next_event(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Option<FrontendEvent>, IpcError> {
+        let next = async {
+            match StreamExt::next(self).await {
+                Some(Ok(event)) => Ok(Some(event)),
+                Some(Err(e)) => Err(e),
+                None => Err(IpcError::Io(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                ))),
+            }
+        };
+        match timeout {
+            Some(duration) => match tokio::time::timeout(duration, next).await {
+                Ok(result) => result,
+                Err(_) => Ok(None),
+            },
+            None => next.await,
+        }
+    }
+}
+
 impl Stream for AsyncFrontendEventReader {
     type Item = Result<FrontendEvent, IpcError>;
 
@@ -36,18 +67,26 @@ impl Stream for AsyncFrontendEventReader {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        let line = ready!(self.lines_stream.poll_next_unpin(cx));
-        let event = line.map(|l| {
-            l.map_err(Into::<IpcError>::into)
-                .and_then(|l| serde_json::from_str(l.as_str()).map_err(|e| e.into()))
-        });
-        Poll::Ready(event)
+        loop {
+            match ready!(self.lines_stream.poll_next_unpin(cx)) {
+                None => return Poll::Ready(None),
+                Some(Ok(line)) => match serde_json::from_str(line.as_str()) {
+                    Ok(event) => return Poll::Ready(Some(Ok(event))),
+                    // A newer service may know event variants this build does
+                    // not. Skipping the frame is what makes the IPC forward
+                    // compatible; aborting here would turn a display-only
+                    // change into a broken frontend/service pair.
+                    Err(e) => log::warn!("skipping undecodable frontend event: {e}"),
+                },
+                Some(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+            }
+        }
     }
 }
 
 impl AsyncFrontendRequestWriter {
     pub async fn request(&mut self, request: FrontendRequest) -> Result<(), IpcError> {
-        let mut json = serde_json::to_string(&request).unwrap();
+        let mut json = serde_json::to_string(&request)?;
         log::debug!("requesting: {json}");
         json.push('\n');
         self.tx.write_all(json.as_bytes()).await?;

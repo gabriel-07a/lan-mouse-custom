@@ -136,8 +136,16 @@ pub struct InputCapture {
 
 impl InputCapture {
     /// create a new client with the given id
+    ///
+    /// Idempotent: a handle that already exists is left untouched. The backend
+    /// is only asked to create a capture for a position that has no client
+    /// yet; if that fails the bookkeeping is rolled back so a retry (or the
+    /// matching `destroy`) cannot hit an inconsistent state.
     pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
-        assert!(!self.id_map.contains_key(&id));
+        if let Some(existing) = self.id_map.get(&id) {
+            log::warn!("capture {id} already exists @ {existing} (requested @ {pos}), ignoring");
+            return Ok(());
+        }
 
         self.id_map.insert(id, pos);
 
@@ -146,19 +154,34 @@ impl InputCapture {
             Ok(())
         } else {
             self.position_map.insert(pos, vec![id]);
-            self.capture.create(pos).await
+            if let Err(e) = self.capture.create(pos).await {
+                // Roll back: otherwise the position stays registered (later
+                // creates for the same edge would skip the backend) and the
+                // id maps to a capture the backend never created.
+                self.position_map.remove(&pos);
+                self.id_map.remove(&id);
+                return Err(e);
+            }
+            Ok(())
         }
     }
 
     /// destroy the client with the given id, if it exists
+    ///
+    /// Tolerant of unknown handles: the service may request a teardown for a
+    /// capture that was never created (or already destroyed), and panicking
+    /// here would abort the process in release builds (panic = "abort").
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let pos = self
-            .id_map
-            .remove(&id)
-            .expect("no position for this handle");
+        let Some(pos) = self.id_map.remove(&id) else {
+            log::warn!("destroy of unknown capture {id} ignored");
+            return Ok(());
+        };
 
         log::debug!("destroying capture {id} @ {pos}");
-        let remaining = self.position_map.get_mut(&pos).expect("id vector");
+        let Some(remaining) = self.position_map.get_mut(&pos) else {
+            log::warn!("capture {id} @ {pos} without a registered position, ignoring");
+            return Ok(());
+        };
         remaining.retain(|&i| i != id);
 
         log::debug!("remaining ids @ {pos}: {remaining:?}");
@@ -227,10 +250,15 @@ impl InputCapture {
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
         if let Ok(scancode) = scancode::Linux::try_from(key) {
             log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");
-            match state {
-                1 => self.pressed_keys.insert(scancode),
-                _ => self.pressed_keys.remove(&scancode),
-            };
+            // 0 = released, everything else (press, evdev autorepeat) means
+            // the key is down. Treating a repeat (2) as a release would drop
+            // a held modifier from `pressed_keys` and the phantom-key release
+            // on a hand-off would then miss it.
+            if state == 0 {
+                self.pressed_keys.remove(&scancode);
+            } else {
+                self.pressed_keys.insert(scancode);
+            }
         }
     }
 }
@@ -348,7 +376,7 @@ async fn create_backend(
         #[cfg(x11)]
         Backend::X11 => Ok(Box::new(x11::X11InputCapture::new()?)),
         #[cfg(windows)]
-        Backend::Windows => Ok(Box::new(windows::WindowsInputCapture::new())),
+        Backend::Windows => Ok(Box::new(windows::WindowsInputCapture::new()?)),
         #[cfg(target_os = "macos")]
         Backend::MacOs => Ok(Box::new(macos::MacOSInputCapture::new().await?)),
         Backend::Dummy => Ok(Box::new(dummy::DummyInputCapture::new())),
@@ -399,6 +427,84 @@ async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::Context;
+
+    /// Observations recorded by [`MockCapture`], shared with the test so the
+    /// backend calls can be asserted after it moved into the InputCapture.
+    #[derive(Default)]
+    struct MockLog {
+        created: Vec<Position>,
+        destroyed: Vec<Position>,
+        /// fail the next create call
+        fail_next_create: bool,
+    }
+
+    /// Minimal backend used to exercise the state bookkeeping in
+    /// InputCapture without touching a real input device.
+    struct MockCapture {
+        events: VecDeque<(Position, CaptureEvent)>,
+        log: Arc<Mutex<MockLog>>,
+    }
+
+    impl MockCapture {
+        fn new(log: Arc<Mutex<MockLog>>) -> Self {
+            Self {
+                events: VecDeque::new(),
+                log,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Capture for MockCapture {
+        async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+            let mut log = self.log.lock().expect("mock log");
+            if log.fail_next_create {
+                log.fail_next_create = false;
+                return Err(CaptureError::EndOfStream);
+            }
+            log.created.push(pos);
+            Ok(())
+        }
+
+        async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
+            self.log.lock().expect("mock log").destroyed.push(pos);
+            Ok(())
+        }
+
+        async fn release(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    impl Stream for MockCapture {
+        type Item = Result<(Position, CaptureEvent), CaptureError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.events.pop_front() {
+                Some(event) => Poll::Ready(Some(Ok(event))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    fn input_capture_with(mock: MockCapture) -> InputCapture {
+        InputCapture {
+            capture: Box::new(mock),
+            backend: Backend::Dummy,
+            pressed_keys: HashSet::new(),
+            position_map: HashMap::new(),
+            id_map: HashMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
 
     #[test]
     fn position_opposite_is_involutive() {
@@ -429,5 +535,94 @@ mod tests {
     fn position_display_is_lowercase() {
         assert_eq!(Position::Left.to_string(), "left");
         assert_eq!(Position::Bottom.to_string(), "bottom");
+    }
+
+    fn new_mock() -> (Arc<Mutex<MockLog>>, InputCapture) {
+        let log = Arc::new(Mutex::new(MockLog::default()));
+        let capture = input_capture_with(MockCapture::new(log.clone()));
+        (log, capture)
+    }
+
+    #[tokio::test]
+    async fn a_failed_backend_create_rolls_the_bookkeeping_back() {
+        let (log, mut capture) = new_mock();
+        log.lock().expect("mock log").fail_next_create = true;
+
+        assert!(capture.create(7, Position::Left).await.is_err());
+        assert!(capture.id_map.is_empty(), "id must not survive the failure");
+        assert!(
+            capture.position_map.is_empty(),
+            "position must not stay registered (a retry would skip the backend)"
+        );
+
+        // A retry must reach the backend again instead of silently registering.
+        capture.create(7, Position::Left).await.unwrap();
+        assert_eq!(capture.id_map.get(&7), Some(&Position::Left));
+        assert_eq!(log.lock().expect("mock log").created, vec![Position::Left]);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_handle_is_ignored_instead_of_panicking() {
+        let (log, mut capture) = new_mock();
+        capture.create(7, Position::Left).await.unwrap();
+        // The service may re-create a capture for a handle whose destroy is
+        // still queued; aborting the process here is not acceptable.
+        capture.create(7, Position::Right).await.unwrap();
+
+        assert_eq!(capture.id_map.get(&7), Some(&Position::Left));
+        assert_eq!(capture.position_map.keys().count(), 1);
+        assert!(!capture.position_map.contains_key(&Position::Right));
+        assert_eq!(log.lock().expect("mock log").created, vec![Position::Left]);
+    }
+
+    #[tokio::test]
+    async fn destroying_an_unknown_handle_is_ignored_instead_of_panicking() {
+        let (log, mut capture) = new_mock();
+        capture.destroy(42).await.unwrap();
+        assert!(log.lock().expect("mock log").destroyed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn destroying_the_last_handle_at_a_position_tears_the_backend_down() {
+        let (log, mut capture) = new_mock();
+        capture.create(1, Position::Top).await.unwrap();
+        capture.create(2, Position::Top).await.unwrap();
+
+        capture.destroy(1).await.unwrap();
+        assert!(
+            log.lock().expect("mock log").destroyed.is_empty(),
+            "another handle is still registered at the position"
+        );
+
+        capture.destroy(2).await.unwrap();
+        assert_eq!(log.lock().expect("mock log").destroyed, vec![Position::Top]);
+        assert!(capture.position_map.is_empty());
+    }
+
+    #[test]
+    fn autorepeat_keeps_a_key_in_the_pressed_set() {
+        let (_log, mut capture) = new_mock();
+        let key = scancode::Linux::KeyA as u32;
+
+        capture.update_pressed_keys(key, 1);
+        assert!(capture.keys_pressed(&[scancode::Linux::KeyA]));
+        // evdev autorepeat: the key is still held, only the release removes it.
+        capture.update_pressed_keys(key, 2);
+        assert!(capture.keys_pressed(&[scancode::Linux::KeyA]));
+        capture.update_pressed_keys(key, 0);
+        assert!(!capture.keys_pressed(&[scancode::Linux::KeyA]));
+    }
+
+    #[test]
+    fn press_edges_are_removed_from_the_pressed_set_on_release() {
+        let (_log, mut capture) = new_mock();
+        capture.update_pressed_keys(scancode::Linux::KeyLeftCtrl as u32, 1);
+        capture.update_pressed_keys(scancode::Linux::KeyLeftShift as u32, 1);
+        assert!(
+            capture.keys_pressed(&[scancode::Linux::KeyLeftCtrl, scancode::Linux::KeyLeftShift,])
+        );
+        let drained = capture.take_pressed_keys();
+        assert_eq!(drained.len(), 2);
+        assert!(!capture.keys_pressed(&[scancode::Linux::KeyLeftCtrl]));
     }
 }

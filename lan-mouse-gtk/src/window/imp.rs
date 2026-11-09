@@ -162,6 +162,9 @@ pub struct Window {
     pub local_config_changes: RefCell<HashSet<ClientHandle>>,
     /// periodical status refresh source, tied to the window lifetime.
     pub status_tick: RefCell<Option<glib::SourceId>>,
+    /// when the user last requested a network scan (rate limit: the service
+    /// spawns a fresh discovery task per request).
+    pub scan_requested_at: RefCell<Option<std::time::Instant>>,
 }
 
 #[glib::object_subclass]
@@ -192,7 +195,7 @@ impl Window {
 
     #[template_callback]
     fn handle_scan_pressed(&self, _button: &Button) {
-        self.obj().request_scan();
+        self.obj().request_user_scan();
     }
 
     #[template_callback]
@@ -212,9 +215,13 @@ impl Window {
     #[template_callback]
     fn handle_copy_hostname(&self, _: &Button) {
         if let Ok(hostname) = hostname::get() {
-            let display = gdk::Display::default().unwrap();
+            let Some(display) = gdk::Display::default() else {
+                self.obj()
+                    .show_toast("Clipboard unavailable: no display connection");
+                return;
+            };
             let clipboard = display.clipboard();
-            clipboard.set_text(hostname.to_str().expect("hostname: invalid utf8"));
+            clipboard.set_text(&hostname.to_string_lossy());
             let icon = self.hostname_copy_icon.clone();
             icon.set_icon_name(Some("emblem-ok-symbolic"));
             icon.set_css_classes(&["success"]);
@@ -233,7 +240,11 @@ impl Window {
     #[template_callback]
     fn handle_copy_fingerprint(&self, button: &Button) {
         let fingerprint: String = self.fingerprint_row.property("subtitle");
-        let display = gdk::Display::default().unwrap();
+        let Some(display) = gdk::Display::default() else {
+            self.obj()
+                .show_toast("Clipboard unavailable: no display connection");
+            return;
+        };
         let clipboard = display.clipboard();
         clipboard.set_text(&fingerprint);
         button.set_icon_name("emblem-ok-symbolic");
@@ -387,8 +398,9 @@ impl Window {
 impl ObjectImpl for Window {
     fn constructed(&self) {
         if let Ok(hostname) = hostname::get() {
-            self.hostname_label
-                .set_text(hostname.to_str().expect("hostname: invalid utf8"));
+            // Hostnames are not guaranteed to be UTF-8 on Unix; never panic on
+            // user-visible startup text.
+            self.hostname_label.set_text(&hostname.to_string_lossy());
         }
         self.parent_constructed();
         self.set_port(DEFAULT_PORT);

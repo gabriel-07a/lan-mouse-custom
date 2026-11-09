@@ -186,15 +186,18 @@ enum LibeiNotifyEvent {
     Destroy(Position),
 }
 
-#[allow(dead_code)]
 pub struct LibeiInputCapture {
-    input_capture: Pin<Box<InputCapture>>,
+    // The portal handle is owned by the capture task (shared as an `Arc`), so
+    // the backend itself does not need to keep a raw pointer to it alive.
     capture_task: JoinHandle<Result<(), CaptureError>>,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
     cancellation_token: CancellationToken,
     terminated: bool,
+    /// the capture task already reported its final state; polling a finished
+    /// JoinHandle again would panic
+    finished: bool,
 }
 
 /// returns (start pos, end pos), inclusive
@@ -394,8 +397,7 @@ async fn libei_event_handler(
 
 impl LibeiInputCapture {
     pub async fn new() -> std::result::Result<Self, LibeiCaptureCreationError> {
-        let input_capture = Box::pin(InputCapture::new().await?);
-        let input_capture_ptr = input_capture.as_ref().get_ref() as *const InputCapture;
+        let input_capture = Arc::new(InputCapture::new().await?);
 
         // No session is created here on purpose: creating one makes the
         // compositor show its input-capture permission dialog. Portals that
@@ -413,7 +415,7 @@ impl LibeiInputCapture {
         let cancellation_token = CancellationToken::new();
 
         let capture = do_capture(
-            input_capture_ptr,
+            Arc::clone(&input_capture),
             notify_rx,
             notify_release.clone(),
             event_tx,
@@ -422,13 +424,13 @@ impl LibeiInputCapture {
         let capture_task = tokio::task::spawn_local(capture);
 
         let producer = Self {
-            input_capture,
             event_rx,
             capture_task,
             notify_capture,
             notify_release,
             cancellation_token,
             terminated: false,
+            finished: false,
         };
 
         Ok(producer)
@@ -436,18 +438,23 @@ impl LibeiInputCapture {
 }
 
 async fn do_capture(
-    input_capture: *const InputCapture,
+    input_capture: Arc<InputCapture>,
     mut capture_event: Receiver<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
 ) -> Result<(), CaptureError> {
-    /* safety: libei_task does not outlive Self */
-    let input_capture = unsafe { &*input_capture };
+    let input_capture: &InputCapture = &input_capture;
     let mut active_clients: Vec<Position> = vec![];
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
-    let mut zones_changed = input_capture.receive_zones_changed().await?;
+    // Portal calls can block indefinitely (a permission dialog the user never
+    // answers). Shutdown must not wait for them, so both the initial signal
+    // subscription and the session creation below observe the token.
+    let mut zones_changed = tokio::select! {
+        zones = input_capture.receive_zones_changed() => zones?,
+        _ = cancellation_token.cancelled() => return Ok(()),
+    };
 
     loop {
         // do capture session
@@ -483,7 +490,13 @@ async fn do_capture(
         if !active_clients.is_empty() {
             // Session creation is deferred to this point: a machine that only
             // receives input never triggers the compositor's capture dialog.
-            let mut session = create_session(input_capture).await?.0;
+            let mut session = tokio::select! {
+                session = create_session(input_capture) => session?.0,
+                _ = cancellation_token.cancelled() => {
+                    log::debug!("cancelled while creating the capture session");
+                    break Ok(());
+                }
+            };
 
             let capture_session = do_capture_session(
                 input_capture,
@@ -588,11 +601,27 @@ async fn do_capture_session(
                     let activated = activated.ok_or(CaptureError::ActivationClosed)?;
                     log::debug!("activated: {activated:?}");
 
-                    // get barrier id from activation
+                    // The cursor position is optional in the protocol (KDE does
+                    // not report barrier ids, some compositors do not report the
+                    // position). An activation we cannot map to a client is
+                    // dropped instead of panicking inside the capture task.
                     let barrier_id = match activated.barrier_id() {
                         Some(ActivatedBarrier::Barrier(id)) => id,
                         // workaround for KDE plasma not reporting barrier ids
-                        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor")),
+                        Some(ActivatedBarrier::UnknownBarrier) | None => {
+                            let Some(cursor_position) = activated.cursor_position() else {
+                                log::warn!(
+                                    "ignoring activation without a barrier id or cursor position"
+                                );
+                                continue;
+                            };
+                            let Some(id) = find_corresponding_client(&barriers, cursor_position)
+                            else {
+                                log::warn!("activation does not match any registered barrier");
+                                continue;
+                            };
+                            id
+                        }
                     };
 
                     // find client corresponding to barrier
@@ -600,15 +629,36 @@ async fn do_capture_session(
                         Some(id) => *id,
                         None => {
                             log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
-                            let id = find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor"));
-                            let pos = *pos_for_barrier_id.get(&id).expect("invalid barrier id");
-                            pos
+                            let Some(cursor_position) = activated.cursor_position() else {
+                                log::warn!(
+                                    "ignoring activation with an unknown barrier id and no cursor position"
+                                );
+                                continue;
+                            };
+                            let Some(id) = find_corresponding_client(&barriers, cursor_position)
+                            else {
+                                log::warn!("activation does not match any registered barrier");
+                                continue;
+                            };
+                            match pos_for_barrier_id.get(&id) {
+                                Some(pos) => *pos,
+                                None => {
+                                    log::warn!("barrier {id} has no registered client");
+                                    continue;
+                                }
+                            }
                         },
                     };
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
+                    if event_tx
+                        .send((pos, CaptureEvent::Begin))
+                        .await
+                        .is_err()
+                    {
+                        return Err(CaptureError::EndOfStream);
+                    }
 
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
@@ -625,7 +675,10 @@ async fn do_capture_session(
                     }
 
                     release_capture(input_capture, session, activated, pos).await?;
-
+                    // No client is being driven anymore: input events that
+                    // arrive before the next activation must not be forwarded
+                    // with the previous client's position.
+                    current_pos.replace(None);
                 }
                 _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
                     log::debug!("release session requested");
@@ -672,27 +725,33 @@ async fn release_capture(
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
     }
-    let (x, y) = activated
-        .cursor_position()
-        .expect("compositor did not report cursor position!");
-    log::debug!("client entered @ ({x}, {y})");
-    let (dx, dy) = match current_pos {
-        // offset cursor position to not enter again immediately
-        Position::Left => (1., 0.),
-        Position::Right => (-1., 0.),
-        Position::Top => (0., 1.),
-        Position::Bottom => (0., -1.),
-    };
-    // release 1px to the right of the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
-    let release_options = ReleaseOptions::default()
-        .set_activation_id(activated.activation_id())
-        .set_cursor_position(Some(cursor_position));
+    let mut release_options =
+        ReleaseOptions::default().set_activation_id(activated.activation_id());
+    // The cursor position is optional in the protocol. Without it the portal
+    // releases the capture at the current position (the cursor may re-enter
+    // once, which the next activation/release cycle handles) instead of
+    // aborting the capture task with a panic.
+    match activated.cursor_position() {
+        Some((x, y)) => {
+            log::debug!("client entered @ ({x}, {y})");
+            let (dx, dy) = match current_pos {
+                // offset cursor position to not enter again immediately
+                Position::Left => (1., 0.),
+                Position::Right => (-1., 0.),
+                Position::Top => (0., 1.),
+                Position::Bottom => (0., -1.),
+            };
+            // release 1px to the right of the entered zone
+            release_options =
+                release_options.set_cursor_position(Some((x as f64 + dx, y as f64 + dy)));
+        }
+        None => log::warn!("compositor did not report a cursor position for the capture release"),
+    }
     input_capture.release(session, release_options).await?;
     Ok(())
 }
 
-fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> BarrierID {
+fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> Option<BarrierID> {
     barriers
         .iter()
         .copied()
@@ -701,8 +760,7 @@ fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> Barrier
             let (x1, y1, x2, y2) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32);
             distance_to_line(((x1, y1), (x2, y2)), pos) as i32
         })
-        .expect("could not find barrier corresponding to client")
-        .barrier_id
+        .map(|b| b.barrier_id)
 }
 
 fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
@@ -715,6 +773,11 @@ fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
      */
     let double_triangle_area = ((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1).abs();
     let line_length = ((y2 - y1).powf(2.0) + (x2 - x1).powf(2.0)).sqrt();
+    if line_length == 0.0 {
+        // Degenerate barrier (a portal is free to report empty regions): fall
+        // back to the distance from the point instead of dividing by zero.
+        return ((x0 - x1).powf(2.0) + (y0 - y1).powf(2.0)).sqrt();
+    }
     let distance = double_triangle_area / line_length;
     log::debug!("distance to line({line:?}, {p:?}) = {distance}");
     distance
@@ -760,10 +823,14 @@ async fn handle_ei_event(
         _ => {
             if let Some(pos) = current_client {
                 for event in Event::from_ei_event(ei_event) {
-                    event_tx
+                    if event_tx
                         .send((pos, CaptureEvent::Input(event)))
                         .await
-                        .expect("no channel");
+                        .is_err()
+                    {
+                        // the consumer is gone (capture being torn down)
+                        return Err(CaptureError::EndOfStream);
+                    }
                 }
             }
         }
@@ -796,12 +863,19 @@ impl LanMouseInputCapture for LibeiInputCapture {
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.cancellation_token.cancel();
-        let task = &mut self.capture_task;
         log::debug!("waiting for capture to terminate...");
-        let res = if !task.is_finished() {
-            task.await.expect("libei task panic")
-        } else {
+        // Never propagate a panic out of the task: `terminate` runs on error
+        // and shutdown paths, where unwinding would abort the process (the
+        // release profile uses panic = "abort") while the capture is dropped.
+        let res = if self.capture_task.is_finished() {
             Ok(())
+        } else {
+            match (&mut self.capture_task).await {
+                Ok(res) => res,
+                Err(e) => Err(CaptureError::Io(io::Error::other(format!(
+                    "libei capture task failed: {e}"
+                )))),
+            }
         };
         self.terminated = true;
         log::debug!("done!");
@@ -812,8 +886,15 @@ impl LanMouseInputCapture for LibeiInputCapture {
 impl Drop for LibeiInputCapture {
     fn drop(&mut self) {
         if !self.terminated {
-            /* this workaround is needed until async drop is stabilized */
-            panic!("LibeiInputCapture dropped without being terminated!");
+            // This is a bug in the owner (terminate() must be awaited), but
+            // panicking in Drop turns it into a process abort, including
+            // during unwinding. Cancel and abort the task instead; the task
+            // owns its own Rc of the portal handle, so it cannot dangle.
+            log::error!(
+                "LibeiInputCapture dropped without being terminated; aborting the capture task"
+            );
+            self.cancellation_token.cancel();
+            self.capture_task.abort();
         }
     }
 }
@@ -822,13 +903,21 @@ impl Stream for LibeiInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        match self.capture_task.poll_unpin(cx) {
-            Poll::Ready(r) => match r.expect("failed to join") {
-                Ok(()) => Poll::Ready(None),
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
-            Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
+        if self.finished {
+            return Poll::Ready(None);
         }
+        let polled = match self.capture_task.poll_unpin(cx) {
+            Poll::Ready(Ok(Ok(()))) => Poll::Ready(None),
+            Poll::Ready(Ok(Err(e))) => Poll::Ready(Some(Err(e))),
+            // A panic inside the task is reported as an error instead of
+            // panicking the whole process from the stream poll.
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(CaptureError::Io(io::Error::other(
+                format!("libei capture task failed: {e}"),
+            ))))),
+            Poll::Pending => return self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
+        };
+        self.finished = true;
+        polled
     }
 }
 
@@ -873,6 +962,42 @@ mod token_tests {
         write_token_to(&dir, CAPTURE_TOKEN_FILE, " \n\t").unwrap();
         assert_eq!(read_token_file(&dir.join(CAPTURE_TOKEN_FILE)), None);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closest_barrier_wins_over_the_others() {
+        let barrier = |id, position| ICBarrier::new(BarrierID::new(id).expect("id"), position);
+        let barriers = [
+            barrier(1, (0, 0, 0, 100)),     // left edge
+            barrier(2, (100, 0, 100, 100)), // right edge
+            barrier(3, (0, 0, 100, 0)),     // top edge
+        ];
+
+        assert_eq!(
+            find_corresponding_client(&barriers, (-5.0, 50.0)),
+            Some(BarrierID::new(1).expect("id"))
+        );
+        assert_eq!(
+            find_corresponding_client(&barriers, (105.0, 50.0)),
+            Some(BarrierID::new(2).expect("id"))
+        );
+        assert_eq!(
+            find_corresponding_client(&barriers, (50.0, -5.0)),
+            Some(BarrierID::new(3).expect("id"))
+        );
+    }
+
+    #[test]
+    fn barrier_selection_without_barriers_is_none() {
+        assert_eq!(find_corresponding_client(&[], (3.0, 4.0)), None);
+    }
+
+    #[test]
+    fn degenerate_barrier_does_not_divide_by_zero() {
+        let distance = distance_to_line(((5.0, 5.0), (5.0, 5.0)), (5.0, 5.0));
+        assert_eq!(distance, 0.0);
+        let distance = distance_to_line(((5.0, 5.0), (5.0, 5.0)), (8.0, 9.0));
+        assert_eq!(distance, 5.0);
     }
 
     #[test]

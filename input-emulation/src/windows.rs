@@ -39,18 +39,18 @@ use windows::core::BOOL;
 
 use super::{
     EdgeReturnNotifier, Emulation, EmulationHandle, PointerEdge,
-    absolute::{VirtualScreen, logical_to_physical, overshoot_edge},
+    absolute::{EdgeReturnLatch, VirtualScreen, logical_to_physical, overshoot_edge},
 };
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
+// TODO(windows): read the user's SPI_GETKEYBOARDDELAY / SPI_GETKEYBOARDSPEED
+// values instead of the OS defaults above so key repeat matches other
+// applications on the receiver. Deferred: needs new `windows` crate features
+// and real hardware validation.
 /// How long the enumerated monitor layout is trusted. Display changes are
 /// rare, and enumerating on every motion event would be wasteful.
 const SCREEN_CACHE_TTL: Duration = Duration::from_secs(2);
-/// How often the return hand-off may be requested while the remote peer keeps
-/// pushing past our screen edge. A single `Leave` can be lost over UDP, so the
-/// request is retried at this rate until the peer releases its capture.
-const EDGE_RETURN_THROTTLE: Duration = Duration::from_millis(250);
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
@@ -72,8 +72,9 @@ pub(crate) struct WindowsEmulation {
     /// Service notifier: the remote pointer was pushed past a screen edge and
     /// the driving peer must release its capture (return hand-off).
     edge_return: Option<EdgeReturnNotifier>,
-    /// when the last edge-return request was sent (throttles retries)
-    last_edge_return: Option<Instant>,
+    /// Throttled, bounded retry state for hand-off requests. Re-armed when the
+    /// remote pointer moves back inside the screen or the session ends.
+    edge_return_latch: EdgeReturnLatch,
 }
 
 impl WindowsEmulation {
@@ -92,7 +93,7 @@ impl WindowsEmulation {
             screen_checked: None,
             scale_cache: None,
             edge_return: None,
-            last_edge_return: None,
+            edge_return_latch: EdgeReturnLatch::default(),
         })
     }
 
@@ -166,8 +167,10 @@ impl WindowsEmulation {
             cursor.0.saturating_add(move_x),
             cursor.1.saturating_add(move_y),
         );
-        if let Some(edge) = overshoot_edge(&screen, requested) {
-            self.request_edge_return(edge);
+        match overshoot_edge(&screen, requested) {
+            Some(edge) => self.request_edge_return(edge),
+            // Back inside the screen: the next edge contact is a new hand-off.
+            None => self.edge_return_latch.clear(),
         }
 
         // Clamp to the virtual desktop so the pointer cannot wrap, then
@@ -265,10 +268,13 @@ impl Emulation for WindowsEmulation {
                     state,
                 } => {
                     match state {
-                        // pressed
+                        // released
                         0 => self.kill_repeat_task(),
-                        1 => self.spawn_repeat_task(key).await,
-                        _ => {}
+                        // pressed: only keys the OS itself would repeat get a
+                        // repeat task. Repeating Ctrl/Shift/Alt/... makes the
+                        // receiving application see phantom modifier presses.
+                        _ if is_repeatable_linux_key(key) => self.spawn_repeat_task(key).await,
+                        _ => self.kill_repeat_task(),
                     }
                     key_event(key, state)
                 }
@@ -279,33 +285,53 @@ impl Emulation for WindowsEmulation {
         Ok(())
     }
 
-    async fn create(&mut self, _handle: EmulationHandle) {}
+    async fn create(&mut self, _handle: EmulationHandle) {
+        // A new session starts with no hand-off in flight.
+        self.edge_return_latch.clear();
+    }
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        // The session ended (leave, disconnect or watchdog timeout): the
+        // hand-off latch must not leak into the next session and a held key
+        // must not keep repeating.
+        self.edge_return_latch.clear();
+        self.kill_repeat_task();
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.edge_return_latch.clear();
+        self.kill_repeat_task();
+    }
 
     fn set_edge_return_notifier(&mut self, notifier: EdgeReturnNotifier) {
         self.edge_return = Some(notifier);
     }
+
+    /// Windows synthesizes key repeat in [`Self::spawn_repeat_task`].
+    fn synthesizes_key_repeat(&self) -> bool {
+        true
+    }
 }
 
 impl WindowsEmulation {
-    /// Report that the remote pointer was pushed past `edge`, throttled so a
-    /// lost `Leave` is retried until the peer releases its capture.
+    /// Report that the remote pointer was pushed past `edge`.
+    ///
+    /// Requests are throttled and bounded per contiguous edge contact (see
+    /// [`EdgeReturnLatch`]): a lost `Leave` is retried a few times, but a peer
+    /// that keeps pushing at the edge cannot generate an unbounded stream of
+    /// hand-off requests.
     fn request_edge_return(&mut self, edge: PointerEdge) {
         let Some(notifier) = &self.edge_return else {
             return;
         };
-        if self
-            .last_edge_return
-            .is_some_and(|last| last.elapsed() < EDGE_RETURN_THROTTLE)
-        {
+        let Some(attempt) = self.edge_return_latch.request(edge, Instant::now()) else {
             return;
-        }
+        };
         if notifier.send(edge).is_ok() {
-            self.last_edge_return = Some(Instant::now());
-            log::debug!("remote pointer pushed past the {edge:?} edge: requesting hand-off");
+            log::debug!(
+                "remote pointer pushed past the {edge:?} edge: requesting hand-off \
+                 (attempt {attempt})"
+            );
         }
     }
 
@@ -522,6 +548,28 @@ fn key_event(key: u32, state: u8) {
         dwExtraInfo: 0,
     };
     send_keyboard_input(ki);
+}
+
+/// Whether the OS itself would auto-repeat this key while it is held.
+///
+/// Modifier and lock keys do not auto-repeat on a real keyboard (holding Ctrl
+/// produces no repeated VK_CONTROL), so the repeat task must not synthesize
+/// them.
+fn is_repeatable_linux_key(key: u32) -> bool {
+    !matches!(
+        scancode::Linux::try_from(key),
+        Ok(scancode::Linux::KeyLeftShift
+            | scancode::Linux::KeyRightShift
+            | scancode::Linux::KeyLeftCtrl
+            | scancode::Linux::KeyRightCtrl
+            | scancode::Linux::KeyLeftAlt
+            | scancode::Linux::KeyRightalt
+            | scancode::Linux::KeyLeftMeta
+            | scancode::Linux::KeyRightmeta
+            | scancode::Linux::KeyCapsLock
+            | scancode::Linux::KeyNumlock
+            | scancode::Linux::KeyScrollLock)
+    )
 }
 
 fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {

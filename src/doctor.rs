@@ -55,6 +55,41 @@ struct ClientReport {
     ips: Vec<String>,
 }
 
+/// A device from the config v2 permission table.
+#[derive(Debug, Serialize)]
+struct DeviceReport {
+    fingerprint: String,
+    name: String,
+    source: String,
+    incoming: String,
+    outgoing: String,
+}
+
+/// An auto-authorizing address rule.
+#[derive(Debug, Serialize)]
+struct AddressRuleReport {
+    address: String,
+    incoming: String,
+    outgoing: String,
+}
+
+/// Human readable permission policy, e.g. "allowed [pointer,keyboard]" or
+/// "denied". Kept local so the doctor report does not depend on IPC view types.
+fn policy_summary(policy: &lan_mouse_ipc::DirectionPolicy) -> String {
+    if !policy.allowed {
+        return "denied".to_string();
+    }
+    format!("allowed [{}]", policy.capabilities.summary())
+}
+
+/// Result of trying to bind the UDP listen/discovery port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortStatus {
+    Available,
+    InUse,
+    Unavailable,
+}
+
 /// Which portal a restore token belongs to.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -173,7 +208,9 @@ struct Report {
     port: u16,
     discovery_port: u16,
     listen_port_available: bool,
+    listen_port_status: String,
     discovery_port_available: bool,
+    discovery_port_status: String,
     interfaces: Vec<InterfaceReport>,
     capture_backend_requested: Option<String>,
     emulation_backend_requested: Option<String>,
@@ -186,7 +223,16 @@ struct Report {
     /// portal restore tokens found on disk, by portal
     portal_tokens: Vec<PortalTokenReport>,
     local_fingerprint: String,
+    /// Parse error of config.toml, when the file could not be loaded and the
+    /// service is running with built-in defaults.
+    config_error: Option<String>,
     authorized_fingerprints: Vec<String>,
+    /// config v2 device table (the authoritative permission source)
+    devices: Vec<DeviceReport>,
+    /// auto-authorizing address rules
+    address_rules: Vec<AddressRuleReport>,
+    /// number of revoked fingerprints on disk
+    denied_fingerprints: usize,
     /// where the append-only audit log lives
     audit_log: String,
     /// number of audit entries read as a cheap health signal
@@ -249,7 +295,11 @@ fn portal_token_warnings(
     warnings
 }
 
-fn build_warnings(clients: &[ClientReport], authorized_fingerprints: usize) -> Vec<String> {
+fn build_warnings(
+    clients: &[ClientReport],
+    authorized_fingerprints: usize,
+    known_devices: usize,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     if clients.is_empty() {
         warnings.push(
@@ -281,7 +331,11 @@ fn build_warnings(clients: &[ClientReport], authorized_fingerprints: usize) -> V
             ));
         }
     }
-    if authorized_fingerprints == 0 {
+    // Config v2 stores permissions as a device table; the legacy
+    // authorized_fingerprints map is dual-written but may legitimately be
+    // empty for a hand-written or imported config. Warning in that case was a
+    // false positive that made a healthy setup look broken.
+    if authorized_fingerprints == 0 && known_devices == 0 {
         warnings.push(
             "no authorized fingerprints: incoming connections will be rejected until the peer is \
              authorized"
@@ -316,12 +370,42 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         })
         .collect::<Vec<_>>();
 
+    let devices = config
+        .devices()
+        .into_iter()
+        .map(|device| DeviceReport {
+            fingerprint: device.fingerprint,
+            name: device.name,
+            source: device.source.as_str().to_string(),
+            incoming: policy_summary(&device.incoming),
+            outgoing: policy_summary(&device.outgoing),
+        })
+        .collect::<Vec<_>>();
+    let address_rules = config
+        .address_rules()
+        .into_iter()
+        .map(|rule| AddressRuleReport {
+            address: rule.net.to_string(),
+            incoming: policy_summary(&rule.incoming),
+            outgoing: policy_summary(&rule.outgoing),
+        })
+        .collect::<Vec<_>>();
+    let denied_fingerprints = config.denied_devices().len();
+    let config_error = config.load_error().map(str::to_string);
+
     let live_diagnostics = if lan_mouse_ipc::is_service_running() {
         query_live_diagnostics()
     } else {
         None
     };
-    let mut warnings = build_warnings(&clients, authorized_fingerprints.len());
+    let mut warnings = build_warnings(&clients, authorized_fingerprints.len(), devices.len());
+    if let Some(error) = &config_error {
+        warnings.push(format!(
+            "config.toml could not be parsed, so built-in defaults are in use and the \
+             configured devices/links are NOT active (the unparsable file was backed up next to \
+             it): {error}"
+        ));
+    }
     if let Some(error) = live_diagnostics
         .as_ref()
         .and_then(|diagnostics| diagnostics.last_connection_error.as_deref())
@@ -370,8 +454,10 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
     let port = config.port();
     let discovery_port = config.discovery_port();
     let service_running = lan_mouse_ipc::is_service_running();
-    let listen_port_available = udp_port_available(port);
-    let discovery_port_available = udp_port_available(discovery_port);
+    let listen_port_status = udp_port_status(port);
+    let discovery_port_status = udp_port_status(discovery_port);
+    let listen_port_available = listen_port_status == PortStatus::Available;
+    let discovery_port_available = discovery_port_status == PortStatus::Available;
     let interfaces = crate::discovery::local_interfaces()
         .into_iter()
         .map(|interface| InterfaceReport {
@@ -380,15 +466,27 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
             prefix: interface.prefix,
         })
         .collect::<Vec<_>>();
-    if !service_running && !listen_port_available {
-        warnings.push(format!(
-            "UDP port {port} is already in use; the DTLS listener cannot start"
-        ));
-    }
-    if !service_running && !discovery_port_available {
-        warnings.push(format!(
-            "UDP discovery port {discovery_port} is already in use; scan/announcements may be disabled"
-        ));
+    if !service_running {
+        match listen_port_status {
+            PortStatus::InUse => warnings.push(format!(
+                "UDP port {port} is already in use; the DTLS listener cannot start"
+            )),
+            // A permission error (privileged port) is not "in use"; reporting
+            // it as such sent users chasing the wrong problem.
+            PortStatus::Unavailable => warnings.push(format!(
+                "UDP port {port} cannot be bound; the DTLS listener cannot start"
+            )),
+            PortStatus::Available => {}
+        }
+        match discovery_port_status {
+            PortStatus::InUse => warnings.push(format!(
+                "UDP discovery port {discovery_port} is already in use; scan/announcements may be disabled"
+            )),
+            PortStatus::Unavailable => warnings.push(format!(
+                "UDP discovery port {discovery_port} cannot be bound; scan/announcements may be disabled"
+            )),
+            PortStatus::Available => {}
+        }
     }
 
     let audit = crate::audit::AuditLog::new(crate::audit::AuditLog::default_path());
@@ -405,7 +503,9 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         port,
         discovery_port,
         listen_port_available,
+        listen_port_status: format_port_status(listen_port_status),
         discovery_port_available,
+        discovery_port_status: format_port_status(discovery_port_status),
         interfaces,
         capture_backend_requested: config.capture_backend().map(|backend| backend.to_string()),
         emulation_backend_requested: config
@@ -418,7 +518,11 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
         portal_token_dir,
         portal_tokens,
         local_fingerprint,
+        config_error,
         authorized_fingerprints,
+        devices,
+        address_rules,
+        denied_fingerprints,
         audit_log,
         recent_audit_events,
         clients,
@@ -538,6 +642,32 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
             report.authorized_fingerprints.join(", ")
         }
     );
+    if let Some(error) = &report.config_error {
+        println!("  config error:    {error}");
+    }
+    println!(
+        "  devices:         {} ({} revoked fingerprint(s))",
+        report.devices.len(),
+        report.denied_fingerprints
+    );
+    for device in &report.devices {
+        println!(
+            "    {} ({}) fp={} source={} incoming=[{}] outgoing=[{}]",
+            device.name,
+            device.fingerprint,
+            device.fingerprint,
+            device.source,
+            device.incoming,
+            device.outgoing
+        );
+    }
+    println!("  address rules:   {}", report.address_rules.len());
+    for rule in &report.address_rules {
+        println!(
+            "    {} incoming=[{}] outgoing=[{}]",
+            rule.address, rule.incoming, rule.outgoing
+        );
+    }
 
     if let Some(diagnostics) = &report.live_diagnostics {
         println!(
@@ -630,8 +760,23 @@ fn query_live_diagnostics() -> Option<Diagnostics> {
         .flatten()
 }
 
-fn udp_port_available(port: u16) -> bool {
-    std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok()
+fn udp_port_status(port: u16) -> PortStatus {
+    match std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)) {
+        Ok(socket) => {
+            drop(socket);
+            PortStatus::Available
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => PortStatus::InUse,
+        Err(_) => PortStatus::Unavailable,
+    }
+}
+
+fn format_port_status(status: PortStatus) -> String {
+    match status {
+        PortStatus::Available => "available".to_string(),
+        PortStatus::InUse => "in use".to_string(),
+        PortStatus::Unavailable => "cannot bind (permission or address error)".to_string(),
+    }
 }
 
 fn format_probe(probe: &Probe) -> String {
@@ -695,7 +840,7 @@ mod tests {
 
     #[test]
     fn empty_setup_warns_about_every_aspect() {
-        let warnings = build_warnings(&[], 0);
+        let warnings = build_warnings(&[], 0, 0);
         assert!(warnings.iter().any(|w| w.contains("no clients configured")));
         assert!(warnings.iter().any(|w| w.contains("no active client")));
         assert!(
@@ -707,20 +852,20 @@ mod tests {
 
     #[test]
     fn a_complete_setup_has_no_warnings() {
-        let warnings = build_warnings(&[client(0, "left", true)], 1);
+        let warnings = build_warnings(&[client(0, "left", true)], 1, 1);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
     fn duplicate_active_positions_are_reported() {
-        let warnings = build_warnings(&[client(0, "left", true), client(1, "left", true)], 1);
+        let warnings = build_warnings(&[client(0, "left", true), client(1, "left", true)], 1, 1);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("share the position `left`"));
     }
 
     #[test]
     fn inactive_clients_do_not_conflict() {
-        let warnings = build_warnings(&[client(0, "left", true), client(1, "left", false)], 1);
+        let warnings = build_warnings(&[client(0, "left", true), client(1, "left", false)], 1, 1);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
@@ -729,10 +874,38 @@ mod tests {
         let mut broken = client(3, "top", true);
         broken.hostname = None;
         broken.ips.clear();
-        let warnings = build_warnings(&[broken], 1);
+        let warnings = build_warnings(&[broken], 1, 1);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("client 3"));
         assert!(warnings[0].contains("neither a hostname nor an IP"));
+    }
+
+    #[test]
+    fn config_v2_devices_suppress_the_missing_authorization_warning() {
+        // A config written by the pairing UI may only contain [[devices]] and
+        // no legacy authorized_fingerprints map; that is a healthy setup.
+        let warnings = build_warnings(&[client(0, "left", true)], 0, 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // With neither a device table nor legacy keys the warning is real.
+        let warnings = build_warnings(&[client(0, "left", true)], 0, 0);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("no authorized fingerprints")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn port_status_distinguishes_in_use_from_other_errors() {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .expect("bind a free port");
+        let port = socket.local_addr().expect("addr").port();
+        assert_eq!(udp_port_status(port), PortStatus::InUse);
+        assert_eq!(format_port_status(PortStatus::Available), "available");
+        assert_eq!(format_port_status(PortStatus::InUse), "in use");
+        assert!(format_port_status(PortStatus::Unavailable).contains("cannot bind"));
+        drop(socket);
     }
 
     #[test]

@@ -15,6 +15,17 @@
 //!
 //! Keeping the arithmetic here makes it testable on any host.
 
+use std::time::{Duration, Instant};
+
+/// How often the return hand-off may be requested while the remote peer keeps
+/// pushing past our screen edge.
+pub(crate) const EDGE_RETURN_THROTTLE: Duration = Duration::from_millis(250);
+
+/// How many hand-off requests one contiguous edge contact may send. A single
+/// `Leave` can be lost over UDP, hence the retries; but an unbounded retry
+/// stream would keep shoving control back to a peer that ignores it.
+pub(crate) const EDGE_RETURN_MAX_ATTEMPTS: u8 = 3;
+
 /// Bounding rectangle of the virtual desktop, in cursor coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VirtualScreen {
@@ -144,6 +155,63 @@ pub(crate) fn overshoot_edge(
     candidates.sort_by_key(|&(_, overshoot)| std::cmp::Reverse(overshoot));
     let (edge, overshoot) = candidates[0];
     (overshoot > 0).then_some(edge)
+}
+
+/// Throttled, bounded retry latch for the return hand-off requests.
+///
+/// The Windows backend asks the peer to release its capture whenever the
+/// remote pointer is pushed past a screen edge. One `Leave` can be lost over
+/// UDP, so the request is retried a few times — but only a bounded number of
+/// times per contiguous edge contact. Without the latch, a peer that keeps
+/// pushing at the edge would produce an unbounded stream of `Leave` packets
+/// and could bounce the capture back and forth between the two machines.
+#[derive(Debug, Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct EdgeReturnLatch {
+    /// The edge currently being requested.
+    edge: Option<super::PointerEdge>,
+    /// Hand-off requests sent for this contiguous edge contact.
+    attempts: u8,
+    /// When the last request was sent.
+    last: Option<Instant>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl EdgeReturnLatch {
+    /// Re-arm the latch: the remote pointer is back inside the screen (or the
+    /// session ended), so the next edge contact is a new hand-off.
+    pub(crate) fn clear(&mut self) {
+        self.edge = None;
+        self.attempts = 0;
+        self.last = None;
+    }
+
+    /// Ask for one more hand-off request for `edge`, if it is due.
+    ///
+    /// Returns the 1-based attempt number to log when a request should be
+    /// sent, `None` when it is throttled or the retry budget for this edge
+    /// contact is exhausted.
+    pub(crate) fn request(&mut self, edge: super::PointerEdge, now: Instant) -> Option<u8> {
+        let attempts = if self.edge == Some(edge) {
+            self.attempts
+        } else {
+            0
+        };
+        if attempts >= EDGE_RETURN_MAX_ATTEMPTS {
+            return None;
+        }
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < EDGE_RETURN_THROTTLE)
+        {
+            return None;
+        }
+        let attempt = attempts + 1;
+        self.edge = Some(edge);
+        self.attempts = attempt;
+        self.last = Some(now);
+        Some(attempt)
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +376,85 @@ mod tests {
         assert_eq!(logical_to_physical(10.0, 0.0), 10.0);
         assert_eq!(logical_to_physical(10.0, -1.0), 10.0);
         assert_eq!(logical_to_physical(10.0, f64::NAN), 10.0);
+    }
+
+    fn edge() -> super::super::PointerEdge {
+        super::super::PointerEdge::Left
+    }
+
+    #[test]
+    fn edge_return_requests_are_throttled_and_bounded() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut latch = EdgeReturnLatch::default();
+
+        assert_eq!(latch.request(edge(), t0), Some(1));
+        assert_eq!(
+            latch.request(edge(), t0 + Duration::from_millis(100)),
+            None,
+            "throttled while a request is in flight"
+        );
+        assert_eq!(
+            latch.request(edge(), t0 + EDGE_RETURN_THROTTLE),
+            Some(2),
+            "one retry per throttle interval"
+        );
+        assert_eq!(
+            latch.request(edge(), t0 + EDGE_RETURN_THROTTLE * 2),
+            Some(3)
+        );
+        assert_eq!(
+            latch.request(edge(), t0 + EDGE_RETURN_THROTTLE * 3),
+            None,
+            "retry budget of one edge contact is exhausted"
+        );
+        assert_eq!(
+            latch.request(edge(), t0 + EDGE_RETURN_THROTTLE * 100),
+            None,
+            "a peer that keeps pushing must not generate more Leave packets"
+        );
+    }
+
+    #[test]
+    fn edge_return_latch_rearms_after_the_pointer_returns_inside() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut latch = EdgeReturnLatch::default();
+        for attempt in 0..EDGE_RETURN_MAX_ATTEMPTS {
+            let now = t0 + EDGE_RETURN_THROTTLE * u32::from(attempt);
+            assert_eq!(latch.request(edge(), now), Some(attempt + 1));
+        }
+        assert!(
+            latch
+                .request(edge(), t0 + EDGE_RETURN_THROTTLE * 100)
+                .is_none()
+        );
+        latch.clear();
+        assert_eq!(
+            latch.request(edge(), t0 + Duration::from_millis(1)),
+            Some(1),
+            "a new edge contact starts a new hand-off"
+        );
+    }
+
+    #[test]
+    fn edge_return_latch_restarts_its_budget_for_a_different_edge() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut latch = EdgeReturnLatch::default();
+        assert_eq!(latch.request(edge(), t0), Some(1));
+        assert_eq!(
+            latch.request(super::super::PointerEdge::Bottom, t0),
+            None,
+            "still throttled across the edge change"
+        );
+        assert_eq!(
+            latch.request(
+                super::super::PointerEdge::Bottom,
+                t0 + Duration::from_millis(300)
+            ),
+            Some(1),
+            "the new edge gets its own retry budget"
+        );
     }
 }

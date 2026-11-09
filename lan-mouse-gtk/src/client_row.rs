@@ -33,7 +33,7 @@ pub enum LinkProof {
 
 impl LinkProof {
     /// Whether the peer answered recently enough to call the link connected.
-    fn is_fresh(self) -> bool {
+    pub(crate) fn is_fresh(self) -> bool {
         matches!(self, Self::Recent { .. })
     }
 

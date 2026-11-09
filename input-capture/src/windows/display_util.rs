@@ -181,6 +181,73 @@ pub(crate) fn clamp_to_display_bounds(
     (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
 }
 
+/// Convert consecutive absolute raw mouse positions into a pixel delta.
+///
+/// Per the `RAWMOUSE` documentation (`MOUSE_MOVE_ABSOLUTE`), `lLastX`/`lLastY`
+/// are **always** normalized to `0..=65535`; `MOUSE_VIRTUAL_DESKTOP` only
+/// selects which region that range maps onto (whole virtual desktop or the
+/// primary monitor). The caller passes the pixel extent of that region.
+/// Returns `None` when the coordinates cannot be interpreted (first packet,
+/// out of range) or when the extent is unknown.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn absolute_mouse_delta(
+    absolute: (i32, i32),
+    previous: Option<(i32, i32)>,
+    mapping_extent: (i32, i32),
+) -> Option<(i32, i32)> {
+    let previous = previous?;
+    let (x, y) = absolute;
+    let (previous_x, previous_y) = previous;
+    let normalized = |value: i32| (0..=65535).contains(&value);
+    if !normalized(x) || !normalized(y) || !normalized(previous_x) || !normalized(previous_y) {
+        return None;
+    }
+    let dx = x.checked_sub(previous_x)?;
+    let dy = y.checked_sub(previous_y)?;
+    let (width, height) = mapping_extent;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some((
+        scale_normalized_delta(dx, width),
+        scale_normalized_delta(dy, height),
+    ))
+}
+
+/// Pixel extent that normalized absolute coordinates map onto.
+///
+/// `MOUSE_VIRTUAL_DESKTOP` maps over the whole virtual desktop; without it the
+/// coordinates map over the primary monitor (RAWMOUSE documentation). The
+/// rectangles come from `EnumDisplayMonitors` in physical pixels.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn mapping_extent(
+    displays: &[RECT],
+    primary: Option<RECT>,
+    virtual_desktop: bool,
+) -> Option<(i32, i32)> {
+    let (left, top, right, bottom) = if virtual_desktop {
+        desktop_bounds(displays)?
+    } else {
+        let display = primary.or_else(|| displays.first().copied())?;
+        (display.left, display.top, display.right, display.bottom)
+    };
+    let width = right.checked_sub(left)?;
+    let height = bottom.checked_sub(top)?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// Map a normalized absolute delta (0..=65535) onto `extent` pixels, keeping
+/// the direction even when the movement is smaller than one pixel.
+fn scale_normalized_delta(delta: i32, extent: i32) -> i32 {
+    if delta == 0 {
+        return 0;
+    }
+    let scaled = i64::from(delta) * i64::from(extent) / 65535;
+    let scaled = scaled.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    if scaled == 0 { delta.signum() } else { scaled }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +405,114 @@ mod tests {
         assert_eq!(
             clamp_to_display_bounds(&displays, (1910, 500), (2000, 500)),
             (1919, 500)
+        );
+    }
+
+    #[test]
+    fn absolute_coordinates_are_always_normalized() {
+        // RAWMOUSE documentation: with MOUSE_MOVE_ABSOLUTE the values are
+        // always 0..=65535 - MOUSE_VIRTUAL_DESKTOP only selects the region
+        // they map onto, it does NOT mean the values are pixels. A 1% move on
+        // a 1920 px wide desktop is ~19 px, not 655 px.
+        assert_eq!(
+            absolute_mouse_delta((655, 0), Some((0, 0)), (1920, 1080)),
+            Some((19, 0))
+        );
+        // The vertical extent is 1080 px: 1% is ~10 px.
+        assert_eq!(
+            absolute_mouse_delta((0, 655), Some((0, 0)), (1920, 1080)),
+            Some((0, 10))
+        );
+    }
+
+    #[test]
+    fn mapping_extent_uses_the_virtual_desktop_or_the_primary_monitor() {
+        let displays = [rect(-1920, 0, 0, 1080), rect(0, 0, 1920, 1080)];
+        let primary = Some(rect(0, 0, 1920, 1080));
+        assert_eq!(
+            mapping_extent(&displays, primary, true),
+            Some((3840, 1080)),
+            "MOUSE_VIRTUAL_DESKTOP maps over the whole virtual desktop"
+        );
+        assert_eq!(
+            mapping_extent(&displays, primary, false),
+            Some((1920, 1080)),
+            "without the flag the coordinates map over the primary monitor"
+        );
+        assert_eq!(mapping_extent(&[], None, true), None);
+        assert_eq!(mapping_extent(&[], None, false), None);
+    }
+
+    #[test]
+    fn absolute_normalized_positions_are_scaled_to_the_desktop() {
+        // 32768/65535 of a 1920 px wide desktop is 960 px.
+        assert_eq!(
+            absolute_mouse_delta((32768, 0), Some((0, 0)), (1920, 1080)),
+            Some((960, 0))
+        );
+        // A full-range move covers the whole desktop.
+        assert_eq!(
+            absolute_mouse_delta((65535, 65535), Some((0, 0)), (1920, 1080)),
+            Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn absolute_sub_pixel_moves_keep_their_direction() {
+        // 1/65535 of 1920 px rounds to zero; the direction must survive, and
+        // the x/y axes must not be swapped.
+        assert_eq!(
+            absolute_mouse_delta((1, 0), Some((0, 0)), (1920, 1080)),
+            Some((1, 0)),
+            "+x keeps direction"
+        );
+        assert_eq!(
+            absolute_mouse_delta((0, 1), Some((0, 0)), (1920, 1080)),
+            Some((0, 1)),
+            "+y keeps direction"
+        );
+        assert_eq!(
+            absolute_mouse_delta((0, 0), Some((1, 0)), (1920, 1080)),
+            Some((-1, 0)),
+            "-x keeps direction"
+        );
+        assert_eq!(
+            absolute_mouse_delta((0, 0), Some((0, 1)), (1920, 1080)),
+            Some((0, -1)),
+            "-y keeps direction"
+        );
+    }
+
+    #[test]
+    fn absolute_normalized_negative_and_offset_origins_are_not_swapped() {
+        // The conversion must be pure per-axis arithmetic: offset origins and
+        // negative positions are handled by the desktop-size scaling only.
+        assert_eq!(
+            absolute_mouse_delta((65535, 0), Some((0, 0)), (3840, 2160)),
+            Some((3840, 0))
+        );
+        assert_eq!(
+            absolute_mouse_delta((0, 65535), Some((0, 0)), (3840, 2160)),
+            Some((0, 2160))
+        );
+        assert_eq!(
+            absolute_mouse_delta((0, 0), Some((65535, 65535)), (3840, 2160)),
+            Some((-3840, -2160))
+        );
+    }
+
+    #[test]
+    fn absolute_positions_need_a_reference_and_a_known_desktop() {
+        assert_eq!(absolute_mouse_delta((10, 10), None, (1920, 1080)), None);
+        assert_eq!(
+            absolute_mouse_delta((10, 10), Some((0, 0)), (0, 0)),
+            None,
+            "unknown desktop size"
+        );
+        assert_eq!(
+            absolute_mouse_delta((70000, 0), Some((0, 0)), (1920, 1080)),
+            None,
+            "outside the normalized range"
         );
     }
 }

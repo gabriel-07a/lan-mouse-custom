@@ -27,6 +27,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     rc::Rc,
     sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify, task::spawn_local};
@@ -147,6 +148,16 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// Return hand-offs whose `Leave` has not been confirmed by the peer yet.
+    return_requests: ReturnHandoff,
+    /// Monotonic serial for return hand-off requests (non-zero).
+    return_serial: u32,
+    /// Last permission bits announced by each peer, so identical AuthRequests
+    /// do not produce an audit record (or a state broadcast) every ping round.
+    peer_permissions_seen: HashMap<String, (u8, u8)>,
+    /// A frontend asked the service to shut down (CLI/installer upgrade path).
+    /// The run loop breaks and the regular teardown runs once.
+    shutdown_requested: bool,
 }
 
 #[derive(Debug)]
@@ -287,6 +298,10 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            return_requests: Default::default(),
+            return_serial: 0,
+            peer_permissions_seen: Default::default(),
+            shutdown_requested: false,
         };
         Ok(service)
     }
@@ -316,9 +331,35 @@ impl Service {
             self.announced_tx.clone(),
         ));
 
+        // Retry unanswered return hand-offs: DTLS application data is not
+        // retransmitted, so a single lost `Leave` must not be able to latch the
+        // remote-control state forever.
+        let mut return_retry = tokio::time::interval(RETURN_RETRY_INTERVAL);
+        return_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        return_retry.tick().await;
+        // systemd `stop`, desktop logout and the Windows service wrapper use
+        // SIGTERM; without this the process died without releasing keys or
+        // tearing the backends down.
+        #[cfg(unix)]
+        let mut sigterm = {
+            use tokio::signal::unix::{SignalKind, signal};
+            match signal(SignalKind::terminate()) {
+                Ok(signal) => Some(signal),
+                Err(e) => {
+                    log::warn!("could not install the SIGTERM handler: {e}");
+                    None
+                }
+            }
+        };
+
         loop {
             tokio::select! {
-                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                request = self.frontend_listener.next() => {
+                    self.handle_frontend_request(request);
+                    if self.shutdown_requested {
+                        break;
+                    }
+                }
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
@@ -383,6 +424,15 @@ impl Service {
                     }
                 },
                 _ = self.config.changed() => self.handle_config_change(),
+                _ = return_retry.tick() => self.retry_return_requests(),
+                _ = async {
+                    // SIGTERM (systemd stop / graphical session logout). On
+                    // platforms without it this branch never completes.
+                    #[cfg(unix)]
+                    wait_for_sigterm(&mut sigterm).await;
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => break,
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
         }
@@ -567,6 +617,14 @@ impl Service {
                 incoming,
                 outgoing,
             } => self.start_pairing(seconds, incoming, outgoing),
+            // Graceful shutdown requested over IPC (installer upgrade /
+            // `lan-mouse cli shutdown`). The flag is consumed by the run loop,
+            // so this is idempotent with SIGINT/SIGTERM: whichever arrives
+            // first breaks the loop and the teardown below runs exactly once.
+            FrontendRequest::Shutdown => {
+                log::info!("shutdown requested over the frontend IPC");
+                self.shutdown_requested = true;
+            }
         }
     }
 
@@ -768,6 +826,7 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
+                self.return_requests.forget(addr);
                 self.expire_session_grants(addr);
                 let _ = self.clipboard_peer_events.send(addr);
                 if let Some(handle) = self.client_for_incoming(addr) {
@@ -786,6 +845,11 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
+                    // Persist the runtime port change: peers dial the port
+                    // they were configured with, so after a restart the
+                    // service must come back on the same port (P2-09).
+                    self.config.set_port(port);
+                    self.save_config();
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -800,11 +864,19 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => {
+                // Release the local capture, but keep the remote-peer
+                // suppression latched: it is cleared by the return hand-off
+                // (PeerLeft) or by the session ending. Clearing it here opened
+                // a window where injected motion was accepted as local input,
+                // which is what made both machines enter/leave/enter at the
+                // shared edge.
                 self.capture.release();
-                self.capture.set_remote_peer(None);
             }
             EmulationEvent::EdgeReturn(pos) => self.request_return(pos),
             EmulationEvent::PeerLeft { addr, fingerprint } => {
+                // The peer confirmed it released its capture: the retried
+                // return hand-off is complete.
+                self.return_requests.confirmed(addr);
                 self.peer_released(addr, &fingerprint);
             }
             EmulationEvent::AutoAuthorized {
@@ -936,7 +1008,22 @@ impl Service {
                 incoming_caps,
                 outgoing_caps,
             } => {
-                self.audit.event(
+                // AuthRequest is repeated by every peer ping round; only a
+                // real change of the announced bits is worth an audit record
+                // (and a blocking file open) or a full client state broadcast.
+                // The user's live audit log was 4148/4189 identical
+                // peer_permissions records produced this way.
+                let caps = (incoming_caps, outgoing_caps);
+                if self.peer_permissions_seen.get(&fingerprint) == Some(&caps) {
+                    return;
+                }
+                self.peer_permissions_seen.insert(fingerprint.clone(), caps);
+                // Belt and braces: the source-level dedupe above already limits
+                // this to real changes, and the audit helper suppresses the same
+                // key inside a short window even if two changes race in.
+                self.audit.event_state_change(
+                    &format!("peer_permissions:{fingerprint}:{incoming_caps:x}:{outgoing_caps:x}"),
+                    Duration::from_secs(10),
                     "peer_permissions",
                     Some(&fingerprint),
                     None,
@@ -1005,8 +1092,12 @@ impl Service {
             ICaptureEvent::CaptureBegin(handle) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
-                if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation.send_leave_event(incoming.addr);
+                if let Some(addr) = self
+                    .incoming_conn_info
+                    .get(&handle)
+                    .map(|incoming| incoming.addr)
+                {
+                    self.request_handoff(addr);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
@@ -1148,7 +1239,77 @@ impl Service {
         }
         for addr in addrs {
             log::info!("handing control back: remote pointer left through {pos:?} ({addr})");
-            self.emulation.send_leave_event(addr);
+            self.request_handoff(addr);
+        }
+    }
+
+    /// Ask the peer at addr to release its capture, retrying until it
+    /// confirms with Leave (see ReturnHandoff).
+    fn request_handoff(&mut self, addr: SocketAddr) {
+        let serial = self.next_return_serial();
+        self.return_requests.request(addr, serial, Instant::now());
+        self.emulation.send_leave_request(addr, serial);
+    }
+
+    fn next_return_serial(&mut self) -> u32 {
+        // 0 is reserved for "plain release confirmation" (what peers have always
+        // sent); a non-zero serial marks a retried request.
+        self.return_serial = self.return_serial.wrapping_add(1);
+        if self.return_serial == 0 {
+            self.return_serial = 1;
+        }
+        self.return_serial
+    }
+
+    /// Retry return hand-offs that the peer has not confirmed yet, and clean up
+    /// the ones that exhausted their retry budget.
+    fn retry_return_requests(&mut self) {
+        let due = self.return_requests.due(Instant::now());
+        for (addr, serial) in due {
+            if !self.incoming_conns.contains(&addr) {
+                self.return_requests.forget(addr);
+                continue;
+            }
+            log::debug!("retrying return hand-off request to {addr} (serial {serial})");
+            self.emulation.send_leave_request(addr, serial);
+        }
+        for addr in self.return_requests.take_exhausted() {
+            self.abort_return_handoff(addr);
+        }
+    }
+
+    /// Stop a return hand-off that the peer never confirmed.
+    ///
+    /// A v0.2.4 peer only sends `Leave` while it still holds an active capture,
+    /// so if its single `Leave(0)` confirmation was lost it cannot answer a
+    /// retried request. Retry exhaustion must not leave the remote-control
+    /// suppression latched (stuck cursor): terminate the relationship the same
+    /// way the silence timeout does, by closing the incoming session so the
+    /// peer's watchdog resets its capture. The resulting `Disconnected` event
+    /// repeats this cleanup idempotently.
+    ///
+    /// Deliberately not just `set_remote_peer(None)`: re-enabling local capture
+    /// while the peer might still hold the grab is the documented feedback-loop
+    /// risk.
+    fn abort_return_handoff(&mut self, addr: SocketAddr) {
+        log::warn!(
+            "return hand-off to {addr} unanswered after {RETURN_MAX_ATTEMPTS} tries; \
+             closing the incoming session to avoid a stuck cursor"
+        );
+        // Close the incoming session WITHOUT the explicit-disconnect signal:
+        // a forced "user disconnect" (AuthRevoke) makes the peer deactivate the
+        // device until someone re-enables it manually, which is far worse than
+        // the stuck-cursor case this recovers from. The peer's own watchdog
+        // resets its capture when the session goes away.
+        self.emulation.close_session(addr);
+        // Do not depend on the asynchronous Closed/Disconnected round-trip
+        // for the local suppression: if that event were lost too, the cursor
+        // would stay stuck, which is exactly the bug being fixed here.
+        if self.remove_incoming(addr).is_some() {
+            self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
+        }
+        if self.incoming_conns.is_empty() {
+            self.capture.set_remote_peer(None);
         }
     }
 
@@ -1248,6 +1409,7 @@ impl Service {
     }
 
     fn remove_incoming(&mut self, addr: SocketAddr) -> Option<SocketAddr> {
+        self.return_requests.forget(addr);
         let handle = self
             .incoming_conn_info
             .iter()
@@ -2595,12 +2757,18 @@ impl Service {
     fn remove_client(&mut self, handle: ClientHandle) {
         self.learned_fingerprints.remove(&handle);
         self.auto_reverse_clients.remove(&handle);
-        if self
+        // Remove the entry first so the connection layer's reconnect loop sees
+        // an inactive client, then close the live transport. Without this a
+        // deleted/reloaded client kept its DTLS socket and ping/receive tasks
+        // running, and the slab can reuse the handle for a new client which
+        // would then silently inherit the stale transport.
+        let was_active = self
             .client_manager
             .remove_client(handle)
-            .map(|(_, s)| s.active)
-            .unwrap_or(false)
-        {
+            .map(|(_, state)| state.active)
+            .unwrap_or(false);
+        self.capture.drop_transport(handle);
+        if was_active {
             self.capture.destroy(handle);
         }
         self.notify_frontend(FrontendEvent::Deleted(handle));
@@ -2608,6 +2776,20 @@ impl Service {
 
     fn update_fix_ips(&mut self, handle: ClientHandle, fix_ips: Vec<IpAddr>) {
         self.client_manager.set_fix_ips(handle, fix_ips);
+        // If the live route is no longer part of the client's address set, a
+        // transport to it would keep the UI claiming an endpoint that no
+        // longer exists. Drop it; the reconnect loop (client still active)
+        // dials the addresses that remain.
+        if let Some(active_addr) = self.client_manager.active_addr(handle) {
+            let still_configured = self
+                .client_manager
+                .get_ips(handle)
+                .is_some_and(|ips| ips.contains(&active_addr.ip()));
+            if !still_configured && self.client_manager.is_active(handle) {
+                log::info!("client {handle}: live address {active_addr} was removed, reconnecting");
+                self.capture.drop_transport(handle);
+            }
+        }
         self.broadcast_client(handle);
     }
 
@@ -2615,12 +2797,25 @@ impl Service {
         log::info!("hostname changed: {hostname:?}");
         if self.client_manager.set_hostname(handle, hostname.clone()) {
             self.resolve(handle);
+            // set_hostname cleared active_addr because the resolved endpoint
+            // may be different now. A live transport to the old endpoint must
+            // not be presented as the new one: drop it and let the reconnect
+            // loop dial the new DNS result.
+            if self.client_manager.is_active(handle) {
+                self.capture.drop_transport(handle);
+            }
         }
         self.broadcast_client(handle);
     }
 
     fn update_port(&mut self, handle: ClientHandle, port: u16) {
+        let changed = self.client_manager.get_port(handle) != Some(port);
         self.client_manager.set_port(handle, port);
+        if changed && self.client_manager.is_active(handle) {
+            // The live transport still talks to the old port while
+            // set_port() rewrites active_addr to the new one; reconnect.
+            self.capture.drop_transport(handle);
+        }
         self.broadcast_client(handle);
     }
 
@@ -2669,7 +2864,21 @@ impl Service {
         let Some(cmd) = cmd else { return };
         tokio::task::spawn_local(async move {
             log::info!("spawning {kind} hook for client {handle}");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
+            // The hook is a shell command line. Windows has no sh(1), so use
+            // the command interpreter there instead of silently failing.
+            #[cfg(windows)]
+            let mut command = {
+                let mut command = Command::new("cmd");
+                command.args(["/C", cmd.as_str()]);
+                command
+            };
+            #[cfg(not(windows))]
+            let mut command = {
+                let mut command = Command::new("sh");
+                command.arg("-c").arg(cmd.as_str());
+                command
+            };
+            let mut child = match command.spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     log::warn!("could not execute {kind} hook for client {handle}: {e}");
@@ -2726,6 +2935,125 @@ fn reverse_client_compatible(incoming: Option<&str>, pinned: Option<&str>) -> bo
     }
 }
 
+/// Resolves when the process receives SIGTERM (systemd `stop`, desktop
+/// logout, service manager). `None` means the handler could not be installed;
+/// the future then never completes so the select arm is inert.
+#[cfg(unix)]
+async fn wait_for_sigterm(signal: &mut Option<tokio::signal::unix::Signal>) {
+    match signal {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// How often an unanswered return hand-off request is retried.
+const RETURN_RETRY_INTERVAL: Duration = Duration::from_millis(300);
+/// Maximum number of retransmissions per hand-off episode. A peer that is
+/// alive but never confirms (legacy build) must not be spammed forever.
+const RETURN_MAX_ATTEMPTS: u32 = 8;
+
+/// Return hand-offs waiting for the peer's `Leave` confirmation.
+///
+/// DTLS application data is not retransmitted, so one lost `Leave` used to
+/// latch the peer's remote-control suppression until the next user movement
+/// (cursor stuck on the peer's screen). The request is retried with a non-zero
+/// serial; the peer re-confirms when it receives a retried request, and the
+/// confirmation (`PeerLeft`) clears the entry.
+#[derive(Debug, Default)]
+struct ReturnHandoff {
+    pending: HashMap<SocketAddr, HandoffRequest>,
+    /// Sessions whose request exhausted its retry budget. The service closes
+    /// the incoming session for each exactly once (drained by
+    /// [`ReturnHandoff::take_exhausted`]).
+    exhausted: Vec<SocketAddr>,
+}
+
+#[derive(Debug)]
+struct HandoffRequest {
+    serial: u32,
+    attempts: u32,
+    last_sent: Instant,
+}
+
+impl ReturnHandoff {
+    /// Record a (re)newed request for `addr`. A retried request keeps the same
+    /// serial; a new episode (new capture crossing) uses a new one.
+    fn request(&mut self, addr: SocketAddr, serial: u32, now: Instant) {
+        match self.pending.get_mut(&addr) {
+            Some(existing) => {
+                if existing.serial == serial {
+                    // Same episode: another direct send counts against the
+                    // retry budget, so a peer that never confirms cannot be
+                    // spammed forever.
+                    existing.attempts = existing.attempts.saturating_add(1);
+                } else {
+                    // A new crossing is a new episode: give it a fresh retry
+                    // budget instead of inheriting the previous one's near
+                    // exhaustion (worst case one direct send + one retry).
+                    existing.serial = serial;
+                    existing.attempts = 1;
+                }
+                existing.last_sent = now;
+            }
+            None => {
+                self.pending.insert(
+                    addr,
+                    HandoffRequest {
+                        serial,
+                        attempts: 1,
+                        last_sent: now,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The peer confirmed the release (or its session ended).
+    fn confirmed(&mut self, addr: SocketAddr) {
+        self.pending.remove(&addr);
+        self.exhausted.retain(|candidate| *candidate != addr);
+    }
+
+    /// Drop the state for a session that is gone.
+    fn forget(&mut self, addr: SocketAddr) {
+        self.pending.remove(&addr);
+        self.exhausted.retain(|candidate| *candidate != addr);
+    }
+
+    /// Requests that are due for a retry. Exhausted ones are dropped from
+    /// `pending` and reported through [`Self::take_exhausted`] so the caller
+    /// can close their session.
+    fn due(&mut self, now: Instant) -> Vec<(SocketAddr, u32)> {
+        let mut due = Vec::new();
+        let Self { pending, exhausted } = self;
+        pending.retain(|addr, request| {
+            if request.attempts >= RETURN_MAX_ATTEMPTS {
+                exhausted.push(*addr);
+                return false;
+            }
+            if now.duration_since(request.last_sent) >= RETURN_RETRY_INTERVAL {
+                request.attempts = request.attempts.saturating_add(1);
+                request.last_sent = now;
+                due.push((*addr, request.serial));
+            }
+            true
+        });
+        due
+    }
+
+    /// Sessions that exhausted their retry budget since the last call.
+    fn take_exhausted(&mut self) -> Vec<SocketAddr> {
+        std::mem::take(&mut self.exhausted)
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self, addr: SocketAddr) -> bool {
+        self.pending.contains_key(&addr)
+    }
+}
+
 /// Convert a persisted audit record into the IPC history entry.
 fn history_entry_from_record(record: AuditRecord) -> HistoryEntry {
     HistoryEntry {
@@ -2740,7 +3068,146 @@ fn history_entry_from_record(record: AuditRecord) -> HistoryEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::reverse_client_compatible;
+    use super::{
+        RETURN_MAX_ATTEMPTS, RETURN_RETRY_INTERVAL, ReturnHandoff, reverse_client_compatible,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Instant;
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)), 4242)
+    }
+
+    #[test]
+    fn a_confirmed_handoff_is_forgotten() {
+        let mut handoff = ReturnHandoff::default();
+        let now = Instant::now();
+        handoff.request(addr(1), 7, now);
+        assert!(handoff.is_pending(addr(1)));
+        handoff.confirmed(addr(1));
+        assert!(!handoff.is_pending(addr(1)));
+        assert!(handoff.due(now + RETURN_RETRY_INTERVAL).is_empty());
+    }
+
+    #[test]
+    fn a_handoff_is_retried_only_after_the_interval() {
+        let mut handoff = ReturnHandoff::default();
+        let now = Instant::now();
+        handoff.request(addr(1), 7, now);
+        assert!(
+            handoff.due(now).is_empty(),
+            "the request was just sent directly; no immediate retry"
+        );
+        assert!(
+            handoff.due(now + RETURN_RETRY_INTERVAL / 2).is_empty(),
+            "not due yet"
+        );
+        assert_eq!(
+            handoff.due(now + RETURN_RETRY_INTERVAL),
+            vec![(addr(1), 7)],
+            "the same serial is retried (the peer re-confirms on a retried request)"
+        );
+    }
+
+    #[test]
+    fn handoff_retries_are_bounded() {
+        let mut handoff = ReturnHandoff::default();
+        let mut now = Instant::now();
+        handoff.request(addr(1), 1, now);
+        let mut retries = 0;
+        for _ in 0..100 {
+            now += RETURN_RETRY_INTERVAL;
+            retries += handoff.due(now).len();
+        }
+        assert_eq!(
+            retries as u32,
+            RETURN_MAX_ATTEMPTS - 1,
+            "the first send is not a retry; retries must stop after the cap"
+        );
+        assert!(
+            !handoff.is_pending(addr(1)),
+            "an exhausted hand-off is dropped"
+        );
+    }
+
+    /// Exhaustion must be reported to the service exactly once: it closes the
+    /// incoming session (the only safe way to clear a latched remote-control
+    /// suppression without risking a feedback loop).
+    #[test]
+    fn exhaustion_is_reported_exactly_once() {
+        let mut handoff = ReturnHandoff::default();
+        let mut now = Instant::now();
+        handoff.request(addr(1), 1, now);
+        for _ in 0..100 {
+            now += RETURN_RETRY_INTERVAL;
+            let _ = handoff.due(now);
+        }
+        assert_eq!(
+            handoff.take_exhausted(),
+            vec![addr(1)],
+            "the session cleanup must run exactly once"
+        );
+        assert!(
+            handoff.take_exhausted().is_empty(),
+            "a later tick must not clean the same session again"
+        );
+        assert!(!handoff.is_pending(addr(1)));
+    }
+
+    /// A new crossing (new serial) gets a fresh retry budget instead of the
+    /// leftovers of the previous episode.
+    #[test]
+    fn a_new_crossing_resets_the_retry_budget() {
+        let mut handoff = ReturnHandoff::default();
+        let mut now = Instant::now();
+        handoff.request(addr(1), 1, now);
+        // Spend almost the whole budget on the first episode.
+        for _ in 0..(RETURN_MAX_ATTEMPTS - 2) {
+            now += RETURN_RETRY_INTERVAL;
+            let _ = handoff.due(now);
+        }
+        handoff.request(addr(1), 2, now);
+        let mut retries = 0;
+        for _ in 0..100 {
+            now += RETURN_RETRY_INTERVAL;
+            retries += handoff.due(now).len();
+        }
+        assert_eq!(
+            retries as u32,
+            RETURN_MAX_ATTEMPTS - 1,
+            "the new episode must be retried for the full budget"
+        );
+    }
+
+    #[test]
+    fn a_later_crossing_starts_a_new_episode() {
+        let mut handoff = ReturnHandoff::default();
+        let mut now = Instant::now();
+        handoff.request(addr(1), 1, now);
+        for _ in 0..100 {
+            now += RETURN_RETRY_INTERVAL;
+            let _ = handoff.due(now);
+        }
+        // The user crosses again: a fresh request must be retried again.
+        handoff.request(addr(1), 2, now);
+        assert_eq!(handoff.due(now + RETURN_RETRY_INTERVAL), vec![(addr(1), 2)]);
+    }
+
+    #[test]
+    fn handoffs_are_tracked_per_session() {
+        let mut handoff = ReturnHandoff::default();
+        let now = Instant::now();
+        handoff.request(addr(1), 1, now);
+        handoff.request(addr(2), 2, now);
+        handoff.confirmed(addr(1));
+        let mut due = handoff.due(now + RETURN_RETRY_INTERVAL);
+        due.sort_by_key(|(addr, _)| addr.port());
+        assert_eq!(
+            due,
+            vec![(addr(2), 2)],
+            "only the unconfirmed session retries"
+        );
+    }
 
     #[test]
     fn an_unpinned_legacy_client_can_adopt_a_peer() {

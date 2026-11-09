@@ -85,8 +85,22 @@ impl WlrootsEmulation {
             },
             queue,
         };
-        while emulate.state.keymap.is_none() {
-            emulate.queue.blocking_dispatch(&mut emulate.state)?;
+        // Wait for the seat's keyboard keymap, which is needed to create the
+        // virtual keyboard. A compositor whose seat has no keyboard capability
+        // never sends one, so an unbounded `blocking_dispatch` loop would hang
+        // startup forever; fall through with a warning instead (add_client
+        // handles a missing keymap) and keep the backend usable for pointer
+        // input.
+        for _ in 0..8 {
+            if emulate.state.keymap.is_some() {
+                break;
+            }
+            emulate.queue.roundtrip(&mut emulate.state)?;
+        }
+        if emulate.state.keymap.is_none() {
+            log::warn!(
+                "compositor did not send a keyboard keymap; keyboard emulation may not work"
+            );
         }
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
         // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
@@ -153,17 +167,26 @@ impl Emulation for WlrootsEmulation {
                     _ => {}
                 }
             }
-            virtual_input
-                .consume_event(event)
-                .unwrap_or_else(|_| panic!("failed to convert event: {event:?}"));
+            if virtual_input.consume_event(event).is_err() {
+                // Events arrive from the network: a button state or axis value
+                // outside the protocol enums must never panic the whole
+                // service (that would kill capture, network and IPC with it).
+                log::warn!("dropping unsupported event: ({handle}) - {event:?}");
+                return Ok(());
+            }
             match self.queue.flush() {
                 Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.last_flush_failed = true;
                     log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
                 }
-                Err(WaylandError::Protocol(e)) => panic!("wayland protocol violation: {e}"),
                 Ok(()) => self.last_flush_failed = false,
-                Err(e) => Err(e)?,
+                // A protocol violation is fatal for this Wayland connection.
+                // Report it as an emulation error so the service can disable
+                // emulation instead of panicking (and taking the app down).
+                Err(e) => {
+                    log::error!("wayland connection error: {e}");
+                    return Err(e.into());
+                }
             }
         }
         Ok(())
@@ -204,19 +227,40 @@ impl VirtualInput {
         match event {
             Event::Pointer(e) => {
                 match e {
-                    PointerEvent::Motion { dx, dy, .. } => self.pointer.motion(now, dx, dy),
+                    PointerEvent::Motion { dx, dy, .. } => {
+                        // Non-finite deltas come from a corrupted packet; they
+                        // must not reach the compositor's pointer state.
+                        if !dx.is_finite() || !dy.is_finite() {
+                            return Err(());
+                        }
+                        self.pointer.motion(now, dx, dy);
+                    }
                     PointerEvent::Button { button, state, .. } => {
-                        let state: ButtonState = state.try_into()?;
+                        // 0 = released, anything else is a press: the wire
+                        // carries a raw u32 and a malformed value must not turn
+                        // into a panic via an enum conversion.
+                        let state = if state == 0 {
+                            ButtonState::Released
+                        } else {
+                            ButtonState::Pressed
+                        };
                         self.pointer.button(now, button, state);
                     }
                     PointerEvent::Axis { axis, value, .. } => {
-                        let axis: Axis = (axis as u32).try_into()?;
+                        let Ok(axis) = Axis::try_from(u32::from(axis)) else {
+                            return Err(());
+                        };
+                        if !value.is_finite() {
+                            return Err(());
+                        }
                         self.pointer.axis(now, axis, value);
                         self.pointer.axis_source(AxisSource::Continuous);
                         self.pointer.frame();
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
-                        let axis: Axis = (axis as u32).try_into()?;
+                        let Ok(axis) = Axis::try_from(u32::from(axis)) else {
+                            return Err(());
+                        };
                         self.pointer
                             .axis_discrete(now, axis, value as f64 / 8., value / 120);
                         self.pointer.axis_source(AxisSource::Wheel);
@@ -227,7 +271,10 @@ impl VirtualInput {
             }
             Event::Keyboard(e) => match e {
                 KeyboardEvent::Key { key, state, .. } => {
-                    self.keyboard.key(now, key, state as u32);
+                    // wl_keyboard.key only knows state 0 (released) and 1
+                    // (pressed); forwarding a raw u32 would be a protocol
+                    // violation for any other wire value.
+                    self.keyboard.key(now, key, u32::from(state != 0));
                     if let Ok(mut mods) = self.modifiers.lock() {
                         if mods.update_by_key_event(key, state) {
                             log::trace!("Key triggers modifier change: {mods:?}");

@@ -22,7 +22,10 @@ use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::{sync::Notify, task::JoinHandle};
 
@@ -47,8 +50,15 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
-    /// notify to cancel key repeats
+    /// notify to cancel key repeats (wakes the task immediately)
     notify_repeat_task: Arc<Notify>,
+    /// cancellation flag of the currently running repeat task
+    ///
+    /// A notification is *not* queued when the task has not been polled yet, so
+    /// the flag makes cancellation reliable: without it a press+release pair
+    /// faster than the task's first poll made `cancel_repeat_task` wait forever
+    /// while the task kept injecting repeats (hung emulation + stuck key).
+    repeat_cancel: Arc<AtomicBool>,
     /// cached key for `natural_scroll_enabled`
     natural_scroll_key: CFString,
 }
@@ -95,6 +105,7 @@ impl MacOSEmulation {
             button_click_state: 0,
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
+            repeat_cancel: Arc::new(AtomicBool::new(false)),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
             natural_scroll_key: CFString::new("com.apple.swipescrolldirection"),
         })
@@ -115,17 +126,30 @@ impl MacOSEmulation {
         let event_source = self.event_source.clone();
         let notify = self.notify_repeat_task.clone();
         let modifiers = self.modifier_state.clone();
+        // Each task gets its own cancellation flag: a stale notification must
+        // never cancel a later task.
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.repeat_cancel = cancel.clone();
         let repeat_task = tokio::task::spawn_local(async move {
-            let stop = tokio::select! {
-                _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
-                _ = notify.notified() => true,
-            };
+            // The flag is checked before the first wait: the task may not have
+            // been polled yet when it is cancelled, and a lost notification
+            // would otherwise keep it (and the caller awaiting it) alive.
+            let mut stop = cancel.load(Ordering::SeqCst);
+            if !stop {
+                stop = tokio::select! {
+                    _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
+                    _ = notify.notified() => true,
+                };
+            }
             if !stop {
                 loop {
                     key_event(event_source.clone(), key, 1, modifiers.get());
-                    tokio::select! {
-                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
-                        _ = notify.notified() => break,
+                    let stopped = tokio::select! {
+                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => cancel.load(Ordering::SeqCst),
+                        _ = notify.notified() => true,
+                    };
+                    if stopped {
+                        break;
                     }
                 }
             }
@@ -149,6 +173,9 @@ impl MacOSEmulation {
 
     async fn cancel_repeat_task(&mut self) {
         if let Some(task) = self.repeat_task.take() {
+            // Set the flag *before* waking the task: a wait that starts after
+            // the notification is still cancelled by the flag.
+            self.repeat_cancel.store(true, Ordering::SeqCst);
             self.notify_repeat_task.notify_waiters();
             let _ = task.await;
         }
@@ -480,7 +507,10 @@ impl Emulation for MacOSEmulation {
                         }
 
                         log::debug!("click_state: {}", self.button_click_state);
-                        let location = self.get_mouse_location().unwrap();
+                        let Some(location) = self.get_mouse_location() else {
+                            log::warn!("could not get mouse location!");
+                            return Ok(());
+                        };
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
@@ -511,6 +541,11 @@ impl Emulation for MacOSEmulation {
                         axis,
                         value,
                     } => {
+                        // Non-finite values come from a corrupted packet.
+                        if !value.is_finite() {
+                            log::warn!("invalid scroll event: {axis}, {value}");
+                            return Ok(());
+                        }
                         let value = if natural_scroll_enabled(&self.natural_scroll_key) {
                             -value as i32
                         } else {
@@ -584,6 +619,13 @@ impl Emulation for MacOSEmulation {
                     key,
                     state,
                 } => {
+                    // The wire carries an u32; the evdev table is indexed by u16.
+                    // A malformed/hostile key must not be truncated into a
+                    // different, valid-looking key code.
+                    let Ok(evdev) = u16::try_from(key) else {
+                        log::warn!("key code out of range: {key}");
+                        return Ok(());
+                    };
                     // Fallback table for Linux evdev keys that have no macOS CGKeyCode in
                     // the keycode crate's Chromium-derived table. F13/F14/F15 are the
                     // conventional macOS stand-ins for Print Screen / Scroll Lock / Pause,
@@ -592,7 +634,7 @@ impl Emulation for MacOSEmulation {
                         Ok(scancode::Linux::KeySysrq) => 0x69,      // F13
                         Ok(scancode::Linux::KeyScrollLock) => 0x6B, // F14
                         Ok(scancode::Linux::KeyPause) => 0x71,      // F15
-                        _ => match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
+                        _ => match KeyMap::from_key_mapping(KeyMapping::Evdev(evdev)) {
                             Ok(k) => k.mac as CGKeyCode,
                             Err(_) => {
                                 log::warn!("unable to map key event");
@@ -643,9 +685,19 @@ impl Emulation for MacOSEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        // Session over: never let a repeating key outlive it.
+        self.cancel_repeat_task().await;
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.cancel_repeat_task().await;
+    }
+
+    /// macOS synthesizes key repeat in [`Self::spawn_repeat_task`].
+    fn synthesizes_key_repeat(&self) -> bool {
+        true
+    }
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
@@ -695,10 +747,11 @@ fn set_modifiers(
     locked: u32,
     group: u32,
 ) {
-    let depressed = XMods::from_bits(depressed).unwrap_or_default();
-    let _latched = XMods::from_bits(latched).unwrap_or_default();
+    // Unknown bits from a peer must be ignored, not discard the known ones.
+    let depressed = XMods::from_bits_truncate(depressed);
+    let _latched = XMods::from_bits_truncate(latched);
     let locked = XMods::from_bits_truncate(locked);
-    let _group = XMods::from_bits(group).unwrap_or_default();
+    let _group = XMods::from_bits_truncate(group);
 
     active_modifiers.replace(depressed | (locked & XMods::LockMask));
 }

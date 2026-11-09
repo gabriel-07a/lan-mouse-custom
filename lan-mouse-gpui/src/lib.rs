@@ -119,7 +119,10 @@ mod tray {
 
     pub(crate) fn spawn() -> async_channel::Receiver<Command> {
         let (tx, rx) = async_channel::unbounded();
-        std::thread::Builder::new()
+        // A failed thread spawn (resource exhaustion) must not panic the UI at
+        // startup: without a tray the window simply has no Open/Quit menu, which
+        // is handled by the in-window Quit button.
+        let spawn_result = std::thread::Builder::new()
             .name("lan-mouse-tray".into())
             .spawn(move || {
                 use ksni::TrayMethods;
@@ -140,8 +143,10 @@ mod tray {
                         Err(error) => log::warn!("system tray unavailable: {error}"),
                     }
                 });
-            })
-            .expect("spawn tray thread");
+            });
+        if let Err(error) = spawn_result {
+            log::warn!("could not spawn the system tray thread: {error}");
+        }
         rx
     }
 }
@@ -220,7 +225,12 @@ mod tray {
     }
 }
 
-#[cfg(not(feature = "tray"))]
+/// Fallback for targets without a native tray implementation.
+///
+/// Linux uses StatusNotifierItem and Windows the `tray-icon` crate; other
+/// targets (macOS is documented as unsupported/dormant) must still compile, so
+/// they get an inert channel instead of an unresolved module.
+#[cfg(not(all(feature = "tray", any(target_os = "linux", windows))))]
 mod tray {
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum Command {
@@ -234,65 +244,397 @@ mod tray {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ClientRow {
-    handle: ClientHandle,
-    name: String,
-    endpoint: String,
-    state: String,
-    action: &'static str,
-    active: bool,
-    healthy: bool,
+/// A round-trip reply younger than this proves the outgoing link still works.
+///
+/// The service pings in rounds of ~2 s and closes a link that stopped answering
+/// after two missed rounds; 6 s is conservative and absorbs scheduler jitter
+/// without flickering the badge on a single lost packet. Mirrors the GTK
+/// frontend's `LINK_FRESH_WINDOW` (docs/audit-connected-truth.md §2.1).
+const LINK_FRESH_WINDOW_MS: u64 = 6_000;
+
+/// Milliseconds since the Unix epoch, matching the clock the service uses for
+/// [`ClientState::last_pong_at`].
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
-impl ClientRow {
-    fn from_state(config: &ClientConfig, state: &ClientState) -> Self {
-        let name = config
-            .hostname
-            .clone()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| {
-                config
-                    .fix_ips
-                    .iter()
-                    .next()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "Unknown device".to_string())
-            });
-        let endpoint = state
-            .active_addr
-            .or(state.incoming_addr)
-            .map(|addr| addr.to_string())
-            .or_else(|| config.fix_ips.iter().next().map(ToString::to_string))
-            .unwrap_or_else(|| format!("port {}", config.port));
-        let healthy = state.last_pong_at.is_some_and(|pong| {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            now_ms.saturating_sub(pong) < 6_000
-        });
-        let (state_label, action) = if !state.active && state.incoming_addr.is_none() {
-            ("Disconnected", "Connect")
-        } else if state.active && healthy {
-            ("Connected", "Disconnect")
-        } else if state.active && state.active_addr.is_some() {
-            ("Connecting…", "Cancel")
-        } else if state.incoming_addr.is_some() {
-            ("Peer connected", "Also connect")
-        } else {
-            ("Disconnected", "Connect")
-        };
-        Self {
-            handle: 0,
-            name,
-            endpoint,
-            state: state_label.to_string(),
-            action,
-            active: state.active,
-            healthy,
+/// Char-safe fingerprint truncation for badges and labels.
+///
+/// The service normalizes fingerprints to hex today, but a config file can carry
+/// arbitrary text: slicing a `String` by byte offset panics on a multi-byte
+/// boundary, so the UI must never do that with untrusted text.
+fn short_fingerprint(fingerprint: &str, max_chars: usize) -> String {
+    let mut short: String = fingerprint.chars().take(max_chars).collect();
+    if fingerprint.chars().count() > max_chars {
+        short.push('…');
+    }
+    short
+}
+
+/// Normalized certificate fingerprint of a configured client, if it carries one.
+///
+/// Only the fingerprint is peer identity: two configured clients with the same
+/// fingerprint are the same device (a service entry per address family), while a
+/// hostname or IP is not proof of identity.
+fn normalized_fingerprint(config: &ClientConfig) -> Option<String> {
+    config
+        .fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// Honest, proof-based connection state of one logical peer card.
+///
+/// Derived from the properties the service publishes plus the only direct
+/// evidence of a working round-trip: a recent [`ClientState::last_pong_at`].
+/// `active_addr` only proves the DTLS handshake completed and `alive` is the
+/// peer's "emulation enabled" flag (set optimistically at the handshake), so
+/// neither may be used as liveness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkState {
+    /// Turned off locally and no peer session.
+    Disabled,
+    /// Enabled, an outgoing link may exist, but no round-trip was observed yet.
+    Connecting,
+    /// The link answered before but the peer went silent: never claim Connected.
+    Reconnecting,
+    /// Link up and answering, but the peer reports its emulation as disabled.
+    ConnectedDegraded,
+    /// Outgoing link established and answering, peer emulation enabled.
+    Connected,
+    /// Same, plus an accepted incoming session from the peer.
+    ConnectedBidirectional,
+    /// Incoming session accepted (peer may control us while it enters); the
+    /// outgoing direction may still be missing or unconfirmed.
+    Receiving,
+}
+
+impl LinkState {
+    /// Badge text. Only states backed by a recent round-trip claim "Connected".
+    fn badge(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disconnected",
+            Self::Connecting => "Connecting…",
+            Self::Reconnecting => "Reconnecting…",
+            Self::Connected | Self::ConnectedBidirectional | Self::ConnectedDegraded => "Connected",
+            // An accepted incoming session does not prove the peer entered this
+            // screen or sends input, so this deliberately says neither.
+            Self::Receiving => "Peer connected",
         }
     }
+
+    /// Whether the card must use the amber "not fully healthy" styling.
+    fn is_degraded(self) -> bool {
+        matches!(
+            self,
+            Self::Connecting | Self::Reconnecting | Self::ConnectedDegraded
+        )
+    }
+}
+
+/// The single action a card offers for its derived state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowAction {
+    /// Turn the client on and connect to it.
+    Connect,
+    /// The peer is already connected to us: enable the outgoing direction too.
+    ConnectAlso,
+    /// Stop a pending attempt (the service keeps retrying while the client is
+    /// enabled; deactivating is the only cancellation the IPC offers).
+    Cancel,
+    /// Turn the client off.
+    Disconnect,
+}
+
+impl RowAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "Connect",
+            Self::ConnectAlso => "Also connect",
+            Self::Cancel => "Cancel",
+            Self::Disconnect => "Disconnect",
+        }
+    }
+
+    /// Whether pressing the action turns the client on.
+    fn wants_activation(self) -> bool {
+        matches!(self, Self::Connect | Self::ConnectAlso)
+    }
+}
+
+/// Derive the card state from the service-published properties and the last
+/// observed `Pong` timestamp.
+fn link_state(
+    active: bool,
+    alive: bool,
+    has_outgoing: bool,
+    has_incoming: bool,
+    last_pong_at: Option<u64>,
+    now_ms: u64,
+) -> LinkState {
+    if !active {
+        return if has_incoming {
+            LinkState::Receiving
+        } else {
+            LinkState::Disabled
+        };
+    }
+    if !has_outgoing {
+        return if has_incoming {
+            LinkState::Receiving
+        } else {
+            LinkState::Connecting
+        };
+    }
+    let fresh =
+        last_pong_at.is_some_and(|seen| now_ms.saturating_sub(seen) <= LINK_FRESH_WINDOW_MS);
+    if !fresh {
+        return if last_pong_at.is_some() {
+            LinkState::Reconnecting
+        } else {
+            LinkState::Connecting
+        };
+    }
+    match (alive, has_incoming) {
+        (true, true) => LinkState::ConnectedBidirectional,
+        (true, false) => LinkState::Connected,
+        (false, _) => LinkState::ConnectedDegraded,
+    }
+}
+
+/// Pick the single action for a state (same table as the GTK frontend).
+fn row_action(state: LinkState, active: bool) -> RowAction {
+    match state {
+        LinkState::Disabled => RowAction::Connect,
+        LinkState::Connecting => RowAction::Cancel,
+        LinkState::Reconnecting => RowAction::Disconnect,
+        LinkState::Connected | LinkState::ConnectedBidirectional | LinkState::ConnectedDegraded => {
+            RowAction::Disconnect
+        }
+        LinkState::Receiving if active => RowAction::Cancel,
+        LinkState::Receiving => RowAction::ConnectAlso,
+    }
+}
+
+/// One logical peer rendered as a single card: every configured client whose
+/// certificate fingerprint is the same device.
+#[derive(Clone, Debug, PartialEq)]
+struct PeerAggregate {
+    primary: ClientHandle,
+    members: Vec<ClientHandle>,
+    name: String,
+    endpoint: String,
+    position: Position,
+    sensitivity: u16,
+    active: bool,
+    alive: bool,
+    has_outgoing: bool,
+    has_incoming: bool,
+    last_pong_at: Option<u64>,
+    rtt_ms: Option<u32>,
+    jitter_ms: Option<u32>,
+    loss_percent: Option<u8>,
+    peer_commit: Option<[u8; 8]>,
+    last_error: Option<String>,
+}
+
+/// Merge the configured clients that belong to one logical peer.
+///
+/// `active` is the OR of the members; the link fields come from a member with an
+/// established outgoing link (preferring one that already produced a round-trip)
+/// so duplicate entries cannot make the card flap between address families.
+fn aggregate_peer(members: &[(ClientHandle, ClientConfig, ClientState)]) -> Option<PeerAggregate> {
+    let (primary, first_config, _) = members.first()?;
+    let link_index = members
+        .iter()
+        .position(|(_, _, state)| state.active_addr.is_some() && state.last_pong_at.is_some())
+        .or_else(|| {
+            members
+                .iter()
+                .position(|(_, _, state)| state.active_addr.is_some())
+        })
+        .unwrap_or(0);
+    let (_, link_config, link_state) = &members[link_index];
+    let hostname = members.iter().find_map(|(_, config, _)| {
+        config
+            .hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    });
+    let endpoint = link_state
+        .active_addr
+        .or_else(|| members.iter().find_map(|(_, _, state)| state.incoming_addr))
+        .map(|addr| addr.to_string())
+        .or_else(|| {
+            members
+                .iter()
+                .find_map(|(_, config, _)| config.fix_ips.first().map(ToString::to_string))
+        })
+        .unwrap_or_else(|| format!("port {}", first_config.port));
+    let name = hostname.clone().unwrap_or_else(|| {
+        members
+            .iter()
+            .find_map(|(_, config, _)| config.fix_ips.first().map(ToString::to_string))
+            .unwrap_or_else(|| "Unknown device".to_string())
+    });
+    let has_outgoing = members
+        .iter()
+        .any(|(_, _, state)| state.active_addr.is_some());
+    let has_incoming = members
+        .iter()
+        .any(|(_, _, state)| state.incoming_addr.is_some());
+    Some(PeerAggregate {
+        primary: *primary,
+        members: members.iter().map(|(handle, _, _)| *handle).collect(),
+        name,
+        endpoint,
+        position: link_config.pos,
+        sensitivity: first_config.sensitivity,
+        active: members.iter().any(|(_, _, state)| state.active),
+        alive: link_state.alive,
+        has_outgoing,
+        has_incoming,
+        last_pong_at: members
+            .iter()
+            .filter_map(|(_, _, state)| state.last_pong_at)
+            .max(),
+        rtt_ms: link_state
+            .rtt_ms
+            .or_else(|| members.iter().find_map(|(_, _, state)| state.rtt_ms)),
+        jitter_ms: link_state.jitter_ms,
+        loss_percent: link_state.loss_percent,
+        peer_commit: members.iter().find_map(|(_, _, state)| state.peer_commit),
+        last_error: link_state.last_error.clone().or_else(|| {
+            members
+                .iter()
+                .find_map(|(_, _, state)| state.last_error.clone())
+        }),
+    })
+}
+
+/// A new endpoint must persist this long before replacing the one shown on a
+/// card. Prevents IPv4/IPv6 alternation when the service reports a different
+/// source address per packet (same debounce as the GTK frontend).
+const ENDPOINT_STICKY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Debounced endpoint memory for one logical peer.
+#[derive(Clone, Debug, Default)]
+struct EndpointUi {
+    shown: Option<String>,
+    candidate: Option<(String, std::time::Instant)>,
+}
+
+/// Debounce a flapping endpoint so the card does not alternate between address
+/// families on every packet.
+///
+/// `shown`/`candidate` are caller-owned memory (one pair per peer). A new
+/// endpoint replaces the shown one immediately when nothing was shown yet, and
+/// only after it persisted for `hold` otherwise. Returns the endpoint that
+/// should be displayed now.
+fn sticky_endpoint(
+    shown: &mut Option<String>,
+    candidate: &mut Option<(String, std::time::Instant)>,
+    raw: Option<String>,
+    now: std::time::Instant,
+    hold: std::time::Duration,
+) -> Option<String> {
+    let Some(raw) = raw else {
+        *candidate = None;
+        *shown = None;
+        return None;
+    };
+    if shown.as_deref() == Some(raw.as_str()) {
+        *candidate = None;
+        return Some(raw);
+    }
+    let Some(previous) = shown.clone() else {
+        *shown = Some(raw.clone());
+        *candidate = None;
+        return Some(raw);
+    };
+    match candidate {
+        Some((pending, since)) if pending == &raw => {
+            if now.saturating_duration_since(*since) >= hold {
+                *shown = Some(raw.clone());
+                *candidate = None;
+                Some(raw)
+            } else {
+                Some(previous)
+            }
+        }
+        _ => {
+            *candidate = Some((raw, now));
+            Some(previous)
+        }
+    }
+}
+
+/// Group client handles into logical peers by certificate fingerprint.
+///
+/// Handles are sorted first so the card order is deterministic. Two configured
+/// clients with the same fingerprint are the same device (the service can hold
+/// one entry per address family); entries without a fingerprint stay separate on
+/// purpose, because hiding a real device would be worse than a duplicate.
+fn group_peer_handles(
+    clients: &HashMap<ClientHandle, (ClientConfig, ClientState)>,
+) -> Vec<Vec<ClientHandle>> {
+    let mut handles = clients.keys().copied().collect::<Vec<_>>();
+    handles.sort_unstable();
+    let mut groups: Vec<(Option<String>, Vec<ClientHandle>)> = Vec::new();
+    for handle in handles {
+        let identity = clients
+            .get(&handle)
+            .and_then(|(config, _)| normalized_fingerprint(config));
+        match identity {
+            Some(identity) => match groups
+                .iter_mut()
+                .find(|(key, _)| key.as_deref() == Some(identity.as_str()))
+            {
+                Some((_, members)) => members.push(handle),
+                None => groups.push((Some(identity), vec![handle])),
+            },
+            None => groups.push((None, vec![handle])),
+        }
+    }
+    groups.into_iter().map(|(_, members)| members).collect()
+}
+
+/// Human-friendly age of a Unix timestamp in seconds (audit history rows).
+fn format_timestamp_age(ts_secs: u64, now_ms: u64) -> String {
+    let age = now_ms / 1000;
+    let age = age.saturating_sub(ts_secs);
+    match age {
+        0..=59 => format!("{age}s ago"),
+        60..=3599 => format!("{}m ago", age / 60),
+        3600..=86_399 => format!("{}h ago", age / 3600),
+        _ => format!("{}d ago", age / 86_400),
+    }
+}
+
+/// Whether a client pinned to `fingerprint` has a round-trip proof younger than
+/// the freshness window.
+fn has_fresh_pong(
+    clients: &HashMap<ClientHandle, (ClientConfig, ClientState)>,
+    fingerprint: &str,
+    now_ms: u64,
+) -> bool {
+    let identity = fingerprint.trim();
+    if identity.is_empty() {
+        return false;
+    }
+    clients.values().any(|(config, state)| {
+        normalized_fingerprint(config).is_some_and(|known| known.eq_ignore_ascii_case(identity))
+            && state
+                .last_pong_at
+                .is_some_and(|seen| now_ms.saturating_sub(seen) <= LINK_FRESH_WINDOW_MS)
+    })
 }
 
 fn position_label(position: Position) -> &'static str {
@@ -385,8 +727,15 @@ enum AddField {
 enum SettingsDialogKind {
     Address,
     Certificate,
-    Client { handle: ClientHandle },
-    RenameDevice { fingerprint: String },
+    /// All configured clients of one logical peer (a peer can have one entry per
+    /// address family); an edit is applied to every member so duplicates cannot
+    /// diverge.
+    Client {
+        members: Vec<ClientHandle>,
+    },
+    RenameDevice {
+        fingerprint: String,
+    },
     Port,
 }
 
@@ -426,9 +775,9 @@ impl SettingsDialog {
         }
     }
 
-    fn new_client(handle: ClientHandle, config: &ClientConfig) -> Self {
+    fn new_client(members: Vec<ClientHandle>, config: &ClientConfig) -> Self {
         Self {
-            kind: SettingsDialogKind::Client { handle },
+            kind: SettingsDialogKind::Client { members },
             hostname: config.hostname.clone().unwrap_or_default(),
             port: config.port.to_string(),
             address: String::new(),
@@ -524,6 +873,8 @@ enum BridgeMessage {
     Writer(FrontendRequestWriter),
     Event(Box<FrontendEvent>),
     Error(String),
+    /// The service closed the IPC stream (crash or shutdown).
+    Closed,
 }
 
 struct Dashboard {
@@ -555,6 +906,10 @@ struct Dashboard {
     metric_history: HashMap<ClientHandle, VecDeque<MetricSample>>,
     history: Vec<HistoryEntry>,
     policy_export: Option<String>,
+    /// Debounced endpoint shown per logical peer (first member handle).
+    shown_endpoints: HashMap<ClientHandle, EndpointUi>,
+    /// When the user last requested a network scan (rate limit).
+    scan_requested_at: Option<std::time::Instant>,
     first_frame_logged: bool,
 }
 
@@ -577,18 +932,27 @@ impl Dashboard {
                     return;
                 }
             };
-            let _ = tx.send_blocking(BridgeMessage::Writer(writer));
-            while let Some(event) = reader.next_event() {
-                match event {
-                    Ok(event) => {
+            if tx.send_blocking(BridgeMessage::Writer(writer)).is_err() {
+                return;
+            }
+            loop {
+                match reader.next_event() {
+                    Some(Ok(event)) => {
                         if tx
                             .send_blocking(BridgeMessage::Event(Box::new(event)))
                             .is_err()
                         {
-                            break;
+                            return;
                         }
                     }
-                    Err(error) => log::warn!("frontend event error: {error}"),
+                    Some(Err(error)) => log::warn!("frontend event error: {error}"),
+                    None => {
+                        // The service closed the IPC socket (crash or exit).
+                        // Tell the UI instead of silently freezing on stale
+                        // state: every request from then on is lost.
+                        let _ = tx.send_blocking(BridgeMessage::Closed);
+                        return;
+                    }
                 }
             }
         });
@@ -599,6 +963,22 @@ impl Dashboard {
                     this.handle_bridge(message);
                     cx.notify();
                 });
+            }
+        })
+        .detach();
+
+        // Round-trip freshness decays with time, so the view must be refreshed
+        // even when the service sends no further events; otherwise a silent peer
+        // would keep showing "Connected" forever (the GTK frontend has the same
+        // 1 s status tick). State itself still comes only from the service.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
             }
         })
         .detach();
@@ -635,6 +1015,8 @@ impl Dashboard {
             metric_history: HashMap::new(),
             history: Vec::new(),
             policy_export: None,
+            shown_endpoints: HashMap::new(),
+            scan_requested_at: None,
             first_frame_logged: false,
         }
     }
@@ -659,6 +1041,13 @@ impl Dashboard {
             BridgeMessage::Error(error) => {
                 self.status = format!("Service error: {error}");
             }
+            BridgeMessage::Closed => {
+                // Keep showing the last state but never pretend it is live: the
+                // service is gone, so every subsequent request is lost.
+                self.writer = None;
+                self.status =
+                    "Lost connection to the Lan Mouse service — restart Lan Mouse".to_string();
+            }
         }
     }
 
@@ -666,6 +1055,8 @@ impl Dashboard {
         match event {
             FrontendEvent::Enumerate(rows) => {
                 self.clients.clear();
+                // Endpoint debounce state belongs to the snapshot being replaced.
+                self.shown_endpoints.clear();
                 for (handle, config, state) in rows {
                     self.remember_metrics(handle, &state);
                     self.clients.insert(handle, (config, state));
@@ -726,6 +1117,7 @@ impl Dashboard {
             FrontendEvent::Deleted(handle) => {
                 self.clients.remove(&handle);
                 self.metric_history.remove(&handle);
+                self.shown_endpoints.remove(&handle);
                 if self.selected_client == Some(handle) {
                     self.selected_client = None;
                 }
@@ -734,7 +1126,12 @@ impl Dashboard {
             FrontendEvent::Hello { ipc_version } => {
                 self.status = format!("Service connected (IPC v{ipc_version})");
             }
-            FrontendEvent::Error(error) => self.status = error,
+            FrontendEvent::Error(error) => {
+                self.status = error;
+                // A failed create must not leave a half-configured pending add
+                // around to be applied to an unrelated client later.
+                self.pending_add = None;
+            }
             FrontendEvent::Devices(devices) => self.devices = devices,
             FrontendEvent::NetworkScan(devices) => self.discovered = devices,
             FrontendEvent::AddressRules(rules) => self.address_rules = rules,
@@ -756,26 +1153,95 @@ impl Dashboard {
             FrontendEvent::Diagnostics(diagnostics) => self.diagnostics = diagnostics,
             FrontendEvent::ConnectionHistory(history) => self.history = history,
             FrontendEvent::PolicyExport { json } => self.policy_export = Some(json),
+            // The full request is shown as a card on the Devices page; a status
+            // hint makes it visible without an extra IPC round-trip.
+            FrontendEvent::ConnectionAttempt { addr, .. } => {
+                self.status =
+                    format!("Connection request from {addr} — review it on the Devices page");
+            }
+            FrontendEvent::CertificateChanged { name, .. } => {
+                self.status = format!(
+                    "Certificate changed for {name} — review the pending request before approving"
+                );
+            }
             _ => {}
         }
     }
 
     fn send(&mut self, request: FrontendRequest) {
-        if let Some(writer) = self.writer.as_mut() {
-            if let Err(error) = writer.request(request) {
-                self.status = format!("IPC write error: {error}");
-            }
+        let Some(writer) = self.writer.as_mut() else {
+            self.status = "Not connected to the Lan Mouse service yet".to_string();
+            return;
+        };
+        if let Err(error) = writer.request(request) {
+            self.status = format!("IPC write error: {error}");
         }
     }
 
-    fn toggle_client(&mut self, handle: ClientHandle) {
-        let active = self
-            .clients
-            .get(&handle)
-            .map(|(_, state)| state.active)
-            .unwrap_or(false);
-        self.send(FrontendRequest::Activate(handle, !active));
-        self.selected_client = Some(handle);
+    /// Apply the card's displayed action to every configured client of the peer.
+    ///
+    /// The activation bit is derived from the *displayed* action, never from the
+    /// raw `state.active` flag: that is what kept the old "Connect" button
+    /// disconnecting an already enabled client.
+    fn apply_row_action(&mut self, members: &[ClientHandle], action: RowAction) {
+        let activate = action.wants_activation();
+        for handle in members {
+            self.send(FrontendRequest::Activate(*handle, activate));
+        }
+        self.selected_client = members.first().copied();
+    }
+
+    /// Configured clients grouped into logical peers by certificate fingerprint.
+    ///
+    /// Two configured clients with the same fingerprint are the same device (the
+    /// service can hold one entry per address family). Entries without a
+    /// fingerprint stay separate on purpose: hiding a real device would be worse
+    /// than showing a duplicate.
+    fn peer_groups(&self) -> Vec<Vec<ClientHandle>> {
+        group_peer_handles(&self.clients)
+    }
+
+    fn aggregate_members(&self, members: &[ClientHandle]) -> Option<PeerAggregate> {
+        let entries = members
+            .iter()
+            .filter_map(|handle| {
+                self.clients
+                    .get(handle)
+                    .map(|(config, state)| (*handle, config.clone(), state.clone()))
+            })
+            .collect::<Vec<_>>();
+        aggregate_peer(&entries)
+    }
+
+    /// Aggregate and derive the honest state for one logical peer.
+    fn peer_aggregate(&self, members: &[ClientHandle]) -> Option<(PeerAggregate, LinkState)> {
+        let aggregate = self.aggregate_members(members)?;
+        let state = link_state(
+            aggregate.active,
+            aggregate.alive,
+            aggregate.has_outgoing,
+            aggregate.has_incoming,
+            aggregate.last_pong_at,
+            unix_ms_now(),
+        );
+        Some((aggregate, state))
+    }
+
+    /// Number of peers with a fresh outgoing round-trip (sidebar counter).
+    fn healthy_link_count(&self) -> usize {
+        self.peer_groups()
+            .iter()
+            .filter(|members| {
+                self.peer_aggregate(members).is_some_and(|(_, state)| {
+                    matches!(
+                        state,
+                        LinkState::Connected
+                            | LinkState::ConnectedBidirectional
+                            | LinkState::ConnectedDegraded
+                    )
+                })
+            })
+            .count()
     }
 
     fn switch_page(&mut self, page: Page) {
@@ -793,9 +1259,12 @@ impl Dashboard {
         self.settings_dialog = Some(SettingsDialog::new_certificate());
     }
 
-    fn open_client_edit(&mut self, handle: ClientHandle) {
-        if let Some((config, _)) = self.clients.get(&handle) {
-            self.settings_dialog = Some(SettingsDialog::new_client(handle, config));
+    fn open_client_edit(&mut self, members: &[ClientHandle]) {
+        let Some(handle) = members.first() else {
+            return;
+        };
+        if let Some((config, _)) = self.clients.get(handle) {
+            self.settings_dialog = Some(SettingsDialog::new_client(members.to_vec(), config));
         }
     }
 
@@ -856,14 +1325,21 @@ impl Dashboard {
                     });
                 }
             }
-            SettingsDialogKind::Client { handle } => {
+            SettingsDialogKind::Client { members } => {
                 let hostname = dialog.hostname.trim().to_string();
-                self.send(FrontendRequest::UpdateHostname(
-                    handle,
-                    (!hostname.is_empty()).then_some(hostname),
-                ));
-                if let Ok(port) = dialog.port.trim().parse::<u16>() {
-                    self.send(FrontendRequest::UpdatePort(handle, port));
+                let hostname = (!hostname.is_empty()).then_some(hostname);
+                let port = match dialog.port.trim().parse::<u16>() {
+                    Ok(port) => Some(port),
+                    Err(_) => {
+                        self.status = "Port must be a number between 1 and 65535".to_string();
+                        None
+                    }
+                };
+                for handle in members {
+                    self.send(FrontendRequest::UpdateHostname(handle, hostname.clone()));
+                    if let Some(port) = port {
+                        self.send(FrontendRequest::UpdatePort(handle, port));
+                    }
                 }
             }
         }
@@ -910,20 +1386,31 @@ impl Dashboard {
     }
 
     fn submit_add_dialog(&mut self) {
+        if self.pending_add.is_some() {
+            // A second `Create` would be answered with another `Created` event,
+            // and the single pending-add slot cannot be matched to either one;
+            // the two clients would end up with the wrong address/config.
+            self.status = "Waiting for the service to answer the previous add request".to_string();
+            return;
+        }
         let Some(dialog) = self.add_dialog.take() else {
             return;
         };
-        let port = dialog
-            .port
-            .trim()
-            .parse::<u16>()
-            .unwrap_or(lan_mouse_ipc::DEFAULT_PORT);
-        let fingerprint = dialog
-            .fingerprint
-            .trim()
-            .is_empty()
-            .then_some(None)
-            .unwrap_or_else(|| Some(dialog.fingerprint.trim().to_string()));
+        let port = match dialog.port.trim().parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                // Keep the dialog open so the user can fix the value instead of
+                // silently adding the device on the default port.
+                self.status = "Port must be a number between 1 and 65535".to_string();
+                self.add_dialog = Some(dialog);
+                return;
+            }
+        };
+        let fingerprint = if dialog.fingerprint.trim().is_empty() {
+            None
+        } else {
+            Some(dialog.fingerprint.trim().to_string())
+        };
         self.pending_add = Some(PendingAdd::Manual {
             hostname: dialog.hostname,
             port,
@@ -970,6 +1457,10 @@ impl Dashboard {
     }
 
     fn add_discovered(&mut self, ip: std::net::IpAddr, port: u16, fingerprint: Option<String>) {
+        if self.pending_add.is_some() {
+            self.status = "Waiting for the service to answer the previous add request".to_string();
+            return;
+        }
         self.pending_add = Some(PendingAdd::Discovered {
             ip,
             port,
@@ -979,27 +1470,53 @@ impl Dashboard {
         self.send(FrontendRequest::Create);
     }
 
-    fn cycle_position(&mut self, handle: ClientHandle, current: Position) {
+    fn cycle_position(&mut self, members: &[ClientHandle], current: Position) {
         let next = match current {
             Position::Left => Position::Right,
             Position::Right => Position::Top,
             Position::Top => Position::Bottom,
             Position::Bottom => Position::Left,
         };
-        self.send(FrontendRequest::UpdatePosition(handle, next));
+        for handle in members {
+            self.send(FrontendRequest::UpdatePosition(*handle, next));
+        }
     }
 
-    fn adjust_sensitivity(&mut self, handle: ClientHandle, current: u16, delta: i32) {
+    fn adjust_sensitivity(&mut self, members: &[ClientHandle], current: u16, delta: i32) {
         let next = (i32::from(current) + delta).clamp(10, 500) as u16;
-        self.send(FrontendRequest::UpdateSensitivity(handle, next));
+        for handle in members {
+            self.send(FrontendRequest::UpdateSensitivity(*handle, next));
+        }
     }
 
-    fn resolve_dns(&mut self, handle: ClientHandle) {
-        self.send(FrontendRequest::ResolveDns(handle));
+    /// Start a network scan, at most once every few seconds.
+    ///
+    /// The service spawns a fresh discovery task per \`ScanNetwork\` request, so
+    /// repeated clicks would run concurrent scans and flood the network with
+    /// duplicate beacons.
+    fn start_scan(&mut self) {
+        let debounce = std::time::Duration::from_secs(3);
+        if self
+            .scan_requested_at
+            .is_some_and(|at| at.elapsed() < debounce)
+        {
+            return;
+        }
+        self.scan_requested_at = Some(std::time::Instant::now());
+        self.status = "Scanning the local network…".to_string();
+        self.send(FrontendRequest::ScanNetwork);
     }
 
-    fn delete_client(&mut self, handle: ClientHandle) {
-        self.send(FrontendRequest::Delete(handle));
+    fn resolve_dns(&mut self, members: &[ClientHandle]) {
+        for handle in members {
+            self.send(FrontendRequest::ResolveDns(*handle));
+        }
+    }
+
+    fn delete_peer(&mut self, members: &[ClientHandle]) {
+        for handle in members {
+            self.send(FrontendRequest::Delete(*handle));
+        }
     }
 
     fn set_policy(
@@ -1081,9 +1598,11 @@ impl Dashboard {
     }
 
     fn remember_metrics(&mut self, handle: ClientHandle, state: &ClientState) {
-        let (Some(rtt_ms), jitter_ms, loss_percent) =
-            (state.rtt_ms, state.jitter_ms.unwrap_or(0), state.loss_percent.unwrap_or(0))
-        else {
+        let (Some(rtt_ms), jitter_ms, loss_percent) = (
+            state.rtt_ms,
+            state.jitter_ms.unwrap_or(0),
+            state.loss_percent.unwrap_or(0),
+        ) else {
             return;
         };
         let history = self.metric_history.entry(handle).or_default();
@@ -1095,13 +1614,6 @@ impl Dashboard {
         while history.len() > 40 {
             history.pop_front();
         }
-    }
-
-    fn active_count(&self) -> usize {
-        self.clients
-            .values()
-            .filter(|(_, state)| state.active)
-            .count()
     }
 
     fn sidebar_item(
@@ -1132,47 +1644,99 @@ impl Dashboard {
             .on_click(cx.listener(move |this, _, _, _| this.switch_page(page)))
     }
 
-    fn render_client(
-        &self,
-        handle: ClientHandle,
-        (config, state): &(ClientConfig, ClientState),
+    /// Render one logical peer card (one or more configured clients sharing a
+    /// certificate fingerprint) from the aggregated, proof-based state.
+    fn render_peer(
+        &mut self,
+        members: &[ClientHandle],
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let mut row = ClientRow::from_state(config, state);
-        row.handle = handle;
-        let version_mismatch = state
+    ) -> gpui::AnyElement {
+        let Some((peer, state)) = self.peer_aggregate(members) else {
+            return div().into_any_element();
+        };
+        let action = row_action(state, peer.active);
+        let version_mismatch = peer
             .peer_commit
-            .is_some_and(|peer| peer != self.local_commit);
-        let mut link_metrics = state
+            .is_some_and(|peer_commit| peer_commit != self.local_commit);
+        let mut link_metrics = peer
             .rtt_ms
             .map(|rtt| format!(" · RTT {rtt} ms"))
             .unwrap_or_default();
-        if let Some(jitter) = state.jitter_ms {
+        if let Some(jitter) = peer.jitter_ms {
             link_metrics.push_str(&format!(" · jitter {jitter} ms"));
         }
-        if let Some(loss) = state.loss_percent {
+        if let Some(loss) = peer.loss_percent {
             link_metrics.push_str(&format!(" · loss {loss}%"));
         }
-        let last_error = state.last_error.clone();
-        let last_pong = state
+        let now = unix_ms_now();
+        let last_pong = peer
             .last_pong_at
-            .map(|seen| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_millis() as u64)
-                    .unwrap_or(0);
-                format!(" · last Pong {}s ago", now.saturating_sub(seen) / 1000)
-            })
+            .map(|seen| format!(" · last Pong {}s ago", now.saturating_sub(seen) / 1000))
             .unwrap_or_default();
-        let position = config.pos;
-        let sensitivity = config.sensitivity;
-        let (state_color, state_bg) = if row.healthy {
-            (GREEN, 0x173225)
-        } else if row.active {
-            (AMBER, 0x342b12)
-        } else {
-            (MUTED, 0x1d222a)
+        let stale_secs = peer
+            .last_pong_at
+            .map(|seen| now.saturating_sub(seen) / 1000)
+            .unwrap_or_default();
+        // Debounce the displayed endpoint: the service can rewrite `active_addr`
+        // on every Pong, which would make a dual-stack card flap between IPv4 and
+        // IPv6. A new endpoint only replaces the shown one after it persisted for
+        // the sticky window.
+        let display_endpoint = {
+            let ui = self.shown_endpoints.entry(peer.primary).or_default();
+            sticky_endpoint(
+                &mut ui.shown,
+                &mut ui.candidate,
+                Some(peer.endpoint.clone()),
+                std::time::Instant::now(),
+                ENDPOINT_STICKY_WINDOW,
+            )
+        }
+        .unwrap_or_else(|| peer.endpoint.clone());
+        // Explain the state using only the evidence available. A handshake is
+        // never described as "connected" and a stale link says how long the peer
+        // has been silent.
+        let detail = match state {
+            LinkState::Disabled => "offline".to_string(),
+            LinkState::Connecting if peer.has_outgoing => {
+                format!("link to {display_endpoint} up — waiting for a reply")
+            }
+            LinkState::Connecting => format!("trying {display_endpoint} — no answer yet"),
+            LinkState::Reconnecting => {
+                format!("no reply for {stale_secs}s — reconnecting…{link_metrics}{last_pong}")
+            }
+            LinkState::ConnectedDegraded => {
+                format!("link up{link_metrics}{last_pong} — emulation disabled on the other PC")
+            }
+            LinkState::Connected => format!("link healthy{link_metrics}{last_pong}"),
+            LinkState::ConnectedBidirectional => {
+                format!("link healthy (bidirectional){link_metrics}{last_pong}")
+            }
+            LinkState::Receiving if peer.active => {
+                "incoming session — outgoing connection still being established".to_string()
+            }
+            LinkState::Receiving => {
+                "incoming session — input is applied only while it enters this screen".to_string()
+            }
         };
+        let (state_color, state_bg) = if state.is_degraded() {
+            (AMBER, 0x342b12)
+        } else if state == LinkState::Disabled {
+            (MUTED, 0x1d222a)
+        } else if state == LinkState::Receiving {
+            (ACCENT, 0x1b2a3a)
+        } else {
+            (GREEN, 0x173225)
+        };
+        let position = peer.position;
+        let sensitivity = peer.sensitivity;
+        let primary = peer.primary;
+        let action_members = peer.members.clone();
+        let edit_members = peer.members.clone();
+        let dns_members = peer.members.clone();
+        let position_members = peer.members.clone();
+        let sensitivity_down_members = peer.members.clone();
+        let sensitivity_up_members = peer.members.clone();
+        let delete_members = peer.members.clone();
         div()
             .flex()
             .flex_col()
@@ -1197,13 +1761,13 @@ impl Dashboard {
                                     .text_base()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
-                                    .child(row.name.clone()),
+                                    .child(peer.name.clone()),
                             )
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(rgb(MUTED))
-                                    .child(row.endpoint.clone()),
+                                    .child(display_endpoint.clone()),
                             ),
                     )
                     .child(
@@ -1214,7 +1778,7 @@ impl Dashboard {
                             .bg(rgb(state_bg))
                             .text_color(rgb(state_color))
                             .text_xs()
-                            .child(row.state.clone()),
+                            .child(state.badge()),
                     ),
             )
             .child(
@@ -1224,27 +1788,26 @@ impl Dashboard {
                     .gap_2()
                     .child(
                         div()
-                            .id(SharedString::from(format!("toggle-{}", row.handle)))
+                            .id(SharedString::from(format!("toggle-{primary}")))
                             .px_3()
                             .py_2()
                             .rounded_md()
-                            .bg(rgb(if row.active { 0x2a2020 } else { 0x1b2a3a }))
-                            .text_color(rgb(if row.active { RED } else { ACCENT }))
+                            .bg(rgb(match action {
+                                RowAction::Connect | RowAction::ConnectAlso => 0x1b2a3a,
+                                _ => 0x2a2020,
+                            }))
+                            .text_color(rgb(match action {
+                                RowAction::Connect | RowAction::ConnectAlso => ACCENT,
+                                _ => RED,
+                            }))
                             .text_sm()
                             .cursor_pointer()
-                            .child(row.action)
-                            .on_click(cx.listener(move |this, _, _, _| this.toggle_client(handle))),
+                            .child(action.label())
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.apply_row_action(&action_members, action)
+                            })),
                     )
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                        "{}{link_metrics}{last_pong}",
-                        if row.healthy {
-                            "link healthy"
-                        } else if row.active {
-                            "waiting for reply"
-                        } else {
-                            "offline"
-                        }
-                    )))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(detail))
                     .when(version_mismatch, |this| {
                         this.child(
                             div()
@@ -1253,16 +1816,11 @@ impl Dashboard {
                                 .child("build mismatch with this peer; update both machines"),
                         )
                     })
-                    .when(last_error.is_some(), |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(RED))
-                                .child(format!(
-                                    "last error: {}",
-                                    last_error.clone().unwrap_or_default()
-                                )),
-                        )
+                    .when(peer.last_error.is_some(), |this| {
+                        this.child(div().text_xs().text_color(rgb(RED)).child(format!(
+                            "last error: {}",
+                            peer.last_error.clone().unwrap_or_default()
+                        )))
                     }),
             )
             .child(
@@ -1283,7 +1841,7 @@ impl Dashboard {
                         TEXT,
                         cx,
                         move |this, _, window, _| {
-                            this.open_client_edit(handle);
+                            this.open_client_edit(&edit_members);
                             window.focus(&this.add_focus);
                         },
                     ))
@@ -1293,7 +1851,7 @@ impl Dashboard {
                         0x1d222a,
                         TEXT,
                         cx,
-                        move |this, _, _, _| this.resolve_dns(handle),
+                        move |this, _, _, _| this.resolve_dns(&dns_members),
                     ))
                     .child(self.action_button(
                         "position",
@@ -1301,7 +1859,7 @@ impl Dashboard {
                         0x1d222a,
                         TEXT,
                         cx,
-                        move |this, _, _, _| this.cycle_position(handle, position),
+                        move |this, _, _, _| this.cycle_position(&position_members, position),
                     ))
                     .child(self.action_button(
                         "sensitivity-down",
@@ -1309,7 +1867,9 @@ impl Dashboard {
                         0x1d222a,
                         TEXT,
                         cx,
-                        move |this, _, _, _| this.adjust_sensitivity(handle, sensitivity, -10),
+                        move |this, _, _, _| {
+                            this.adjust_sensitivity(&sensitivity_down_members, sensitivity, -10)
+                        },
                     ))
                     .child(self.action_button(
                         "sensitivity-up",
@@ -1317,7 +1877,9 @@ impl Dashboard {
                         0x1d222a,
                         TEXT,
                         cx,
-                        move |this, _, _, _| this.adjust_sensitivity(handle, sensitivity, 10),
+                        move |this, _, _, _| {
+                            this.adjust_sensitivity(&sensitivity_up_members, sensitivity, 10)
+                        },
                     ))
                     .child(self.action_button(
                         "delete-client",
@@ -1325,10 +1887,11 @@ impl Dashboard {
                         0x3a2020,
                         RED,
                         cx,
-                        move |this, _, _, _| this.delete_client(handle),
+                        move |this, _, _, _| this.delete_peer(&delete_members),
                     )),
             )
-            .child(self.render_metric_sparkline(handle))
+            .child(self.render_metric_sparkline(primary))
+            .into_any_element()
     }
 
     fn render_metric_sparkline(&self, handle: ClientHandle) -> impl IntoElement + use<> {
@@ -1524,7 +2087,7 @@ impl Render for Dashboard {
                         div()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(format!("{} active link(s)", self.active_count())),
+                            .child(format!("{} active link(s)", self.healthy_link_count())),
                     ),
             );
 
@@ -1598,9 +2161,7 @@ impl Render for Dashboard {
                                     .text_sm()
                                     .cursor_pointer()
                                     .child("Scan network")
-                                    .on_click(cx.listener(|this, _, _, _| {
-                                        this.send(FrontendRequest::ScanNetwork)
-                                    })),
+                                    .on_click(cx.listener(|this, _, _, _| this.start_scan())),
                             )
                         }),
                 )
@@ -1711,7 +2272,13 @@ impl Dashboard {
                             .text_sm()
                             .text_color(rgb(TEXT))
                             .child("✕")
-                            .on_click(cx.listener(|_, _, window, _| window.remove_window())),
+                            // Close-to-tray, exactly like the WM close button
+                            // (see `on_window_should_close` below): removing the
+                            // window would leave the process alive with a tray
+                            // whose "Open" cannot restore it — an invisible app
+                            // that must be killed. Minimize keeps the window
+                            // recoverable.
+                            .on_click(cx.listener(|_, _, window, _| window.minimize_window())),
                     ),
             )
     }
@@ -2091,7 +2658,7 @@ impl Dashboard {
             .clone()
             .unwrap_or_else(|| "fingerprint not received".to_string());
         let fingerprint = if self.public_fingerprint.is_some() {
-            format!("{}…", &fingerprint_full[..fingerprint_full.len().min(16)])
+            short_fingerprint(&fingerprint_full, 16)
         } else {
             fingerprint_full.clone()
         };
@@ -2176,8 +2743,8 @@ impl Dashboard {
             let cert_changed = request.previous_fingerprint.is_some();
             let cert_warning = request.previous_fingerprint.as_deref().map(|previous| {
                 format!(
-                    "⚠ certificate changed (old: {}…). Only approve if you replaced it; the old identity will be revoked.",
-                    &previous[..previous.len().min(20)]
+                    "⚠ certificate changed (old: {}). Only approve if you replaced it; the old identity will be revoked.",
+                    short_fingerprint(previous, 20)
                 )
             });
             let name = request
@@ -2289,14 +2856,11 @@ impl Dashboard {
         div().flex().flex_col().gap_2().children(cards)
     }
 
-    fn render_devices(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let mut cards = Vec::new();
-        let mut handles: Vec<ClientHandle> = self.clients.keys().copied().collect();
-        handles.sort_unstable();
-        for handle in handles {
-            if let Some(entry) = self.clients.get(&handle) {
-                cards.push(self.render_client(handle, entry, cx).into_any_element());
-            }
+    fn render_devices(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let groups = self.peer_groups();
+        let mut cards = Vec::with_capacity(groups.len());
+        for members in &groups {
+            cards.push(self.render_peer(members, cx));
         }
 
         let pending = self.pending.len();
@@ -2415,8 +2979,8 @@ impl Dashboard {
                             .gap_1()
                             .child(div().text_sm().text_color(rgb(TEXT)).child(device.name))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                "{}… · authorized via {}",
-                                &device.fingerprint[..device.fingerprint.len().min(20)],
+                                "{} · authorized via {}",
+                                short_fingerprint(&device.fingerprint, 20),
                                 device.source
                             ))),
                     )
@@ -2540,6 +3104,19 @@ impl Dashboard {
                         TEXT,
                         cx,
                         |this, _, _, _| this.send(FrontendRequest::ListHistory { limit: 20 }),
+                    ))
+                    .child(self.action_button(
+                        "quit-app",
+                        "Quit Lan Mouse",
+                        0x3a2020,
+                        RED,
+                        cx,
+                        // Closing the window keeps the app in the tray, so this
+                        // is the only in-window way to exit on desktops without
+                        // a StatusNotifier host. Going through the GPUI quit path
+                        // lets `Application::run` return: the launcher then stops
+                        // the daemon it started.
+                        |_, _, _, cx| cx.quit(),
                     )),
             )
     }
@@ -2571,8 +3148,9 @@ impl Dashboard {
             .clone()
             .unwrap_or_else(|| "unavailable".to_string());
         let mut history_rows = Vec::new();
+        let now_ms = unix_ms_now();
         for entry in self.history.iter().take(8) {
-            let when = entry.ts;
+            let when = format_timestamp_age(entry.ts, now_ms);
             let subject = entry
                 .name
                 .clone()
@@ -2580,7 +3158,7 @@ impl Dashboard {
                     entry
                         .fingerprint
                         .clone()
-                        .map(|fp| fp[..fp.len().min(16)].to_string())
+                        .map(|fp| short_fingerprint(&fp, 16))
                 })
                 .unwrap_or_else(|| "—".to_string());
             let detail = entry
@@ -2759,27 +3337,35 @@ impl Dashboard {
                                         .child(device.name.clone()),
                                 )
                                 .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                    "{}… · in:{} · out:{} · {}",
-                                    &device.fingerprint[..device.fingerprint.len().min(16)],
+                                    "{} · in:{} · out:{} · {}",
+                                    short_fingerprint(&device.fingerprint, 16),
                                     device.incoming.capabilities.summary(),
                                     device.outgoing.capabilities.summary(),
                                     device.source
                                 ))),
                         )
-                        .child(
+                        .child({
+                            // `DeviceView::connected` only proves that the service
+                            // holds a session/optimistic flag, not that the peer
+                            // answers: only a fresh Pong may claim "connected".
+                            let verified =
+                                has_fresh_pong(&self.clients, &device.fingerprint, unix_ms_now());
+                            let (label, color, background) = if verified {
+                                ("connected", GREEN, 0x173225u32)
+                            } else if device.connected {
+                                ("unconfirmed", AMBER, 0x342b12u32)
+                            } else {
+                                ("offline", MUTED, 0x1d222au32)
+                            };
                             div()
                                 .px_2()
                                 .py_1()
                                 .rounded_full()
-                                .bg(rgb(if device.connected { 0x173225 } else { 0x1d222a }))
-                                .text_color(rgb(if device.connected { GREEN } else { MUTED }))
+                                .bg(rgb(background))
+                                .text_color(rgb(color))
                                 .text_xs()
-                                .child(if device.connected {
-                                    "connected"
-                                } else {
-                                    "offline"
-                                }),
-                        ),
+                                .child(label)
+                        }),
                 )
                 .child(
                     div()
@@ -2914,9 +3500,7 @@ impl Dashboard {
         let mut authorized = self
             .authorized
             .iter()
-            .map(|(fingerprint, name)| {
-                format!("{name} · {}…", &fingerprint[..fingerprint.len().min(16)])
-            })
+            .map(|(fingerprint, name)| format!("{name} · {}", short_fingerprint(fingerprint, 16)))
             .collect::<Vec<_>>();
         authorized.sort();
         let mut rules = self
@@ -3075,14 +3659,32 @@ impl Dashboard {
                             .items_center()
                             .justify_between()
                             .child(div().text_sm().text_color(rgb(MUTED)).child(pairing_label))
-                            .child(self.action_button(
-                                "start-pairing",
-                                "Open",
-                                ACCENT,
-                                0x081018,
-                                cx,
-                                |this, _, _, _| this.start_pairing(),
-                            )),
+                            .when(self.pairing_active, |this| {
+                                // The service owns the pairing timer: keep the
+                                // button non-interactive while a window is open so
+                                // clicks cannot queue duplicate pairing_open
+                                // records in the audit log.
+                                this.child(
+                                    div()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(rgb(0x1d222a))
+                                        .text_color(rgb(MUTED))
+                                        .text_sm()
+                                        .child("Pairing…"),
+                                )
+                            })
+                            .when(!self.pairing_active, |this| {
+                                this.child(self.action_button(
+                                    "start-pairing",
+                                    "Open",
+                                    ACCENT,
+                                    0x081018,
+                                    cx,
+                                    |this, _, _, _| this.start_pairing(),
+                                ))
+                            }),
                     ),
             )
             .child(
@@ -3153,10 +3755,7 @@ impl Dashboard {
                                                 div().text_sm().text_color(rgb(TEXT)).child(name),
                                             )
                                             .child(div().text_xs().text_color(rgb(MUTED)).child(
-                                                format!(
-                                                    "{}…",
-                                                    &fingerprint[..fingerprint.len().min(24)]
-                                                ),
+                                                short_fingerprint(&fingerprint, 24),
                                             )),
                                     )
                                     .child(
@@ -3305,29 +3904,36 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
         log::info!("UI scale: {:.0}%", ui_scale() * 100.0);
         let bounds = Bounds::centered(None, size(px(980.0), px(720.0)), cx);
         let dashboard: Entity<Dashboard> = cx.new(|cx| Dashboard::new(cx, local_commit));
-        let window_handle = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Lan Mouse".into()),
-                        appears_transparent: false,
-                        traffic_light_position: None,
-                    }),
-                    app_id: Some("de.feschber.LanMouse".into()),
-                    window_decorations: if cfg!(target_os = "linux") {
-                        Some(WindowDecorations::Client)
-                    } else {
-                        None
-                    },
-                    ..Default::default()
+        let window_handle = match cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Lan Mouse".into()),
+                    appears_transparent: false,
+                    traffic_light_position: None,
+                }),
+                app_id: Some("de.feschber.LanMouse".into()),
+                window_decorations: if cfg!(target_os = "linux") {
+                    Some(WindowDecorations::Client)
+                } else {
+                    None
                 },
-                |window, _| {
-                    window.set_rem_size(px(16.0));
-                    dashboard
-                },
-            )
-            .expect("open Lan Mouse GPUI window");
+                ..Default::default()
+            },
+            |window, _| {
+                window.set_rem_size(px(16.0));
+                dashboard
+            },
+        ) {
+            Ok(window_handle) => window_handle,
+            Err(error) => {
+                // No compositor / GPU initialization failure: report it instead
+                // of panicking (release builds abort on panic).
+                log::error!("could not open the Lan Mouse window: {error:?}");
+                cx.quit();
+                return;
+            }
+        };
         log::info!("GPUI window created in {:?}", startup.elapsed());
 
         // Closing the window keeps the process alive in the tray: minimize
@@ -3350,10 +3956,12 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
                         });
                     }
                     tray::Command::Quit => {
-                        // Prototype: tray Quit ends the process. The integrated
-                        // frontend will route this through the application quit
-                        // path instead.
-                        std::process::exit(0);
+                        // Graceful quit: `Application::run` returns, main exits
+                        // with code 0 and the launcher stops the daemon it
+                        // started (instead of `process::exit`, which skips log
+                        // flushing and destructors).
+                        let _ = cx.update(|cx| cx.quit());
+                        break;
                     }
                 }
             }
@@ -3369,6 +3977,42 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
 mod tests {
     use super::*;
 
+    const NOW: u64 = 1_700_000_000_000;
+
+    fn config(hostname: Option<&str>, fingerprint: Option<&str>) -> ClientConfig {
+        ClientConfig {
+            hostname: hostname.map(str::to_string),
+            fingerprint: fingerprint.map(str::to_string),
+            port: lan_mouse_ipc::DEFAULT_PORT,
+            ..Default::default()
+        }
+    }
+
+    fn state(
+        active: bool,
+        alive: bool,
+        active_addr: Option<&str>,
+        incoming_addr: Option<&str>,
+        last_pong_at: Option<u64>,
+    ) -> ClientState {
+        ClientState {
+            active,
+            alive,
+            active_addr: active_addr.map(|addr| addr.parse().expect("address")),
+            incoming_addr: incoming_addr.map(|addr| addr.parse().expect("address")),
+            last_pong_at,
+            ..Default::default()
+        }
+    }
+
+    fn member(
+        handle: ClientHandle,
+        config: ClientConfig,
+        state: ClientState,
+    ) -> (ClientHandle, ClientConfig, ClientState) {
+        (handle, config, state)
+    }
+
     #[test]
     fn position_labels_cover_all_sides() {
         assert_eq!(position_label(Position::Left), "left");
@@ -3378,45 +4022,315 @@ mod tests {
     }
 
     #[test]
-    fn disabled_client_is_offline_with_connect_action() {
-        let config = ClientConfig::default();
-        let state = ClientState::default();
-        let row = ClientRow::from_state(&config, &state);
-        assert_eq!(row.state, "Disconnected");
-        assert_eq!(row.action, "Connect");
-        assert!(!row.active);
-        assert!(!row.healthy);
+    fn disabled_peer_is_offline_and_offers_connect() {
+        let derived = link_state(false, false, false, false, None, NOW);
+        assert_eq!(derived, LinkState::Disabled);
+        assert_eq!(derived.badge(), "Disconnected");
+        let action = row_action(derived, false);
+        assert_eq!(action, RowAction::Connect);
+        assert!(action.wants_activation());
+    }
+
+    /// Regression: an enabled client with no outgoing link yet (first handshake
+    /// attempt, or the automatic retry after a drop) used to render as
+    /// "Disconnected" with a "Connect" button that actually *deactivated* it.
+    #[test]
+    fn enabled_client_without_link_is_connecting_and_offers_cancel() {
+        for alive in [false, true] {
+            let derived = link_state(true, alive, false, false, None, NOW);
+            assert_eq!(derived, LinkState::Connecting);
+            assert_eq!(derived.badge(), "Connecting…");
+            let action = row_action(derived, true);
+            assert_eq!(action, RowAction::Cancel);
+            assert!(
+                !action.wants_activation(),
+                "Cancel must not activate (it would disconnect an enabled client)"
+            );
+        }
+    }
+
+    /// A completed DTLS handshake is not proof that the peer answers: without a
+    /// Pong the card must not claim "Connected".
+    #[test]
+    fn handshake_without_round_trip_is_not_connected() {
+        for alive in [false, true] {
+            for incoming in [false, true] {
+                let derived = link_state(true, alive, true, incoming, None, NOW);
+                assert_eq!(derived, LinkState::Connecting);
+                assert_ne!(derived.badge(), "Connected");
+            }
+        }
     }
 
     #[test]
-    fn active_client_with_fresh_pong_is_connected() {
-        let config = ClientConfig::default();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let state = ClientState {
-            active: true,
-            last_pong_at: Some(now),
-            ..Default::default()
-        };
-        let row = ClientRow::from_state(&config, &state);
-        assert_eq!(row.state, "Connected");
-        assert_eq!(row.action, "Disconnect");
-        assert!(row.healthy);
+    fn fresh_round_trip_is_the_only_way_to_claim_connected() {
+        let fresh = Some(NOW - 1_000);
+        assert_eq!(
+            link_state(true, true, true, false, fresh, NOW),
+            LinkState::Connected
+        );
+        assert_eq!(
+            link_state(true, true, true, true, fresh, NOW),
+            LinkState::ConnectedBidirectional
+        );
+        assert_eq!(LinkState::Connected.badge(), "Connected");
+        // Boundary: exactly the freshness window still counts as fresh.
+        let boundary = Some(NOW - LINK_FRESH_WINDOW_MS);
+        assert_eq!(
+            link_state(true, true, true, false, boundary, NOW),
+            LinkState::Connected
+        );
+        // A single millisecond past it is a dead link, not a healthy one.
+        let stale = Some(NOW - LINK_FRESH_WINDOW_MS - 1);
+        assert_eq!(
+            link_state(true, true, true, false, stale, NOW),
+            LinkState::Reconnecting
+        );
     }
 
     #[test]
-    fn active_client_without_pong_is_still_connecting() {
-        let config = ClientConfig::default();
-        let state = ClientState {
-            active: true,
-            last_pong_at: Some(0),
-            ..Default::default()
-        };
-        let row = ClientRow::from_state(&config, &state);
-        assert!(row.active);
-        assert!(!row.healthy);
+    fn stale_link_is_reconnecting_not_connected() {
+        let stale = Some(NOW - 30_000);
+        let derived = link_state(true, true, true, false, stale, NOW);
+        assert_eq!(derived, LinkState::Reconnecting);
+        assert_ne!(derived.badge(), "Connected");
+        assert!(derived.is_degraded());
+        assert_eq!(row_action(derived, true), RowAction::Disconnect);
+    }
+
+    #[test]
+    fn peer_emulation_disabled_is_degraded_not_green() {
+        let derived = link_state(true, false, true, false, Some(NOW), NOW);
+        assert_eq!(derived, LinkState::ConnectedDegraded);
+        assert!(derived.is_degraded());
+        // The link is real, so the badge still says Connected — the note explains
+        // the degradation.
+        assert_eq!(derived.badge(), "Connected");
+        assert_eq!(row_action(derived, true), RowAction::Disconnect);
+    }
+
+    #[test]
+    fn incoming_session_never_claims_connected() {
+        for outgoing in [false, true] {
+            for pong in [None, Some(NOW), Some(NOW - 60_000)] {
+                let derived = link_state(false, true, outgoing, true, pong, NOW);
+                assert_eq!(derived, LinkState::Receiving);
+                assert_eq!(derived.badge(), "Peer connected");
+                assert_ne!(derived.badge(), "Connected");
+            }
+        }
+        assert_eq!(
+            row_action(LinkState::Receiving, false),
+            RowAction::ConnectAlso
+        );
+        assert!(row_action(LinkState::Receiving, false).wants_activation());
+        assert_eq!(row_action(LinkState::Receiving, true), RowAction::Cancel);
+        assert!(!row_action(LinkState::Receiving, true).wants_activation());
+    }
+
+    #[test]
+    fn action_table_matches_each_state() {
+        let expectation = [
+            (LinkState::Disabled, RowAction::Connect, true),
+            (LinkState::Connecting, RowAction::Cancel, false),
+            (LinkState::Reconnecting, RowAction::Disconnect, false),
+            (LinkState::ConnectedDegraded, RowAction::Disconnect, false),
+            (LinkState::Connected, RowAction::Disconnect, false),
+            (
+                LinkState::ConnectedBidirectional,
+                RowAction::Disconnect,
+                false,
+            ),
+            (LinkState::Receiving, RowAction::Cancel, false),
+        ];
+        for (state, expected_action, expected_activation) in expectation {
+            let action = row_action(state, true);
+            assert_eq!(action, expected_action, "{state:?}");
+            assert_eq!(action.wants_activation(), expected_activation, "{state:?}");
+            assert!(!action.label().trim().is_empty());
+        }
+    }
+
+    /// Regression: one service entry per address family used to render as two
+    /// device cards for the same peer (the GTK frontend fixed this by grouping
+    /// on the certificate fingerprint).
+    #[test]
+    fn duplicate_entries_of_one_peer_are_aggregated() {
+        let members = [
+            member(
+                1,
+                config(Some("predator"), Some("AA:BB")),
+                state(
+                    true,
+                    true,
+                    Some("192.168.1.10:4242"),
+                    None,
+                    Some(NOW - 1_000),
+                ),
+            ),
+            member(
+                2,
+                config(Some("predator"), Some("aa:bb")),
+                state(
+                    false,
+                    false,
+                    Some("[fd00::1]:4242"),
+                    Some("[fd00::1]:50000"),
+                    None,
+                ),
+            ),
+        ];
+        let peer = aggregate_peer(&members).expect("aggregate");
+        assert_eq!(peer.primary, 1);
+        assert_eq!(peer.members, vec![1, 2]);
+        assert_eq!(peer.name, "predator");
+        // Link data comes from the member with a proven round-trip, so the card
+        // cannot flap between the two links.
+        assert_eq!(peer.endpoint, "192.168.1.10:4242");
+        assert!(peer.active);
+        assert!(peer.has_outgoing);
+        assert!(peer.has_incoming);
+        assert_eq!(peer.last_pong_at, Some(NOW - 1_000));
+        let derived = link_state(
+            peer.active,
+            peer.alive,
+            peer.has_outgoing,
+            peer.has_incoming,
+            peer.last_pong_at,
+            NOW,
+        );
+        assert_eq!(derived, LinkState::ConnectedBidirectional);
+    }
+
+    #[test]
+    fn aggregation_prefers_the_member_with_a_round_trip() {
+        let members = [
+            member(
+                10,
+                config(None, Some("aa:bb")),
+                state(true, true, Some("192.168.1.10:4242"), None, None),
+            ),
+            member(
+                11,
+                config(None, Some("aa:bb")),
+                state(true, false, Some("[fd00::1]:4242"), None, Some(NOW - 500)),
+            ),
+        ];
+        let peer = aggregate_peer(&members).expect("aggregate");
+        assert_eq!(peer.endpoint, "[fd00::1]:4242");
+        assert!(!peer.alive);
+        // No hostname: falls back to an unknown-device label rather than an
+        // empty card title.
+        assert_eq!(peer.name, "Unknown device");
+    }
+
+    #[test]
+    fn peers_are_grouped_by_fingerprint() {
+        let mut clients = HashMap::new();
+        clients.insert(1, (config(None, Some("AA:BB")), ClientState::default()));
+        clients.insert(2, (config(None, Some("aa:bb")), ClientState::default()));
+        clients.insert(3, (config(Some("loner"), None), ClientState::default()));
+        clients.insert(4, (config(None, Some("aa:bb")), ClientState::default()));
+        let groups = group_peer_handles(&clients);
+        assert_eq!(groups, vec![vec![1, 2, 4], vec![3]]);
+        // An empty map has no groups and therefore no cards.
+        assert!(group_peer_handles(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn multibyte_fingerprint_truncation_does_not_panic() {
+        // Fingerprints are normalized hex today, but a config file can carry
+        // arbitrary text: byte slicing used to be able to panic here.
+        let weird = "aé𝒶🧪 fingerprint";
+        let short = short_fingerprint(weird, 3);
+        assert_eq!(short.chars().count(), 4, "3 chars + ellipsis");
+        assert!(short.ends_with('…'));
+        // Short strings are not decorated.
+        assert_eq!(short_fingerprint("ab", 8), "ab");
+    }
+
+    #[test]
+    fn fresh_pong_requires_a_known_and_pinned_fingerprint() {
+        let mut clients = HashMap::new();
+        clients.insert(
+            7,
+            (
+                config(None, Some("AA:BB")),
+                state(true, true, None, None, Some(NOW - 1_000)),
+            ),
+        );
+        assert!(has_fresh_pong(&clients, "aa:bb", NOW));
+        assert!(has_fresh_pong(&clients, " AA:BB ", NOW));
+        assert!(!has_fresh_pong(&clients, "cc:dd", NOW));
+        assert!(!has_fresh_pong(&clients, "", NOW));
+        // Stale proof must not count.
+        assert!(!has_fresh_pong(
+            &clients,
+            "aa:bb",
+            NOW + LINK_FRESH_WINDOW_MS + 1
+        ));
+        // A client without a fingerprint cannot be matched to a device identity.
+        let mut unpinned = HashMap::new();
+        unpinned.insert(
+            8,
+            (config(None, None), state(true, true, None, None, Some(NOW))),
+        );
+        assert!(!has_fresh_pong(&unpinned, "aa:bb", NOW));
+    }
+
+    #[test]
+    fn endpoint_debounce_does_not_flap_between_families() {
+        let hold = std::time::Duration::from_secs(3);
+        let start = std::time::Instant::now();
+        let mut shown = None;
+        let mut candidate = None;
+        let ipv4 = Some("192.168.1.10:4242".to_string());
+        let ipv6 = Some("[fd00::1]:4242".to_string());
+        assert_eq!(
+            sticky_endpoint(&mut shown, &mut candidate, ipv4.clone(), start, hold),
+            ipv4
+        );
+        // A different endpoint from the next packet does not replace it yet.
+        for offset in [0u64, 1, 2] {
+            assert_eq!(
+                sticky_endpoint(
+                    &mut shown,
+                    &mut candidate,
+                    ipv6.clone(),
+                    start + std::time::Duration::from_secs(offset),
+                    hold
+                ),
+                ipv4
+            );
+        }
+        // Once it persisted for the hold window, the new one is shown.
+        assert_eq!(
+            sticky_endpoint(
+                &mut shown,
+                &mut candidate,
+                ipv6.clone(),
+                start + std::time::Duration::from_secs(3),
+                hold
+            ),
+            ipv6
+        );
+        // Losing the link clears the shown endpoint.
+        assert_eq!(
+            sticky_endpoint(&mut shown, &mut candidate, None, start, hold),
+            None
+        );
+    }
+
+    #[test]
+    fn timestamp_age_is_human_readable() {
+        let now_ms = NOW;
+        let now_secs = now_ms / 1000;
+        assert_eq!(format_timestamp_age(now_secs - 5, now_ms), "5s ago");
+        assert_eq!(format_timestamp_age(now_secs - 90, now_ms), "1m ago");
+        assert_eq!(format_timestamp_age(now_secs - 7_200, now_ms), "2h ago");
+        assert_eq!(format_timestamp_age(now_secs - 90_000, now_ms), "1d ago");
+        // Clock skew (timestamp in the future) must not underflow.
+        assert_eq!(format_timestamp_age(now_secs + 60, now_ms), "0s ago");
     }
 
     #[test]

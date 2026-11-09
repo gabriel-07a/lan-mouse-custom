@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -25,6 +25,9 @@ mod libei;
 
 #[cfg(target_os = "macos")]
 mod macos;
+
+#[cfg(any(libei, rdp))]
+mod portal_token;
 
 mod absolute;
 /// fallback input emulation (logs events)
@@ -96,6 +99,10 @@ pub struct InputEmulation {
     backend: Backend,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    /// Pointer buttons held by each handle. Like `pressed_keys`, they are
+    /// released when the handle is destroyed: a peer that disconnects mid-drag
+    /// would otherwise leave the button pressed in the OS forever.
+    pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
 }
 
 impl InputEmulation {
@@ -120,6 +127,7 @@ impl InputEmulation {
             backend,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
         })
     }
 
@@ -181,11 +189,28 @@ impl InputEmulation {
     ) -> Result<(), EmulationError> {
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
-                // prevent double pressed / released keys
-                if self.update_pressed_keys(handle, key, state) {
+                let forward = match self.update_pressed_keys(handle, key, state) {
+                    // No `create` for this handle (yet): never inject input that
+                    // could not be released later.
+                    KeyUpdate::NotTracked | KeyUpdate::DuplicateRelease => false,
+                    KeyUpdate::Pressed | KeyUpdate::Released => true,
+                    // The sender's OS repeats a held key by sending more
+                    // key-down events. Backends that synthesize their own repeat
+                    // (Windows, macOS) must not see them twice; the others only
+                    // repeat if they are passed through, so the repeat rate
+                    // follows the sender's OS settings.
+                    KeyUpdate::DuplicatePress => !self.emulation.synthesizes_key_repeat(),
+                };
+                if forward {
                     self.emulation.consume(event, handle).await?;
                 }
                 Ok(())
+            }
+            Event::Pointer(PointerEvent::Button { button, state, .. }) => {
+                // Track held buttons so they can be released on destroy. The
+                // event itself is always forwarded.
+                self.update_pressed_buttons(handle, button, state);
+                self.emulation.consume(event, handle).await
             }
             _ => self.emulation.consume(event, handle).await,
         }
@@ -194,6 +219,7 @@ impl InputEmulation {
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
+            self.pressed_buttons.insert(handle, HashSet::new());
             self.emulation.create(handle).await;
             true
         } else {
@@ -202,9 +228,14 @@ impl InputEmulation {
     }
 
     pub async fn destroy(&mut self, handle: EmulationHandle) {
-        let _ = self.release_keys(handle).await;
+        if let Err(e) = self.release_keys(handle).await {
+            // Best effort: the backend is going away, but a failure here means
+            // the OS may keep the last keys/buttons pressed.
+            log::warn!("failed to release held input for handle {handle}: {e}");
+        }
         if self.handles.remove(&handle) {
             self.pressed_keys.remove(&handle);
+            self.pressed_buttons.remove(&handle);
             self.emulation.destroy(handle).await
         }
     }
@@ -216,30 +247,74 @@ impl InputEmulation {
         self.emulation.terminate().await
     }
 
+    /// Release every key and pointer button still held by `handle`, then reset
+    /// the modifier state.
+    ///
+    /// Called from [`Self::destroy`] (peer disconnect, leave or watchdog
+    /// timeout) and [`Self::terminate`]. Without it the receiving OS keeps the
+    /// last modifier or mouse button pressed forever: a stuck Ctrl breaks every
+    /// following keystroke and a stuck left button keeps selecting/dragging —
+    /// the worst failure mode of a KVM.
+    ///
+    /// Every held input is attempted even if one release fails; a single failed
+    /// event must not leave the remaining keys stuck. The first error is
+    /// returned once all releases were attempted.
     pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
-        if let Some(keys) = self.pressed_keys.get_mut(&handle) {
-            let keys = keys.drain().collect::<Vec<_>>();
-            for key in keys {
-                let event = Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key,
-                    state: 0,
-                });
-                self.emulation.consume(event, handle).await?;
-                if let Ok(key) = input_event::scancode::Linux::try_from(key) {
-                    log::warn!("releasing stuck key: {key:?}");
-                }
+        let keys = self
+            .pressed_keys
+            .get_mut(&handle)
+            .map(|keys| keys.drain().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let buttons = self
+            .pressed_buttons
+            .get_mut(&handle)
+            .map(|buttons| buttons.drain().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let mut first_error = None;
+        for key in keys {
+            let event = Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key,
+                state: 0,
+            });
+            if let Err(e) = self.emulation.consume(event, handle).await {
+                first_error.get_or_insert(e);
+                continue;
+            }
+            if let Ok(key) = input_event::scancode::Linux::try_from(key) {
+                log::warn!("releasing stuck key: {key:?}");
             }
         }
+        for button in buttons {
+            let event = Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button,
+                state: 0,
+            });
+            if let Err(e) = self.emulation.consume(event, handle).await {
+                first_error.get_or_insert(e);
+                continue;
+            }
+            log::warn!("releasing stuck mouse button: {button:#x}");
+        }
 
+        // Reset the modifier state as well: a peer may have sent a Modifiers
+        // event without the matching per-key events.
         let event = Event::Keyboard(KeyboardEvent::Modifiers {
             depressed: 0,
             latched: 0,
             locked: 0,
             group: 0,
         });
-        self.emulation.consume(event, handle).await?;
-        Ok(())
+        if let Err(e) = self.emulation.consume(event, handle).await {
+            first_error.get_or_insert(e);
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn has_pressed_keys(&self, handle: EmulationHandle) -> bool {
@@ -248,21 +323,55 @@ impl InputEmulation {
             .is_some_and(|p| !p.is_empty())
     }
 
-    /// update the pressed_keys for the given handle
-    /// returns whether the event should be processed
-    fn update_pressed_keys(&mut self, handle: EmulationHandle, key: u32, state: u8) -> bool {
+    /// Update the pressed keys for the given handle and classify the event.
+    fn update_pressed_keys(&mut self, handle: EmulationHandle, key: u32, state: u8) -> KeyUpdate {
         let Some(pressed_keys) = self.pressed_keys.get_mut(&handle) else {
-            return false;
+            return KeyUpdate::NotTracked;
         };
 
         if state == 0 {
             // currently pressed => can release
-            pressed_keys.remove(&key)
+            if pressed_keys.remove(&key) {
+                KeyUpdate::Released
+            } else {
+                KeyUpdate::DuplicateRelease
+            }
         } else {
             // currently not pressed => can press
-            pressed_keys.insert(key)
+            if pressed_keys.insert(key) {
+                KeyUpdate::Pressed
+            } else {
+                KeyUpdate::DuplicatePress
+            }
         }
     }
+
+    /// Track (or forget) a held pointer button for the given handle.
+    fn update_pressed_buttons(&mut self, handle: EmulationHandle, button: u32, state: u32) {
+        let Some(pressed_buttons) = self.pressed_buttons.get_mut(&handle) else {
+            return;
+        };
+        if state == 0 {
+            pressed_buttons.remove(&button);
+        } else {
+            pressed_buttons.insert(button);
+        }
+    }
+}
+
+/// How one keyboard key event relates to the pressed-keys state of a handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyUpdate {
+    /// The handle was never created: drop the event.
+    NotTracked,
+    /// First press of the key.
+    Pressed,
+    /// The key is already held: an OS auto-repeat from the sender.
+    DuplicatePress,
+    /// Release matching a tracked press.
+    Released,
+    /// Release for a key that was not tracked.
+    DuplicateRelease,
 }
 
 #[async_trait]
@@ -279,11 +388,109 @@ trait Emulation: Send {
     /// Backends that can observe the injected pointer at a screen edge report
     /// it here so the service can hand control back to the peer.
     fn set_edge_return_notifier(&mut self, _notifier: EdgeReturnNotifier) {}
+
+    /// Whether this backend synthesizes key auto-repeat itself for a held key.
+    ///
+    /// Windows and macOS do (they have a repeat task); the Wayland/libei/X11/
+    /// portal backends do not. For those, [`InputEmulation::consume`] passes the
+    /// sender's repeated key-down events through instead of dropping them, so
+    /// holding a key on the controlling machine keeps repeating on the receiver
+    /// at the sender's OS repeat rate.
+    fn synthesizes_key_repeat(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Records every event a backend is asked to inject, so the dispatch logic
+    /// can be tested without touching a real input stack.
+    #[derive(Default)]
+    struct RecordingEmulation {
+        events: Arc<Mutex<Vec<Event>>>,
+        synthesize_repeat: bool,
+        /// Fail every release-shaped event (key/button up, modifier reset) to
+        /// exercise the release path of a peer whose backend is already dying.
+        fail_on_release: bool,
+    }
+
+    #[async_trait]
+    impl Emulation for RecordingEmulation {
+        async fn consume(
+            &mut self,
+            event: Event,
+            _: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            self.events.lock().expect("recording lock").push(event);
+            let is_release = matches!(
+                event,
+                Event::Keyboard(KeyboardEvent::Key { state: 0, .. })
+                    | Event::Keyboard(KeyboardEvent::Modifiers { .. })
+                    | Event::Pointer(PointerEvent::Button { state: 0, .. })
+            );
+            if self.fail_on_release && is_release {
+                return Err(EmulationError::EndOfStream);
+            }
+            Ok(())
+        }
+        async fn create(&mut self, _: EmulationHandle) {}
+        async fn destroy(&mut self, _: EmulationHandle) {}
+        async fn terminate(&mut self) {}
+        fn synthesizes_key_repeat(&self) -> bool {
+            self.synthesize_repeat
+        }
+    }
+
+    fn recording(
+        synthesize_repeat: bool,
+        fail_on_release: bool,
+    ) -> (InputEmulation, Arc<Mutex<Vec<Event>>>) {
+        let events: Arc<Mutex<Vec<Event>>> = Default::default();
+        let emulation = InputEmulation {
+            emulation: Box::new(RecordingEmulation {
+                events: events.clone(),
+                synthesize_repeat,
+                fail_on_release,
+            }),
+            backend: Backend::Dummy,
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        };
+        (emulation, events)
+    }
+
+    fn recorded(events: &Arc<Mutex<Vec<Event>>>) -> Vec<Event> {
+        events.lock().expect("recording lock").clone()
+    }
+
+    fn key(key: u32, state: u8) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state,
+        })
+    }
+
+    fn button(button: u32, state: u32) -> Event {
+        Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button,
+            state,
+        })
+    }
+
+    fn modifiers_zero() -> Event {
+        Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: 0,
+            latched: 0,
+            locked: 0,
+            group: 0,
+        })
+    }
 
     #[tokio::test]
     async fn dummy_backend_is_selectable_and_reports_itself() {
@@ -294,37 +501,165 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_key_events_are_filtered() {
-        let mut emulation = InputEmulation::new(Some(Backend::Dummy))
-            .await
-            .expect("dummy emulation");
+    async fn key_events_are_classified_by_the_pressed_keys_state() {
+        let (mut emulation, _events) = recording(false, false);
         assert!(emulation.create(0).await);
 
-        assert!(emulation.update_pressed_keys(0, 30, 1), "first press");
-        assert!(!emulation.update_pressed_keys(0, 30, 1), "duplicate press");
+        assert_eq!(
+            emulation.update_pressed_keys(0, 30, 1),
+            KeyUpdate::Pressed,
+            "first press"
+        );
+        assert_eq!(
+            emulation.update_pressed_keys(0, 30, 1),
+            KeyUpdate::DuplicatePress,
+            "auto-repeat from the sender"
+        );
         assert_eq!(emulation.pressed_keys.get(&0).map(HashSet::len), Some(1));
 
-        assert!(emulation.update_pressed_keys(0, 30, 0), "first release");
-        assert!(
-            !emulation.update_pressed_keys(0, 30, 0),
+        assert_eq!(
+            emulation.update_pressed_keys(0, 30, 0),
+            KeyUpdate::Released,
+            "first release"
+        );
+        assert_eq!(
+            emulation.update_pressed_keys(0, 30, 0),
+            KeyUpdate::DuplicateRelease,
             "duplicate release"
         );
         assert_eq!(emulation.pressed_keys.get(&0).map(HashSet::len), Some(0));
 
         // events for an unknown handle are ignored
-        assert!(!emulation.update_pressed_keys(99, 30, 1));
+        assert_eq!(
+            emulation.update_pressed_keys(99, 30, 1),
+            KeyUpdate::NotTracked
+        );
+    }
+
+    /// Regression for the Windows -> Linux direction: the sender repeats a held
+    /// key by sending more key-down events, and backends without a repeat task
+    /// must receive them instead of having them filtered out.
+    #[tokio::test]
+    async fn backends_without_native_repeat_receive_the_senders_repeats() {
+        let (mut emulation, events) = recording(false, false);
+        assert!(emulation.create(0).await);
+
+        for _ in 0..3 {
+            emulation.consume(key(30, 1), 0).await.expect("consume");
+        }
+        assert_eq!(
+            recorded(&events),
+            vec![key(30, 1), key(30, 1), key(30, 1)],
+            "the repeat presses must reach the backend"
+        );
+
+        emulation.consume(key(30, 0), 0).await.expect("consume");
+        emulation.consume(key(30, 0), 0).await.expect("consume");
+        assert_eq!(
+            recorded(&events).len(),
+            4,
+            "a duplicate release must still be filtered"
+        );
+    }
+
+    /// Windows and macOS synthesize their own repeat: the sender's repeated
+    /// presses must not be injected a second time.
+    #[tokio::test]
+    async fn backends_with_native_repeat_do_not_receive_duplicate_presses() {
+        let (mut emulation, events) = recording(true, false);
+        assert!(emulation.create(0).await);
+
+        for _ in 0..3 {
+            emulation.consume(key(30, 1), 0).await.expect("consume");
+        }
+        emulation.consume(key(30, 0), 0).await.expect("consume");
+        assert_eq!(recorded(&events), vec![key(30, 1), key(30, 0)]);
     }
 
     #[tokio::test]
-    async fn destroy_drops_pressed_key_state() {
-        let mut emulation = InputEmulation::new(Some(Backend::Dummy))
+    async fn events_for_unknown_handles_are_dropped() {
+        let (mut emulation, events) = recording(false, false);
+        emulation.consume(key(30, 1), 99).await.expect("consume");
+        assert!(recorded(&events).is_empty());
+    }
+
+    /// A peer disconnecting (or the watchdog timing out) while keys and a mouse
+    /// button are held must release all of them: a stuck Ctrl or a stuck left
+    /// button is the worst failure mode of a KVM.
+    #[tokio::test]
+    async fn destroy_releases_held_keys_and_buttons() {
+        let (mut emulation, events) = recording(false, false);
+        assert!(emulation.create(1).await);
+        emulation.consume(key(29, 1), 1).await.expect("consume");
+        emulation.consume(key(30, 1), 1).await.expect("consume");
+        emulation
+            .consume(button(input_event::BTN_LEFT, 1), 1)
             .await
-            .expect("dummy emulation");
+            .expect("consume");
+
+        emulation.destroy(1).await;
+
+        let events = recorded(&events);
+        for expected in [
+            key(29, 0),
+            key(30, 0),
+            button(input_event::BTN_LEFT, 0),
+            modifiers_zero(),
+        ] {
+            assert!(
+                events.contains(&expected),
+                "missing release event: {expected:?} (got {events:?})"
+            );
+        }
+        assert!(!emulation.pressed_buttons.contains_key(&1));
+        assert!(!emulation.pressed_keys.contains_key(&1));
+    }
+
+    /// One failed release must not leave the remaining keys/buttons stuck: all
+    /// releases are attempted and the first error is returned afterwards.
+    #[tokio::test]
+    async fn release_attempts_every_held_input_when_one_fails() {
+        let (mut emulation, events) = recording(false, true);
+        assert!(emulation.create(2).await);
+        emulation.consume(key(29, 1), 2).await.expect("tracked");
+        emulation.consume(key(30, 1), 2).await.expect("tracked");
+        emulation
+            .consume(button(input_event::BTN_RIGHT, 1), 2)
+            .await
+            .expect("tracked");
+
+        let result = emulation.release_keys(2).await;
+        assert!(result.is_err(), "the backend error must be reported");
+
+        let events = recorded(&events);
+        for expected in [
+            key(29, 0),
+            key(30, 0),
+            button(input_event::BTN_RIGHT, 0),
+            modifiers_zero(),
+        ] {
+            assert!(
+                events.contains(&expected),
+                "missing release attempt: {expected:?} (got {events:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn destroy_drops_pressed_key_and_button_state() {
+        let (mut emulation, _events) = recording(false, false);
         assert!(emulation.create(1).await);
         assert!(!emulation.create(1).await, "duplicate create is a no-op");
-        emulation.update_pressed_keys(1, 42, 1);
+        emulation.consume(key(42, 1), 1).await.expect("consume");
+        emulation
+            .consume(button(input_event::BTN_MIDDLE, 1), 1)
+            .await
+            .expect("consume");
+        assert!(emulation.has_pressed_keys(1));
+
         emulation.destroy(1).await;
         assert!(!emulation.handles.contains(&1));
         assert!(!emulation.pressed_keys.contains_key(&1));
+        assert!(!emulation.pressed_buttons.contains_key(&1));
     }
 }
