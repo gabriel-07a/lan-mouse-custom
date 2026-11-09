@@ -187,6 +187,37 @@ fn windows_installer_creates_shortcuts_and_keeps_the_icon() {
     );
 }
 
+/// The GPUI frontend owns the visible window on Windows, so it (not only the
+/// launcher) must carry the icon resource: GPUI loads the window/taskbar icon
+/// from resource id 1 of its own executable. Without it a pinned shortcut shows
+/// the generic Windows icon.
+#[test]
+fn windows_gpui_frontend_embeds_the_icon_resource() {
+    let build = read("lan-mouse-gpui/build.rs");
+    assert!(
+        build.contains("assets/icon.ico"),
+        "the frontend build script must embed assets/icon.ico"
+    );
+    assert!(
+        build.contains("winresource"),
+        "the frontend build script must use winresource"
+    );
+    let manifest = read("lan-mouse-gpui/Cargo.toml");
+    assert!(
+        manifest.contains("[target.'cfg(windows)'.build-dependencies]"),
+        "the icon build dependency must be Windows-only"
+    );
+    assert!(
+        manifest.contains("winresource"),
+        "the frontend must declare the icon build dependency"
+    );
+    let lib = read("lan-mouse-gpui/src/lib.rs");
+    assert!(
+        lib.contains("Icon::from_resource"),
+        "the Windows tray icon must come from the embedded resource"
+    );
+}
+
 #[test]
 fn deb_package_ships_icons_and_a_trusted_desktop_shortcut() {
     let script = read("scripts/package-deb.sh");

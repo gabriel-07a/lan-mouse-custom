@@ -123,3 +123,7 @@ See capture.md R-02 and frontend.md R-03/R-04.
 - Closing the connection on ANY machine now completely closes it (outgoing transport, incoming session,
   AuthRevoke to the peer, local suppression cleared). Side edits no longer move a live incoming capture
   zone. Regression: qa-two-instances.sh scenario close.
+
+- Windows: the GPUI frontend now embeds the icon resource, fixing the missing taskbar/pinned-shortcut
+  icon; the notification-area icon uses the same embedded Lan Mouse icon. Regression: packaging test
+  windows_gpui_frontend_embeds_the_icon_resource.

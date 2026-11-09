@@ -166,8 +166,12 @@ mod tray {
     }
 
     fn icon() -> Icon {
-        // 16x16 solid accent icon; the production frontend will use the
-        // embedded Lan Mouse icon resource.
+        // The build script embeds assets/icon.ico into this executable, so the
+        // notification-area icon matches the window/taskbar icon instead of a
+        // solid placeholder. Fall back only if the resource is unavailable.
+        if let Ok(icon) = Icon::from_resource(1, Some((32, 32))) {
+            return icon;
+        }
         let mut rgba = vec![0u8; 16 * 16 * 4];
         for pixel in rgba.chunks_exact_mut(4) {
             pixel.copy_from_slice(&[0x5a, 0xa9, 0xff, 0xff]);
