@@ -22,10 +22,10 @@ use lan_mouse_ipc::{DEFAULT_PORT, DirectionPolicy, Position};
 
 /// Default sensitivity of the absolute-pointer injection, in percent.
 ///
-/// 100 % keeps the monitor-scale normalisation (one pointer count moves the
-/// physical distance the previous relative injection moved) and the mirrored
-/// libinput acceleration supplies the speed-dependent boost.  Lower it for a
-/// slower cursor, raise it for a faster one; values are clamped to 10..=500.
+/// 100 % maps one pointer count to one logical pixel (screen-relative, so the
+/// mapping does not depend on resolution or monitor scale); the mirrored
+/// libinput acceleration supplies the velocity-dependent boost.  Lower it for
+/// a slower cursor, raise it for a faster one; values are clamped to 10..=500.
 pub const DEFAULT_ABSOLUTE_POINTER_SENSITIVITY: u16 = 100;
 
 use input_event::scancode::{
@@ -1130,7 +1130,8 @@ impl Config {
     }
 
     /// Sensitivity of input received from peers through the absolute pointer,
-    /// in percent. 100 = 1:1 after the monitor-scale normalisation.
+    /// in percent. 100 = screen-relative 1:1 (mirrored acceleration adds the
+    /// speed-dependent boost).
     pub fn absolute_pointer_sensitivity(&self) -> u16 {
         self.config_toml
             .as_ref()

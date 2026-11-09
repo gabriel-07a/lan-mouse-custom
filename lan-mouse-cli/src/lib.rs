@@ -135,7 +135,7 @@ enum CliSubcommand {
     /// set the motion scale of a client in percent (100 = unchanged)
     SetSensitivity { id: ClientHandle, percent: u16 },
     /// set the sensitivity of input received from peers through the absolute
-    /// pointer, in percent (100 = 1:1 after monitor-scale normalisation)
+    /// pointer, in percent (100 = screen-relative 1:1)
     SetAbsoluteSensitivity { percent: u16 },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },

@@ -714,6 +714,9 @@ impl Service {
         // the frontend/CLI, so an external config edit only takes effect on
         // the next start.
         self.clipboard_limits.set(self.config.clipboard_limits());
+        // The sensitivity can be edited in config.toml while the service runs.
+        self.emulation
+            .set_absolute_sensitivity(self.config.absolute_pointer_sensitivity());
         self.sync_frontend();
     }
 

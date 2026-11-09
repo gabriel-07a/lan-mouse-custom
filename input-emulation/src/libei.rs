@@ -130,6 +130,8 @@ pub(crate) struct LibeiEmulation {
     pointer_settings: PointerSettings,
     /// previous motion timestamp, used to estimate the pointer velocity
     last_motion_time: Option<u32>,
+    /// temporary LAN_MOUSE_ABSOLUTE_SCALE override, applied on every gain update
+    absolute_env_scale: f64,
 }
 
 /// Pixels the pointer must be pushed past the entry edge before the hand-off
@@ -188,6 +190,40 @@ fn read_gsettings(schema: &str, key: &str) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Effective delta multiplier: monitor normalisation * user sensitivity *
+/// environment override. Shared by arming and live updates so a live change
+/// can never drop the env override.
+fn effective_delta_scale(base_scale: f64, sensitivity: f64, env_scale: f64) -> f64 {
+    base_scale * sensitivity * env_scale
+}
+
+/// Convert a raw timestamp difference into milliseconds.
+///
+/// Windows sends milliseconds, the Linux/libei capture sends microseconds;
+/// values >= 1000 are treated as microseconds.
+fn dt_from_raw(previous: Option<u32>, time: u32) -> f64 {
+    previous
+        .map(|previous| time.wrapping_sub(previous))
+        .map(|raw| {
+            if raw >= 1000 {
+                raw as f64 / 1000.0
+            } else {
+                raw as f64
+            }
+        })
+        .filter(|dt| *dt > 0.0 && *dt < 100.0)
+        .unwrap_or(8.0)
+}
+
+/// Temporary sensitivity override from the environment (1.0 = none).
+fn read_env_scale() -> f64 {
+    std::env::var("LAN_MOUSE_ABSOLUTE_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.05 && *value < 20.0)
+        .unwrap_or(1.0)
 }
 
 /// Distance (logical px) the cursor starts inside the entry edge. Big enough
@@ -299,7 +335,8 @@ impl AbsoluteTracker {
         }
         // Corrupted single deltas would jump the tracked cursor anywhere; drop
         // them instead of clamping (a clamp could still fire the hand-off).
-        if dx.abs() > MAX_DELTA_PX || dy.abs() > MAX_DELTA_PX {
+        // The limit leaves room for the mirrored acceleration boost (max 2.2x).
+        if dx.abs() > MAX_DELTA_PX * 3.0 || dy.abs() > MAX_DELTA_PX * 3.0 {
             log::debug!("dropping implausible absolute delta ({dx}, {dy})");
             return None;
         }
@@ -525,13 +562,12 @@ impl LibeiEmulation {
         // acceleration adds the velocity-dependent boost the relative path had.
         let base_scale = 1.0;
         // user override for fine tuning without recompiling
-        let user_scale = std::env::var("LAN_MOUSE_ABSOLUTE_SCALE")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value > 0.05 && *value < 20.0)
-            .unwrap_or(1.0);
-        let gain = self.absolute_sensitivity * user_scale;
-        let delta_scale = base_scale * gain;
+        let gain = self.absolute_sensitivity * self.absolute_env_scale;
+        let delta_scale = effective_delta_scale(
+            base_scale,
+            self.absolute_sensitivity,
+            self.absolute_env_scale,
+        );
         let Some(tracker) = AbsoluteTracker::new(
             edge,
             pointer.generation,
@@ -562,12 +598,14 @@ impl LibeiEmulation {
     }
 
     /// Milliseconds since the previous motion event (clamped); 8 ms fallback.
+    ///
+    /// Capture backends do not agree on the timestamp unit: Windows sends
+    /// milliseconds while the Linux/libei capture sends microseconds. A raw
+    /// difference of 1000 or more is treated as microseconds (a 1000 Hz mouse
+    /// reports 1000 us = 1 ms), so the velocity estimate works for both
+    /// without a protocol change.
     fn motion_dt(&mut self, time: u32) -> f64 {
-        let dt = self
-            .last_motion_time
-            .map(|previous| time.wrapping_sub(previous) as f64)
-            .filter(|dt| *dt > 0.0 && *dt < 100.0)
-            .unwrap_or(8.0);
+        let dt = dt_from_raw(self.last_motion_time, time);
         self.last_motion_time = Some(time);
         dt
     }
@@ -610,6 +648,7 @@ impl LibeiEmulation {
             absolute_sensitivity: 1.0,
             pointer_settings: PointerSettings::detect(),
             last_motion_time: None,
+            absolute_env_scale: read_env_scale(),
         })
     }
 }
@@ -629,7 +668,8 @@ impl Emulation for LibeiEmulation {
     fn set_absolute_sensitivity(&mut self, gain: f64) {
         self.absolute_sensitivity = gain;
         if let Some(tracker) = self.absolute.as_mut() {
-            tracker.delta_scale = tracker.base_scale * gain;
+            tracker.delta_scale =
+                effective_delta_scale(tracker.base_scale, gain, self.absolute_env_scale);
         }
     }
 
@@ -667,6 +707,13 @@ impl Emulation for LibeiEmulation {
                     // forwarded into the EIS device state.
                     if !dx.is_finite() || !dy.is_finite() {
                         log::warn!("dropping non-finite motion: ({dx}, {dy})");
+                        return Ok(());
+                    }
+                    // Sanity-check the raw delta before the acceleration boost:
+                    // accelerating first could turn a legitimate fast event
+                    // into an "implausibly large" one and drop it.
+                    if dx.abs() > MAX_DELTA_PX || dy.abs() > MAX_DELTA_PX {
+                        log::debug!("dropping implausible raw delta ({dx}, {dy})");
                         return Ok(());
                     }
                     // While a peer drives this machine and the compositor
@@ -1336,6 +1383,42 @@ mod absolute_tracker_tests {
         let _ = sensitive.apply(1000.0, 0.0);
         let (x1, _) = sensitive.absolute();
         assert!((x1 - x0 - 1200.0).abs() < 4.0);
+    }
+
+    #[test]
+    fn timestamp_units_are_inferred() {
+        // milliseconds (Windows): 8 ms between events
+        assert!((dt_from_raw(Some(100), 108) - 8.0).abs() < 1e-9);
+        // microseconds (libei): 8000 us between events = 8 ms
+        assert!((dt_from_raw(Some(1_000_000), 1_008_000) - 8.0).abs() < 1e-9);
+        // a 1000 Hz report (1000 us) is one millisecond
+        assert!((dt_from_raw(Some(5_000), 6_000) - 1.0).abs() < 1e-9);
+        // missing/duplicate timestamps fall back to the nominal interval
+        assert!((dt_from_raw(None, 42) - 8.0).abs() < 1e-9);
+        assert!((dt_from_raw(Some(42), 42) - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn live_update_keeps_the_environment_override() {
+        let base = 1.0;
+        let sensitivity = 1.0;
+        let env = 2.0;
+        let armed = effective_delta_scale(base, sensitivity, env);
+        // even a no-op live update must keep the temporary override
+        let updated = effective_delta_scale(base, 1.0, env);
+        assert!((armed - 2.0).abs() < 1e-9);
+        assert!((updated - armed).abs() < 1e-9);
+        // a real sensitivity change scales on top of the override
+        let faster = effective_delta_scale(base, 1.5, env);
+        assert!((faster - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn accelerated_fast_delta_is_not_rejected() {
+        let mut tracker = tracker(PointerEdge::Left);
+        // the raw delta limit is 4096; the tracker must accept the boosted
+        // value (up to 3x) instead of treating it as corrupted
+        assert_eq!(tracker.apply(-8800.0, 0.0), Some(PointerEdge::Left));
     }
 
     #[test]
