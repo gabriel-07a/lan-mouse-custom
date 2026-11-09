@@ -551,30 +551,27 @@ where
     // The EIS connection persists across Enable()/Disable() cycles and across
     // activations; it is set up once per portal session (portal docs).
     let (context, _conn, mut ei_event_stream) = connect_to_eis(input_capture, session).await?;
-    let (mut barriers, mut pos_for_barrier_id) =
-        update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
+    // GNOME's InputCapture v1 forbids changing pointer barriers after the
+    // session is enabled ("Session already enabled") and a disabled session
+    // cannot be re-enabled, so changing a client position at runtime used to
+    // leave the new edge without a barrier and capture stopped working.
+    // Install barriers for every edge up front; activations for edges that do
+    // not belong to an enabled client are released immediately below, so a
+    // position change only changes the filter, never the barrier set.
+    const ALL_POSITIONS: [Position; 4] = [
+        Position::Left,
+        Position::Right,
+        Position::Top,
+        Position::Bottom,
+    ];
+    let (barriers, pos_for_barrier_id) =
+        update_barriers(input_capture, session, &ALL_POSITIONS, next_barrier_id).await?;
     log::debug!("enabling session");
     input_capture.enable(session, Default::default()).await?;
     let mut activated = input_capture.receive_activated().await?;
     let current_pos = Rc::new(Cell::new(None));
-    // Barrier positions must be refreshed when clients or zones change, but the
-    // portal only accepts a new barrier set outside of an active capture.
-    let mut barriers_dirty = false;
 
     loop {
-        if barriers_dirty {
-            if active_clients.is_empty() {
-                // The portal may reject an empty barrier set; keep the last one
-                // and just release any activation that still fires (see below).
-                log::debug!("no client enabled; keeping the previous barrier set");
-            } else {
-                (barriers, pos_for_barrier_id) =
-                    update_barriers(input_capture, session, active_clients, next_barrier_id)
-                        .await?;
-            }
-            barriers_dirty = false;
-        }
-
         tokio::select! {
             _ = cancellation_token.cancelled() => return Ok(()),
             _ = notify_release.notified() => {
@@ -582,8 +579,10 @@ where
                 log::debug!("release requested while no capture is active");
             }
             _ = zones_changed.next() => {
-                log::debug!("zones changed; refreshing barriers");
-                barriers_dirty = true;
+                // Barriers are fixed for the lifetime of the enabled session
+                // (GNOME cannot update them); only the active-client filter
+                // changes, handled when an activation arrives.
+                log::debug!("zones changed; keeping the fixed barrier set");
             }
             event = capture_event.recv() => match event {
                 Some(event) => {
@@ -591,7 +590,6 @@ where
                     // Keep the session alive while no client is enabled: closing
                     // and recreating it would ask for consent again on portals
                     // that cannot persist it (InputCapture v1, GNOME).
-                    barriers_dirty = true;
                 }
                 None => return Ok(()),
             },
@@ -652,6 +650,15 @@ where
                         }
                     }
                 };
+                // All four edges have a barrier; only the edges that belong
+                // to an enabled client may capture. Release immediately for a
+                // position that is not configured, keeping the cursor on this
+                // screen.
+                if !active_clients.contains(&pos) {
+                    log::debug!("activation on unconfigured edge {pos:?}; releasing");
+                    release_capture(input_capture, session, activated_event, pos).await?;
+                    continue;
+                }
                 current_pos.replace(Some(pos));
                 if event_tx.send((pos, CaptureEvent::Begin)).await.is_err() {
                     return Err(CaptureError::EndOfStream);
@@ -669,15 +676,16 @@ where
                             release_now = true;
                         }
                         _ = zones_changed.next() => {
-                            barriers_dirty = true;
+                            // fixed barrier set (see above)
                         }
                         event = capture_event.recv() => match event {
                             Some(event) => {
                                 apply_client_event(active_clients, event);
-                                if active_clients.is_empty() {
+                                if active_clients.is_empty()
+                                    || !active_clients.contains(&pos)
+                                {
                                     release_now = true;
                                 }
-                                barriers_dirty = true;
                             }
                             None => release_now = true,
                         },

@@ -94,3 +94,16 @@ Note: InputCapture v1 (GNOME 50 as shipped by Ubuntu) has no restore token, so a
 lan-mouse launch can be guaranteed; with portal v2 (KDE and newer compositors) the token makes the
 consent persist across restarts as well. The dialog is only requested when the first client starts
 capturing (never on a receive-only machine).
+
+
+## R-13: changing the client side at runtime broke edge capture
+
+Reported after the edge-return work: after changing which side the pointer leaves through, capture stopped
+working. The GNOME InputCapture v1 portal answers SetPointerBarriers/GetZones with
+"AccessDenied: Session already enabled" once the session has been enabled, and a disabled session cannot be
+re-enabled, so the new edge never received a barrier.
+
+Fix: the capture session installs pointer barriers for all four edges once, before Enable. The active-client
+filter decides which edge may capture: an activation on an edge that does not belong to an enabled client is
+released immediately (cursor stays on this screen), and position changes only update the filter - the barrier
+set is never rebuilt. The session is still created once and reused, so no extra portal dialog appears.
