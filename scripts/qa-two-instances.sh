@@ -775,38 +775,6 @@ activate_on_startup = true"
 # screen edges. The software tracker in crate::edge_return detects the return
 # from the injected 1:1 motion deltas, and a local Disconnect keeps the peer out
 # for a short grace window so a lost AuthRevoke cannot restore the session.
-scenario_retorno() {
-    say "### scenario retorno: cursor volta do receptor sem ficar preso"
-    start_pair || return 1
-    write_config a "$PORT_A" "[[clients]]
-hostname = \"b\"
-ips = [\"127.0.0.1\"]
-port = $PORT_B
-position = \"left\"
-activate_on_startup = true"
-    restart_daemon a || return 1
-    if ! wait_connected a 10; then
-        fail "A não conectou a B"
-        return 1
-    fi
-    local waited=0
-    while [ "$waited" -lt 60 ]; do
-        if grep -q "pushed the pointer back out" "$(inst_dir b)/daemon.log" 2>/dev/null; then break; fi
-        sleep 0.25
-        waited=$((waited + 1))
-    done
-    check_contains "receptor detecta o retorno do cursor" "pushed the pointer back out" "$(grep -m1 "pushed the pointer back out" "$(inst_dir b)/daemon.log" 2>/dev/null)"
-    sleep 1
-    check_contains "controlador libera a captura no retorno" "releasing capture" "$(grep -m1 "releasing capture" "$(inst_dir a)/daemon.log" 2>/dev/null)"
-    check_contains "link continua conectado depois do retorno" "connected" "$(first_status a)"
-    local returns
-    returns=$(grep -c "pushed the pointer back out" "$(inst_dir b)/daemon.log" 2>/dev/null || true)
-    if [ "$returns" -ge 2 ]; then
-        pass "retorno repetido não quebra a sessão ($returns x)"
-    else
-        fail "retorno não se repetiu ($returns x)"
-    fi
-}
 
 scenario_grace() {
     say "### scenario grace: disconnect local bloqueia reconexão silenciosa"
@@ -862,9 +830,56 @@ activate_on_startup = true"
 }
 
 
+# Regression (user report): accepting a peer once must not produce a second
+# permission prompt on the machine that initiated the connection. A peer we
+# connected to is a trusted identity: it is registered as a device with the
+# bidirectional defaults, so its reverse connection is auto-authorized.
+scenario_noprompt() {
+    say "### scenario noprompt: aceitar uma vez não gera segundo pedido"
+    start_pair || return 1
+    # A initiates the connection and does NOT pre-trust loopback addresses; the
+    # peer must be learned from the outgoing handshake (TOFU).
+    {
+        printf 'port = %s\n' "$PORT_A"
+        printf 'capture_backend = "dummy"\n'
+        printf 'emulation_backend = "dummy"\n'
+        printf '\n[[clients]]\nhostname = "b"\nips = ["127.0.0.1"]\nport = %s\nposition = "right"\nactivate_on_startup = true\n' "$PORT_B"
+    } > "$(inst_dir a)/config/lan-mouse/config.toml"
+    restart_daemon a || return 1
+    if ! wait_connected a 10; then
+        fail "A não conectou a B"
+        return 1
+    fi
+    local fp
+    fp=$(grep -oE '([0-9a-f]{2}:){31}[0-9a-f]{2}' "$(inst_dir a)/daemon.log" | head -1)
+    if [ -z "$fp" ]; then
+        fail "A não aprendeu o fingerprint do peer"
+        return 1
+    fi
+    note "fingerprint aprendido: $fp"
+    local short_fp
+    short_fp=$(printf '%s' "$fp" | cut -d: -f1-8)
+    check_contains "peer conectado é registrado como device" "$short_fp" "$(cli a devices)"
+
+    # The peer now connects back (the reverse direction). A must accept it
+    # without a second permission request.
+    local before
+    before=$(grep -c "connection request from" "$(inst_dir a)/daemon.log" 2>/dev/null || true)
+    write_config b "$PORT_B" "[[clients]]
+hostname = \"a\"
+ips = [\"127.0.0.1\"]
+port = $PORT_A
+position = \"left\"
+activate_on_startup = true"
+    restart_daemon b || return 1
+    sleep 4
+    check_contains "conexão reversa aceita sem novo pedido" "$before" "$(grep -c "connection request from" "$(inst_dir a)/daemon.log" 2>/dev/null || true)"
+    check_contains "banco conectou de volta" "connected" "$(first_status b)"
+}
+
 SCENARIOS=("$@")
 if [ "${#SCENARIOS[@]}" -eq 0 ]; then
-    SCENARIOS=(dual duplicate peer_down disconnect revoke side close retorno grace stale_config reset_config no_spin isolation)
+    SCENARIOS=(dual duplicate peer_down disconnect revoke side close noprompt grace stale_config reset_config no_spin isolation)
 fi
 
 say "lan-mouse QA two-instances (repo: $REPO_ROOT, bin: $BIN, base: $BASE)"
@@ -879,7 +894,7 @@ for scenario in "${SCENARIOS[@]}"; do
         peer_down) scenario_peer_down ;;
         side) scenario_side ;;
         close) scenario_close ;;
-        retorno) scenario_retorno ;;
+        noprompt) scenario_noprompt ;;
         grace) scenario_grace ;;
         revoke)
             scenario_revoke

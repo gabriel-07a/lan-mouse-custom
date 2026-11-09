@@ -394,9 +394,12 @@ impl Service {
                                     .get_state(handle)
                                     .and_then(|(config, _)| config.hostname)
                                     .unwrap_or_else(|| fingerprint.clone());
-                                // Learning an outgoing peer must not grant it
-                                // inbound control: incoming stays denied until
-                                // the user authorizes the device.
+                                // The user chose to connect to this peer, so it
+                                // is a trusted identity. Register it with the
+                                // bidirectional defaults: otherwise the peer's
+                                // reverse connection would raise a second
+                                // permission prompt on this machine ("accept
+                                // once" should mean both directions).
                                 self.audit.event(
                                     "cert_learned",
                                     Some(&fingerprint),
@@ -408,7 +411,7 @@ impl Service {
                                     &fingerprint,
                                     name,
                                     DeviceSource::Legacy,
-                                    DirectionPolicy::deny(),
+                                    DirectionPolicy::allow_all(),
                                     DirectionPolicy::allow_all(),
                                 );
                                 self.learned_fingerprints.insert(handle, fingerprint.clone());

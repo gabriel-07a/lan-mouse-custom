@@ -138,3 +138,9 @@ See capture.md R-02 and frontend.md R-03/R-04.
   AuthRevoke is retransmitted, and the receiver rejects reconnections of that identity at the handshake
   until the device is allowed again (no transport, no injected input, no blink). Regression: scenarios
   close/grace (assert zero new sessions/dials after the disconnect).
+
+- Automatic edge-return on relative-only backends (GNOME Wayland) was removed again: without an absolute
+  pointer anchor it fired on ordinary movement. Use the release bind (Ctrl+Shift+Meta+Alt) on the machine
+  that holds the capture, or disconnect. Native Windows edge reporting stays.
+- A peer you connected to is registered as a trusted device with the bidirectional defaults, so accepting
+  it once no longer produces a second permission prompt when it connects back (scenario noprompt).

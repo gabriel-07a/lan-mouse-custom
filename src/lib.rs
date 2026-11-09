@@ -11,8 +11,6 @@ mod devices;
 mod discovery;
 mod dns;
 pub mod doctor;
-#[cfg(not(target_os = "windows"))]
-mod edge_return;
 mod emulation;
 pub mod emulation_test;
 mod listen;
