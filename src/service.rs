@@ -376,6 +376,14 @@ impl Service {
                 handle = self.conn_state_rx.recv() => {
                     if let Some(handle) = handle {
                         self.broadcast_client(handle);
+                        // A peer's AuthRevoke deactivates the client in the
+                        // connection layer only. Drop the matching outgoing
+                        // capture barrier here too, otherwise the local pointer
+                        // keeps retrying a link that the user already closed
+                        // (release/re-grab loop at the screen edge).
+                        if !self.client_manager.is_active(handle) {
+                            self.capture.destroy(handle);
+                        }
                         // A successful outgoing connection with an unpinned
                         // client learns the peer certificate (TOFU) and pins
                         // it, so later connections cannot be impersonated.
@@ -1227,12 +1235,26 @@ impl Service {
     /// through). This is the return hand-off: without it the peer keeps the
     /// local pointer grabbed on its side of the shared edge.
     fn request_return(&mut self, pos: Position) {
-        let addrs: Vec<SocketAddr> = self
+        let mut addrs: Vec<SocketAddr> = self
             .incoming_conn_info
             .values()
             .filter(|incoming| incoming.pos == pos)
             .map(|incoming| incoming.addr)
             .collect();
+        if addrs.is_empty() {
+            // A mismatching position must never trap the cursor: when exactly
+            // one peer is driving this machine, hand control back to it anyway.
+            if let Some(incoming) = self.incoming_conn_info.values().next() {
+                if self.incoming_conn_info.len() == 1 {
+                    log::warn!(
+                        "return hand-off through {pos:?} did not match the live edge ({:?}); using the only incoming session {}",
+                        incoming.pos,
+                        incoming.addr
+                    );
+                    addrs.push(incoming.addr);
+                }
+            }
+        }
         if addrs.is_empty() {
             log::debug!("return hand-off through {pos:?}, but no incoming session matches it");
             return;
@@ -1634,6 +1656,9 @@ impl Service {
         };
         {
             let mut store = self.devices.write().expect("lock");
+            // Setting a policy is the user explicitly allowing the device
+            // again: lift the post-disconnect reconnect block.
+            store.allow_reconnect(&fingerprint);
             if store.device(&fingerprint).is_none() {
                 let name = self
                     .client_manager
@@ -1972,7 +1997,7 @@ impl Service {
                     .remove(&previous);
                 self.disconnect_fingerprint(&previous);
                 for handle in self.client_manager.all_handles_for_fingerprint(&previous) {
-                    self.deactivate_client_and_peer(handle);
+                    self.deactivate_client_and_peer(handle, false);
                     self.client_manager
                         .set_fingerprint(handle, Some(fingerprint.clone()));
                     self.client_manager.set_hostname(handle, Some(name.clone()));
@@ -2642,9 +2667,17 @@ impl Service {
 
     fn set_client_active(&mut self, handle: ClientHandle, active: bool) {
         if active {
+            // The user explicitly asked for this client again: allow the
+            // identity to reconnect (lift the post-disconnect block).
+            if let Some(fingerprint) = self.client_manager.fingerprint(handle) {
+                self.devices
+                    .write()
+                    .expect("lock")
+                    .allow_reconnect(&fingerprint);
+            }
             self.activate_client(handle);
         } else {
-            self.deactivate_client_and_peer(handle);
+            self.deactivate_client_and_peer(handle, true);
         }
     }
 
@@ -2663,9 +2696,13 @@ impl Service {
     /// marked inactive first so the reconnect loop cannot revive it; the
     /// outgoing transport sends `AuthRevoke` before closing and all incoming
     /// sessions for the same identity are closed too.
-    fn deactivate_client_and_peer(&mut self, handle: ClientHandle) {
+    fn deactivate_client_and_peer(&mut self, handle: ClientHandle, user_initiated: bool) {
         log::debug!("explicitly disconnecting client {handle}");
         let fingerprint = self.client_manager.fingerprint(handle);
+        // A peer that controls this machine uses a reverse (inactive) client
+        // entry; the full teardown below is what stops it, and the grace window
+        // then keeps a racing reconnect from silently restoring the session.
+        let had_incoming = self.client_manager.incoming_addr(handle).is_some();
         // Mark inactive first so the reconnect loop cannot revive the link.
         let was_active = self.client_manager.deactivate_client(handle);
         // Close the outgoing transport with an explicit AuthRevoke (only when
@@ -2682,17 +2719,38 @@ impl Service {
                 self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
             }
         }
-        if let Some(fingerprint) = fingerprint {
+        if let Some(fingerprint) = fingerprint.as_deref() {
             if !fingerprint.is_empty() {
                 // Closes every remaining live session of this identity (and
                 // sends AuthRevoke to the peer).
-                self.disconnect_fingerprint(&fingerprint);
+                self.disconnect_fingerprint(fingerprint);
             }
         }
         self.capture.destroy(handle);
         self.client_manager.set_incoming_addr(handle, None);
         if self.incoming_conns.is_empty() {
             self.capture.set_remote_peer(None);
+        }
+        if user_initiated && had_incoming {
+            if let Some(fingerprint) = fingerprint.as_deref() {
+                if !fingerprint.is_empty() {
+                    // Reject the peer's next handshake at the listener: a peer
+                    // that ignores the revoke (or lost it) must not be able to
+                    // re-establish a session and inject input behind the UI's
+                    // back. The user lifts this by allowing the device again.
+                    self.devices
+                        .write()
+                        .expect("lock")
+                        .suppress_reconnect(fingerprint.to_string());
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "device {} disconnected locally; allow it again in Devices to reconnect",
+                        &fingerprint[..fingerprint.len().min(16)]
+                    )));
+                    log::info!(
+                        "blocking reconnects from {fingerprint} until the device is allowed again"
+                    );
+                }
+            }
         }
         self.broadcast_client(handle);
         log::info!("explicitly disconnected client {handle}");
@@ -2703,7 +2761,7 @@ impl Service {
     fn deactivate_fingerprint(&mut self, fingerprint: &str) {
         let handles = self.client_manager.all_handles_for_fingerprint(fingerprint);
         for handle in handles {
-            self.deactivate_client_and_peer(handle);
+            self.deactivate_client_and_peer(handle, false);
         }
     }
 

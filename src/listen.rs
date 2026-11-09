@@ -767,6 +767,22 @@ fn per_connection_verify(
                 return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
             }
 
+            // A device the local user just disconnected must not be able to
+            // re-establish a session behind the UI's back: rejecting here means
+            // no transport, no injected input and no "Peer connected" blink,
+            // even for a peer that keeps retrying. The block is lifted when the
+            // user allows the device again (activate / policy change).
+            if devices
+                .read()
+                .expect("lock")
+                .is_reconnect_suppressed(&fingerprint)
+            {
+                log::warn!(
+                    "rejecting reconnect from {addr} ({fingerprint}): this device was disconnected locally; allow it again to reconnect"
+                );
+                return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+            }
+
             if authorized.read().expect("lock").contains_key(&fingerprint) {
                 return Ok(());
             }

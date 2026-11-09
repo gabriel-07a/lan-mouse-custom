@@ -152,6 +152,16 @@ impl ConnCtx {
     /// Start a background connect attempt, unless one is already running or
     /// the client is already connected.
     fn start_connecting(&self, handle: ClientHandle) {
+        // A client that is not active must never be dialed. The capture task
+        // retries `ensure_connected` on every failed send; before this gate a
+        // peer's explicit disconnect (AuthRevoke -> `deactivate_client`) was
+        // undone by that retry and the controller silently re-established the
+        // session behind the UI's back. Only an explicit activation may start
+        // a new session.
+        if !self.client_manager.is_active(handle) {
+            log::debug!("client {handle}: refusing to connect, client is not active");
+            return;
+        }
         if self.active(handle).is_some() {
             return;
         }
@@ -735,6 +745,17 @@ async fn connect_to_handle(
             connect_first(addrs, ctx.cert.clone(), ADDRESS_TIMEOUT, expected.clone()).await?;
         log::info!("client ({handle}) connected @ {addr}");
 
+        // A dial can race the peer's AuthRevoke (or a local deactivate). The
+        // handshake may already have succeeded while the client was marked
+        // inactive; never install a transport for an inactive client.
+        if !ctx.client_manager.is_active(handle) {
+            log::info!(
+                "client {handle}: discarding connection to {addr}, the client was deactivated while dialing"
+            );
+            let _ = conn.close().await;
+            return Ok(());
+        }
+
         // Trust on first use: pin the certificate the peer actually presented
         // so the next connection is verified against it.
         if expected.is_none() {
@@ -1146,7 +1167,15 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnecti
                         // sides: never let the reconnect loop revive the link.
                         ctx.client_manager.deactivate_client(handle);
                         ctx.notify_state_changed(handle);
-                        ctx.disconnect(handle, active.generation).await;
+                        // Close whatever transport is live *now*: a capture
+                        // retry racing this frame may already have installed a
+                        // replacement generation, which `active.generation`
+                        // (the transport this loop was started for) no longer
+                        // identifies, so `take_if_current` would silently
+                        // leave it alive.
+                        if let Some(current) = ctx.active(handle) {
+                            ctx.disconnect(handle, current.generation).await;
+                        }
                         return;
                     }
                     // The listener is the responder for permission requests.

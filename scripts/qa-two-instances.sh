@@ -737,6 +737,11 @@ activate_on_startup = true"
     sleep 2
     check_contains "controlador não reconecta sozinho" "disconnected" "$(first_status a)"
 
+    # The receiver keeps this peer out for the post-disconnect grace window, so
+    # restart it before the second case (a clean restart clears the window; the
+    # grace scenario checks the window itself).
+    restart_daemon b || return 1
+    sleep 0.5
     cli a activate 0 >/dev/null 2>&1
     if ! wait_connected a 10; then
         fail "A não reconectou para o segundo caso"
@@ -765,9 +770,101 @@ activate_on_startup = true"
     check_contains "trocar o lado no receptor mantém a sessão de entrada" "receiving-only" "$(first_status b)"
 }
 
+# Regression (user report): the controlled machine could not hand the cursor
+# back on Wayland/libei because only the Windows emulation backend reports
+# screen edges. The software tracker in crate::edge_return detects the return
+# from the injected 1:1 motion deltas, and a local Disconnect keeps the peer out
+# for a short grace window so a lost AuthRevoke cannot restore the session.
+scenario_retorno() {
+    say "### scenario retorno: cursor volta do receptor sem ficar preso"
+    start_pair || return 1
+    write_config a "$PORT_A" "[[clients]]
+hostname = \"b\"
+ips = [\"127.0.0.1\"]
+port = $PORT_B
+position = \"left\"
+activate_on_startup = true"
+    restart_daemon a || return 1
+    if ! wait_connected a 10; then
+        fail "A não conectou a B"
+        return 1
+    fi
+    local waited=0
+    while [ "$waited" -lt 60 ]; do
+        if grep -q "pushed the pointer back out" "$(inst_dir b)/daemon.log" 2>/dev/null; then break; fi
+        sleep 0.25
+        waited=$((waited + 1))
+    done
+    check_contains "receptor detecta o retorno do cursor" "pushed the pointer back out" "$(grep -m1 "pushed the pointer back out" "$(inst_dir b)/daemon.log" 2>/dev/null)"
+    sleep 1
+    check_contains "controlador libera a captura no retorno" "releasing capture" "$(grep -m1 "releasing capture" "$(inst_dir a)/daemon.log" 2>/dev/null)"
+    check_contains "link continua conectado depois do retorno" "connected" "$(first_status a)"
+    local returns
+    returns=$(grep -c "pushed the pointer back out" "$(inst_dir b)/daemon.log" 2>/dev/null || true)
+    if [ "$returns" -ge 2 ]; then
+        pass "retorno repetido não quebra a sessão ($returns x)"
+    else
+        fail "retorno não se repetiu ($returns x)"
+    fi
+}
+
+scenario_grace() {
+    say "### scenario grace: disconnect local bloqueia reconexão silenciosa"
+    start_pair || return 1
+    write_config a "$PORT_A" "[[clients]]
+hostname = \"b\"
+ips = [\"127.0.0.1\"]
+port = $PORT_B
+position = \"left\"
+activate_on_startup = true"
+    restart_daemon a || return 1
+    if ! wait_connected a 10; then
+        fail "A não conectou a B"
+        return 1
+    fi
+    local conn_before
+    conn_before=$(grep -c "dtls client connected" "$(inst_dir b)/daemon.log" 2>/dev/null || true)
+    cli b deactivate 0 >/dev/null 2>&1
+    sleep 3
+    check_contains "receptor fica desconectado" "disconnected" "$(first_status b)"
+    check_contains "controlador fica desconectado" "disconnected" "$(first_status a)"
+    local conn_after
+    conn_after=$(grep -c "dtls client connected" "$(inst_dir b)/daemon.log" 2>/dev/null || true)
+    check_eq "controlador não reabre sessão sozinho" "$conn_before" "$conn_after"
+    local dials_after
+    dials_after=$(grep -c "connecting to" "$(inst_dir a)/daemon.log" 2>/dev/null || true)
+    sleep 3
+    check_eq "controlador não fica tentando discar" "$dials_after" "$(grep -c "connecting to" "$(inst_dir a)/daemon.log" 2>/dev/null || true)"
+
+    # A deliberate re-enable on the controller must not get back in: the
+    # listener rejects the handshake (no transport, no injected input, no blink).
+    cli a activate 0 >/dev/null 2>&1
+    sleep 2
+    local forced
+    forced=$(first_status a)
+    if printf '%s' "$forced" | grep -q "connected ("; then
+        fail "controlador reconectou após o disconnect: $forced"
+    else
+        pass "reconexão imediata é recusada ($forced)"
+    fi
+    check_contains "receptor continua desconectado" "disconnected" "$(first_status b)"
+    check_contains "receptor registra o bloqueio" "disconnected locally" "$(grep -m1 "disconnected locally" "$(inst_dir b)/daemon.log" 2>/dev/null)"
+
+    # The user allows the device again on the receiving machine; reconnection
+    # then works (the block is not permanent).
+    cli b activate 0 >/dev/null 2>&1
+    cli a activate 0 >/dev/null 2>&1
+    if ! wait_connected a 15; then
+        fail "reconexão após permitir o dispositivo falhou"
+        return 1
+    fi
+    pass "reconexão explícita após permitir o dispositivo funciona"
+}
+
+
 SCENARIOS=("$@")
 if [ "${#SCENARIOS[@]}" -eq 0 ]; then
-    SCENARIOS=(dual duplicate peer_down disconnect revoke side close stale_config reset_config no_spin isolation)
+    SCENARIOS=(dual duplicate peer_down disconnect revoke side close retorno grace stale_config reset_config no_spin isolation)
 fi
 
 say "lan-mouse QA two-instances (repo: $REPO_ROOT, bin: $BIN, base: $BASE)"
@@ -782,6 +879,8 @@ for scenario in "${SCENARIOS[@]}"; do
         peer_down) scenario_peer_down ;;
         side) scenario_side ;;
         close) scenario_close ;;
+        retorno) scenario_retorno ;;
+        grace) scenario_grace ;;
         revoke)
             scenario_revoke
             ;;

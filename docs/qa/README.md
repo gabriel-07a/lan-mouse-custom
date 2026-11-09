@@ -127,3 +127,14 @@ See capture.md R-02 and frontend.md R-03/R-04.
 - Windows: the GPUI frontend now embeds the icon resource, fixing the missing taskbar/pinned-shortcut
   icon; the notification-area icon uses the same embedded Lan Mouse icon. Regression: packaging test
   windows_gpui_frontend_embeds_the_icon_resource.
+
+- The controlled machine can hand the cursor back on Wayland/libei again: a software tracker reconstructs
+  the pointer distance from the entry edge out of the injected deltas and requests the standard Leave
+  hand-off when the user pushes back out. Regression: scenario retorno.
+- Closing from either side is reliable: AuthRevoke is retransmitted and a 10 s local grace window tears
+  down racing reconnections (no "blink back"). Regression: scenarios close/grace.
+
+- A local Disconnect is final: the controller no longer re-dials an inactive client (capture-retry gate),
+  AuthRevoke is retransmitted, and the receiver rejects reconnections of that identity at the handshake
+  until the device is allowed again (no transport, no injected input, no blink). Regression: scenarios
+  close/grace (assert zero new sessions/dials after the disconnect).

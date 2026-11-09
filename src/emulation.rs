@@ -1,5 +1,7 @@
 use crate::config::local_commit;
 use crate::devices::DeviceStore;
+#[cfg(not(target_os = "windows"))]
+use crate::edge_return::EdgeReturnTracker;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCommand, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, PointerEdge};
@@ -176,6 +178,8 @@ impl Emulation {
             reply_rx,
             devices,
             fingerprints: Default::default(),
+            #[cfg(not(target_os = "windows"))]
+            edge_return: EdgeReturnTracker::default(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -308,9 +312,37 @@ struct ListenTask {
     devices: Option<Arc<RwLock<DeviceStore>>>,
     /// peer fingerprint per live connection, used for permission events
     fingerprints: HashMap<SocketAddr, String>,
+    /// software return hand-off detection for emulation backends that cannot
+    /// report screen edges (everything but Windows; see crate::edge_return)
+    #[cfg(not(target_os = "windows"))]
+    edge_return: EdgeReturnTracker,
 }
 
 impl ListenTask {
+    /// Tell the peer that this is a deliberate user disconnect.
+    ///
+    /// Events travel over DTLS/UDP without retransmission. A single lost
+    /// AuthRevoke made the peer treat the close as a network drop and reconnect
+    /// (the Disconnect button appeared to blink back), so send a few copies
+    /// with short spacing before closing the transport.
+    async fn explicit_disconnect(&mut self, addr: SocketAddr) {
+        for copy in 0..5 {
+            self.listener
+                .reply(
+                    addr,
+                    ProtoEvent::AuthRevoke {
+                        session_id: 0,
+                        reason: 1,
+                    },
+                )
+                .await;
+            if copy + 1 < 5 {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+        self.listener.disconnect(addr).await;
+    }
+
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut last_response = HashMap::new();
@@ -332,6 +364,8 @@ impl ListenTask {
                                     self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
                                 } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     last_enter.record(addr, serial);
+                                    #[cfg(not(target_os = "windows"))]
+                                    self.edge_return.enter(addr, to_ipc_pos(pos));
                                     log::info!("releasing capture: {addr} entered this device");
                                     // Publish the hand-off before the Ack gives the
                                     // peer permission to start injecting input. The
@@ -346,6 +380,8 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                #[cfg(not(target_os = "windows"))]
+                                self.edge_return.leave(addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                 // The peer is no longer driving this machine.
@@ -362,7 +398,23 @@ impl ListenTask {
                                     .ok()
                                     .unwrap_or_default();
                             }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::Input(event) => {
+                                // On backends without native edge reporting the
+                                // injected motion itself is the only evidence
+                                // that the user pushed the pointer back out
+                                // through the entry edge.
+                                #[cfg(not(target_os = "windows"))]
+                                if let Some(pos) = self.edge_return.observe(addr, &event) {
+                                    log::info!(
+                                        "{addr} pushed the pointer back out through {pos:?}; requesting capture release"
+                                    );
+                                    self.event_tx
+                                        .send(EmulationEvent::EdgeReturn(pos))
+                                        .ok()
+                                        .unwrap_or_default();
+                                }
+                                self.emulation_proxy.consume(event, addr)
+                            }
                             ProtoEvent::AuthRequest {
                                 session_id,
                                 incoming_caps,
@@ -511,16 +563,9 @@ impl ListenTask {
                     EmulationRequest::Disconnect(addr) => {
                         // Tell the peer this is an explicit user disconnect so
                         // it deactivates its client instead of reconnecting.
-                        self.listener
-                            .reply(
-                                addr,
-                                ProtoEvent::AuthRevoke {
-                                    session_id: 0,
-                                    reason: 1,
-                                },
-                            )
-                            .await;
-                        self.listener.disconnect(addr).await
+                        self.explicit_disconnect(addr).await;
+                        #[cfg(not(target_os = "windows"))]
+                        self.edge_return.leave(addr);
                     }
                     EmulationRequest::CloseSession(addr) => {
                         // No AuthRevoke: a forced "user disconnect" would make
@@ -539,16 +584,9 @@ impl ListenTask {
                             log::info!(
                                 "closing incoming session from {addr}: device {fingerprint} revoked"
                             );
-                            self.listener
-                                .reply(
-                                    addr,
-                                    ProtoEvent::AuthRevoke {
-                                        session_id: 0,
-                                        reason: 1,
-                                    },
-                                )
-                                .await;
-                            self.listener.disconnect(addr).await;
+                            self.explicit_disconnect(addr).await;
+                            #[cfg(not(target_os = "windows"))]
+                            self.edge_return.leave(addr);
                         }
                         // Also ask the listener to close sessions known by
                         // identity but not yet in the emulation map.
@@ -578,6 +616,8 @@ impl ListenTask {
                         self.emulation_proxy.remove(addr);
                         last_response.remove(&addr);
                         last_enter.clear(addr);
+                        #[cfg(not(target_os = "windows"))]
+                        self.edge_return.leave(addr);
                         self.listener.disconnect(addr).await;
                         self.event_tx.send(EmulationEvent::Disconnected { addr }).ok().unwrap_or_default();
                     }

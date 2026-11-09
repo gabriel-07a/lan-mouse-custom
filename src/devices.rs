@@ -207,6 +207,11 @@ pub(crate) struct DeviceStore {
     denied: HashMap<String, DeniedRecord>,
     /// devices granted only for the current session; never persisted
     ephemeral: HashSet<String>,
+    /// identities the local user disconnected while they were driving this
+    /// machine. Their next handshake is rejected until the user allows the
+    /// device again (explicit activation or a device policy change). Kept in
+    /// memory only: restarting the app clears it.
+    reconnect_suppressed: HashSet<String>,
     pending: HashMap<String, PendingDevice>,
 }
 
@@ -229,6 +234,20 @@ impl DeviceStore {
             .retain(|fingerprint, _| !self.denied.contains_key(fingerprint));
     }
 
+    /// Refuse reconnections of a device the local user just disconnected.
+    pub(crate) fn suppress_reconnect(&mut self, fingerprint: String) {
+        self.reconnect_suppressed.insert(fingerprint);
+    }
+
+    pub(crate) fn is_reconnect_suppressed(&self, fingerprint: &str) -> bool {
+        self.reconnect_suppressed.contains(fingerprint)
+    }
+
+    /// Lift the post-disconnect block (explicit user action).
+    pub(crate) fn allow_reconnect(&mut self, fingerprint: &str) {
+        self.reconnect_suppressed.remove(fingerprint);
+    }
+
     pub(crate) fn device(&self, fingerprint: &str) -> Option<&Device> {
         self.devices.get(fingerprint)
     }
@@ -238,6 +257,7 @@ impl DeviceStore {
     }
 
     pub(crate) fn put(&mut self, device: Device) {
+        self.reconnect_suppressed.remove(&device.fingerprint);
         self.denied.remove(&device.fingerprint);
         self.ephemeral.remove(&device.fingerprint);
         self.devices.insert(device.fingerprint.clone(), device);
@@ -640,6 +660,30 @@ mod tests {
         assert!(!device.incoming.allows_input());
         assert!(!device.outgoing.allowed);
         assert!(store.outgoing(&fp(1)).capabilities.is_empty());
+    }
+
+    #[test]
+    fn reconnect_suppression_blocks_until_explicitly_allowed() {
+        let mut store = DeviceStore::default();
+        store.put(Device::new(fp(1), "peer".into()));
+        assert!(!store.is_reconnect_suppressed(&fp(1)));
+
+        store.suppress_reconnect(fp(1));
+        assert!(store.is_reconnect_suppressed(&fp(1)));
+
+        // An explicit policy update (Devices page / CLI allow) lifts the block.
+        store.put(Device::new(fp(1), "peer".into()));
+        assert!(!store.is_reconnect_suppressed(&fp(1)));
+
+        // So does an explicit allow request.
+        store.suppress_reconnect(fp(2));
+        assert!(store.is_reconnect_suppressed(&fp(2)));
+        store.allow_reconnect(&fp(2));
+        assert!(!store.is_reconnect_suppressed(&fp(2)));
+
+        // Suppression is per identity.
+        store.suppress_reconnect(fp(1));
+        assert!(!store.is_reconnect_suppressed(&fp(2)));
     }
 
     #[test]

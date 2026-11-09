@@ -157,3 +157,10 @@ modified; there is no capability bit, version bump or mixed-version requirement 
 | ID | Sev | Location | Symptom | Root cause | Fix |
 |---|---|---|---|---|---|
 | RT-05 | P3 | libei.rs scroll_deltas | huge-but-finite f64 (e.g. 1e300) narrowed to f32::INFINITY and passed to EIS scroll | finiteness checked before the f32 cast, not after | re-check finiteness after narrowing (Motion path already did) |
+
+
+## Post-release round (v0.2.9 user report) - R-09: cursor can leave the controlled machine
+
+| ID | Sev | Location | Symptom | Root cause | Fix |
+|---|---|---|---|---|---|
+| R-09 | P1 | src/edge_return.rs + src/emulation.rs (listen task) | On Ubuntu/Wayland the controlled machine could not hand the cursor back: moving the pointer into it trapped it there (no disconnect involved) | only the Windows emulation backend implements the edge-return notifier. On Linux the return hand-off relied on capture barriers reacting to injected motion, which the GNOME/libei portal does not do reliably - so the receiver never asked the controller to release its capture | a software tracker (src/edge_return.rs) reconstructs the cursor distance from the entry edge out of the injected 1:1 motion deltas: it arms after 24 px inward and fires when the summed distance overshoots the entry edge by 6 px, then the service sends the standard Leave hand-off. It runs only on non-Windows builds (Windows keeps its native notifier) and is covered by unit tests for every edge/sign, jitter, non-finite deltas and session cleanup. The service also falls back to the only live incoming session when a Return position does not match the stored edge |
