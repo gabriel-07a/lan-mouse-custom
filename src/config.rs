@@ -84,7 +84,8 @@ struct ConfigToml {
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
     /// sensitivity of input received from peers through the absolute pointer,
-    /// in percent (167 compensates a 166% monitor scale)
+    /// in percent (100 = screen-relative 1:1; the mirrored pointer acceleration
+    /// supplies the velocity-dependent boost)
     absolute_pointer_sensitivity: Option<u16>,
     port: Option<u16>,
     /// UDP discovery/broadcast port (defaults to 4245)
