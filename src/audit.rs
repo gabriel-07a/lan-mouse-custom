@@ -60,7 +60,10 @@ struct AuditState {
     /// Whether the parent directory is known to exist, so the common append
     /// path does not need a create_dir_all syscall per record.
     parent_ready: bool,
-    /// Whether the current file permissions were tightened already.
+    /// Whether the current file permissions were tightened already. Only the
+    /// unix path tightens permissions; keeping the field gated avoids a
+    /// "never read" warning on Windows (CI builds with -D warnings).
+    #[cfg(unix)]
     file_tightened: bool,
     /// Last write time per state-change key (see event_state_change).
     #[cfg_attr(not(test), allow(dead_code))]
