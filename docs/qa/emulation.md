@@ -199,3 +199,14 @@ personal taste. It is adjustable in the GPUI Settings page ("Incoming pointer se
 applied live and saved), in config.toml (absolute_pointer_sensitivity) or through the CLI:
 "lan-mouse cli set-absolute-sensitivity <percent>". LAN_MOUSE_ABSOLUTE_SCALE overrides it temporarily.
 The arm log line shows the effective gain: "absolute pointer armed at ... gain 1.00x (accel mirrored)".
+
+
+### R-17: Windows receiver handed control back on every screen edge
+
+Reported on Windows 10/11: while the other PC controlled it, moving the injected cursor to any screen edge
+(not only the edge the peer entered through) handed control back, i.e. the other PC "switched" unexpectedly.
+
+The Windows emulation backend reported an EdgeReturn whenever the remote pointer overshot any screen edge, and
+the service's only-incoming-session fallback then accepted it even though the edge did not match the entry
+edge. The backend now remembers the entry edge (Emulation::begin_remote_control) and only reports the
+hand-off for that edge; the other edges keep the cursor clamped on this screen.

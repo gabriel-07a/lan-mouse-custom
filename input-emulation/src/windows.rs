@@ -75,6 +75,10 @@ pub(crate) struct WindowsEmulation {
     /// Throttled, bounded retry state for hand-off requests. Re-armed when the
     /// remote pointer moves back inside the screen or the session ends.
     edge_return_latch: EdgeReturnLatch,
+    /// Screen edge the peer entered through. Only pushing the remote pointer
+    /// back out through *that* edge is the return hand-off; the other three
+    /// edges must keep the cursor clamped on this screen.
+    remote_edge: Option<PointerEdge>,
 }
 
 impl WindowsEmulation {
@@ -94,6 +98,7 @@ impl WindowsEmulation {
             scale_cache: None,
             edge_return: None,
             edge_return_latch: EdgeReturnLatch::default(),
+            remote_edge: None,
         })
     }
 
@@ -168,7 +173,13 @@ impl WindowsEmulation {
             cursor.1.saturating_add(move_y),
         );
         match overshoot_edge(&screen, requested) {
-            Some(edge) => self.request_edge_return(edge),
+            // Only the edge the peer entered through is a return hand-off.
+            // Reporting every edge made the other PC take control back when
+            // the cursor merely reached the top/bottom/opposite side.
+            Some(edge) if self.remote_edge.is_none_or(|entry| entry == edge) => {
+                self.request_edge_return(edge)
+            }
+            Some(_) => self.edge_return_latch.clear(),
             // Back inside the screen: the next edge contact is a new hand-off.
             None => self.edge_return_latch.clear(),
         }
@@ -305,6 +316,16 @@ impl Emulation for WindowsEmulation {
 
     fn set_edge_return_notifier(&mut self, notifier: EdgeReturnNotifier) {
         self.edge_return = Some(notifier);
+    }
+
+    async fn begin_remote_control(&mut self, edge: PointerEdge) {
+        self.remote_edge = Some(edge);
+        self.edge_return_latch.clear();
+    }
+
+    async fn end_remote_control(&mut self) {
+        self.remote_edge = None;
+        self.edge_return_latch.clear();
     }
 
     /// Windows synthesizes key repeat in [`Self::spawn_repeat_task`].
