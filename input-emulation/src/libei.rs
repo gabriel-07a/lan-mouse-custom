@@ -130,6 +130,9 @@ pub(crate) struct LibeiEmulation {
     pointer_settings: PointerSettings,
     /// previous motion timestamp, used to estimate the pointer velocity
     last_motion_time: Option<u32>,
+    /// local arrival time of the previous motion event (backends that do not
+    /// populate the wire timestamp, e.g. Windows, report time = 0)
+    last_motion_arrival: Option<Instant>,
     /// temporary LAN_MOUSE_ABSOLUTE_SCALE override, applied on every gain update
     absolute_env_scale: f64,
 }
@@ -203,7 +206,7 @@ fn effective_delta_scale(base_scale: f64, sensitivity: f64, env_scale: f64) -> f
 ///
 /// Windows sends milliseconds, the Linux/libei capture sends microseconds;
 /// values >= 1000 are treated as microseconds.
-fn dt_from_raw(previous: Option<u32>, time: u32) -> f64 {
+fn dt_from_raw(previous: Option<u32>, time: u32) -> Option<f64> {
     previous
         .map(|previous| time.wrapping_sub(previous))
         .map(|raw| {
@@ -213,8 +216,10 @@ fn dt_from_raw(previous: Option<u32>, time: u32) -> f64 {
                 raw as f64
             }
         })
-        .filter(|dt| *dt > 0.0 && *dt < 100.0)
-        .unwrap_or(8.0)
+        .filter(|dt| dt.is_finite() && *dt > 0.0)
+        // Real gaps (paused mouse, heavy frame) keep their duration instead of
+        // getting a fake 8 ms interval (which would boost right after a pause).
+        .map(|dt| dt.clamp(0.5, 100.0))
 }
 
 /// Temporary sensitivity override from the environment (1.0 = none).
@@ -299,15 +304,21 @@ impl AbsoluteTracker {
             layout_min_y,
             layout_max_x,
             layout_max_y,
-            x: match edge {
-                PointerEdge::Left => f64::from(entry.0) + EDGE_ANCHOR_INSET,
-                PointerEdge::Right => f64::from(entry.2) - 1.0 - EDGE_ANCHOR_INSET,
-                _ => f64::from(entry.0 + (entry.2 - entry.0) / 2.0),
+            x: {
+                let inset = EDGE_ANCHOR_INSET.min(f64::from((entry.2 - entry.0) / 2.0));
+                match edge {
+                    PointerEdge::Left => f64::from(entry.0) + inset,
+                    PointerEdge::Right => f64::from(entry.2) - 1.0 - inset,
+                    _ => f64::from(entry.0 + (entry.2 - entry.0) / 2.0),
+                }
             },
-            y: match edge {
-                PointerEdge::Top => f64::from(entry.1) + EDGE_ANCHOR_INSET,
-                PointerEdge::Bottom => f64::from(entry.3) - 1.0 - EDGE_ANCHOR_INSET,
-                _ => f64::from(entry.1 + (entry.3 - entry.1) / 2.0),
+            y: {
+                let inset = EDGE_ANCHOR_INSET.min(f64::from((entry.3 - entry.1) / 2.0));
+                match edge {
+                    PointerEdge::Top => f64::from(entry.1) + inset,
+                    PointerEdge::Bottom => f64::from(entry.3) - 1.0 - inset,
+                    _ => f64::from(entry.1 + (entry.3 - entry.1) / 2.0),
+                }
             },
             fired: false,
         })
@@ -335,8 +346,9 @@ impl AbsoluteTracker {
         }
         // Corrupted single deltas would jump the tracked cursor anywhere; drop
         // them instead of clamping (a clamp could still fire the hand-off).
-        // The limit leaves room for the mirrored acceleration boost (max 2.2x).
-        if dx.abs() > MAX_DELTA_PX * 3.0 || dy.abs() > MAX_DELTA_PX * 3.0 {
+        // Leave room for the mirrored boost: speed +1 doubles the base and the
+        // curve adds up to 2.2x, so valid values can reach 4.4x the wire limit.
+        if dx.abs() > MAX_DELTA_PX * 5.0 || dy.abs() > MAX_DELTA_PX * 5.0 {
             log::debug!("dropping implausible absolute delta ({dx}, {dy})");
             return None;
         }
@@ -605,9 +617,21 @@ impl LibeiEmulation {
     /// reports 1000 us = 1 ms), so the velocity estimate works for both
     /// without a protocol change.
     fn motion_dt(&mut self, time: u32) -> f64 {
-        let dt = dt_from_raw(self.last_motion_time, time);
-        self.last_motion_time = Some(time);
-        dt
+        let now = Instant::now();
+        // Prefer the wire timestamp (Linux/libei capture is precise) but fall
+        // back to the local arrival time when the backend does not provide one
+        // (Windows/macOS capture report time = 0).
+        let wire_dt = (time != 0)
+            .then(|| dt_from_raw(self.last_motion_time, time))
+            .flatten();
+        let arrival_dt = self
+            .last_motion_arrival
+            .map(|previous| now.duration_since(previous).as_secs_f64() * 1000.0)
+            .filter(|dt| dt.is_finite() && *dt > 0.0)
+            .map(|dt| dt.clamp(0.5, 100.0));
+        self.last_motion_time = (time != 0).then_some(time);
+        self.last_motion_arrival = Some(now);
+        wire_dt.or(arrival_dt).unwrap_or(8.0)
     }
 
     pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
@@ -648,6 +672,7 @@ impl LibeiEmulation {
             absolute_sensitivity: 1.0,
             pointer_settings: PointerSettings::detect(),
             last_motion_time: None,
+            last_motion_arrival: None,
             absolute_env_scale: read_env_scale(),
         })
     }
@@ -677,6 +702,8 @@ impl Emulation for LibeiEmulation {
         self.remote_edge = Some(edge);
         self.absolute = None;
         self.absolute_warned = false;
+        self.last_motion_time = None;
+        self.last_motion_arrival = None;
         self.start_absolute_tracking();
     }
 
@@ -684,6 +711,8 @@ impl Emulation for LibeiEmulation {
         self.remote_edge = None;
         self.absolute = None;
         self.absolute_warned = false;
+        self.last_motion_time = None;
+        self.last_motion_arrival = None;
     }
 
     async fn consume(
@@ -1211,14 +1240,13 @@ mod absolute_tracker_tests {
     }
 
     #[test]
-    fn hidpi_scale_normalises_the_physical_speed() {
-        // display scale 1.6667: 1000 physical-ish counts move the logical
-        // cursor 600 px, matching the previous relative injection feel
+    fn screen_relative_mapping_is_one_logical_pixel_per_count() {
+        // independent of the monitor scale: 1000 counts move 1000 logical px
         let mut tracker = AbsoluteTracker::new(
             PointerEdge::Left,
             1,
             vec![(0.0, 0.0, 1536.0, 960.0)],
-            1.0 / 1.66667,
+            1.0,
             1.0,
         )
         .expect("region");
@@ -1226,8 +1254,8 @@ mod absolute_tracker_tests {
         assert_eq!(tracker.apply(1000.0, 0.0), None);
         let (x1, _) = tracker.absolute();
         assert!(
-            (x1 - x0 - 600.0).abs() < 2.0,
-            "expected ~600 px, got {}",
+            (x1 - x0 - 1000.0).abs() < 2.0,
+            "expected ~1000 px, got {}",
             x1 - x0
         );
     }
@@ -1354,48 +1382,46 @@ mod absolute_tracker_tests {
     }
 
     #[test]
-    fn screen_scale_and_sensitivity_are_independent() {
-        // physical 1 count must become 1/scale logical pixels at 100%
-        let scaled = AbsoluteTracker::new(
-            PointerEdge::Left,
-            1,
-            vec![(0.0, 0.0, 1536.0, 960.0)],
-            1.0 / 1.66667,
-            1.0,
-        )
-        .expect("region");
-        let mut scaled = scaled;
-        let (x0, _) = scaled.absolute();
-        let _ = scaled.apply(1000.0, 0.0);
-        let (x1, _) = scaled.absolute();
-        assert!((x1 - x0 - 600.0).abs() < 2.0);
-
-        // doubling the user sensitivity doubles the logical movement
+    fn sensitivity_scales_the_screen_relative_mapping() {
+        // 200% sensitivity doubles the logical movement, at any monitor scale
         let mut sensitive = AbsoluteTracker::new(
             PointerEdge::Left,
             1,
             vec![(0.0, 0.0, 1536.0, 960.0)],
-            1.0 / 1.66667,
+            1.0,
             2.0,
         )
         .expect("region");
         let (x0, _) = sensitive.absolute();
-        let _ = sensitive.apply(1000.0, 0.0);
+        let _ = sensitive.apply(400.0, 0.0);
         let (x1, _) = sensitive.absolute();
-        assert!((x1 - x0 - 1200.0).abs() < 4.0);
+        assert!((x1 - x0 - 800.0).abs() < 4.0);
+    }
+
+    #[test]
+    fn tiny_region_anchor_stays_inside_the_region() {
+        let tracker =
+            AbsoluteTracker::new(PointerEdge::Left, 1, vec![(0.0, 0.0, 20.0, 20.0)], 1.0, 1.0)
+                .expect("region");
+        let (x, y) = tracker.absolute();
+        assert!((0.0..=19.0).contains(&x), "x={x} outside the region");
+        assert!((0.0..=19.0).contains(&y), "y={y} outside the region");
     }
 
     #[test]
     fn timestamp_units_are_inferred() {
-        // milliseconds (Windows): 8 ms between events
-        assert!((dt_from_raw(Some(100), 108) - 8.0).abs() < 1e-9);
+        // milliseconds: 8 ms between events
+        assert_eq!(dt_from_raw(Some(100), 108), Some(8.0));
         // microseconds (libei): 8000 us between events = 8 ms
-        assert!((dt_from_raw(Some(1_000_000), 1_008_000) - 8.0).abs() < 1e-9);
+        assert_eq!(dt_from_raw(Some(1_000_000), 1_008_000), Some(8.0));
         // a 1000 Hz report (1000 us) is one millisecond
-        assert!((dt_from_raw(Some(5_000), 6_000) - 1.0).abs() < 1e-9);
-        // missing/duplicate timestamps fall back to the nominal interval
-        assert!((dt_from_raw(None, 42) - 8.0).abs() < 1e-9);
-        assert!((dt_from_raw(Some(42), 42) - 8.0).abs() < 1e-9);
+        assert_eq!(dt_from_raw(Some(5_000), 6_000), Some(1.0));
+        // a real pause keeps its duration instead of a fake 8 ms interval
+        assert_eq!(dt_from_raw(Some(0), 50), Some(50.0));
+        assert_eq!(dt_from_raw(Some(0), 200), Some(100.0));
+        // missing or duplicate timestamps do not produce a velocity
+        assert_eq!(dt_from_raw(None, 42), None);
+        assert_eq!(dt_from_raw(Some(42), 42), None);
     }
 
     #[test]
