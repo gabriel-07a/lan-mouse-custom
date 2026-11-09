@@ -106,3 +106,13 @@ User report after v0.2.6: closing the connection on the receiving side left the 
 connected with the physical mouse frozen (cursor still captured). Root cause and fix in
 session.md row R-01: session teardown by certificate identity, including sessions that
 never registered a capture zone. Regression: scripts/qa-two-instances.sh revoke.
+
+
+## Post-release fixes (v0.2.7 user report, not yet released)
+
+- Capture portal (GNOME v1) now creates ONE session per app run and reuses it for every hand-off;
+  the permission dialog no longer appears on every activation. At most one prompt per lan-mouse
+  launch on GNOME (portal v1 cannot persist consent across restarts); portal v2 persists it.
+- Windows: the GPUI frontend no longer allocates a console window.
+- Device approval always grants both directions (single Approve action).
+See capture.md R-02 and frontend.md R-03/R-04.

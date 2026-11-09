@@ -2737,8 +2737,6 @@ impl Dashboard {
         let mut cards = Vec::new();
         for request in pending {
             let approve_fp = request.fingerprint.clone();
-            let control_me_fp = request.fingerprint.clone();
-            let i_control_fp = request.fingerprint.clone();
             let deny_fp = request.fingerprint.clone();
             let cert_changed = request.previous_fingerprint.is_some();
             let cert_warning = request.previous_fingerprint.as_deref().map(|previous| {
@@ -2802,45 +2800,21 @@ impl Dashboard {
                     div()
                         .flex()
                         .gap_2()
+                        // Accepting a request always grants both directions
+                        // (full pointer/keyboard/clipboard in and out); the
+                        // per-direction presets stay in the device permissions
+                        // panel for later adjustments.
                         .child(self.action_button(
                             "approve-pending",
                             if cert_changed {
                                 "Trust new certificate"
                             } else {
-                                "Approve both"
+                                "Approve"
                             },
                             GREEN,
                             0x081018,
                             cx,
                             move |this, _, _, _| this.approve_pending(approve_fp.clone()),
-                        ))
-                        .child(self.action_button(
-                            "approve-control-me",
-                            "Control me",
-                            0x1d2430,
-                            TEXT,
-                            cx,
-                            move |this, _, _, _| {
-                                this.respond_pending_with(
-                                    control_me_fp.clone(),
-                                    DirectionPolicy::allow_all(),
-                                    DirectionPolicy::deny(),
-                                )
-                            },
-                        ))
-                        .child(self.action_button(
-                            "approve-i-control",
-                            "I control it",
-                            0x1d2430,
-                            TEXT,
-                            cx,
-                            move |this, _, _, _| {
-                                this.respond_pending_with(
-                                    i_control_fp.clone(),
-                                    DirectionPolicy::deny(),
-                                    DirectionPolicy::allow_all(),
-                                )
-                            },
                         ))
                         .child(self.action_button(
                             "deny-pending",

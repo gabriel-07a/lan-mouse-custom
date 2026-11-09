@@ -147,3 +147,11 @@ and `cargo clippy` do **not** need it (no linking).
 ## Red-team round (independent verifier, 2026-11-09 (post-freeze))
 
 No new frontend findings: the verifier re-checked GPUI LinkState/RowAction (apply_row_action uses action.wants_activation(), so no displayed action sends the opposite request), peer aggregation, and the GTK request/Enumerate/proof paths — no concrete failure path found.
+
+
+## Post-release round (v0.2.7 user report) - R-03/R-04 fixed
+
+| ID | Sev | Location | Symptom | Root cause | Fix |
+|---|---|---|---|---|---|
+| R-03 | P2 | lan-mouse-gpui/src/main.rs | A console window reappeared on Windows after the v0.2.6 frontend split | the standalone GPUI launcher binary is a console-subsystem executable and the GUI binary spawns it | added the same windows_subsystem attribute (release builds) as the main binary |
+| R-04 | P2 (UX) | lan-mouse-gpui/src/lib.rs pending-request card | approving a device required choosing "Approve both" / directional presets | the approval card exposed directional choices | accepting a request always grants both directions now (single "Approve" / "Trust new certificate"); per-direction presets remain in the device permissions panel for later adjustments |

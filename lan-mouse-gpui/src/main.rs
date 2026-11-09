@@ -3,6 +3,14 @@
 //! The shipping `lan-mouse` binary will call `lan_mouse_gpui::run()` once the
 //! GTK frontend is replaced; this binary is useful for UI development.
 
+// The launcher spawns this binary on Windows; without the GUI subsystem the
+// frontend allocates a console window (the reported "terminal reappeared on
+// Windows"). Debug builds keep the console for backtraces.
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 fn local_commit() -> [u8; 8] {
     let mut commit = *b"devgpui\0";
     let Ok(text) = std::env::var("LAN_MOUSE_LOCAL_COMMIT") else {
