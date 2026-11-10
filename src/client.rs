@@ -197,6 +197,32 @@ impl ClientManager {
         self.update_ips(handle);
     }
 
+    /// Learn a peer address from an accepted incoming session.
+    ///
+    /// The peer just proved it can reach us, so the same address is the best
+    /// candidate for the outgoing half of a bidirectional link — especially
+    /// when the configured hostname does not resolve (mDNS failure, offline
+    /// DNS). Kept in the in-memory DNS set (not the persisted config) and
+    /// IPv4-only, matching the rest of the address bookkeeping.
+    ///
+    /// Returns whether a new address was added.
+    pub(crate) fn add_peer_ip(&self, handle: ClientHandle, ip: IpAddr) -> bool {
+        if !ip.is_ipv4() {
+            return false;
+        }
+        let mut added = false;
+        if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            if !c.fix_ips.contains(&ip) && !s.dns_ips.contains(&ip) {
+                s.dns_ips.push(ip);
+                added = true;
+            }
+        }
+        if added {
+            self.update_ips(handle);
+        }
+        added
+    }
+
     fn update_ips(&self, handle: ClientHandle) {
         if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             // Lan Mouse is IPv4-only: an AAAA record must not create a
@@ -640,6 +666,37 @@ mod tests {
         assert_eq!(config.pos, Position::Right);
         assert!(state.active);
         assert_eq!(state.ips, HashSet::from([ip(10)]));
+    }
+
+    #[test]
+    fn peer_ip_from_an_incoming_session_is_learned_for_outgoing_dials() {
+        let manager = ClientManager::default();
+        let handle = manager.add_with_config(config_client(Position::Right, true));
+        assert!(
+            manager.add_peer_ip(handle, ip(42)),
+            "a new peer address must be learned"
+        );
+        let (_, state) = manager.get_state(handle).expect("client");
+        assert!(state.ips.contains(&ip(42)), "learned ip must be dialable");
+        assert!(state.dns_ips.contains(&ip(42)));
+
+        assert!(
+            !manager.add_peer_ip(handle, ip(42)),
+            "the same address must not be added twice"
+        );
+        assert!(
+            !manager.add_peer_ip(handle, ip(10)),
+            "an address already configured as a fixed ip is not duplicated"
+        );
+        assert!(
+            !manager.add_peer_ip(handle, "fd00::42".parse().expect("v6")),
+            "Lan Mouse is IPv4-only"
+        );
+        assert_eq!(
+            state.ips,
+            manager.get_state(handle).expect("client").1.ips,
+            "the state exposed to the frontend is updated"
+        );
     }
 
     #[test]

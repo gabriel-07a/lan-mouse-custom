@@ -2688,12 +2688,29 @@ impl Service {
             self.client_manager.set_incoming_addr(handle, Some(addr));
             changed = true;
         }
+        // The peer just proved it can reach this machine. Learn its source
+        // address so the outgoing half of the link can dial it even when the
+        // configured hostname does not resolve (mDNS/DNS failure); this is the
+        // difference between "Peer connected" and a half-open bidirectional
+        // link that shows "outgoing connection still being established".
+        if self.client_manager.add_peer_ip(handle, addr.ip()) {
+            log::info!(
+                "learned peer address {} for client {handle} from incoming session",
+                addr.ip()
+            );
+            changed = true;
+        }
         if changed {
             self.broadcast_client(handle);
         }
         // Connecting is bidirectional by definition: if the peer reached us,
         // this machine must be able to reach the peer too.
         self.ensure_bidirectional(handle);
+        // Kick a fresh outgoing attempt immediately instead of waiting for the
+        // reconnect backoff: the incoming session just gave us a reachable
+        // address (the previous attempts may have failed only because DNS was
+        // down). `start_connecting` is gated on the client being active.
+        self.capture.connect(handle);
     }
 
     /// An established incoming session means the peer is connected to this

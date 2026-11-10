@@ -13,7 +13,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     rc::Rc,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -730,6 +730,40 @@ fn dial_order(
     addrs
 }
 
+/// Build the candidate addresses for the outgoing half of a link.
+///
+/// The configured/DNS addresses are the base. If the peer has an accepted
+/// incoming session, its source address is added too: the peer proved that
+/// address can reach us, and hostname resolution may be failing (mDNS/DNS
+/// down). That address becomes the preferred candidate when no remembered
+/// address is usable. IPv4-only, matching the dial path.
+fn outgoing_addrs(
+    mut ips: HashSet<IpAddr>,
+    port: u16,
+    incoming: Option<SocketAddr>,
+    preferred: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    if let Some(incoming) = incoming {
+        if incoming.ip().is_ipv4() {
+            ips.insert(incoming.ip());
+        }
+    }
+    let preferred = preferred
+        .filter(|preferred| ips.contains(&preferred.ip()))
+        .or_else(|| {
+            incoming
+                .map(|addr| SocketAddr::new(addr.ip(), port))
+                .filter(|candidate| ips.contains(&candidate.ip()))
+        });
+    dial_order(
+        ips.into_iter().map(|ip| SocketAddr::new(ip, port)),
+        preferred,
+    )
+    .into_iter()
+    .filter(SocketAddr::is_ipv4)
+    .collect()
+}
+
 /// Try the candidate addresses one at a time, in [`dial_order`] order, and
 /// return the first successful handshake.
 ///
@@ -777,24 +811,16 @@ async fn connect_to_handle(
             .get_ips(handle)
             .ok_or(LanMouseConnectionError::NotConnected)?;
         let port = ctx.client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
-        let preferred = ctx
-            .client_manager
-            .preferred_addr(handle)
-            .filter(|preferred| ips.contains(&preferred.ip()));
-        if preferred.is_none() {
+        let incoming = ctx.client_manager.incoming_addr(handle);
+        let mut preferred = ctx.client_manager.preferred_addr(handle);
+        if preferred.is_some_and(|preferred| !ips.contains(&preferred.ip())) {
             // The remembered address is no longer part of the client's address
             // set (DNS change, new DHCP lease, edited config): forget it so the
             // failover starts from the documented address preference again.
             ctx.client_manager.clear_preferred_addr(handle);
+            preferred = None;
         }
-        let addrs = dial_order(
-            ips.into_iter().map(|ip| SocketAddr::new(ip, port)),
-            preferred,
-        )
-        .into_iter()
-        // Lan Mouse is IPv4-only by design; see bind_listener().
-        .filter(SocketAddr::is_ipv4)
-        .collect::<Vec<_>>();
+        let addrs = outgoing_addrs(ips, port, incoming, preferred);
         if addrs.is_empty() {
             return Err(LanMouseConnectionError::NotConnected);
         }
@@ -1338,6 +1364,50 @@ mod tests {
             dial_order([v4, other], Some(sa("192.168.1.99", 4242))),
             vec![other, v4]
         );
+    }
+
+    #[test]
+    fn outgoing_addrs_use_the_incoming_peer_address_when_dns_is_empty() {
+        let incoming = sa("192.168.1.42", 54321);
+        assert_eq!(
+            outgoing_addrs(std::collections::HashSet::new(), 4242, Some(incoming), None),
+            vec![sa("192.168.1.42", 4242)],
+            "the incoming source address is the only reachable candidate"
+        );
+    }
+
+    #[test]
+    fn outgoing_addrs_prefer_the_incoming_address_over_stale_dns() {
+        let incoming = sa("192.168.1.42", 54321);
+        let mut ips = std::collections::HashSet::new();
+        ips.insert("10.0.0.1".parse::<IpAddr>().expect("ip"));
+        assert_eq!(
+            outgoing_addrs(ips, 4242, Some(incoming), None),
+            vec![sa("192.168.1.42", 4242), sa("10.0.0.1", 4242)]
+        );
+    }
+
+    #[test]
+    fn outgoing_addrs_keep_a_valid_remembered_address_first() {
+        let incoming = sa("192.168.1.42", 54321);
+        let remembered = sa("10.0.0.1", 4242);
+        let mut ips = std::collections::HashSet::new();
+        ips.insert("10.0.0.1".parse::<IpAddr>().expect("ip"));
+        ips.insert("192.168.1.42".parse::<IpAddr>().expect("ip"));
+        assert_eq!(
+            outgoing_addrs(ips, 4242, Some(incoming), Some(remembered)),
+            vec![remembered, sa("192.168.1.42", 4242)]
+        );
+    }
+
+    #[test]
+    fn outgoing_addrs_ignore_ipv6_incoming_and_empty_sets() {
+        let incoming = sa("fd00::42", 54321);
+        assert!(
+            outgoing_addrs(std::collections::HashSet::new(), 4242, Some(incoming), None).is_empty(),
+            "Lan Mouse is IPv4-only"
+        );
+        assert!(outgoing_addrs(std::collections::HashSet::new(), 4242, None, None).is_empty());
     }
 
     #[test]
@@ -2182,6 +2252,21 @@ mod tests {
                     clipboard_b_tx,
                     None,
                 );
+                // Start B's backend before A connects. In production the
+                // service does this on `Connected`; here the test has no
+                // service, and a lazy backend would advertise `alive = false`
+                // in its first Pong, making A's Enter send fail with
+                // `TargetEmulationDisabled` (the old flaky failure).
+                emulation_b.warm_up();
+                let warmed = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let EmulationEvent::EmulationEnabled = emulation_b.event().await {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                assert!(warmed.is_ok(), "B's emulation backend must warm up");
 
                 // Peer A: ClientManager + LanMouseConnection + Capture (DummyInputCapture emits on Position::Left)
                 let manager_a = ClientManager::default();
@@ -2199,8 +2284,31 @@ mod tests {
                 let conn_a = LanMouseConnection::new(cert_a, manager_a.clone(), 2000);
                 let clipboard_sender_a = conn_a.sender();
 
+                // Create the capture task first (it polls the connection), then
+                // wait for the application-level Hello handshake before asking
+                // the Dummy backend to emit Begin. Creating the capture later
+                // avoids racing the DTLS/Hello handshake under a loaded parallel
+                // run, which used to lose the first Enter and release the grab
+                // before the peer was ready.
                 let mut capture_a =
                     Capture::new(Some(input_capture::Backend::Dummy), conn_a, vec![], 0, 2000);
+                capture_a.connect(handle_a);
+                let link_deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let ready = manager_a
+                        .get_state(handle_a)
+                        .is_some_and(|(_, state)| state.peer_commit.is_some() && state.alive);
+                    if ready || Instant::now() >= link_deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    manager_a
+                        .get_state(handle_a)
+                        .is_some_and(|(_, state)| { state.peer_commit.is_some() && state.alive }),
+                    "A must finish the Hello handshake and see B's emulation alive before Begin"
+                );
                 capture_a.create(handle_a, IpcPosition::Left, CaptureType::Default);
 
                 // 1. DummyInputCapture fires Begin -> Capture sends Enter -> Emulation B emits Entered
@@ -2216,8 +2324,12 @@ mod tests {
                 }
                 assert!(a_entered, "Capture A must report ClientEntered");
 
+                // Fresh deadline: under a loaded parallel test run the DTLS
+                // handshake can consume most of the first deadline, and the
+                // listener must not be starved of its own wait window.
+                let b_deadline = Instant::now() + Duration::from_secs(10);
                 let mut b_entered = false;
-                while Instant::now() < deadline && !b_entered {
+                while Instant::now() < b_deadline && !b_entered {
                     if let Ok(EmulationEvent::Entered {
                         pos, fingerprint, ..
                     }) =
@@ -2229,7 +2341,11 @@ mod tests {
                         b_entered = true;
                     }
                 }
-                assert!(b_entered, "Emulation B must receive Entered from A");
+                assert!(
+                    b_entered,
+                    "Emulation B must receive Entered from A; A state={:?}",
+                    manager_a.get_state(handle_a)
+                );
 
                 // 2. Send a ClipboardFrame over the same established DTLS connection
                 let offer = ClipboardFrame::Offer {
