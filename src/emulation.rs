@@ -26,6 +26,62 @@ use tokio::{
 /// to survive Wi-Fi jitter and a couple of lost pings.
 const EMULATION_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Minimal listener surface used by the emulation task.
+///
+/// Boxed so tests can inject `ListenEvent`s and capture replies without a real
+/// DTLS/UDP listener; production uses [`LanMouseListener`].
+#[async_trait::async_trait(?Send)]
+pub(crate) trait ListenerPort {
+    async fn next(&mut self) -> Option<ListenEvent>;
+    async fn reply(&self, addr: SocketAddr, event: ProtoEvent);
+    async fn reply_raw(&self, addr: SocketAddr, bytes: &[u8]);
+    async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String>;
+    async fn disconnect(&self, addr: SocketAddr);
+    async fn disconnect_fingerprint(&self, fingerprint: &str) -> Vec<SocketAddr>;
+    fn request_port_change(&mut self, port: u16);
+    async fn port_changed(&mut self) -> Result<u16, ListenerCreationError>;
+    async fn terminate(&mut self);
+}
+
+#[async_trait::async_trait(?Send)]
+impl ListenerPort for LanMouseListener {
+    async fn next(&mut self) -> Option<ListenEvent> {
+        StreamExt::next(self).await
+    }
+
+    async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
+        LanMouseListener::reply(self, addr, event).await;
+    }
+
+    async fn reply_raw(&self, addr: SocketAddr, bytes: &[u8]) {
+        LanMouseListener::reply_raw(self, addr, bytes).await;
+    }
+
+    async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
+        LanMouseListener::get_certificate_fingerprint(self, addr).await
+    }
+
+    async fn disconnect(&self, addr: SocketAddr) {
+        LanMouseListener::disconnect(self, addr).await;
+    }
+
+    async fn disconnect_fingerprint(&self, fingerprint: &str) -> Vec<SocketAddr> {
+        LanMouseListener::disconnect_fingerprint(self, fingerprint).await
+    }
+
+    fn request_port_change(&mut self, port: u16) {
+        LanMouseListener::request_port_change(self, port);
+    }
+
+    async fn port_changed(&mut self) -> Result<u16, ListenerCreationError> {
+        LanMouseListener::port_changed(self).await
+    }
+
+    async fn terminate(&mut self) {
+        LanMouseListener::terminate(self).await;
+    }
+}
+
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
     task: JoinHandle<()>,
@@ -175,7 +231,7 @@ impl Emulation {
         let (event_tx, event_rx) = channel();
         let (reply_tx, reply_rx) = channel();
         let emulation_task = ListenTask {
-            listener,
+            listener: Box::new(listener),
             emulation_proxy,
             request_rx,
             event_tx,
@@ -333,7 +389,7 @@ impl EnterDeduper {
 }
 
 struct ListenTask {
-    listener: LanMouseListener,
+    listener: Box<dyn ListenerPort>,
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -1485,5 +1541,146 @@ mod tests {
                 dy: 10.0,
             })
         );
+    }
+
+    use std::cell::RefCell;
+
+    struct FakeListener {
+        fingerprint: Option<String>,
+        replies: Rc<RefCell<Vec<(SocketAddr, ProtoEvent)>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ListenerPort for FakeListener {
+        async fn next(&mut self) -> Option<ListenEvent> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
+            self.replies.borrow_mut().push((addr, event));
+        }
+
+        async fn reply_raw(&self, _addr: SocketAddr, _bytes: &[u8]) {}
+
+        async fn get_certificate_fingerprint(&self, _addr: SocketAddr) -> Option<String> {
+            self.fingerprint.clone()
+        }
+
+        async fn disconnect(&self, _addr: SocketAddr) {}
+
+        async fn disconnect_fingerprint(&self, _fingerprint: &str) -> Vec<SocketAddr> {
+            Vec::new()
+        }
+
+        fn request_port_change(&mut self, _port: u16) {}
+
+        async fn port_changed(&mut self) -> Result<u16, ListenerCreationError> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        async fn terminate(&mut self) {}
+    }
+
+    type RecordedReplies = Rc<RefCell<Vec<(SocketAddr, ProtoEvent)>>>;
+    type ListenFixture = (ListenTask, Receiver<EmulationEvent>, RecordedReplies);
+
+    fn listen_task(fingerprint: Option<&str>) -> ListenFixture {
+        let (request_tx, request_rx) = channel();
+        let (event_tx, event_rx) = channel();
+        let (clipboard_tx, _clipboard_rx) = channel();
+        let (_reply_tx, reply_rx) = channel();
+        let replies = Rc::new(RefCell::new(Vec::new()));
+        let listener = FakeListener {
+            fingerprint: fingerprint.map(str::to_string),
+            replies: replies.clone(),
+        };
+        let proxy = EmulationProxy::new(
+            Some(input_emulation::Backend::Dummy),
+            Rc::new(Cell::new(None)),
+        );
+        let task = ListenTask {
+            listener: Box::new(listener),
+            emulation_proxy: proxy,
+            request_rx,
+            event_tx,
+            clipboard_tx,
+            reply_rx,
+            devices: None,
+            fingerprints: HashMap::new(),
+        };
+        let _ = request_tx;
+        (task, event_rx, replies)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enter_publishes_release_and_entered_before_acking() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut task, mut events, replies) = listen_task(Some("aa:bb"));
+                let addr: SocketAddr = "127.0.0.1:4242".parse().expect("addr");
+                let mut deduper = EnterDeduper::default();
+                task.handle_enter(
+                    addr,
+                    lan_mouse_proto::Position::Right,
+                    7,
+                    Some(0.25),
+                    &mut deduper,
+                )
+                .await;
+
+                assert!(matches!(
+                    replies.borrow().as_slice(),
+                    [(_, ProtoEvent::Ack(7))]
+                ));
+                assert!(matches!(
+                    events.recv().now_or_never(),
+                    Some(Some(EmulationEvent::ReleaseNotify))
+                ));
+                match events.recv().now_or_never() {
+                    Some(Some(EmulationEvent::Entered {
+                        pos, fingerprint, ..
+                    })) => {
+                        assert_eq!(pos, lan_mouse_ipc::Position::Right);
+                        assert_eq!(fingerprint, "aa:bb");
+                    }
+                    _ => panic!("expected Entered"),
+                }
+
+                // A retransmitted serial is re-acked without publishing a second
+                // hand-off or re-arming the backend.
+                task.handle_enter(
+                    addr,
+                    lan_mouse_proto::Position::Right,
+                    7,
+                    Some(0.25),
+                    &mut deduper,
+                )
+                .await;
+                assert_eq!(replies.borrow().len(), 2);
+                assert!(events.recv().now_or_never().is_none());
+
+                task.emulation_proxy.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enter_without_a_fingerprint_is_ignored() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut task, mut events, replies) = listen_task(None);
+                let addr: SocketAddr = "127.0.0.1:4242".parse().expect("addr");
+                let mut deduper = EnterDeduper::default();
+                task.handle_enter(addr, lan_mouse_proto::Position::Left, 1, None, &mut deduper)
+                    .await;
+                assert!(replies.borrow().is_empty());
+                assert!(events.recv().now_or_never().is_none());
+                task.emulation_proxy.terminate().await;
+            })
+            .await;
     }
 }
