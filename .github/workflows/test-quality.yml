@@ -1,0 +1,81 @@
+name: Test quality
+
+# Quality gates that are too slow for every push: coverage, flake detection and
+# mutation testing. They run manually and weekly until the baseline is stable,
+# then coverage can move to the pull-request workflow with a ratchet threshold.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: coverage (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev \
+            libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+
+      - name: Coverage report
+        # Initial threshold is deliberately low; raise it as the suite grows
+        # (the plan's target is 75% overall / 90% for core modules).
+        run: scripts/coverage.sh --check 50
+
+      - name: Upload LCOV
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: target/coverage/lcov.info
+          if-no-files-found: error
+
+  flake:
+    name: flake detection (3 runs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev \
+            libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      - name: Repeat the workspace suite
+        run: scripts/test-repeat.sh --runs 3 --all-features
+
+  mutation:
+    name: mutation (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev \
+            libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-mutants
+
+      - name: Mutate the protocol crate
+        run: cargo mutants -p lan-mouse-proto --in-place --timeout 120

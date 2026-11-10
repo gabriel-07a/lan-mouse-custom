@@ -1,0 +1,16 @@
+# cargo-mutants scope: start with the pure logic that the unit tests own.
+# Expand crate-by-crate as coverage grows; OS-specific FFI modules are excluded
+# because mutants cannot be verified without the real OS.
+exclude_globs = [
+  "input-capture/src/windows/**",
+  "input-capture/src/macos.rs",
+  "input-emulation/src/windows.rs",
+  "input-emulation/src/macos.rs",
+  "input-emulation/src/wlroots.rs",
+  "input-emulation/src/x11.rs",
+  "input-emulation/src/xdg_desktop_portal.rs",
+  "input-clipboard/src/x11.rs",
+  "input-clipboard/src/wayland.rs",
+  "lan-mouse-gtk/**",
+  "lan-mouse-gpui/**",
+]

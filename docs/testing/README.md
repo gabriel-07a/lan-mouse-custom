@@ -74,13 +74,19 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 # smoke de rede real (serial, quando existir)
 cargo test --workspace --all-features network_smoke -- --test-threads=1
 
-# cobertura (quando o job de coverage estiver habilitado)
-cargo llvm-cov --workspace --all-features --summary-only
+# repetir a suíte para expor flakes (CI semanal roda 3x)
+scripts/test-repeat.sh --runs 10 --all-features
+
+# cobertura (cargo-llvm-cov; threshold inicial 50%, meta 75%)
+scripts/coverage.sh --check 50
 ```
 
 CI atual: Linux + Windows, jobs de build/check/clippy/test, fmt e feature
 matrix. Windows roda serial para backends que tocam estado global; Linux roda em
-paralelo.
+paralelo. O workflow `.github/workflows/test-quality.yml` (manual/semanal) roda
+cobertura (`cargo-llvm-cov`), detecção de flake (3 execuções) e mutation
+(`cargo-mutants`) no crate de protocolo; `cargo-nextest` está configurado em
+`.config/nextest.toml` sem retries.
 
 ## Política de PR
 
