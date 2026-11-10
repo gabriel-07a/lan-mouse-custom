@@ -4533,4 +4533,104 @@ mod tests {
             assert!(!v4.is_link_local());
         }
     }
+
+    #[test]
+    fn peer_groups_group_by_fingerprint_and_keep_unknowns_separate() {
+        let mut clients = std::collections::HashMap::new();
+        clients.insert(
+            2,
+            (
+                config(Some("b"), Some("aa:bb")),
+                state(false, false, None, None, None),
+            ),
+        );
+        clients.insert(
+            0,
+            (
+                config(Some("a"), Some("aa:bb")),
+                state(false, false, None, None, None),
+            ),
+        );
+        clients.insert(
+            1,
+            (
+                config(Some("unknown"), None),
+                state(false, false, None, None, None),
+            ),
+        );
+        clients.insert(
+            3,
+            (
+                config(Some("unknown2"), None),
+                state(false, false, None, None, None),
+            ),
+        );
+
+        assert_eq!(
+            group_peer_handles(&clients),
+            vec![vec![0, 2], vec![1], vec![3]],
+            "same certificate groups together; unknown identities stay separate and sorted"
+        );
+    }
+
+    #[test]
+    fn sticky_endpoint_holds_a_flapping_endpoint_until_the_window_expires() {
+        use std::time::{Duration, Instant};
+        let hold = Duration::from_secs(3);
+        let now = Instant::now();
+        let mut shown = None;
+        let mut candidate = None;
+
+        assert_eq!(
+            sticky_endpoint(&mut shown, &mut candidate, Some("a".into()), now, hold),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            sticky_endpoint(
+                &mut shown,
+                &mut candidate,
+                Some("b".into()),
+                now + Duration::from_millis(1),
+                hold
+            ),
+            Some("a".to_string()),
+            "a new endpoint must not replace the shown one immediately"
+        );
+        assert_eq!(
+            sticky_endpoint(
+                &mut shown,
+                &mut candidate,
+                Some("b".into()),
+                now + Duration::from_millis(1) + hold,
+                hold
+            ),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            sticky_endpoint(&mut shown, &mut candidate, None, now + hold, hold),
+            None
+        );
+    }
+
+    #[test]
+    fn aggregate_peer_uses_the_member_with_a_live_link() {
+        let members = [
+            member(
+                1,
+                config(Some("peer"), Some("aa:bb")),
+                state(false, false, None, Some("127.0.0.1:5000"), None),
+            ),
+            member(
+                2,
+                config(Some("peer"), Some("aa:bb")),
+                state(true, true, Some("127.0.0.1:4242"), None, Some(NOW)),
+            ),
+        ];
+        let aggregate = aggregate_peer(&members).expect("aggregate");
+        assert_eq!(aggregate.members, vec![1, 2]);
+        assert!(aggregate.active);
+        assert!(aggregate.has_outgoing);
+        assert!(aggregate.last_pong_at.is_some());
+        assert_eq!(aggregate.position, lan_mouse_ipc::Position::Left);
+    }
 }
