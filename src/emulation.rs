@@ -1683,4 +1683,61 @@ mod tests {
             })
             .await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enter_at_crosses_an_in_memory_wire_and_is_acked() {
+        use lan_mouse_test_support::{
+            transport::{LinkConfig, memory_link},
+            wire::encode,
+        };
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut sender, mut receiver) =
+                    memory_link(LinkConfig::default(), LinkConfig::default());
+                let (mut task, mut events, replies) = listen_task(Some("aa:bb"));
+                let addr: SocketAddr = "127.0.0.1:4242".parse().expect("addr");
+                let mut deduper = EnterDeduper::default();
+
+                let enter = ProtoEvent::EnterAt {
+                    pos: lan_mouse_proto::Position::Right,
+                    serial: 9,
+                    along: 0.25,
+                };
+                assert_eq!(sender.send(encode(enter)), 1);
+                let bytes = receiver.recv().await.expect("EnterAt datagram");
+                let decoded = ProtoEvent::try_from(bytes.as_slice()).expect("decode");
+                match decoded {
+                    ProtoEvent::EnterAt { pos, serial, along } => {
+                        task.handle_enter(addr, pos, serial, Some(along), &mut deduper)
+                            .await
+                    }
+                    _ => panic!("expected EnterAt"),
+                }
+
+                // The listener's Ack is encoded and sent back over the same
+                // in-memory link; the sender decodes it without any real socket.
+                let reply = replies.borrow().first().cloned().expect("listener replied");
+                assert_eq!(receiver.send(encode(reply.1)), 1);
+                let ack_bytes = sender.recv().await.expect("Ack datagram");
+                assert!(matches!(
+                    ProtoEvent::try_from(ack_bytes.as_slice()).expect("decode ack"),
+                    ProtoEvent::Ack(9)
+                ));
+
+                // The hand-off is published before/independently from the Ack.
+                assert!(matches!(
+                    events.recv().now_or_never(),
+                    Some(Some(EmulationEvent::ReleaseNotify))
+                ));
+                assert!(matches!(
+                    events.recv().now_or_never(),
+                    Some(Some(EmulationEvent::Entered { .. }))
+                ));
+
+                task.emulation_proxy.terminate().await;
+            })
+            .await;
+    }
 }

@@ -79,3 +79,18 @@ jobs:
 
       - name: Mutate the protocol crate
         run: cargo mutants -p lan-mouse-proto --in-place --timeout 120
+
+  fuzz:
+    name: fuzz smoke (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz proto_decode for 60 s
+        run: cargo +nightly fuzz run proto_decode -- -max_total_time=60

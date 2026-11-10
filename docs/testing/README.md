@@ -79,6 +79,9 @@ scripts/test-repeat.sh --runs 10 --all-features
 
 # cobertura (cargo-llvm-cov; baseline 58,03%, threshold inicial 55%, meta 75%)
 scripts/coverage.sh --check 55
+
+# fuzz de protocolo (nightly; ver fuzz/README.md)
+cargo +nightly fuzz run proto_decode -- -max_total_time=60
 ```
 
 CI atual: Linux + Windows, jobs de build/check/clippy/test, fmt e feature
