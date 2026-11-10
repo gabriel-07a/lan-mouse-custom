@@ -647,3 +647,27 @@ mod tests {
         assert!(!capture.keys_pressed(&[scancode::Linux::KeyLeftCtrl]));
     }
 }
+
+#[cfg(test)]
+mod capture_event_tests {
+    use super::*;
+    use input_event::{Event, PointerEvent};
+
+    fn motion() -> Event {
+        Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        })
+    }
+
+    #[test]
+    fn begin_helpers_classify_both_begin_variants() {
+        assert!(CaptureEvent::Begin.is_begin());
+        assert_eq!(CaptureEvent::Begin.begin_along(), None);
+        assert!(CaptureEvent::BeginAt(0.25).is_begin());
+        assert_eq!(CaptureEvent::BeginAt(0.25).begin_along(), Some(0.25));
+        assert!(!CaptureEvent::Input(motion()).is_begin());
+        assert_eq!(CaptureEvent::Input(motion()).begin_along(), None);
+    }
+}

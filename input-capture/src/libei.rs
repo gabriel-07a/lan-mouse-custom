@@ -1094,3 +1094,66 @@ mod tests {
         assert!(clients.is_empty());
     }
 }
+
+#[cfg(test)]
+mod barrier_edge_fraction_tests {
+    use super::*;
+    use std::num::NonZeroU32;
+
+    fn barrier(id: u32, position: (i32, i32, i32, i32)) -> ICBarrier {
+        ICBarrier::new(NonZeroU32::new(id).expect("non-zero id"), position)
+    }
+
+    fn mapping(edges: &[(u32, Position)]) -> HashMap<BarrierID, Position> {
+        edges
+            .iter()
+            .map(|(id, pos)| (NonZeroU32::new(*id).expect("id"), *pos))
+            .collect()
+    }
+
+    #[test]
+    fn left_and_right_edges_use_the_vertical_span() {
+        let barriers = [barrier(1, (0, 0, 0, 999)), barrier(2, (0, 1000, 0, 1999))];
+        let edges = mapping(&[(1, Position::Left), (2, Position::Left)]);
+        let fraction = barrier_edge_fraction(&barriers, &edges, Position::Left, (0.0, 1500.0))
+            .expect("left fraction");
+        assert!((fraction - 1500.0 / 1999.0).abs() < 1e-6);
+
+        let right = [barrier(3, (1920, 0, 1920, 1079))];
+        let edges = mapping(&[(3, Position::Right)]);
+        let fraction = barrier_edge_fraction(&right, &edges, Position::Right, (1920.0, 540.0))
+            .expect("right fraction");
+        assert!((fraction - 540.0 / 1079.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn top_edge_uses_the_horizontal_span_across_monitors() {
+        let barriers = [barrier(1, (0, 0, 1919, 0)), barrier(2, (1920, 0, 3839, 0))];
+        let edges = mapping(&[(1, Position::Top), (2, Position::Top)]);
+        let fraction = barrier_edge_fraction(&barriers, &edges, Position::Top, (2880.0, 0.0))
+            .expect("top fraction");
+        assert!((fraction - 2880.0 / 3839.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fractions_are_clamped_and_missing_edges_are_none() {
+        let barriers = [barrier(1, (0, 0, 0, 999))];
+        let edges = mapping(&[(1, Position::Left)]);
+        assert_eq!(
+            barrier_edge_fraction(&barriers, &edges, Position::Left, (0.0, -10.0)),
+            Some(0.0)
+        );
+        assert_eq!(
+            barrier_edge_fraction(&barriers, &edges, Position::Left, (0.0, 5000.0)),
+            Some(1.0)
+        );
+        assert_eq!(
+            barrier_edge_fraction(&barriers, &edges, Position::Right, (0.0, 500.0)),
+            None
+        );
+        assert_eq!(
+            barrier_edge_fraction(&[], &HashMap::new(), Position::Left, (0.0, 0.0)),
+            None
+        );
+    }
+}

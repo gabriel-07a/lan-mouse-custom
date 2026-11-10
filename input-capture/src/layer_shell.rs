@@ -262,10 +262,17 @@ fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
 
 /// Normalised position (0.0..=1.0) of `coord` along the layout edge `pos`,
 /// using the union of the outputs touching that edge as the span.
-fn edge_fraction(outputs: &[Output], pos: Position, coord: i32) -> Option<f32> {
+///
+/// Takes the already-resolved [`OutputInfo`] values rather than the Wayland
+/// proxy objects, so the mapping is unit-testable without a compositor.
+fn edge_fraction<'a>(
+    outputs: impl Iterator<Item = &'a OutputInfo>,
+    pos: Position,
+    coord: i32,
+) -> Option<f32> {
     let mut min = i32::MAX;
     let mut max = i32::MIN;
-    for info in outputs.iter().filter_map(|output| output.info.as_ref()) {
+    for info in outputs {
         let (lo, hi) = match pos {
             Position::Left | Position::Right => (info.position.1, info.position.1 + info.size.1),
             Position::Top | Position::Bottom => (info.position.0, info.position.0 + info.size.0),
@@ -870,12 +877,16 @@ impl Dispatch<WlPointer, ()> for State {
                 // surface coordinate plus the output position gives the
                 // crossing point in layout coordinates.
                 let along = match pos {
-                    Position::Left | Position::Right => {
-                        edge_fraction(&app.outputs, pos, window.output_pos.1 + surface_y as i32)
-                    }
-                    Position::Top | Position::Bottom => {
-                        edge_fraction(&app.outputs, pos, window.output_pos.0 + surface_x as i32)
-                    }
+                    Position::Left | Position::Right => edge_fraction(
+                        app.outputs.iter().filter_map(|output| output.info.as_ref()),
+                        pos,
+                        window.output_pos.1 + surface_y as i32,
+                    ),
+                    Position::Top | Position::Bottom => edge_fraction(
+                        app.outputs.iter().filter_map(|output| output.info.as_ref()),
+                        pos,
+                        window.output_pos.0 + surface_x as i32,
+                    ),
                 };
                 let begin = match along {
                     Some(along) => CaptureEvent::BeginAt(along),
@@ -1176,3 +1187,53 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+mod edge_fraction_tests {
+    use super::*;
+
+    fn output(x: i32, y: i32, w: i32, h: i32) -> OutputInfo {
+        OutputInfo {
+            name: format!("output-{x}-{y}"),
+            description: String::new(),
+            position: (x, y),
+            size: (w, h),
+        }
+    }
+
+    fn outputs() -> Vec<OutputInfo> {
+        vec![output(0, 0, 1920, 1080), output(1920, 0, 1920, 1080)]
+    }
+
+    #[test]
+    fn edge_fraction_maps_each_edge_over_the_layout() {
+        let outputs = outputs();
+        let iter = || outputs.iter();
+        assert!((edge_fraction(iter(), Position::Right, 540).expect("right") - 0.5).abs() < 1e-6);
+        assert!((edge_fraction(iter(), Position::Top, 2880).expect("top") - 0.75).abs() < 1e-6);
+        assert_eq!(edge_fraction(iter(), Position::Left, 0), Some(0.0));
+        assert!(
+            (edge_fraction(iter(), Position::Bottom, 1920).expect("bottom") - 0.5).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn edge_fraction_clamps_out_of_range_coordinates() {
+        let outputs = outputs();
+        assert_eq!(
+            edge_fraction(outputs.iter(), Position::Top, -100),
+            Some(0.0)
+        );
+        assert_eq!(
+            edge_fraction(outputs.iter(), Position::Top, 5000),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn edge_fraction_without_a_span_is_none() {
+        assert_eq!(edge_fraction(std::iter::empty(), Position::Left, 10), None);
+        let degenerate = [output(0, 0, 0, 0)];
+        assert_eq!(edge_fraction(degenerate.iter(), Position::Left, 10), None);
+    }
+}
