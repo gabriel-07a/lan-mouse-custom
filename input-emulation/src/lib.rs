@@ -297,10 +297,19 @@ impl InputEmulation {
                 Ok(())
             }
             Event::Pointer(PointerEvent::Button { button, state, .. }) => {
-                // Track held buttons so they can be released on destroy. The
-                // event itself is always forwarded.
-                self.update_pressed_buttons(handle, button, state);
-                self.emulation.consume(event, handle).await
+                // Track held buttons so they can be released on destroy, and
+                // drop duplicates: the capture side may retransmit a release
+                // to survive an isolated packet loss, and injecting it twice
+                // must not have a side effect. Buttons never auto-repeat, so
+                // unlike keys no duplicate press is forwarded either.
+                let forward = matches!(
+                    self.update_pressed_buttons(handle, button, state),
+                    ButtonUpdate::Pressed | ButtonUpdate::Released
+                );
+                if forward {
+                    self.emulation.consume(event, handle).await?;
+                }
+                Ok(())
             }
             _ => self.emulation.consume(event, handle).await,
         }
@@ -436,15 +445,26 @@ impl InputEmulation {
         }
     }
 
-    /// Track (or forget) a held pointer button for the given handle.
-    fn update_pressed_buttons(&mut self, handle: EmulationHandle, button: u32, state: u32) {
+    /// Update the pressed buttons for the given handle and classify the event.
+    fn update_pressed_buttons(
+        &mut self,
+        handle: EmulationHandle,
+        button: u32,
+        state: u32,
+    ) -> ButtonUpdate {
         let Some(pressed_buttons) = self.pressed_buttons.get_mut(&handle) else {
-            return;
+            return ButtonUpdate::NotTracked;
         };
         if state == 0 {
-            pressed_buttons.remove(&button);
+            if pressed_buttons.remove(&button) {
+                ButtonUpdate::Released
+            } else {
+                ButtonUpdate::DuplicateRelease
+            }
+        } else if pressed_buttons.insert(button) {
+            ButtonUpdate::Pressed
         } else {
-            pressed_buttons.insert(button);
+            ButtonUpdate::DuplicatePress
         }
     }
 }
@@ -461,6 +481,22 @@ enum KeyUpdate {
     /// Release matching a tracked press.
     Released,
     /// Release for a key that was not tracked.
+    DuplicateRelease,
+}
+
+/// How one pointer-button event relates to the pressed-buttons state of a
+/// handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ButtonUpdate {
+    /// The handle was never created: drop the event.
+    NotTracked,
+    /// First press of the button.
+    Pressed,
+    /// The button is already held: a retransmitted press.
+    DuplicatePress,
+    /// Release matching a tracked press.
+    Released,
+    /// Release for a button that was not tracked: a retransmitted release.
     DuplicateRelease,
 }
 
@@ -642,6 +678,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn button_events_are_classified_by_the_pressed_buttons_state() {
+        let (mut emulation, _events) = recording(false, false);
+        assert!(emulation.create(0).await);
+
+        assert_eq!(
+            emulation.update_pressed_buttons(0, input_event::BTN_LEFT, 1),
+            ButtonUpdate::Pressed,
+            "first press"
+        );
+        assert_eq!(
+            emulation.update_pressed_buttons(0, input_event::BTN_LEFT, 1),
+            ButtonUpdate::DuplicatePress,
+            "retransmitted press"
+        );
+        assert_eq!(
+            emulation.update_pressed_buttons(0, input_event::BTN_LEFT, 0),
+            ButtonUpdate::Released,
+            "first release"
+        );
+        assert_eq!(
+            emulation.update_pressed_buttons(0, input_event::BTN_LEFT, 0),
+            ButtonUpdate::DuplicateRelease,
+            "retransmitted release"
+        );
+        assert!(
+            emulation
+                .pressed_buttons
+                .get(&0)
+                .is_some_and(|buttons| buttons.is_empty()),
+            "the duplicate release must not keep the button held"
+        );
+        // events for an unknown handle are ignored
+        assert_eq!(
+            emulation.update_pressed_buttons(99, input_event::BTN_LEFT, 1),
+            ButtonUpdate::NotTracked
+        );
+    }
+
+    /// The capture side retransmits a release to survive packet loss; the
+    /// duplicate must not be injected a second time, and a retransmitted press
+    /// must not become a double click.
+    #[tokio::test]
+    async fn duplicate_button_events_are_not_injected_twice() {
+        let (mut emulation, events) = recording(false, false);
+        assert!(emulation.create(0).await);
+
+        for _ in 0..2 {
+            emulation
+                .consume(button(input_event::BTN_LEFT, 1), 0)
+                .await
+                .expect("consume");
+        }
+        for _ in 0..2 {
+            emulation
+                .consume(button(input_event::BTN_LEFT, 0), 0)
+                .await
+                .expect("consume");
+        }
+
+        assert_eq!(
+            recorded(&events),
+            vec![
+                button(input_event::BTN_LEFT, 1),
+                button(input_event::BTN_LEFT, 0)
+            ],
+            "only the first press and first release may reach the backend"
+        );
+        assert!(
+            emulation
+                .pressed_buttons
+                .get(&0)
+                .is_some_and(|buttons| buttons.is_empty())
+        );
+    }
+
     /// Regression for the Windows -> Linux direction: the sender repeats a held
     /// key by sending more key-down events, and backends without a repeat task
     /// must receive them instead of having them filtered out.
@@ -686,6 +798,12 @@ mod tests {
     async fn events_for_unknown_handles_are_dropped() {
         let (mut emulation, events) = recording(false, false);
         emulation.consume(key(30, 1), 99).await.expect("consume");
+        // A button injected before `create` could never be released later, so
+        // it is dropped just like a key.
+        emulation
+            .consume(button(input_event::BTN_LEFT, 1), 99)
+            .await
+            .expect("consume");
         assert!(recorded(&events).is_empty());
     }
 

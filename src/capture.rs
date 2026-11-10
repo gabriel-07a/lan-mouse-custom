@@ -107,6 +107,7 @@ impl Capture {
             outgoing_caps: Default::default(),
             conn,
             enter: EnterState::default(),
+            last_enter_pair: None,
             sensitivity: Default::default(),
             remote_peer: None,
             grace: Duration::from_millis(connect_grace_ms),
@@ -253,6 +254,12 @@ const ENTER_RETRY_MIN: Duration = Duration::from_millis(25);
 const ENTER_RETRY_MAX: Duration = Duration::from_millis(100);
 /// Default `Enter` retransmission interval before the first RTT sample arrives.
 const ENTER_RETRY_DEFAULT: Duration = Duration::from_millis(35);
+/// Minimum interval between `Enter` packets paired with input while the
+/// hand-off is still unacknowledged. The regular retry timer only fires every
+/// 25-100 ms, which would stall the first click or movement after a lost
+/// `Enter` for that long; pairing repairs it within a couple of milliseconds
+/// without flooding the link with hand-off packets.
+const ENTER_PAIR_THROTTLE: Duration = Duration::from_millis(5);
 /// Maximum time a discrete event (`Button`, `Keyboard`, `Enter`) may wait for
 /// an in-flight connection attempt on a single capture loop iteration before
 /// falling back to the `disconnected_since` grace tracker.
@@ -381,6 +388,10 @@ struct CaptureTask {
     conn: LanMouseConnection,
     /// `Enter`/`Ack` handoff state
     enter: EnterState,
+    /// Last time an unacknowledged `Enter` was paired with input, throttled by
+    /// [`ENTER_PAIR_THROTTLE`] so the retransmission is repaired quickly
+    /// without flooding the link.
+    last_enter_pair: Option<Instant>,
     /// per-client motion scale (1.0 = unchanged)
     sensitivity: HashMap<CaptureHandle, f64>,
     /// capabilities allowed in the outgoing direction, per client
@@ -783,6 +794,7 @@ impl CaptureTask {
                 // retransmitted and a duplicate one can be dropped.
                 self.state = State::WaitingForAck;
                 self.enter.begin(Instant::now(), ENTER_TIMEOUT);
+                self.last_enter_pair = None;
             } else {
                 // Legacy peer (e.g. any upstream release): it never
                 // acknowledges `Enter`. Waiting for an `Ack` would release
@@ -818,9 +830,10 @@ impl CaptureTask {
         };
 
         // Coalesce pointer motion while a client is active. Motion that
-        // arrives while we are still waiting for `Ack` is buffered and
-        // flushed as soon as the acknowledgement arrives, so the brief
-        // handshake window does not drop the first movements.
+        // arrives while we are still waiting for `Ack` is buffered and flushed
+        // on the normal cadence (a lost `Enter` is repaired ahead of it by
+        // `pair_enter_if_due`), so the handshake window does not drop the first
+        // movements.
         if self.coalescer.enabled() && self.active_client == Some(handle) {
             if let CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })) =
                 event
@@ -849,20 +862,24 @@ impl CaptureTask {
         };
         let opposite_pos = to_proto_pos(pos.opposite());
         let enter_serial = self.enter.serial();
+        let is_begin = event == CaptureEvent::Begin;
+
+        // Old behaviour rewrote every input event into a duplicate `Enter`
+        // until the peer acknowledged the hand-off, silently dropping clicks,
+        // wheel ticks and key presses that happened within the first round
+        // trip (or longer, when `Enter`/`Ack` was lost). The receiver accepts
+        // input as soon as the first `Enter` arrived and deduplicates repeated
+        // serials, so pair the event with a repair `Enter` and forward it.
+        if !is_begin {
+            self.pair_enter_if_due(handle).await;
+        }
 
         let event = match event {
             CaptureEvent::Begin => ProtoEvent::Enter {
                 pos: opposite_pos,
                 serial: enter_serial,
             },
-            CaptureEvent::Input(e) => match self.state {
-                // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter {
-                    pos: opposite_pos,
-                    serial: enter_serial,
-                },
-                State::Sending => ProtoEvent::Input(e),
-            },
+            CaptureEvent::Input(e) => ProtoEvent::Input(e),
         };
 
         // Scroll/axis events are high-frequency streams like pointer motion:
@@ -887,9 +904,35 @@ impl CaptureTask {
         // grace window. If the link stays down past `self.grace`, the capture
         // is released cleanly.
         let budget = self.grace.min(DISCRETE_SEND_BUDGET);
+        // A release lost on the Wi-Fi leaves the peer's button/key latched;
+        // retransmit it once. Peers that deduplicate retransmissions (the same
+        // builds that acknowledge `Enter`) drop the duplicate, so the second
+        // datagram has no side effect; older peers would inject it twice.
+        let redundant_release =
+            is_release_event(&event) && self.conn.peer_supports_enter_ack(handle);
         match self.conn.send_with_grace(event, handle, budget).await {
             Ok(()) => {
                 self.disconnected_since = None;
+                // A single lost `Enter` stalls the hand-off until the retry
+                // timer. Sending a second copy on the same path mirrors the
+                // redundant `Leave(0)` and makes the common case survive an
+                // isolated packet loss; the receiver re-acks instead of
+                // re-applying it.
+                if is_begin && self.state == State::WaitingForAck {
+                    let _ = self
+                        .conn
+                        .send_now(
+                            ProtoEvent::Enter {
+                                pos: opposite_pos,
+                                serial: enter_serial,
+                            },
+                            handle,
+                        )
+                        .await;
+                }
+                if redundant_release {
+                    let _ = self.conn.send_now(event, handle).await;
+                }
             }
             Err(e) => {
                 let now = Instant::now();
@@ -913,6 +956,39 @@ impl CaptureTask {
         Ok(())
     }
 
+    /// Pair a retransmission of the still-unacknowledged `Enter` with the next
+    /// input packet, if the throttle allows it.
+    ///
+    /// The adaptive retry timer only fires every 25-100 ms. A click or the
+    /// first movement after a crossing usually happens sooner, and when the
+    /// original `Enter` was lost the receiver cannot apply that input until a
+    /// retransmission arrives. Sending the repair right before the input keeps
+    /// the worst case down to [`ENTER_PAIR_THROTTLE`] without a retransmission
+    /// flood: the receiver deduplicates the serial and only re-acks it.
+    async fn pair_enter_if_due(&mut self, handle: CaptureHandle) {
+        if self.state != State::WaitingForAck
+            || self.enter.awaiting_ack().is_none()
+            || self.active_client != Some(handle)
+        {
+            return;
+        }
+        if self
+            .last_enter_pair
+            .is_some_and(|last| last.elapsed() < ENTER_PAIR_THROTTLE)
+        {
+            return;
+        }
+        let Some(pos) = self.get_pos(handle) else {
+            return;
+        };
+        self.last_enter_pair = Some(Instant::now());
+        let event = ProtoEvent::Enter {
+            pos: to_proto_pos(pos.opposite()),
+            serial: self.enter.serial(),
+        };
+        let _ = self.conn.send_now(event, handle).await;
+    }
+
     /// Send and clear the pending motion of a single handle.
     /// Returns `false` if the send failed hard (the caller should release).
     async fn flush_handle(&mut self, handle: CaptureHandle) -> bool {
@@ -927,6 +1003,9 @@ impl CaptureTask {
     async fn flush_motion(&mut self) -> bool {
         let mut ok = true;
         for (handle, motion) in self.coalescer.take_all() {
+            // Repair a lost hand-off packet ahead of the first movement so the
+            // receiver opens the session before the motion arrives.
+            self.pair_enter_if_due(handle).await;
             ok &= self.send_motion(handle, motion).await;
         }
         ok
@@ -1113,6 +1192,21 @@ fn is_suppressed_remote_begin(
     remote_peer.is_some() && capture_type == CaptureType::Default && *event == CaptureEvent::Begin
 }
 
+/// Whether `event` is a key or pointer-button release.
+///
+/// A lost release leaves the peer with the key/button latched until the next
+/// event or the watchdog fires, so these are the only discrete events that are
+/// transmitted twice (see the call site). Duplicate releases are harmless on a
+/// deduplicating peer: keys are already filtered by the input-emulation
+/// pressed-key set, and mouse buttons are filtered the same way.
+fn is_release_event(event: &ProtoEvent) -> bool {
+    matches!(
+        event,
+        ProtoEvent::Input(Event::Pointer(PointerEvent::Button { state: 0, .. }))
+            | ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key { state: 0, .. }))
+    )
+}
+
 fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
     match pos {
         lan_mouse_ipc::Position::Left => input_capture::Position::Left,
@@ -1264,6 +1358,42 @@ mod enter_state_tests {
     }
 
     #[test]
+    fn releases_are_recognised_for_redundant_transmission() {
+        let button_release = ProtoEvent::Input(Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: input_event::BTN_LEFT,
+            state: 0,
+        }));
+        let button_press = ProtoEvent::Input(Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: input_event::BTN_LEFT,
+            state: 1,
+        }));
+        let key_release = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 0,
+        }));
+        let key_press = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 1,
+        }));
+        let motion = ProtoEvent::Input(Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        }));
+
+        assert!(is_release_event(&button_release));
+        assert!(is_release_event(&key_release));
+        assert!(!is_release_event(&button_press));
+        assert!(!is_release_event(&key_press));
+        assert!(!is_release_event(&motion));
+        assert!(!is_release_event(&ProtoEvent::Leave(0)));
+    }
+
+    #[test]
     fn a_remote_peer_only_allows_the_incoming_capture_to_begin() {
         let begin = CaptureEvent::Begin;
         let motion = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
@@ -1326,6 +1456,7 @@ mod capture_handle_tests {
             coalescer: MotionCoalescer::new(0),
             conn: LanMouseConnection::new(certificate(), ClientManager::default(), 1000),
             enter: EnterState::default(),
+            last_enter_pair: None,
             sensitivity: HashMap::new(),
             outgoing_caps: HashMap::new(),
             remote_peer: None,
@@ -1337,6 +1468,54 @@ mod capture_handle_tests {
             selected_backend: Default::default(),
             state: State::default(),
         }
+    }
+
+    /// The retry timer may be 25-100 ms away, so the first input after a lost
+    /// `Enter` repairs the hand-off itself, at most once per throttle window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lost_enter_is_paired_at_most_once_per_throttle_window() {
+        let mut task = capture_task(vec![(7, Position::Left, CaptureType::Default)]);
+        task.active_client = Some(7);
+        task.state = State::WaitingForAck;
+        task.enter.begin(Instant::now(), Duration::from_secs(2));
+
+        task.pair_enter_if_due(7).await;
+        let first = task.last_enter_pair.expect("first pair is due immediately");
+        task.pair_enter_if_due(7).await;
+        assert_eq!(
+            task.last_enter_pair,
+            Some(first),
+            "a second call inside the throttle window must not send another Enter"
+        );
+
+        // Simulate the throttle window elapsing instead of sleeping.
+        task.last_enter_pair =
+            Some(Instant::now() - ENTER_PAIR_THROTTLE - Duration::from_millis(1));
+        task.pair_enter_if_due(7).await;
+        assert!(
+            task.last_enter_pair.is_some_and(|last| last > first),
+            "the next input after the throttle window gets a fresh repair Enter"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pairing_is_inert_after_the_ack_and_for_other_handles() {
+        let mut task = capture_task(vec![(7, Position::Left, CaptureType::Default)]);
+        task.active_client = Some(7);
+        task.enter.begin(Instant::now(), Duration::from_secs(2));
+        task.state = State::Sending;
+        task.pair_enter_if_due(7).await;
+        assert!(
+            task.last_enter_pair.is_none(),
+            "an acknowledged hand-off must not be retransmitted"
+        );
+
+        task.state = State::WaitingForAck;
+        task.pair_enter_if_due(8).await;
+        assert!(
+            task.last_enter_pair.is_none(),
+            "only the active client's hand-off is repaired"
+        );
     }
 
     #[test]
