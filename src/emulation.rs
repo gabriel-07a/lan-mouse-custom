@@ -146,9 +146,6 @@ enum EmulationRequest {
     /// Create the (possibly portal-backed) emulation backend as soon as a peer
     /// session exists, instead of waiting for the first input. Idempotent.
     WarmUp,
-    /// A peer started driving this machine through this local screen edge: arm
-    /// absolute-pointer edge-return tracking.
-    RemoteEnter(lan_mouse_ipc::Position),
     /// The peer no longer drives this machine.
     RemoteLeave,
     /// Update the absolute-pointer sensitivity (percent).
@@ -270,14 +267,6 @@ impl Emulation {
             .unwrap_or_default();
     }
 
-    /// A peer started driving this machine through the local screen edge \`pos\`.
-    pub(crate) fn remote_enter(&self, pos: lan_mouse_ipc::Position) {
-        self.request_tx
-            .send(EmulationRequest::RemoteEnter(pos))
-            .ok()
-            .unwrap_or_default();
-    }
-
     /// Update the absolute-pointer sensitivity (percent) live.
     pub(crate) fn set_absolute_sensitivity(&self, percent: u16) {
         self.request_tx
@@ -357,6 +346,56 @@ struct ListenTask {
 }
 
 impl ListenTask {
+    /// Handle a (possibly retransmitted) `Enter`/`EnterAt`.
+    ///
+    /// The absolute-pointer backend is armed *here*, before the `Ack` and
+    /// before any queued `Input` datagram, so the first injected delta starts
+    /// from the exact entry coordinate instead of the previous cursor
+    /// position. The service still receives `Entered` for capture suppression
+    /// and UI state, but no longer arms the backend (that would warp the
+    /// cursor after the first motion had already been applied).
+    async fn handle_enter(
+        &mut self,
+        addr: SocketAddr,
+        pos: lan_mouse_proto::Position,
+        serial: u32,
+        along: Option<f32>,
+        last_enter: &mut EnterDeduper,
+    ) {
+        if last_enter.is_duplicate(addr, serial) {
+            log::debug!("duplicate Enter({serial}) from {addr}, re-acking");
+            self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
+            return;
+        }
+        let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await else {
+            return;
+        };
+        last_enter.record(addr, serial);
+        self.emulation_proxy.open(addr);
+        let edge = to_pointer_edge(to_ipc_pos(pos));
+        self.emulation_proxy.begin_remote_control(edge, along);
+        log::debug!("handoff: armed {edge:?} along {along:?} before Ack");
+        log::info!("releasing capture: {addr} entered this device");
+        // Publish the hand-off before the Ack gives the peer permission to
+        // start injecting input. The service must have installed the
+        // remote-peer suppression by then; otherwise the first injected motion
+        // can be mistaken for local input and both machines ping-pong control
+        // at the shared edge (the old enter/leave cycle).
+        self.event_tx
+            .send(EmulationEvent::ReleaseNotify)
+            .ok()
+            .unwrap_or_default();
+        self.event_tx
+            .send(EmulationEvent::Entered {
+                addr,
+                pos: to_ipc_pos(pos),
+                fingerprint,
+            })
+            .ok()
+            .unwrap_or_default();
+        self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
+    }
+
     /// Tell the peer that this is a deliberate user disconnect.
     ///
     /// Events travel over DTLS/UDP without retransmission. A single lost
@@ -403,25 +442,10 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter { pos, serial } => {
-                                let duplicate = last_enter.is_duplicate(addr, serial);
-                                if duplicate {
-                                    log::debug!("duplicate Enter({serial}) from {addr}, re-acking");
-                                    self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
-                                } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                    last_enter.record(addr, serial);
-                                    self.emulation_proxy.open(addr);
-                                    log::info!("releasing capture: {addr} entered this device");
-                                    // Publish the hand-off before the Ack gives the
-                                    // peer permission to start injecting input. The
-                                    // service must have installed the remote-peer
-                                    // suppression by then; otherwise the first
-                                    // injected motion can be mistaken for local
-                                    // input and both machines ping-pong control at
-                                    // the shared edge (the old enter/leave cycle).
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).ok().unwrap_or_default();
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).ok().unwrap_or_default();
-                                    self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
-                                }
+                                self.handle_enter(addr, pos, serial, None, &mut last_enter).await;
+                            }
+                            ProtoEvent::EnterAt { pos, serial, along } => {
+                                self.handle_enter(addr, pos, serial, Some(along), &mut last_enter).await;
                             }
                             ProtoEvent::Leave(_) => {
                                 self.emulation_proxy.remove(addr);
@@ -616,9 +640,6 @@ impl ListenTask {
                         self.listener.disconnect_fingerprint(&fingerprint).await;
                     }
                     EmulationRequest::WarmUp => self.emulation_proxy.warm_up(),
-                    EmulationRequest::RemoteEnter(pos) => self
-                        .emulation_proxy
-                        .begin_remote_control(to_pointer_edge(pos)),
                     EmulationRequest::RemoteLeave => self.emulation_proxy.end_remote_control(),
                     EmulationRequest::SetAbsoluteSensitivity(percent) => self
                         .emulation_proxy
@@ -680,8 +701,11 @@ enum ProxyRequest {
     /// valid again (a closed address is otherwise dropped, see Remove).
     Open(SocketAddr),
     /// Arm absolute-pointer edge-return tracking for a peer that entered
-    /// through this local edge.
-    RemoteEnter(PointerEdge),
+    /// through this local edge, at the normalised crossing coordinate.
+    RemoteEnter {
+        edge: PointerEdge,
+        along: Option<f32>,
+    },
     /// The peer released the machine.
     RemoteLeave,
     /// Set the absolute-pointer sensitivity gain (1.0 = 100%).
@@ -776,9 +800,9 @@ impl EmulationProxy {
     }
 
     /// Arm absolute-pointer edge-return tracking for a peer entering here.
-    fn begin_remote_control(&self, edge: PointerEdge) {
+    fn begin_remote_control(&self, edge: PointerEdge, along: Option<f32>) {
         self.request_tx
-            .send(ProxyRequest::RemoteEnter(edge))
+            .send(ProxyRequest::RemoteEnter { edge, along })
             .ok()
             .unwrap_or_default();
     }
@@ -831,7 +855,7 @@ struct EmulationTask {
     selected_backend: Rc<Cell<Option<input_emulation::Backend>>>,
     /// RemoteEnter/RemoteLeave received while the backend was still being
     /// created: they must not be dropped (the service does not re-send Enter).
-    pending_remote: Option<PointerEdge>,
+    pending_remote: Option<(PointerEdge, Option<f32>)>,
     /// Whether the portal-backed backend may be selected (persisted consent or
     /// an explicit user enable).
     allow_portal: bool,
@@ -927,8 +951,8 @@ impl EmulationTask {
                     warmup = Some((event, addr));
                     break;
                 }
-                ProxyRequest::RemoteEnter(edge) => {
-                    self.pending_remote = Some(edge);
+                ProxyRequest::RemoteEnter { edge, along } => {
+                    self.pending_remote = Some((edge, along));
                 }
                 ProxyRequest::RemoteLeave => self.pending_remote = None,
                 ProxyRequest::SetAbsoluteSensitivity(gain) => {
@@ -976,7 +1000,9 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::WarmUp => { /* never retry a portal dialog automatically */ }
-                    ProxyRequest::RemoteEnter(edge) => self.pending_remote = Some(edge),
+                    ProxyRequest::RemoteEnter { edge, along } => {
+                        self.pending_remote = Some((edge, along));
+                    }
                     ProxyRequest::RemoteLeave => self.pending_remote = None,
                     ProxyRequest::SetAbsoluteSensitivity(gain) => {
                         self.absolute_sensitivity = gain;
@@ -1026,7 +1052,9 @@ impl EmulationTask {
                 result = &mut create => return Ok(Some(result?)),
                 request = next_proxy_request(&mut self.request_rx, &mut self.peeked_request) => match request.expect("channel closed") {
                     ProxyRequest::Terminate => return Ok(None),
-                    ProxyRequest::RemoteEnter(edge) => self.pending_remote = Some(edge),
+                    ProxyRequest::RemoteEnter { edge, along } => {
+                        self.pending_remote = Some((edge, along));
+                    }
                     ProxyRequest::RemoteLeave => self.pending_remote = None,
                     ProxyRequest::Remove(addr) => {
                         self.closed.insert(addr);
@@ -1083,8 +1111,8 @@ impl EmulationTask {
 
         // A peer may have entered while the portal was still coming up: replay
         // the edge so absolute tracking arms for this session.
-        if let Some(edge) = self.pending_remote {
-            emulation.begin_remote_control(edge).await;
+        if let Some((edge, along)) = self.pending_remote {
+            emulation.begin_remote_control(edge, along).await;
         }
 
         // The input that triggered the (lazy) backend start is injected first so
@@ -1158,12 +1186,12 @@ impl EmulationTask {
                     ProxyRequest::Open(addr) => {
                         self.closed.remove(&addr);
                     }
-                    ProxyRequest::RemoteEnter(edge) => {
+                    ProxyRequest::RemoteEnter { edge, along } => {
                         // Remember the edge: if the backend restarts while the
                         // peer still drives, creation replays it and arms the
                         // new backend instead of injecting relative-only input.
-                        self.pending_remote = Some(edge);
-                        emulation.begin_remote_control(edge).await;
+                        self.pending_remote = Some((edge, along));
+                        emulation.begin_remote_control(edge, along).await;
                     }
                     ProxyRequest::RemoteLeave => {
                         self.pending_remote = None;

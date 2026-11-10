@@ -116,6 +116,9 @@ pub(crate) struct LibeiEmulation {
     session: Session<RemoteDesktop>,
     /// edge the peer entered through, while it drives this machine
     remote_edge: Option<PointerEdge>,
+    /// normalised crossing coordinate along `remote_edge`, when the peer sent
+    /// an `EnterAt`; `None` keeps the legacy edge-centre anchor
+    entry_along: Option<f32>,
     /// exact absolute-position tracker once armed
     absolute: Option<AbsoluteTracker>,
     /// service notifier for the return hand-off
@@ -287,6 +290,7 @@ struct AbsoluteTracker {
 }
 
 impl AbsoluteTracker {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(
         edge: PointerEdge,
         generation: u64,
@@ -294,7 +298,20 @@ impl AbsoluteTracker {
         base_scale: f64,
         gain: f64,
     ) -> Option<Self> {
-        let entry = entry_region_bounds(&regions, edge)?;
+        Self::new_with_entry(edge, generation, regions, base_scale, gain, None)
+    }
+
+    /// Arm the tracker, optionally at the exact normalised crossing coordinate
+    /// (`along`). `None` keeps the legacy edge-centre anchor used with peers
+    /// that do not send `EnterAt`.
+    fn new_with_entry(
+        edge: PointerEdge,
+        generation: u64,
+        regions: Vec<(f32, f32, f32, f32)>,
+        base_scale: f64,
+        gain: f64,
+        along: Option<f32>,
+    ) -> Option<Self> {
         let layout_min_x = regions.iter().map(|r| r.0).fold(f32::INFINITY, f32::min);
         let layout_min_y = regions.iter().map(|r| r.1).fold(f32::INFINITY, f32::min);
         let layout_max_x = regions
@@ -305,6 +322,30 @@ impl AbsoluteTracker {
             .iter()
             .map(|r| r.3)
             .fold(f32::NEG_INFINITY, f32::max);
+        let (entry, x, y) = match along {
+            Some(along) => entry_point_at(
+                &regions,
+                edge,
+                along,
+                (layout_min_x, layout_min_y, layout_max_x, layout_max_y),
+            )?,
+            None => {
+                let entry = entry_region_bounds(&regions, edge)?;
+                let inset_x = EDGE_ANCHOR_INSET.min(f64::from((entry.2 - entry.0) / 2.0));
+                let inset_y = EDGE_ANCHOR_INSET.min(f64::from((entry.3 - entry.1) / 2.0));
+                let x = match edge {
+                    PointerEdge::Left => f64::from(entry.0) + inset_x,
+                    PointerEdge::Right => f64::from(entry.2) - 1.0 - inset_x,
+                    _ => f64::from(entry.0 + (entry.2 - entry.0) / 2.0),
+                };
+                let y = match edge {
+                    PointerEdge::Top => f64::from(entry.1) + inset_y,
+                    PointerEdge::Bottom => f64::from(entry.3) - 1.0 - inset_y,
+                    _ => f64::from(entry.1 + (entry.3 - entry.1) / 2.0),
+                };
+                (entry, x, y)
+            }
+        };
         Some(Self {
             edge,
             generation,
@@ -316,22 +357,8 @@ impl AbsoluteTracker {
             layout_min_y,
             layout_max_x,
             layout_max_y,
-            x: {
-                let inset = EDGE_ANCHOR_INSET.min(f64::from((entry.2 - entry.0) / 2.0));
-                match edge {
-                    PointerEdge::Left => f64::from(entry.0) + inset,
-                    PointerEdge::Right => f64::from(entry.2) - 1.0 - inset,
-                    _ => f64::from(entry.0 + (entry.2 - entry.0) / 2.0),
-                }
-            },
-            y: {
-                let inset = EDGE_ANCHOR_INSET.min(f64::from((entry.3 - entry.1) / 2.0));
-                match edge {
-                    PointerEdge::Top => f64::from(entry.1) + inset,
-                    PointerEdge::Bottom => f64::from(entry.3) - 1.0 - inset,
-                    _ => f64::from(entry.1 + (entry.3 - entry.1) / 2.0),
-                }
-            },
+            x,
+            y,
             fired: false,
         })
     }
@@ -501,6 +528,60 @@ fn entry_region_bounds(
     })
 }
 
+/// Pick the monitor region whose entry-edge segment contains the normalised
+/// coordinate `along` and return its bounds plus the exact edge pixel.
+///
+/// Multi-monitor layouts are ordered along the edge; a fraction that lands in a
+/// gap snaps to the nearest segment. `along` is clamped to `0..=1`.
+type EdgeEntry = ((f32, f32, f32, f32), f64, f64);
+
+fn entry_point_at(
+    regions: &[(f32, f32, f32, f32)],
+    edge: PointerEdge,
+    along: f32,
+    layout: (f32, f32, f32, f32),
+) -> Option<EdgeEntry> {
+    let (min_x, min_y, max_x, max_y) = layout;
+    let along = f64::from(along.clamp(0.0, 1.0));
+    let (span_min, span_max) = match edge {
+        PointerEdge::Left | PointerEdge::Right => (min_y, max_y),
+        PointerEdge::Top | PointerEdge::Bottom => (min_x, max_x),
+    };
+    if span_max <= span_min {
+        return None;
+    }
+    let point = f64::from(span_min) + along * f64::from(span_max - span_min);
+    let touches = |r: &(f32, f32, f32, f32)| match edge {
+        PointerEdge::Left => r.0 <= min_x + 0.5,
+        PointerEdge::Right => r.2 >= max_x - 0.5,
+        PointerEdge::Top => r.1 <= min_y + 0.5,
+        PointerEdge::Bottom => r.3 >= max_y - 0.5,
+    };
+    let mut best: Option<(EdgeEntry, f64)> = None;
+    for r in regions.iter().copied().filter(|r| touches(r)) {
+        let (lo, hi) = match edge {
+            PointerEdge::Left | PointerEdge::Right => (r.1, r.3),
+            PointerEdge::Top | PointerEdge::Bottom => (r.0, r.2),
+        };
+        let max_along = f64::from(hi - 1.0).max(f64::from(lo));
+        let clamped = point.clamp(f64::from(lo), max_along);
+        let distance = (clamped - point).abs();
+        let (x, y) = match edge {
+            PointerEdge::Left => (f64::from(r.0), clamped),
+            PointerEdge::Right => (f64::from(r.2) - 1.0, clamped),
+            PointerEdge::Top => (clamped, f64::from(r.1)),
+            PointerEdge::Bottom => (clamped, f64::from(r.3) - 1.0),
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_distance)| distance < *best_distance)
+        {
+            best = Some(((r, x, y), distance));
+        }
+    }
+    best.map(|(entry, _)| entry)
+}
+
 async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
     let remote_desktop = RemoteDesktop::new().await?;
 
@@ -592,12 +673,13 @@ impl LibeiEmulation {
             self.absolute_sensitivity,
             self.absolute_env_scale,
         );
-        let Some(tracker) = AbsoluteTracker::new(
+        let Some(tracker) = AbsoluteTracker::new_with_entry(
             edge,
             pointer.generation,
             pointer.regions.clone(),
             base_scale,
             gain,
+            self.entry_along,
         ) else {
             log::warn!("absolute pointer has no usable region; automatic edge return disabled");
             return false;
@@ -678,6 +760,7 @@ impl LibeiEmulation {
             _remote_desktop,
             session,
             remote_edge: None,
+            entry_along: None,
             absolute: None,
             edge_return: None,
             absolute_warned: false,
@@ -711,8 +794,9 @@ impl Emulation for LibeiEmulation {
         }
     }
 
-    async fn begin_remote_control(&mut self, edge: PointerEdge) {
+    async fn begin_remote_control(&mut self, edge: PointerEdge, along: Option<f32>) {
         self.remote_edge = Some(edge);
+        self.entry_along = along;
         self.absolute = None;
         self.absolute_warned = false;
         self.last_motion_time = None;
@@ -722,6 +806,7 @@ impl Emulation for LibeiEmulation {
 
     async fn end_remote_control(&mut self) {
         self.remote_edge = None;
+        self.entry_along = None;
         self.absolute = None;
         self.absolute_warned = false;
         self.last_motion_time = None;
@@ -1160,6 +1245,76 @@ mod absolute_tracker_tests {
             tracker(PointerEdge::Bottom).absolute(),
             (1280.0, H - 1.0 - 24.0)
         );
+    }
+
+    #[test]
+    fn entry_coordinate_parks_at_the_crossing_point() {
+        let regions = vec![(0.0, 0.0, W, H)];
+        let left = AbsoluteTracker::new_with_entry(
+            PointerEdge::Left,
+            1,
+            regions.clone(),
+            1.0,
+            1.0,
+            Some(0.25),
+        )
+        .expect("left tracker");
+        assert_eq!(left.absolute(), (0.0, 400.0));
+
+        let right = AbsoluteTracker::new_with_entry(
+            PointerEdge::Right,
+            1,
+            regions.clone(),
+            1.0,
+            1.0,
+            Some(0.75),
+        )
+        .expect("right tracker");
+        assert_eq!(right.absolute(), (W - 1.0, 1200.0));
+
+        let top = AbsoluteTracker::new_with_entry(
+            PointerEdge::Top,
+            1,
+            regions.clone(),
+            1.0,
+            1.0,
+            Some(0.5),
+        )
+        .expect("top tracker");
+        assert_eq!(top.absolute(), (1280.0, 0.0));
+
+        let bottom =
+            AbsoluteTracker::new_with_entry(PointerEdge::Bottom, 1, regions, 1.0, 1.0, Some(0.5))
+                .expect("bottom tracker");
+        assert_eq!(bottom.absolute(), (1280.0, H - 1.0));
+    }
+
+    #[test]
+    fn entry_coordinate_selects_the_touched_monitor_and_clamps() {
+        // Two monitors side by side; crossing the top edge at 75% must land on
+        // the second monitor at its own relative position.
+        let tracker = AbsoluteTracker::new_with_entry(
+            PointerEdge::Top,
+            1,
+            dual_regions(),
+            1.0,
+            1.0,
+            Some(0.75),
+        )
+        .expect("multi-monitor tracker");
+        assert_eq!(tracker.absolute(), (2880.0, 0.0));
+
+        // Out-of-range fractions are clamped instead of escaping the layout.
+        let clamped = AbsoluteTracker::new_with_entry(
+            PointerEdge::Left,
+            1,
+            vec![(0.0, 0.0, W, H)],
+            1.0,
+            1.0,
+            Some(2.0),
+        )
+        .expect("clamped tracker");
+        assert_eq!(clamped.absolute(), (0.0, H - 1.0));
     }
 
     #[test]

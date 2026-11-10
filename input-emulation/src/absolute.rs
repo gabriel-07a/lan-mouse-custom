@@ -212,6 +212,33 @@ pub(crate) fn entry_anchor(
     }
 }
 
+/// Park the cursor at the normalised position `along` (0.0 = top/left,
+/// 1.0 = bottom/right) of `edge`, `margin` pixels inside it.
+///
+/// Used when the peer sent the exact crossing coordinate: the cursor appears
+/// where it crossed instead of jumping a fixed inset into the screen.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn entry_anchor_fraction(
+    screen: &VirtualScreen,
+    edge: super::PointerEdge,
+    along: f32,
+    margin: i32,
+) -> (i32, i32) {
+    let along = f64::from(along.clamp(0.0, 1.0));
+    match edge {
+        super::PointerEdge::Left | super::PointerEdge::Right => {
+            let span = f64::from(screen.height.saturating_sub(1).max(1));
+            let y = screen.top + (along * span).round() as i32;
+            entry_anchor(screen, edge, y, margin)
+        }
+        super::PointerEdge::Top | super::PointerEdge::Bottom => {
+            let span = f64::from(screen.width.saturating_sub(1).max(1));
+            let x = screen.left + (along * span).round() as i32;
+            entry_anchor(screen, edge, x, margin)
+        }
+    }
+}
+
 /// Throttled, bounded retry latch for the return hand-off requests.
 ///
 /// The Windows backend asks the peer to release its capture whenever the
@@ -341,6 +368,31 @@ mod tests {
         assert_eq!(
             entry_anchor(&screen, super::super::PointerEdge::Bottom, 500, margin),
             (500, 1079 - margin)
+        );
+    }
+
+    #[test]
+    fn entry_anchor_fraction_maps_along_the_edge() {
+        let screen = screen();
+        assert_eq!(
+            entry_anchor_fraction(&screen, super::super::PointerEdge::Left, 0.0, 1),
+            (1, 0)
+        );
+        assert_eq!(
+            entry_anchor_fraction(&screen, super::super::PointerEdge::Left, 0.5, 1),
+            (1, 540)
+        );
+        assert_eq!(
+            entry_anchor_fraction(&screen, super::super::PointerEdge::Right, 0.5, 1),
+            (1918, 540)
+        );
+        assert_eq!(
+            entry_anchor_fraction(&screen, super::super::PointerEdge::Top, 0.5, 1),
+            (960, 1)
+        );
+        assert_eq!(
+            entry_anchor_fraction(&screen, super::super::PointerEdge::Bottom, 1.0, 1),
+            (1919, 1078)
         );
     }
 

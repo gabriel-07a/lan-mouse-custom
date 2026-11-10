@@ -232,3 +232,30 @@ Two causes were addressed:
    new capture started bounced control between the machines. Peers now advertise
    `capabilities::SERIALIZED_LEAVE`; for those peers a `Leave(0)` while capturing is ignored, while legacy
    peers (and older builds without the bit) keep the old release-on-`Leave(0)` behaviour.
+
+
+### R-19: cursor jumped to the edge centre instead of continuing from the crossing point
+
+Goal: crossing into the other machine should feel like moving the pointer onto a second monitor.
+
+1. **Entry coordinate on the wire.** Peers advertising `capabilities::EDGE_COORDINATE` now send
+   `ProtoEvent::EnterAt { pos, serial, along }` instead of `Enter`: `along` is the normalised crossing
+   position (0.0 = top/left, 1.0 = bottom/right) along the entry edge of the sender's virtual desktop. The
+   event id is additive and capability-gated, so older peers never receive it and keep the legacy `Enter`
+   path; the decoder rejects non-finite coordinates and clamps the rest into `0..=1`.
+2. **Backends report the crossing point.** `CaptureEvent::BeginAt(along)` is produced by the Windows capture
+   hook (from the crossing `at` + display layout), by libei (from the activation cursor position + barrier
+   segments) and by layer-shell (from the pointer surface coordinates + output layout). X11 capture is a
+   stub and macOS is dormant, so they keep `CaptureEvent::Begin` and the legacy fallback.
+3. **Receiver parks the cursor exactly at the crossing point.** `Emulation::begin_remote_control` now takes
+   the optional `along`. libei picks the monitor region that contains the coordinate and anchors at the
+   exact edge pixel (no more 24 px inset) while keeping `RETURN_MARGIN_PX`; Windows uses
+   `entry_anchor_fraction()` for the same purpose. `None` keeps the old edge-centre/current-cursor fallback.
+4. **Arming before the first injected motion.** The listener arms the backend directly when it handles
+   `Enter`/`EnterAt`, before the `Ack` and before any queued `Input`, so the first delta starts from the
+   entry coordinate. The service no longer re-arms on `Entered` (that warped the cursor after the first
+   motion had already been applied). The emulation backend is also warmed up when a client is activated, so
+   the first crossing does not pay the backend-creation cost.
+5. **Leading edge for the first motion.** `MotionCoalescer::arm_leading_edge()` makes the first motion of a
+   hand-off flush immediately instead of waiting for the 2 ms batch window inherited from the previous
+   screen.

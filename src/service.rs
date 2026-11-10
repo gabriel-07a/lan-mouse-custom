@@ -829,11 +829,11 @@ impl Service {
                 // A peer is about to drive this machine: make sure the
                 // (lazily created) emulation backend exists so input can be
                 // injected and the capability is advertised back to the peer.
+                // The absolute-pointer tracker is armed by the listener before
+                // the `Ack` (and before any queued input), with the exact
+                // crossing coordinate; arming it here again would warp the
+                // cursor after the first motion had already been injected.
                 self.emulation.warm_up();
-                // Arm the absolute-pointer tracker: it warps the cursor to a
-                // known anchor and detects the exact moment the user pushes it
-                // back past this entry edge (the return hand-off).
-                self.emulation.remote_enter(pos);
                 // The peer is driving this machine: local barrier detection
                 // must not react to the injected pointer motion (ping-pong at
                 // the shared border). Knowing *which* edge the peer entered
@@ -2898,6 +2898,11 @@ impl Service {
             }
             None => Capabilities::ALL,
         };
+
+        // Create the (possibly portal-backed) emulation backend now, while the
+        // user is configuring the link, so the first crossing does not pay the
+        // backend-creation cost.
+        self.emulation.warm_up();
 
         /* resolve dns on activate */
         self.resolve(handle);

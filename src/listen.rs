@@ -994,7 +994,7 @@ fn event_allowed(
             | PointerEvent::AxisDiscrete120 { .. },
         )) => policy.allows(Capabilities::POINTER),
         ProtoEvent::Input(InputEvent::Keyboard(_)) => policy.allows(Capabilities::KEYBOARD),
-        ProtoEvent::Enter { .. } => {
+        ProtoEvent::Enter { .. } | ProtoEvent::EnterAt { .. } => {
             policy.allowed
                 && (policy.capabilities.contains(Capabilities::POINTER)
                     || policy.capabilities.contains(Capabilities::KEYBOARD))

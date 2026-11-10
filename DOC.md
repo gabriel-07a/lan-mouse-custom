@@ -65,6 +65,12 @@ earlier revisions of this document described. The actual flow is:
   revocation uses `AuthRevoke`.
 - **Liveness**: `Ping`/`Pong` provides RTT and detects a dead peer; a watchdog
   closes the transport and the reconnect loop backs off.
+- **Edge hand-off extension**: peers advertising `EDGE_COORDINATE` may send
+  `EnterAt { pos, serial, along }` with the normalised crossing coordinate
+  (0.0 = top/left, 1.0 = bottom/right) so the receiver continues the pointer
+  from the same point instead of jumping to the edge centre. The event id is
+  additive and capability-gated: older peers keep receiving plain `Enter` and
+  use the legacy fallback.
 
 A beacon advertising a fingerprint is displayed as *unverified* until the
 fingerprint is known locally, pinned by a handshake, or accepted by the user.
