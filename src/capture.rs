@@ -629,8 +629,28 @@ impl CaptureTask {
                         // the cursor stuck on its screen).
                         ProtoEvent::Leave(serial) => {
                             if self.active_client == Some(handle) {
-                                log::info!("releasing capture: left remote client device region");
-                                self.release_capture(capture).await?;
+                                // A non-zero serial is an explicit return
+                                // hand-off request. `Leave(0)` from a peer that
+                                // advertises serialized requests is only the
+                                // confirmation of that peer releasing its own
+                                // capture (sent on every `Enter`); honouring it
+                                // cancelled the capture we just acquired and
+                                // bounced control between the machines at the
+                                // shared edge. Legacy peers use `Leave(0)` as
+                                // the request, so they keep the old behaviour.
+                                if leave_releases_capture(
+                                    serial,
+                                    self.conn.peer_supports_serialized_leave(handle),
+                                ) {
+                                    log::info!(
+                                        "releasing capture: left remote client device region (Leave({serial}))"
+                                    );
+                                    self.release_capture(capture).await?;
+                                } else {
+                                    log::debug!(
+                                        "ignoring release confirmation Leave(0) from client {handle}"
+                                    );
+                                }
                             } else if serial != 0 {
                                 log::debug!(
                                     "re-confirming capture release to {handle} (retried request {serial})"
@@ -1192,6 +1212,20 @@ fn is_suppressed_remote_begin(
     remote_peer.is_some() && capture_type == CaptureType::Default && *event == CaptureEvent::Begin
 }
 
+/// Whether a `Leave` received while we hold the capture must release it.
+///
+/// `Leave(serial)` with a non-zero serial is an explicit return hand-off
+/// request (retried until acknowledged). `Leave(0)` is the plain release
+/// confirmation from peers that advertise
+/// [`lan_mouse_proto::capabilities::SERIALIZED_LEAVE`]; older peers, including
+/// builds that already acknowledge `Enter`, still use `Leave(0)` as the
+/// request, so for them it releases. Without this distinction a confirmation
+/// arriving right after a new capture started cancelled that capture and
+/// bounced control between the machines at the shared edge.
+fn leave_releases_capture(serial: u32, peer_supports_serialized_leave: bool) -> bool {
+    serial != 0 || !peer_supports_serialized_leave
+}
+
 /// Whether `event` is a key or pointer-button release.
 ///
 /// A lost release leaves the peer with the key/button latched until the next
@@ -1391,6 +1425,26 @@ mod enter_state_tests {
         assert!(!is_release_event(&key_press));
         assert!(!is_release_event(&motion));
         assert!(!is_release_event(&ProtoEvent::Leave(0)));
+    }
+
+    #[test]
+    fn leave_release_requests_are_distinguished_from_confirmations() {
+        assert!(
+            leave_releases_capture(7, true),
+            "a non-zero serial is an explicit return request and must release"
+        );
+        assert!(
+            !leave_releases_capture(0, true),
+            "Leave(0) from a serialized-leave peer is only a confirmation and must not cancel the new capture"
+        );
+        assert!(
+            leave_releases_capture(0, false),
+            "legacy peers use Leave(0) as the actual release request"
+        );
+        assert!(
+            leave_releases_capture(7, false),
+            "an unexpected serial from a legacy peer must not regress"
+        );
     }
 
     #[test]

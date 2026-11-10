@@ -44,11 +44,19 @@ pub mod capabilities {
     /// connection on an unknown event id, so these must only be sent when the
     /// peer advertised this bit.
     pub const PERMISSIONS: u32 = 1 << 5;
+    /// The peer sends return hand-off requests as `Leave(serial)` with a
+    /// non-zero serial and reserves `Leave(0)` for the plain release
+    /// confirmation. Peers without this bit (including older builds that
+    /// already speak [`capabilities::ENTER_ACK`]) may use `Leave(0)` as the
+    /// actual release request, so the receiver must keep honouring it.
+    pub const SERIALIZED_LEAVE: u32 = 1 << 6;
 }
 
 /// Features this build can use when the peer also advertises them.
-pub const CAPABILITIES: u32 =
-    capabilities::ENTER_ACK | capabilities::CLIPBOARD | capabilities::PERMISSIONS;
+pub const CAPABILITIES: u32 = capabilities::ENTER_ACK
+    | capabilities::CLIPBOARD
+    | capabilities::PERMISSIONS
+    | capabilities::SERIALIZED_LEAVE;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -892,6 +900,7 @@ mod extra_tests {
             capabilities::ENTER_ACK,
             capabilities::CLIPBOARD,
             capabilities::PERMISSIONS,
+            capabilities::SERIALIZED_LEAVE,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");

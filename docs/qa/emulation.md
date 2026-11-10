@@ -210,3 +210,25 @@ The Windows emulation backend reported an EdgeReturn whenever the remote pointer
 the service's only-incoming-session fallback then accepted it even though the edge did not match the entry
 edge. The backend now remembers the entry edge (Emulation::begin_remote_control) and only reports the
 hand-off for that edge; the other edges keep the cursor clamped on this screen.
+
+
+### R-18: stutter/ping-pong when entering the other machine
+
+Reported: the cursor stuttered or bounced back right after crossing into the other PC, with repeated
+"releasing capture: left remote client device region" lines in the log.
+
+Two causes were addressed:
+
+1. **Windows had no entry anchor.** libei warps the pointer to a point 24 px inside the entry edge and only
+   hands control back after a real overshoot; the Windows backend kept the cursor wherever it was. Parked on
+   the edge, the first pixel of jitter handed control back; parked elsewhere, the first deltas clamped at
+   another edge and the cursor looked frozen. `WindowsEmulation::begin_remote_control` now parks the cursor
+   at `entry_anchor()` (24 px inside the edge, along-coordinate preserved) and `overshoot_edge` ignores
+   overshoots smaller than `EDGE_RETURN_MIN_OVERSHOOT` (2 px).
+
+2. **A release confirmation could cancel a fresh capture.** `Leave(serial)` with a non-zero serial is an
+   explicit return request; `Leave(0)` is the plain release confirmation every `Enter` triggers. The capture
+   task used to release on any `Leave` while it held the capture, so a confirmation arriving just after a
+   new capture started bounced control between the machines. Peers now advertise
+   `capabilities::SERIALIZED_LEAVE`; for those peers a `Leave(0)` while capturing is ignored, while legacy
+   peers (and older builds without the bit) keep the old release-on-`Leave(0)` behaviour.

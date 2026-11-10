@@ -32,14 +32,17 @@ use windows::Win32::{
             MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
             MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT,
         },
-        WindowsAndMessaging::GetCursorPos,
+        WindowsAndMessaging::{GetCursorPos, SetCursorPos},
     },
 };
 use windows::core::BOOL;
 
 use super::{
     EdgeReturnNotifier, Emulation, EmulationHandle, PointerEdge,
-    absolute::{EdgeReturnLatch, VirtualScreen, logical_to_physical, overshoot_edge},
+    absolute::{
+        ENTRY_ANCHOR_MARGIN, EdgeReturnLatch, VirtualScreen, entry_anchor, logical_to_physical,
+        overshoot_edge,
+    },
 };
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
@@ -321,6 +324,32 @@ impl Emulation for WindowsEmulation {
     async fn begin_remote_control(&mut self, edge: PointerEdge) {
         self.remote_edge = Some(edge);
         self.edge_return_latch.clear();
+        // Fractional motion from the previous session must not leak into the
+        // new entry position.
+        self.subpixel = Default::default();
+        // Park the cursor a little inside the entry edge, mirroring the libei
+        // absolute tracker. Without this the cursor keeps whatever position it
+        // had before the peer entered: sitting exactly on the edge it hands
+        // control back on the first pixel of jitter, parked elsewhere the first
+        // deltas clamp at another edge and the pointer looks frozen until the
+        // user pulls the other way.
+        let along = match cursor_pos() {
+            Some(point) if matches!(edge, PointerEdge::Left | PointerEdge::Right) => point.y,
+            Some(point) => point.x,
+            None => 0,
+        };
+        match unsafe { virtual_screen() } {
+            Some(screen) => {
+                let (x, y) = entry_anchor(&screen, edge, along, ENTRY_ANCHOR_MARGIN);
+                unsafe {
+                    let _ = SetCursorPos(x, y);
+                }
+                log::info!("absolute pointer armed at ({x},{y}) on the {edge:?} entry edge");
+            }
+            None => log::debug!(
+                "could not enumerate the virtual screen to park the pointer on the {edge:?} entry edge"
+            ),
+        }
     }
 
     async fn end_remote_control(&mut self) {

@@ -122,6 +122,25 @@ pub(crate) fn logical_to_physical(delta: f64, scale: f64) -> f64 {
     delta * sanitise_scale(scale)
 }
 
+/// Minimum overshoot, in physical pixels, before a target counts as pushed
+/// past a screen edge.
+///
+/// A single pixel is produced by pointer jitter at the border and used to
+/// bounce control between the machines; a deliberate push still crosses it
+/// immediately.
+pub(crate) const EDGE_RETURN_MIN_OVERSHOOT: i32 = 2;
+
+/// How far inside the entry edge the cursor is parked when remote control
+/// starts.
+///
+/// Mirrors the libei absolute tracker's anchor. Without it the Windows cursor
+/// keeps whatever position it had before the peer entered: parked exactly on
+/// the edge it hands control back on the first pixel of jitter, parked
+/// elsewhere the first deltas clamp at the wrong edge (the cursor looks frozen
+/// until the user pulls the other way).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const ENTRY_ANCHOR_MARGIN: i32 = 24;
+
 /// Screen edge that an unclamped pointer target overshoots.
 ///
 /// The emulation backend computes the target as `cursor + requested motion`
@@ -154,7 +173,43 @@ pub(crate) fn overshoot_edge(
     ];
     candidates.sort_by_key(|&(_, overshoot)| std::cmp::Reverse(overshoot));
     let (edge, overshoot) = candidates[0];
-    (overshoot > 0).then_some(edge)
+    (overshoot >= EDGE_RETURN_MIN_OVERSHOOT).then_some(edge)
+}
+
+/// Park the cursor `margin` pixels inside `edge`, keeping the coordinate along
+/// the edge at `along` (clamped to the screen).
+///
+/// Used when remote control starts so the cursor has a deterministic entry
+/// point: small movements back towards the edge do not immediately count as a
+/// return hand-off, and the first injected deltas cannot clamp at another edge.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn entry_anchor(
+    screen: &VirtualScreen,
+    edge: super::PointerEdge,
+    along: i32,
+    margin: i32,
+) -> (i32, i32) {
+    // Keep the anchor inside the screen even for a tiny virtual desktop.
+    let margin_x = margin.clamp(1, (screen.width / 2).max(1));
+    let margin_y = margin.clamp(1, (screen.height / 2).max(1));
+    match edge {
+        super::PointerEdge::Left => (
+            screen.left.saturating_add(margin_x),
+            along.clamp(screen.top, screen.bottom()),
+        ),
+        super::PointerEdge::Right => (
+            screen.right().saturating_sub(margin_x),
+            along.clamp(screen.top, screen.bottom()),
+        ),
+        super::PointerEdge::Top => (
+            along.clamp(screen.left, screen.right()),
+            screen.top.saturating_add(margin_y),
+        ),
+        super::PointerEdge::Bottom => (
+            along.clamp(screen.left, screen.right()),
+            screen.bottom().saturating_sub(margin_y),
+        ),
+    }
 }
 
 /// Throttled, bounded retry latch for the return hand-off requests.
@@ -247,6 +302,80 @@ mod tests {
         assert_eq!(overshoot_edge(&screen(), (0, 0)), None);
         assert_eq!(overshoot_edge(&screen(), (1919, 1079)), None);
         assert_eq!(overshoot_edge(&screen(), (960, 540)), None);
+    }
+
+    #[test]
+    fn jitter_below_the_minimum_overshoot_is_ignored() {
+        // One pixel past the edge is pointer jitter, not a deliberate push.
+        assert_eq!(overshoot_edge(&screen(), (-1, 500)), None);
+        assert_eq!(overshoot_edge(&screen(), (1920, 500)), None);
+        assert_eq!(overshoot_edge(&screen(), (500, (-1))), None);
+        assert_eq!(overshoot_edge(&screen(), (500, 1080)), None);
+        // From the threshold on it is a real hand-off.
+        assert_eq!(
+            overshoot_edge(&screen(), (-2, 500)),
+            Some(super::super::PointerEdge::Left)
+        );
+        assert_eq!(
+            overshoot_edge(&screen(), (1921, 500)),
+            Some(super::super::PointerEdge::Right)
+        );
+    }
+
+    #[test]
+    fn entry_anchor_parks_inside_each_edge() {
+        let screen = screen();
+        let margin = ENTRY_ANCHOR_MARGIN;
+        assert_eq!(
+            entry_anchor(&screen, super::super::PointerEdge::Left, 500, margin),
+            (margin, 500)
+        );
+        assert_eq!(
+            entry_anchor(&screen, super::super::PointerEdge::Right, 500, margin),
+            (1919 - margin, 500)
+        );
+        assert_eq!(
+            entry_anchor(&screen, super::super::PointerEdge::Top, 500, margin),
+            (500, margin)
+        );
+        assert_eq!(
+            entry_anchor(&screen, super::super::PointerEdge::Bottom, 500, margin),
+            (500, 1079 - margin)
+        );
+    }
+
+    #[test]
+    fn entry_anchor_clamps_along_and_stays_inside_a_tiny_screen() {
+        let screen = screen();
+        assert_eq!(
+            entry_anchor(
+                &screen,
+                super::super::PointerEdge::Left,
+                -100,
+                ENTRY_ANCHOR_MARGIN
+            ),
+            (ENTRY_ANCHOR_MARGIN, 0)
+        );
+        assert_eq!(
+            entry_anchor(
+                &screen,
+                super::super::PointerEdge::Left,
+                5000,
+                ENTRY_ANCHOR_MARGIN
+            ),
+            (ENTRY_ANCHOR_MARGIN, 1079)
+        );
+        let tiny = VirtualScreen::from_monitors(&[(0, 0, 10, 10)]).expect("tiny screen");
+        let (x, y) = entry_anchor(
+            &tiny,
+            super::super::PointerEdge::Right,
+            5,
+            ENTRY_ANCHOR_MARGIN,
+        );
+        assert!(
+            (0..10).contains(&x) && (0..10).contains(&y),
+            "anchor ({x},{y}) escaped the tiny screen"
+        );
     }
 
     #[test]

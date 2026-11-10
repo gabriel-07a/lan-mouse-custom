@@ -424,6 +424,14 @@ impl LanMouseConnection {
         self.sender.peer_supports_enter_ack(handle)
     }
 
+    /// Whether the peer advertises serialized return hand-off requests
+    /// (`Leave(serial)` with a non-zero serial, `Leave(0)` reserved for the
+    /// plain release confirmation). Older peers may use `Leave(0)` as the
+    /// actual request, so the capture must keep honouring it for them.
+    pub(crate) fn peer_supports_serialized_leave(&self, handle: ClientHandle) -> bool {
+        self.sender.peer_supports_serialized_leave(handle)
+    }
+
     pub(crate) fn peer_rtt_ms(&self, handle: ClientHandle) -> Option<u32> {
         self.sender.peer_rtt_ms(handle)
     }
@@ -474,6 +482,17 @@ impl ConnectionSender {
             return false;
         };
         caps & lan_mouse_proto::capabilities::ENTER_ACK != 0
+    }
+
+    /// Whether the peer advertises serialized return hand-off requests
+    /// (`Leave(serial)` with a non-zero serial). Peers without this bit,
+    /// including older builds that already acknowledge `Enter`, may still use
+    /// `Leave(0)` as the release request.
+    pub(crate) fn peer_supports_serialized_leave(&self, handle: ClientHandle) -> bool {
+        self.ctx
+            .client_manager
+            .peer_capabilities(handle)
+            .is_some_and(|caps| caps & lan_mouse_proto::capabilities::SERIALIZED_LEAVE != 0)
     }
 
     pub(crate) fn peer_rtt_ms(&self, handle: ClientHandle) -> Option<u32> {
