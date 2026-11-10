@@ -15,21 +15,33 @@ Lan Mouse é um Software KVM: um conjunto de mouse e teclado controla vários PC
 pela rede local, com o cursor atravessando a borda da tela — parecido com o
 Universal Control da Apple ou com dois monitores ligados no mesmo computador.
 
-Este fork existe para resolver um problema bem específico meu: **tornar a
-passagem do cursor de um PC para o outro fluida o suficiente para parecer que
-os dois são monitores da mesma máquina**. Não é um produto, não é uma release
+Eu fiz este fork porque gostava muito do projeto original, mas ele estava há
+muito tempo sem contribuições e eu sentia falta de algumas funcionalidades:
+**copiar e colar texto e imagens (Ctrl+C / Ctrl+V) entre as máquinas** e um
+**frontend repaginado**. Com o tempo, também usei o fork para deixar o handoff
+de borda mais fluido no meu próprio setup. Não é um produto, não é uma release
 oficial do upstream e não tem a intenção de substituir o projeto original.
 
 ---
 
-## O problema que este fork resolve
+## Por que eu fiz o fork
 
-Meu cenário é um PC com **Ubuntu 26.04 (Wayland/GNOME)** como máquina
-principal e um PC com **Windows 10/11** como secundário, na mesma rede local.
-O uso normal é mouse/teclado compartilhados, com o cursor cruzando a borda entre
-as telas.
+### Motivação original
 
-Os sintomas que eu via:
+O projeto original sempre foi muito bom, mas estava parado há bastante tempo
+sem contribuições. Eu queria adicionar coisas que faziam falta no meu dia a
+dia:
+
+- **clipboard de texto e imagens**: Ctrl+C em uma máquina e Ctrl+V na outra,
+  incluindo texto simples, HTML e imagens PNG;
+- **frontend repaginado**: uma interface mais moderna e rápida (GPUI), no lugar
+  da UI antiga.
+
+### Depois: fluidez do handoff no meu setup
+
+Com o fork já em uso, comecei a ajustar o handoff de borda para o meu cenário:
+PC principal com **Ubuntu 26.04 (Wayland/GNOME)** e secundário com
+**Windows 10/11**. Os sintomas que eu via eram:
 
 - o cursor **travava ou voltava sozinho** logo depois de entrar no outro PC;
 - ao cruzar a borda, o cursor **aparecia no centro da borda** (ou na posição
@@ -43,12 +55,37 @@ Os sintomas que eu via:
   segundo plano;
 - o ping-pong de `Enter`/`Leave` na borda aparecia como travamento no cursor.
 
-Este fork ataca esses pontos um por um, sempre com mudanças **aditivas e
-negociadas por capability**, para não quebrar peers antigos.
+Esses ajustes de handoff/rede são melhorias que eu fiz para o meu uso; **não
+eram problemas do repositório original**. As mudanças de protocolo são
+aditivas e negociadas por capability, para não quebrar peers antigos.
 
 ## O que mudou neste fork
 
-### 1. Handoff de borda (o foco principal)
+### Frontend GPUI repaginado
+
+- Novo frontend **GPUI** (GPU, mais rápido) como padrão, com a interface
+  repaginada: dispositivos, rede/descoberta, configurações, status do clipboard
+  e emparelhamento.
+- O frontend antigo em GTK continua disponível como fallback opt-in
+  (`--features gtk`); `LAN_MOUSE_FRONTEND=gpui` força o GPUI.
+- O serviço/daemon e o frontend são processos separados; fechar a janela não
+  precisa derrubar o daemon (ver seção de fechamento abaixo).
+
+### Clipboard: Ctrl+C / Ctrl+V de texto e imagens
+
+- Sincronização de clipboard entre as máquinas: **texto simples, HTML e imagens
+  PNG**.
+- Ctrl+C em uma máquina e Ctrl+V na outra funciona quando o clipboard está
+  habilitado e as permissões de clipboard foram concedidas.
+- Backends: portal XDG (GNOME/KDE), data-control (wlroots), clipboard nativo do
+  Windows e seleção CLIPBOARD do X11 (com INCR para payloads grandes).
+- Respeita as permissões por direção (`clipboard-read` / `clipboard-write`) e os
+  limites de tamanho configuráveis em `[clipboard]`; pode ser desligado com
+  `--no-clipboard` ou `lan-mouse cli clipboard enable|disable`.
+- Histórico de clipboard/nuvem do Windows e áreas de transferência não
+  autorizadas não são sincronizados.
+
+### Handoff de borda (melhoria posterior)
 
 - **Coordenada de cruzamento no protocolo.** Peers novos anunciam a capability
   `EDGE_COORDINATE` e enviam `EnterAt { pos, serial, along }`, em que `along` é
@@ -75,7 +112,7 @@ negociadas por capability**, para não quebrar peers antigos.
   continua sendo stub (só recebe); macOS é dormente; wlroots usa o caminho
   relativo quando não há posicionamento absoluto.
 
-### 2. Handoff confiável (`Enter`/`Ack`/`Leave`)
+### Handoff confiável (`Enter`/`Ack`/`Leave`)
 
 - `Enter` com serial + `Ack`, retransmissão e deduplicação.
 - Input não é mais transformado em `Enter` durante o handshake: o primeiro
@@ -87,14 +124,17 @@ negociadas por capability**, para não quebrar peers antigos.
 - `EdgeReturnLatch` no receptor limita os pedidos de retorno por contato com a
   borda.
 
-### 3. Rede e lag
+### Rede e lag (ajustes para o meu setup)
+
+Estas melhorias foram feitas para o meu uso; **o upstream não tinha esses
+problemas**:
 
 - Coalescing de movimento (agrupa deltas de poucos ms em um datagrama) para
   reduzir pacotes no Wi-Fi.
 - Reconexão com backoff, timeouts e métricas de RTT/jitter/loss no frontend.
 - Correções de pacing do clipboard e de eventos de alta frequência.
 
-### 4. Fechar a janela mantendo o serviço
+### Fechar a janela mantendo o serviço
 
 - No Ubuntu, fechar a janela (X) agora encerra apenas o frontend; o daemon e a
   conexão continuam rodando (contrato de exit code 3). O app pode ser reaberto
@@ -102,7 +142,7 @@ negociadas por capability**, para não quebrar peers antigos.
 - O serviço pode rodar como serviço de usuário do systemd
   (`lan-mouse-custom.service`), separado da janela.
 
-### 5. Compatibilidade
+### Compatibilidade
 
 - Todas as mudanças de protocolo são **capability-gated**; peers antigos
   ignoram os bits novos e mantêm o comportamento anterior.
@@ -171,6 +211,7 @@ Contribuições são bem-vindas, principalmente:
   conexão (cabo/Wi-Fi) e o trecho do log com as linhas `handoff:`;
 - correções de posicionamento em multi-monitor/DPI misto;
 - resiliência a perda de pacotes no movimento (redundância/sequência);
+- testes de clipboard (texto, HTML, imagens) e do frontend GPUI;
 - documentação e melhorias de acessibilidade.
 
 Antes de abrir PR:
@@ -245,8 +286,11 @@ correspondente em [README-upstream.md](README-upstream.md#clean-install-reset-an
 ## English summary
 
 This is a personal, experimental fork of
-[Lan Mouse](https://github.com/feschber/lan-mouse) focused on making the
-edge-crossing hand-off between two PCs feel like moving between two monitors.
+[Lan Mouse](https://github.com/feschber/lan-mouse). I created it because the
+upstream project had been without contributions for a long time and I wanted
+features it was missing: cross-machine clipboard copy/paste (text, HTML, PNG)
+and a redesigned GPUI frontend. Later I also improved the edge-crossing hand-off
+between two PCs so it feels like moving between two monitors.
 It is only tested on **Ubuntu 26.04 (Wayland/GNOME) + Windows 10/11**; other OS
 combinations are untested. The upstream documentation is preserved in
 [README-upstream.md](README-upstream.md). Testers and contributors are welcome:
