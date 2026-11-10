@@ -661,11 +661,19 @@ fn activate(pos: Position, at: (i32, i32)) {
         let _ = SetCursorPos(entry_point.0, entry_point.1);
     }
     log::debug!("ENTERED @ {at:?}, pinned to {entry_point:?}");
+    // Carry the exact crossing coordinate along the edge so the peer can
+    // continue the pointer from the same relative position.
+    let begin = match DISPLAYS
+        .with_borrow(|(displays, _, _)| display_util::edge_fraction(displays, pos, at))
+    {
+        Some(along) => CaptureEvent::BeginAt(along),
+        None => CaptureEvent::Begin,
+    };
     // `Begin` must land before any motion from this capture. It is enqueued
     // from the hook thread without blocking; if the channel is momentarily
     // full, undo the activation and let the next raw event retry instead of
     // risking an out-of-order stream (Windows can kill hooks that block).
-    if let Err(e) = try_send_event(pos, CaptureEvent::Begin) {
+    if let Err(e) = try_send_event(pos, begin) {
         log::warn!("could not enqueue capture begin: {e}");
         release_active_client();
     }

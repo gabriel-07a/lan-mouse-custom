@@ -660,7 +660,17 @@ where
                     continue;
                 }
                 current_pos.replace(Some(pos));
-                if event_tx.send((pos, CaptureEvent::Begin)).await.is_err() {
+                // Carry the exact crossing coordinate along the edge when the
+                // portal reports it, so the peer can continue the pointer from
+                // the same relative position.
+                let begin = activated_event
+                    .cursor_position()
+                    .and_then(|point| {
+                        barrier_edge_fraction(&barriers, &pos_for_barrier_id, pos, point)
+                    })
+                    .map(CaptureEvent::BeginAt)
+                    .unwrap_or(CaptureEvent::Begin);
+                if event_tx.send((pos, begin)).await.is_err() {
                     return Err(CaptureError::EndOfStream);
                 }
 
@@ -755,6 +765,41 @@ async fn release_capture(
     }
     input_capture.release(session, release_options).await?;
     Ok(())
+}
+
+/// Normalised position of `point` along the layout edge `pos`, using the
+/// barrier segments installed for that edge as the layout span.
+///
+/// Multiple monitors on the same edge are ordered along it; a point in a gap
+/// snaps to `0..=1`. Returns `None` when the edge has no usable span.
+fn barrier_edge_fraction(
+    barriers: &[ICBarrier],
+    pos_for_barrier_id: &HashMap<BarrierID, Position>,
+    pos: Position,
+    point: (f32, f32),
+) -> Option<f32> {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for barrier in barriers {
+        if pos_for_barrier_id.get(&barrier.barrier_id) != Some(&pos) {
+            continue;
+        }
+        let (x1, y1, x2, y2) = barrier.position;
+        let (lo, hi) = match pos {
+            Position::Left | Position::Right => (y1 as f32, y2 as f32),
+            Position::Top | Position::Bottom => (x1 as f32, x2 as f32),
+        };
+        min = min.min(lo);
+        max = max.max(hi);
+    }
+    if max <= min {
+        return None;
+    }
+    let value = match pos {
+        Position::Left | Position::Right => point.1,
+        Position::Top | Position::Bottom => point.0,
+    };
+    Some(((value - min) / (max - min)).clamp(0.0, 1.0))
 }
 
 fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> Option<BarrierID> {

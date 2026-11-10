@@ -117,7 +117,10 @@ async fn windows_backends_initialize_and_move_cursor_and_trigger_barrier() {
                 let begin = tokio::time::timeout(Duration::from_secs(2), capture.next()).await;
                 if let Ok(Some(Ok((handle, event)))) = begin {
                     assert_eq!(handle, 0, "expected Left barrier (handle 0)");
-                    assert_eq!(event, CaptureEvent::Begin);
+                    assert!(
+                        event.is_begin(),
+                        "expected a capture begin, got {event:?}"
+                    );
 
                     // While this machine drives the peer, the local pointer
                     // must disappear (1x1 topmost overlay under the pinned

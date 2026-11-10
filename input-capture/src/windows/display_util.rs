@@ -181,6 +181,29 @@ pub(crate) fn clamp_to_display_bounds(
     (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
 }
 
+/// Normalised position (0.0..=1.0) of `point` along the virtual desktop edge
+/// `pos` (0 = top/left, 1 = bottom/right).
+///
+/// Used to carry the crossing point to the peer so it can continue the pointer
+/// from the same relative position instead of jumping to the edge centre.
+/// Returns `None` when the layout has no span on that axis.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn edge_fraction(displays: &[RECT], pos: Position, point: (i32, i32)) -> Option<f32> {
+    let min_x = displays.iter().map(|d| d.left).min()?;
+    let max_x = displays.iter().map(|d| d.right).max()?;
+    let min_y = displays.iter().map(|d| d.top).min()?;
+    let max_y = displays.iter().map(|d| d.bottom).max()?;
+    let (value, min, max) = match pos {
+        Position::Left | Position::Right => (point.1, min_y, max_y),
+        Position::Top | Position::Bottom => (point.0, min_x, max_x),
+    };
+    let span = max.saturating_sub(min);
+    if span <= 0 {
+        return None;
+    }
+    Some(((value - min) as f32 / span as f32).clamp(0.0, 1.0))
+}
+
 /// Convert consecutive absolute raw mouse positions into a pixel delta.
 ///
 /// Per the `RAWMOUSE` documentation (`MOUSE_MOVE_ABSOLUTE`), `lLastX`/`lLastY`
@@ -499,6 +522,34 @@ mod tests {
             absolute_mouse_delta((0, 0), Some((65535, 65535)), (3840, 2160)),
             Some((-3840, -2160))
         );
+    }
+
+    #[test]
+    fn edge_fraction_maps_the_crossing_point() {
+        let displays = [
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            RECT {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1080,
+            },
+        ];
+        assert_eq!(
+            edge_fraction(&displays, Position::Right, (1920, 540)),
+            Some(0.5)
+        );
+        assert_eq!(edge_fraction(&displays, Position::Left, (0, 0)), Some(0.0));
+        assert_eq!(
+            edge_fraction(&displays, Position::Bottom, (2880, 1080)),
+            Some(0.75)
+        );
+        assert_eq!(edge_fraction(&[], Position::Left, (0, 0)), None);
     }
 
     #[test]

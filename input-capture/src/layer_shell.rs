@@ -150,6 +150,9 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
+    /// Logical position of the output this window is anchored to; used to map
+    /// the pointer's surface coordinates to a layout edge fraction.
+    output_pos: (i32, i32),
 }
 
 impl Window {
@@ -157,6 +160,7 @@ impl Window {
         state: &State,
         qh: &QueueHandle<State>,
         output: &WlOutput,
+        output_pos: (i32, i32),
         pos: Position,
         size: (i32, i32),
     ) -> io::Result<Window> {
@@ -220,6 +224,7 @@ impl Window {
         surface.commit();
         Ok(Window {
             pos,
+            output_pos,
             buffer,
             surface,
             layer_surface,
@@ -253,6 +258,26 @@ fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
             })
         })
         .collect()
+}
+
+/// Normalised position (0.0..=1.0) of `coord` along the layout edge `pos`,
+/// using the union of the outputs touching that edge as the span.
+fn edge_fraction(outputs: &[Output], pos: Position, coord: i32) -> Option<f32> {
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    for info in outputs.iter().filter_map(|output| output.info.as_ref()) {
+        let (lo, hi) = match pos {
+            Position::Left | Position::Right => (info.position.1, info.position.1 + info.size.1),
+            Position::Top | Position::Bottom => (info.position.0, info.position.0 + info.size.0),
+        };
+        min = min.min(lo);
+        max = max.max(hi);
+    }
+    let span = max.saturating_sub(min);
+    if span <= 0 {
+        return None;
+    }
+    Some(((coord - min) as f32 / span as f32).clamp(0.0, 1.0))
 }
 
 fn get_output_configuration(state: &State, pos: Position) -> Vec<Output> {
@@ -561,7 +586,14 @@ impl State {
             let Some(info) = output.info.as_ref() else {
                 continue;
             };
-            match Window::new(self, &self.qh, &output.wl_output, pos, info.size) {
+            match Window::new(
+                self,
+                &self.qh,
+                &output.wl_output,
+                info.position,
+                pos,
+                info.size,
+            ) {
                 Ok(window) => self.active_windows.push(Arc::new(window)),
                 Err(e) => {
                     log::warn!("could not create the capture window on {output}: {e}");
@@ -821,8 +853,8 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
                 // get client corresponding to the focused surface
                 let Some(window) = app
@@ -834,9 +866,24 @@ impl Dispatch<WlPointer, ()> for State {
                     return;
                 };
                 let pos = window.pos;
+                // The 1-pixel strip covers the full output edge, so the
+                // surface coordinate plus the output position gives the
+                // crossing point in layout coordinates.
+                let along = match pos {
+                    Position::Left | Position::Right => {
+                        edge_fraction(&app.outputs, pos, window.output_pos.1 + surface_y as i32)
+                    }
+                    Position::Top | Position::Bottom => {
+                        edge_fraction(&app.outputs, pos, window.output_pos.0 + surface_x as i32)
+                    }
+                };
+                let begin = match along {
+                    Some(along) => CaptureEvent::BeginAt(along),
+                    None => CaptureEvent::Begin,
+                };
                 app.focused = Some(window);
                 app.grab(&surface, pointer, serial, qh);
-                app.pending_events.push_back((pos, CaptureEvent::Begin));
+                app.pending_events.push_back((pos, begin));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in

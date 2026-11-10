@@ -107,6 +107,7 @@ impl Capture {
             outgoing_caps: Default::default(),
             conn,
             enter: EnterState::default(),
+            enter_along: None,
             last_enter_pair: None,
             sensitivity: Default::default(),
             remote_peer: None,
@@ -388,6 +389,9 @@ struct CaptureTask {
     conn: LanMouseConnection,
     /// `Enter`/`Ack` handoff state
     enter: EnterState,
+    /// Normalised crossing coordinate along the entry edge for the current
+    /// hand-off (`BeginAt`); reused by retries and repair `EnterAt` events.
+    enter_along: Option<f32>,
     /// Last time an unacknowledged `Enter` was paired with input, throttled by
     /// [`ENTER_PAIR_THROTTLE`] so the retransmission is repaired quickly
     /// without flooding the link.
@@ -729,11 +733,35 @@ impl CaptureTask {
             return true;
         };
         match event {
-            CaptureEvent::Begin => {
+            CaptureEvent::Begin | CaptureEvent::BeginAt(_) => {
                 caps.intersects(Capabilities::POINTER) || caps.intersects(Capabilities::KEYBOARD)
             }
             CaptureEvent::Input(Event::Pointer(_)) => caps.contains(Capabilities::POINTER),
             CaptureEvent::Input(Event::Keyboard(_)) => caps.contains(Capabilities::KEYBOARD),
+        }
+    }
+
+    /// Build the hand-off event for `handle`.
+    ///
+    /// `EnterAt` is only used when the peer advertised
+    /// [`lan_mouse_proto::capabilities::EDGE_COORDINATE`] and the capture
+    /// backend reported where the pointer crossed; otherwise the legacy
+    /// `Enter` keeps the old edge-centre fallback.
+    fn enter_event(
+        &self,
+        handle: CaptureHandle,
+        opposite_pos: lan_mouse_proto::Position,
+    ) -> ProtoEvent {
+        match self.enter_along {
+            Some(along) if self.conn.peer_supports_edge_coordinate(handle) => ProtoEvent::EnterAt {
+                pos: opposite_pos,
+                serial: self.enter.serial(),
+                along,
+            },
+            _ => ProtoEvent::Enter {
+                pos: opposite_pos,
+                serial: self.enter.serial(),
+            },
         }
     }
 
@@ -784,7 +812,7 @@ impl CaptureTask {
             return Ok(());
         }
 
-        if event == CaptureEvent::Begin {
+        if event.is_begin() {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
                 .ok()
@@ -807,8 +835,12 @@ impl CaptureTask {
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+        if event.is_begin() && Some(handle) != self.active_client {
             self.active_client.replace(handle);
+            self.enter_along = event.begin_along();
+            // The first motion of the hand-off must not wait for a batch
+            // window inherited from the movement on the previous screen.
+            self.coalescer.arm_leading_edge();
             if self.conn.peer_supports_enter_ack(handle) {
                 // The peer echoes the serial back, so a lost `Enter` can be
                 // retransmitted and a duplicate one can be dropped.
@@ -871,7 +903,7 @@ impl CaptureTask {
         // motion. `Begin` is excluded because it is the *start* of a new
         // session and any pending motion belongs to the old one.
         if self.active_client == Some(handle)
-            && event != CaptureEvent::Begin
+            && !event.is_begin()
             && !self.flush_handle(handle).await
         {
             return self.release_capture(capture).await;
@@ -881,8 +913,7 @@ impl CaptureTask {
             return Ok(());
         };
         let opposite_pos = to_proto_pos(pos.opposite());
-        let enter_serial = self.enter.serial();
-        let is_begin = event == CaptureEvent::Begin;
+        let is_begin = event.is_begin();
 
         // Old behaviour rewrote every input event into a duplicate `Enter`
         // until the peer acknowledged the hand-off, silently dropping clicks,
@@ -895,10 +926,9 @@ impl CaptureTask {
         }
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter {
-                pos: opposite_pos,
-                serial: enter_serial,
-            },
+            CaptureEvent::Begin | CaptureEvent::BeginAt(_) => {
+                self.enter_event(handle, opposite_pos)
+            }
             CaptureEvent::Input(e) => ProtoEvent::Input(e),
         };
 
@@ -939,16 +969,8 @@ impl CaptureTask {
                 // isolated packet loss; the receiver re-acks instead of
                 // re-applying it.
                 if is_begin && self.state == State::WaitingForAck {
-                    let _ = self
-                        .conn
-                        .send_now(
-                            ProtoEvent::Enter {
-                                pos: opposite_pos,
-                                serial: enter_serial,
-                            },
-                            handle,
-                        )
-                        .await;
+                    let repair = self.enter_event(handle, opposite_pos);
+                    let _ = self.conn.send_now(repair, handle).await;
                 }
                 if redundant_release {
                     let _ = self.conn.send_now(event, handle).await;
@@ -1002,10 +1024,7 @@ impl CaptureTask {
             return;
         };
         self.last_enter_pair = Some(Instant::now());
-        let event = ProtoEvent::Enter {
-            pos: to_proto_pos(pos.opposite()),
-            serial: self.enter.serial(),
-        };
+        let event = self.enter_event(handle, to_proto_pos(pos.opposite()));
         let _ = self.conn.send_now(event, handle).await;
     }
 
@@ -1103,13 +1122,9 @@ impl CaptureTask {
             return Ok(());
         };
         let pos = to_proto_pos(pos.opposite());
-        let serial = self.enter.serial();
+        let event = self.enter_event(handle, pos);
         let budget = self.grace.min(DISCRETE_SEND_BUDGET);
-        if let Err(e) = self
-            .conn
-            .send_with_grace(ProtoEvent::Enter { pos, serial }, handle, budget)
-            .await
-        {
+        if let Err(e) = self.conn.send_with_grace(event, handle, budget).await {
             log::debug!("failed to retransmit Enter to client {handle}: {e}");
         }
         Ok(())
@@ -1209,7 +1224,7 @@ fn is_suppressed_remote_begin(
     capture_type: CaptureType,
     event: &CaptureEvent,
 ) -> bool {
-    remote_peer.is_some() && capture_type == CaptureType::Default && *event == CaptureEvent::Begin
+    remote_peer.is_some() && capture_type == CaptureType::Default && event.is_begin()
 }
 
 /// Whether a `Leave` received while we hold the capture must release it.
@@ -1510,6 +1525,7 @@ mod capture_handle_tests {
             coalescer: MotionCoalescer::new(0),
             conn: LanMouseConnection::new(certificate(), ClientManager::default(), 1000),
             enter: EnterState::default(),
+            enter_along: None,
             last_enter_pair: None,
             sensitivity: HashMap::new(),
             outgoing_caps: HashMap::new(),

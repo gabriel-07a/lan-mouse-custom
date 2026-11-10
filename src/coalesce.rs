@@ -35,6 +35,10 @@ pub(crate) struct MotionCoalescer {
     batch: Option<Duration>,
     pending: HashMap<CaptureHandle, Motion>,
     last_flush: Instant,
+    /// Send the next motion immediately, regardless of `last_flush`. Armed
+    /// when a capture begins so the first movement of a hand-off does not
+    /// wait for the batch window inherited from the previous screen.
+    leading_edge: bool,
     events_in: u64,
     batches_out: u64,
 }
@@ -45,6 +49,7 @@ impl MotionCoalescer {
             batch: (batch_ms > 0).then(|| Duration::from_millis(batch_ms)),
             pending: HashMap::new(),
             last_flush: Instant::now(),
+            leading_edge: false,
             events_in: 0,
             batches_out: 0,
         }
@@ -52,6 +57,11 @@ impl MotionCoalescer {
 
     pub(crate) fn enabled(&self) -> bool {
         self.batch.is_some()
+    }
+
+    /// Flush the next motion immediately (used at the start of a hand-off).
+    pub(crate) fn arm_leading_edge(&mut self) {
+        self.leading_edge = true;
     }
 
     /// The batch window, or `None` when coalescing is disabled.
@@ -84,10 +94,15 @@ impl MotionCoalescer {
             }
         }
 
-        match self.batch {
+        let due = match self.batch {
             Some(batch) => now.saturating_duration_since(self.last_flush) >= batch,
             None => false,
+        };
+        if due || self.leading_edge {
+            self.leading_edge = false;
+            return true;
         }
+        false
     }
 
     /// Take the pending motion of a single handle (used before sending a
@@ -97,6 +112,7 @@ impl MotionCoalescer {
         if motion.is_some() {
             self.last_flush = Instant::now();
             self.batches_out += 1;
+            self.leading_edge = false;
         }
         motion
     }
@@ -107,6 +123,7 @@ impl MotionCoalescer {
             return Vec::new();
         }
         self.last_flush = Instant::now();
+        self.leading_edge = false;
         let pending = self.pending.drain().collect::<Vec<_>>();
         self.batches_out += pending.len() as u64;
         pending
@@ -190,6 +207,23 @@ mod tests {
         assert!(
             c.push(1, 1, 1.0, 0.0, t0 + Duration::from_millis(50)),
             "idle for longer than the window must flush at once"
+        );
+    }
+
+    #[test]
+    fn leading_edge_flushes_the_first_motion_of_a_handoff() {
+        let mut c = MotionCoalescer::new(2);
+        let t0 = Instant::now();
+        c.push(1, 0, 1.0, 0.0, t0);
+        assert!(c.take(1).is_some(), "flush before the hand-off");
+        c.arm_leading_edge();
+        assert!(
+            c.push(1, 1, 1.0, 0.0, t0 + Duration::from_micros(100)),
+            "the first motion after a Begin must not wait for the batch window"
+        );
+        assert!(
+            !c.push(1, 2, 1.0, 0.0, t0 + Duration::from_micros(200)),
+            "only the first motion gets the leading edge"
         );
     }
 

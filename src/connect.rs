@@ -432,6 +432,12 @@ impl LanMouseConnection {
         self.sender.peer_supports_serialized_leave(handle)
     }
 
+    /// Whether the peer understands `EnterAt` and can continue the pointer
+    /// from the exact crossing coordinate instead of the edge centre.
+    pub(crate) fn peer_supports_edge_coordinate(&self, handle: ClientHandle) -> bool {
+        self.sender.peer_supports_edge_coordinate(handle)
+    }
+
     pub(crate) fn peer_rtt_ms(&self, handle: ClientHandle) -> Option<u32> {
         self.sender.peer_rtt_ms(handle)
     }
@@ -493,6 +499,15 @@ impl ConnectionSender {
             .client_manager
             .peer_capabilities(handle)
             .is_some_and(|caps| caps & lan_mouse_proto::capabilities::SERIALIZED_LEAVE != 0)
+    }
+
+    /// Whether the peer understands `EnterAt` and can position the pointer at
+    /// the exact crossing coordinate.
+    pub(crate) fn peer_supports_edge_coordinate(&self, handle: ClientHandle) -> bool {
+        self.ctx
+            .client_manager
+            .peer_capabilities(handle)
+            .is_some_and(|caps| caps & lan_mouse_proto::capabilities::EDGE_COORDINATE != 0)
     }
 
     pub(crate) fn peer_rtt_ms(&self, handle: ClientHandle) -> Option<u32> {

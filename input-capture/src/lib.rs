@@ -42,14 +42,35 @@ pub type CaptureHandle = u64;
 pub enum CaptureEvent {
     /// capture on this capture handle is now active
     Begin,
+    /// capture on this capture handle is now active; `along` is the normalised
+    /// position (0.0 = top/left, 1.0 = bottom/right) where the pointer crossed
+    /// the entry edge, so the receiver can continue from the same point instead
+    /// of jumping to the edge centre.
+    BeginAt(f32),
     /// input event coming from capture handle
     Input(Event),
+}
+
+impl CaptureEvent {
+    /// Whether this event starts a capture.
+    pub fn is_begin(&self) -> bool {
+        matches!(self, CaptureEvent::Begin | CaptureEvent::BeginAt(_))
+    }
+
+    /// Normalised entry coordinate carried by [`CaptureEvent::BeginAt`].
+    pub fn begin_along(&self) -> Option<f32> {
+        match self {
+            CaptureEvent::BeginAt(along) => Some(*along),
+            _ => None,
+        }
+    }
 }
 
 impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::BeginAt(along) => write!(f, "begin capture at {along:.3}"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
