@@ -10,6 +10,9 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError, PairingWindow},
+    service_core::{
+        BidirectionalAction, bidirectional_action, duplicate_reverse_clients, return_targets,
+    },
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -1292,31 +1295,25 @@ impl Service {
     /// through). This is the return hand-off: without it the peer keeps the
     /// local pointer grabbed on its side of the shared edge.
     fn request_return(&mut self, pos: Position) {
-        let mut addrs: Vec<SocketAddr> = self
+        let incoming: Vec<(SocketAddr, Position)> = self
             .incoming_conn_info
             .values()
-            .filter(|incoming| incoming.pos == pos)
-            .map(|incoming| incoming.addr)
+            .map(|incoming| (incoming.addr, incoming.pos))
             .collect();
-        if addrs.is_empty() {
-            // A mismatching position must never trap the cursor: when exactly
-            // one peer is driving this machine, hand control back to it anyway.
-            if let Some(incoming) = self.incoming_conn_info.values().next() {
-                if self.incoming_conn_info.len() == 1 {
-                    log::warn!(
-                        "return hand-off through {pos:?} did not match the live edge ({:?}); using the only incoming session {}",
-                        incoming.pos,
-                        incoming.addr
-                    );
-                    addrs.push(incoming.addr);
-                }
-            }
+        let targets = return_targets(&incoming, pos);
+        if let Some(addr) = targets.fallback {
+            log::warn!(
+                "return hand-off through {pos:?} did not match the live edge; using the only incoming session {addr}"
+            );
+            log::info!("handing control back: remote pointer left through {pos:?} ({addr})");
+            self.request_handoff(addr);
+            return;
         }
-        if addrs.is_empty() {
+        if targets.matching.is_empty() {
             log::debug!("return hand-off through {pos:?}, but no incoming session matches it");
             return;
         }
-        for addr in addrs {
+        for addr in targets.matching {
             log::info!("handing control back: remote pointer left through {pos:?} ({addr})");
             self.request_handoff(addr);
         }
@@ -2718,32 +2715,42 @@ impl Service {
     /// connection is bidirectional automatically instead of requiring the old
     /// "Also connect" button.
     fn ensure_bidirectional(&mut self, handle: ClientHandle) {
-        if self.client_manager.is_active(handle) {
-            return;
-        }
-        // An auto-created reverse client has no known listen port yet. Dialing
-        // the default port would create a phantom connection, so stay
-        // receiving-only until discovery or the user supplies the address.
-        if self.auto_reverse_clients.contains(&handle) {
-            let Some((config, _)) = self.client_manager.get_state(handle) else {
-                return;
-            };
-            let known_port = config
-                .fix_ips
-                .first()
-                .and_then(|ip| self.discovered.get(ip).and_then(|device| device.port));
-            match known_port {
-                Some(port) => self.client_manager.set_port(handle, port),
-                None => {
-                    log::info!(
-                        "incoming session established but the listen port of the peer is unknown; keeping client {handle} receiving-only"
-                    );
-                    return;
+        let auto_reverse = self.auto_reverse_clients.contains(&handle);
+        let known_port = if auto_reverse {
+            // An auto-created reverse client has no known listen port yet.
+            // Dialing the default port would create a phantom connection, so
+            // stay receiving-only until discovery or the user supplies the
+            // address.
+            self.client_manager
+                .get_state(handle)
+                .and_then(|(config, _)| {
+                    config
+                        .fix_ips
+                        .first()
+                        .and_then(|ip| self.discovered.get(ip).and_then(|device| device.port))
+                })
+        } else {
+            None
+        };
+        match bidirectional_action(
+            self.client_manager.is_active(handle),
+            auto_reverse,
+            known_port,
+        ) {
+            BidirectionalAction::AlreadyActive => {}
+            BidirectionalAction::NeedsPort => log::info!(
+                "incoming session established but the listen port of the peer is unknown; keeping client {handle} receiving-only"
+            ),
+            BidirectionalAction::Activate { port } => {
+                if let Some(port) = port {
+                    self.client_manager.set_port(handle, port);
                 }
+                log::info!(
+                    "incoming session established: activating client {handle} back (bidirectional)"
+                );
+                self.set_client_active(handle, true);
             }
         }
-        log::info!("incoming session established: activating client {handle} back (bidirectional)");
-        self.set_client_active(handle, true);
     }
 
     /// Drop an auto-added reverse client once the configured client for the
@@ -2754,13 +2761,12 @@ impl Service {
     /// port, while the configured client stayed deactivated by the position
     /// collision — two rows for one peer and a stale capture zone.
     fn merge_auto_reverse_client(&mut self, handle: ClientHandle, fingerprint: &str) {
-        let duplicates: Vec<ClientHandle> = self
+        let candidates: Vec<(ClientHandle, Option<String>)> = self
             .auto_reverse_clients
             .iter()
-            .copied()
-            .filter(|other| *other != handle)
-            .filter(|other| self.client_manager.fingerprint(*other).as_deref() == Some(fingerprint))
+            .map(|other| (*other, self.client_manager.fingerprint(*other)))
             .collect();
+        let duplicates = duplicate_reverse_clients(&candidates, handle, fingerprint);
         if duplicates.is_empty() {
             return;
         }

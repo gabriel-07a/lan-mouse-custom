@@ -16,4 +16,5 @@ pub mod emulation_test;
 mod listen;
 mod reset;
 pub mod service;
+mod service_core;
 pub mod trusted;
