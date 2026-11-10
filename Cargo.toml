@@ -36,6 +36,7 @@ winresource = "0.1"
 lan-mouse-test-support = { path = "lan-mouse-test-support" }
 
 [dependencies]
+async-trait = "0.1.80"
 input-clipboard = { path = "input-clipboard", version = "0.1.0" }
 input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }

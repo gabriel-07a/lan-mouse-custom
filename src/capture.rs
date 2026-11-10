@@ -15,7 +15,89 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::{coalesce::MotionCoalescer, connect::LanMouseConnection};
+use crate::{
+    coalesce::MotionCoalescer,
+    connect::{LanMouseConnection, LanMouseConnectionError},
+};
+
+/// Minimal connection surface used by the capture task.
+///
+/// Boxed so tests can drive the task with a deterministic fake instead of a
+/// real DTLS/UDP connection; production uses [`LanMouseConnection`].
+#[async_trait::async_trait(?Send)]
+pub(crate) trait CaptureConnection {
+    fn peer_supports_enter_ack(&self, handle: CaptureHandle) -> bool;
+    fn peer_supports_serialized_leave(&self, handle: CaptureHandle) -> bool;
+    fn peer_supports_edge_coordinate(&self, handle: CaptureHandle) -> bool;
+    fn peer_rtt_ms(&self, handle: CaptureHandle) -> Option<u32>;
+    fn ensure_connected(&self, handle: CaptureHandle);
+    async fn send_with_grace(
+        &self,
+        event: ProtoEvent,
+        handle: CaptureHandle,
+        grace: Duration,
+    ) -> Result<(), LanMouseConnectionError>;
+    async fn send_now(
+        &self,
+        event: ProtoEvent,
+        handle: CaptureHandle,
+    ) -> Result<(), LanMouseConnectionError>;
+    async fn recv(&mut self) -> (CaptureHandle, ProtoEvent);
+    async fn disconnect(&self, handle: CaptureHandle);
+    async fn drop_transport(&self, handle: CaptureHandle);
+}
+
+#[async_trait::async_trait(?Send)]
+impl CaptureConnection for LanMouseConnection {
+    fn peer_supports_enter_ack(&self, handle: CaptureHandle) -> bool {
+        LanMouseConnection::peer_supports_enter_ack(self, handle)
+    }
+
+    fn peer_supports_serialized_leave(&self, handle: CaptureHandle) -> bool {
+        LanMouseConnection::peer_supports_serialized_leave(self, handle)
+    }
+
+    fn peer_supports_edge_coordinate(&self, handle: CaptureHandle) -> bool {
+        LanMouseConnection::peer_supports_edge_coordinate(self, handle)
+    }
+
+    fn peer_rtt_ms(&self, handle: CaptureHandle) -> Option<u32> {
+        LanMouseConnection::peer_rtt_ms(self, handle)
+    }
+
+    fn ensure_connected(&self, handle: CaptureHandle) {
+        LanMouseConnection::ensure_connected(self, handle);
+    }
+
+    async fn send_with_grace(
+        &self,
+        event: ProtoEvent,
+        handle: CaptureHandle,
+        grace: Duration,
+    ) -> Result<(), LanMouseConnectionError> {
+        LanMouseConnection::send_with_grace(self, event, handle, grace).await
+    }
+
+    async fn send_now(
+        &self,
+        event: ProtoEvent,
+        handle: CaptureHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        LanMouseConnection::send_now(self, event, handle).await
+    }
+
+    async fn recv(&mut self) -> (CaptureHandle, ProtoEvent) {
+        LanMouseConnection::recv(self).await
+    }
+
+    async fn disconnect(&self, handle: CaptureHandle) {
+        LanMouseConnection::disconnect(self, handle).await;
+    }
+
+    async fn drop_transport(&self, handle: CaptureHandle) {
+        LanMouseConnection::drop_transport(self, handle).await;
+    }
+}
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -105,7 +187,7 @@ impl Capture {
             captures: Default::default(),
             coalescer: MotionCoalescer::new(motion_batch_ms),
             outgoing_caps: Default::default(),
-            conn,
+            conn: Box::new(conn),
             enter: EnterState::default(),
             enter_along: None,
             handoff_begin_at: None,
@@ -387,7 +469,7 @@ struct CaptureTask {
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     coalescer: MotionCoalescer,
-    conn: LanMouseConnection,
+    conn: Box<dyn CaptureConnection>,
     /// `Enter`/`Ack` handoff state
     enter: EnterState,
     /// Normalised crossing coordinate along the entry edge for the current
@@ -1528,12 +1610,25 @@ mod capture_handle_tests {
     }
 
     fn capture_task(captures: Vec<(CaptureHandle, Position, CaptureType)>) -> CaptureTask {
-        capture_task_with_manager(captures, ClientManager::default())
+        // Default tests use the deterministic fake connection; the real
+        // LanMouseConnection is only needed when the test exercises peer
+        // capability negotiation.
+        capture_task_with_connection(captures, Box::new(FakeConnection::new()))
     }
 
     fn capture_task_with_manager(
         captures: Vec<(CaptureHandle, Position, CaptureType)>,
         manager: ClientManager,
+    ) -> CaptureTask {
+        capture_task_with_connection(
+            captures,
+            Box::new(LanMouseConnection::new(certificate(), manager, 1000)),
+        )
+    }
+
+    fn capture_task_with_connection(
+        captures: Vec<(CaptureHandle, Position, CaptureType)>,
+        conn: Box<dyn CaptureConnection>,
     ) -> CaptureTask {
         let (event_tx, _event_rx) = channel();
         let (_request_tx, request_rx) = channel();
@@ -1543,7 +1638,7 @@ mod capture_handle_tests {
             cancellation_token: CancellationToken::new(),
             captures,
             coalescer: MotionCoalescer::new(0),
-            conn: LanMouseConnection::new(certificate(), manager, 1000),
+            conn,
             enter: EnterState::default(),
             enter_along: None,
             handoff_begin_at: None,
@@ -1677,6 +1772,153 @@ mod capture_handle_tests {
         task.handle_capture_event(&mut capture, (7, CaptureEvent::Begin))
             .await
             .expect("a stale event must not fail or panic");
+        capture.terminate().await.expect("terminate");
+    }
+
+    #[derive(Clone)]
+    struct FakeConnection {
+        sent: Rc<RefCell<Vec<ProtoEvent>>>,
+        supports_ack: bool,
+        supports_serialized_leave: bool,
+        supports_edge_coordinate: bool,
+    }
+
+    impl FakeConnection {
+        fn new() -> Self {
+            Self {
+                sent: Rc::new(RefCell::new(Vec::new())),
+                supports_ack: true,
+                supports_serialized_leave: true,
+                supports_edge_coordinate: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl CaptureConnection for FakeConnection {
+        fn peer_supports_enter_ack(&self, _handle: CaptureHandle) -> bool {
+            self.supports_ack
+        }
+
+        fn peer_supports_serialized_leave(&self, _handle: CaptureHandle) -> bool {
+            self.supports_serialized_leave
+        }
+
+        fn peer_supports_edge_coordinate(&self, _handle: CaptureHandle) -> bool {
+            self.supports_edge_coordinate
+        }
+
+        fn peer_rtt_ms(&self, _handle: CaptureHandle) -> Option<u32> {
+            Some(2)
+        }
+
+        fn ensure_connected(&self, _handle: CaptureHandle) {}
+
+        async fn send_with_grace(
+            &self,
+            event: ProtoEvent,
+            _handle: CaptureHandle,
+            _grace: Duration,
+        ) -> Result<(), LanMouseConnectionError> {
+            self.sent.borrow_mut().push(event);
+            Ok(())
+        }
+
+        async fn send_now(
+            &self,
+            event: ProtoEvent,
+            _handle: CaptureHandle,
+        ) -> Result<(), LanMouseConnectionError> {
+            self.sent.borrow_mut().push(event);
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> (CaptureHandle, ProtoEvent) {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        async fn disconnect(&self, _handle: CaptureHandle) {}
+
+        async fn drop_transport(&self, _handle: CaptureHandle) {}
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn begin_at_is_forwarded_as_enter_at_with_the_crossing_coordinate() {
+        let fake = FakeConnection::new();
+        let sent = fake.sent.clone();
+        let mut task = capture_task_with_connection(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.25)))
+            .await
+            .expect("begin");
+        {
+            let sent = sent.borrow();
+            match sent.first() {
+                Some(ProtoEvent::EnterAt { pos, along, .. }) => {
+                    assert_eq!(*pos as u8, lan_mouse_proto::Position::Right as u8);
+                    assert_eq!(*along, 0.25);
+                }
+                other => panic!("expected EnterAt, got {other:?}"),
+            }
+        }
+
+        task.handle_capture_event(
+            &mut capture,
+            (
+                7,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: 2.0,
+                    dy: 0.0,
+                })),
+            ),
+        )
+        .await
+        .expect("motion");
+        {
+            let sent = sent.borrow();
+            assert!(
+                sent.iter()
+                    .any(|event| matches!(event, ProtoEvent::Input(_))),
+                "motion must be forwarded after EnterAt: {sent:?}"
+            );
+        }
+
+        capture.terminate().await.expect("terminate");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_peer_gets_plain_enter() {
+        let fake = FakeConnection {
+            supports_edge_coordinate: false,
+            ..FakeConnection::new()
+        };
+        let sent = fake.sent.clone();
+        let mut task = capture_task_with_connection(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("begin");
+        assert!(
+            matches!(
+                sent.borrow().first(),
+                Some(ProtoEvent::Enter { serial: 1, .. })
+            ),
+            "legacy peer must get Enter: {:?}",
+            sent.borrow()
+        );
         capture.terminate().await.expect("terminate");
     }
 }
