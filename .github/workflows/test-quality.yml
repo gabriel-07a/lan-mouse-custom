@@ -32,7 +32,7 @@ jobs:
       - name: Coverage report
         # Initial threshold is deliberately low; raise it as the suite grows
         # (the plan's target is 75% overall / 90% for core modules).
-        run: scripts/coverage.sh --check 50
+        run: scripts/coverage.sh --check 55
 
       - name: Upload LCOV
         uses: actions/upload-artifact@v4

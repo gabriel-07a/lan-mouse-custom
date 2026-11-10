@@ -77,8 +77,8 @@ cargo test --workspace --all-features network_smoke -- --test-threads=1
 # repetir a suíte para expor flakes (CI semanal roda 3x)
 scripts/test-repeat.sh --runs 10 --all-features
 
-# cobertura (cargo-llvm-cov; threshold inicial 50%, meta 75%)
-scripts/coverage.sh --check 50
+# cobertura (cargo-llvm-cov; baseline 58,03%, threshold inicial 55%, meta 75%)
+scripts/coverage.sh --check 55
 ```
 
 CI atual: Linux + Windows, jobs de build/check/clippy/test, fmt e feature
