@@ -383,7 +383,10 @@ not used or shown.
 
 On the *remote* device, authorize your *local* device for incoming traffic; the
 fingerprint to compare is shown in the This Computer card and the pending
-request card. Closing the window keeps the process in the system tray.
+request card. Closing the window only closes the UI: the background service and
+the LAN connection keep running, and starting Lan Mouse again reopens the
+window against the same service. Use **Settings → Quit Lan Mouse** (or the tray
+menu while the window is open) to stop the service and the connection.
 
 The legacy GTK frontend remains available by building with `--features gtk`;
 the `LAN_MOUSE_FRONTEND=gpui` environment variable selects the GPUI frontend

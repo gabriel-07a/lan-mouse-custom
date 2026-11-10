@@ -181,9 +181,19 @@ No new frontend findings: the verifier re-checked GPUI LinkState/RowAction (appl
 
 ## R-16: the X button closes the window, the connection keeps running
 
-Reported: clicking X on Windows and Ubuntu only hid/minimized the app instead of closing it.
+Reported (round 1): clicking X on Windows and Ubuntu only hid/minimized the app instead of closing it.
+Reported (round 2): after the first fix, Ubuntu still only hid the window and Windows killed the LAN
+connection, because GPUI 0.2.2 stops the frontend process when its last window is destroyed and the
+launcher then stopped the daemon child it had started.
 
-The window close (custom titlebar X on Linux, WM close on Windows) now destroys the window while the
-process and the LAN connection keep running. The tray "Open Lan Mouse" action re-creates the window (and
-re-activates an existing one) using the same Dashboard entity, so live state continues where it was. The
-in-window and tray "Quit Lan Mouse" actions are unchanged and still stop everything, including the daemon.
+Fix: the X / WM close destroys the window on both platforms. The frontend now distinguishes a plain
+window close from an explicit quit and exits with `lan_mouse_ipc::FRONTEND_EXIT_KEEP_SERVICE` (3) for the
+former; the launcher sees that code and deliberately leaves the daemon child running, so the service and
+the LAN connection survive. The tray and Settings "Quit Lan Mouse" actions send
+`FrontendRequest::Shutdown` over IPC (which also covers a service started by systemd or by an earlier
+launch, where the launcher does not own the child) and exit with code 0; the launcher then stops its own
+child as before. Starting Lan Mouse again reuses the running service and reopens the window.
+
+Limitation: GPUI 0.2.2 cannot keep a process alive with zero windows, so the tray icon itself goes away
+with the window; the app icon is the way back to the UI. A persistent tray would require moving the tray
+into the service/launcher process or patching GPUI's last-window quit behaviour.

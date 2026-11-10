@@ -23,8 +23,22 @@ fn local_commit() -> [u8; 8] {
 }
 
 fn main() {
-    if let Err(error) = lan_mouse_gpui::run(local_commit()) {
-        eprintln!("GPUI frontend failed: {error}");
-        std::process::exit(1);
+    match lan_mouse_gpui::run(local_commit()) {
+        Ok(lan_mouse_gpui::FrontendExit::Quit) => {
+            // Explicit quit: the Dashboard already asked the service to shut
+            // down over IPC, and the launcher stops a daemon it spawned itself.
+            std::process::exit(0);
+        }
+        Ok(lan_mouse_gpui::FrontendExit::WindowClosed) => {
+            // The window was closed, not the application: exit with the code
+            // that tells the launcher to leave the service (and therefore the
+            // LAN connection) running. Starting Lan Mouse again reopens the
+            // window against the still-running service.
+            std::process::exit(lan_mouse_ipc::FRONTEND_EXIT_KEEP_SERVICE);
+        }
+        Err(error) => {
+            eprintln!("GPUI frontend failed: {error}");
+            std::process::exit(1);
+        }
     }
 }
