@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent,
@@ -27,6 +28,18 @@ fn ui_scale() -> f32 {
 fn set_ui_scale(scale: f32) {
     let permille = (scale.clamp(0.75, 2.5) * 1000.0).round() as u32;
     UI_SCALE_PERMILLE.store(permille, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Set when the user explicitly asked to quit (tray/settings "Quit Lan Mouse").
+///
+/// The GPUI platform loop returns both when the app is asked to quit and when
+/// the last window is destroyed, so this flag is the only way to tell the two
+/// apart after `Application::run` returns: a plain window close must leave the
+/// service (and the LAN connection) running, an explicit quit must stop it.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn request_quit() {
+    QUIT_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 /// Drop-in replacement for `gpui::px` so every existing layout constant and
@@ -3253,12 +3266,16 @@ impl Dashboard {
                         0x3a2020,
                         RED,
                         cx,
-                        // Closing the window keeps the app in the tray, so this
-                        // is the only in-window way to exit on desktops without
-                        // a StatusNotifier host. Going through the GPUI quit path
-                        // lets `Application::run` return: the launcher then stops
-                        // the daemon it started.
-                        |_, _, _, cx| cx.quit(),
+                        // Closing the window only closes the UI; this is the
+                        // explicit "stop everything" action. Ask the service to
+                        // shut down over IPC first (it may have been started by
+                        // systemd or by an earlier launch, so the launcher may
+                        // not own it), then quit the UI process.
+                        |this, _, _, cx| {
+                            this.send(FrontendRequest::Shutdown);
+                            request_quit();
+                            cx.quit();
+                        },
                     )),
             )
     }
@@ -4004,9 +4021,24 @@ pub enum GpuiError {
     ApplicationExited,
 }
 
+/// Why the GPUI frontend process is exiting.
+///
+/// The GPUI platform loop returns in both cases; the caller must distinguish
+/// them because a closed window must not stop the background service (and the
+/// LAN connection), while an explicit quit must.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontendExit {
+    /// The user asked to quit (tray or Settings): the service was asked to shut
+    /// down over IPC and the launcher may stop the daemon it started.
+    Quit,
+    /// The last window was closed: keep the service and the LAN connection
+    /// running. Launching Lan Mouse again reconnects a new window to it.
+    WindowClosed,
+}
+
 /// Run the GPUI frontend. The caller (the `lan-mouse` binary) starts the
 /// service/IPC first, exactly as it does for the GTK frontend.
-pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
+pub fn run(local_commit: [u8; 8]) -> Result<FrontendExit, GpuiError> {
     let startup = std::time::Instant::now();
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
@@ -4028,8 +4060,11 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
             Ok(window_handle) => window_handle,
             Err(error) => {
                 // No compositor / GPU initialization failure: report it instead
-                // of panicking (release builds abort on panic).
+                // of panicking (release builds abort on panic). Treat it as an
+                // explicit quit so the launcher does not leave a service behind
+                // for a UI that never appeared.
                 log::error!("could not open the Lan Mouse window: {error:?}");
+                request_quit();
                 cx.quit();
                 return;
             }
@@ -4070,10 +4105,17 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
                         let _ = result;
                     }
                     tray::Command::Quit => {
-                        // Graceful quit: `Application::run` returns, main exits
-                        // with code 0 and the launcher stops the daemon it
-                        // started (instead of `process::exit`, which skips log
-                        // flushing and destructors).
+                        // Explicit quit: stop the service over IPC (it may not
+                        // be owned by the launcher when it was started by
+                        // systemd or a previous launch), then let the GPUI loop
+                        // return so the process exits gracefully.
+                        let dashboard = reopen_dashboard.clone();
+                        let _ = cx.update(|cx| {
+                            dashboard.update(cx, |this, _| {
+                                this.send(FrontendRequest::Shutdown);
+                            });
+                        });
+                        request_quit();
                         let _ = cx.update(|cx| cx.quit());
                         break;
                     }
@@ -4084,7 +4126,18 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GpuiError> {
 
         cx.activate(true);
     });
-    Ok(())
+
+    // `Application::run` returns when the platform loop stops: either an
+    // explicit quit (tray/Settings/startup failure) or the last window being
+    // destroyed. The window close must keep the service alive, so the two
+    // cases are distinguished by the quit flag set by those explicit paths.
+    if QUIT_REQUESTED.load(Ordering::SeqCst) {
+        log::info!("GPUI frontend quit requested; the launcher stops the service");
+        Ok(FrontendExit::Quit)
+    } else {
+        log::info!("GPUI window closed; keeping the service and the LAN connection running");
+        Ok(FrontendExit::WindowClosed)
+    }
 }
 
 #[cfg(test)]

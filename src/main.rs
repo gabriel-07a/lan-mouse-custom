@@ -104,12 +104,24 @@ fn run() -> Result<(), LanMouseError> {
                     Some(start_service()?)
                 };
                 let res = run_gpui_frontend();
-                // Whatever the frontend returned, the daemon we started must
-                // be stopped and reaped before this process exits. Cleanup is
-                // infallible and bounded: a stuck daemon must never hang the
-                // window close.
-                shutdown_service(service.as_mut());
-                res?;
+                match &res {
+                    Ok(FrontendExit::KeepService) => {
+                        // The window was closed, not the application: leave the
+                        // daemon (and the LAN connection) running. The child is
+                        // deliberately not waited for, so it keeps running after
+                        // this process exits and the next launch reuses it.
+                        log::info!("frontend window closed; keeping the Lan Mouse service running");
+                    }
+                    _ => {
+                        // Explicit quit, launch failure or a killed frontend:
+                        // the daemon this process started must be stopped and
+                        // reaped before this process exits. Cleanup is
+                        // infallible and bounded: a stuck daemon must never
+                        // hang the window close.
+                        shutdown_service(service.as_mut());
+                    }
+                }
+                res.map(|_| ())?;
             }
             #[cfg(feature = "gtk")]
             {
@@ -126,13 +138,22 @@ fn run() -> Result<(), LanMouseError> {
                     log::info!("LAN_MOUSE_FRONTEND=gpui selected");
                     run_gpui_frontend()
                 } else {
-                    lan_mouse_gtk::run(config::local_commit()).map_err(LanMouseError::from)
+                    lan_mouse_gtk::run(config::local_commit())
+                        .map_err(LanMouseError::from)
+                        .map(|()| FrontendExit::Quit)
                 };
-                // Give the service a chance to terminate gracefully (SIGINT),
-                // but never block the window close on a stuck daemon and
-                // always reap the child.
-                shutdown_service(service.as_mut());
-                res?;
+                match &res {
+                    Ok(FrontendExit::KeepService) => {
+                        log::info!("frontend window closed; keeping the Lan Mouse service running");
+                    }
+                    _ => {
+                        // Give the service a chance to terminate gracefully
+                        // (SIGINT), but never block the window close on a stuck
+                        // daemon and always reap the child.
+                        shutdown_service(service.as_mut());
+                    }
+                }
+                res.map(|_| ())?;
             }
             #[cfg(all(not(feature = "gtk"), not(feature = "gpui")))]
             {
@@ -153,8 +174,34 @@ fn run() -> Result<(), LanMouseError> {
     Ok(())
 }
 
+/// Why the frontend process exited, as decided by its exit code.
 #[cfg(any(feature = "gtk", feature = "gpui"))]
-fn run_gpui_frontend() -> Result<(), LanMouseError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrontendExit {
+    /// Explicit quit: the service was asked to shut down and the daemon this
+    /// process started must be stopped.
+    Quit,
+    /// The user closed the window: keep the service (and the LAN connection)
+    /// running; the next launch reuses it.
+    KeepService,
+}
+
+/// Map the frontend exit code to what the launcher must do with the daemon.
+///
+/// `None` means the process was killed by a signal (or exited with an
+/// unexpected code): that is not a clean window close, so the daemon is
+/// stopped like on any other failure.
+#[cfg(any(feature = "gtk", feature = "gpui"))]
+fn classify_frontend_exit(code: Option<i32>) -> Option<FrontendExit> {
+    match code {
+        Some(lan_mouse_ipc::FRONTEND_EXIT_KEEP_SERVICE) => Some(FrontendExit::KeepService),
+        Some(0) => Some(FrontendExit::Quit),
+        _ => None,
+    }
+}
+
+#[cfg(any(feature = "gtk", feature = "gpui"))]
+fn run_gpui_frontend() -> Result<FrontendExit, LanMouseError> {
     let frontend = gpui_frontend_path()?;
     log::info!("launching GPUI frontend: {frontend:?}");
     let status = std::process::Command::new(&frontend)
@@ -163,13 +210,8 @@ fn run_gpui_frontend() -> Result<(), LanMouseError> {
             String::from_utf8_lossy(&config::local_commit()).to_string(),
         )
         .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(LanMouseError::GpuiFrontend(format!(
-            "{frontend:?} exited with {status}"
-        )))
-    }
+    classify_frontend_exit(status.code())
+        .ok_or_else(|| LanMouseError::GpuiFrontend(format!("{frontend:?} exited with {status}")))
 }
 
 #[cfg(any(feature = "gtk", feature = "gpui"))]
@@ -406,6 +448,40 @@ fn stop_child(service: &mut Child) {
     }
     if let Err(e) = service.wait() {
         log::warn!("could not reap daemon: {e}");
+    }
+}
+
+#[cfg(all(test, any(feature = "gtk", feature = "gpui")))]
+mod frontend_exit_tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_window_keeps_the_service_running() {
+        assert_eq!(
+            classify_frontend_exit(Some(lan_mouse_ipc::FRONTEND_EXIT_KEEP_SERVICE)),
+            Some(FrontendExit::KeepService),
+            "the window-close exit code must leave the daemon alone"
+        );
+    }
+
+    #[test]
+    fn an_explicit_quit_stops_the_service() {
+        assert_eq!(
+            classify_frontend_exit(Some(0)),
+            Some(FrontendExit::Quit),
+            "a regular exit is the user quitting the app"
+        );
+    }
+
+    #[test]
+    fn crashes_and_signals_are_not_treated_as_a_window_close() {
+        assert_eq!(classify_frontend_exit(Some(1)), None);
+        assert_eq!(classify_frontend_exit(Some(2)), None);
+        assert_eq!(
+            classify_frontend_exit(None),
+            None,
+            "a frontend killed by a signal must not leave the daemon running"
+        );
     }
 }
 
