@@ -1018,6 +1018,30 @@ mod extra_tests {
         }
         let known = bits.iter().fold(0, |acc, bit| acc | bit);
         assert_eq!(CAPABILITIES & !known, 0);
+        // Exact advertised set: kills mutants that drop one capability from the
+        // OR chain (they would otherwise still be a subset of `known`).
+        assert_eq!(
+            CAPABILITIES,
+            capabilities::ENTER_ACK
+                | capabilities::CLIPBOARD
+                | capabilities::PERMISSIONS
+                | capabilities::SERIALIZED_LEAVE
+                | capabilities::EDGE_COORDINATE
+        );
+    }
+
+    #[test]
+    fn max_event_size_matches_the_documented_wire_layout() {
+        // u8 event id + u32 time + two f64 deltas = 21 bytes.
+        assert_eq!(MAX_EVENT_SIZE, 21);
+    }
+
+    #[test]
+    fn position_display_is_stable() {
+        assert_eq!(Position::Left.to_string(), "left");
+        assert_eq!(Position::Right.to_string(), "right");
+        assert_eq!(Position::Top.to_string(), "top");
+        assert_eq!(Position::Bottom.to_string(), "bottom");
     }
 
     #[test]
