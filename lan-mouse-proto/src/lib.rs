@@ -50,13 +50,19 @@ pub mod capabilities {
     /// already speak [`capabilities::ENTER_ACK`]) may use `Leave(0)` as the
     /// actual release request, so the receiver must keep honouring it.
     pub const SERIALIZED_LEAVE: u32 = 1 << 6;
+    /// The peer understands [`super::ProtoEvent::EnterAt`] and can position
+    /// the cursor at the exact point along the entry edge where it crossed.
+    /// Legacy peers close the connection on an unknown event id, so this event
+    /// must only be sent when the peer advertised this bit.
+    pub const EDGE_COORDINATE: u32 = 1 << 7;
 }
 
 /// Features this build can use when the peer also advertises them.
 pub const CAPABILITIES: u32 = capabilities::ENTER_ACK
     | capabilities::CLIPBOARD
     | capabilities::PERMISSIONS
-    | capabilities::SERIALIZED_LEAVE;
+    | capabilities::SERIALIZED_LEAVE
+    | capabilities::EDGE_COORDINATE;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -70,6 +76,9 @@ pub enum ProtocolError {
     /// the buffer ended before the event was fully decoded
     #[error("truncated event: not enough bytes to decode")]
     Truncated,
+    /// an edge coordinate was not a finite number
+    #[error("invalid edge coordinate: `{0}`")]
+    InvalidCoordinate(f32),
 }
 
 /// Position of a client
@@ -103,6 +112,16 @@ pub enum ProtoEvent {
     /// Peers predating the serial field send only the position; the decoder
     /// accepts that (serial `0`) for backward compatibility.
     Enter { pos: Position, serial: u32 },
+    /// Like [`ProtoEvent::Enter`], but also carries the normalised position
+    /// along the entry edge (`along`: 0.0 = top/left, 1.0 = bottom/right) so
+    /// the receiver can continue the pointer from where it crossed instead of
+    /// jumping to the edge centre. Only sent to peers advertising
+    /// [`capabilities::EDGE_COORDINATE`].
+    EnterAt {
+        pos: Position,
+        serial: u32,
+        along: f32,
+    },
     /// notify a client that the cursor left its region
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Leave(u32),
@@ -168,6 +187,9 @@ impl Display for ProtoEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ProtoEvent::Enter { pos, serial } => write!(f, "Enter({pos}, {serial})"),
+            ProtoEvent::EnterAt { pos, serial, along } => {
+                write!(f, "EnterAt({pos}, {serial}, along={along:.3})")
+            }
             ProtoEvent::Leave(s) => write!(f, "Leave({s})"),
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
@@ -237,6 +259,7 @@ pub enum EventType {
     AuthRequest = 16,
     AuthResponse = 17,
     AuthRevoke = 18,
+    EnterAt = 19,
 }
 
 impl ProtoEvent {
@@ -257,6 +280,7 @@ impl ProtoEvent {
             ProtoEvent::Ping => EventType::Ping,
             ProtoEvent::Pong { .. } => EventType::Pong,
             ProtoEvent::Enter { .. } => EventType::Enter,
+            ProtoEvent::EnterAt { .. } => EventType::EnterAt,
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
@@ -337,6 +361,19 @@ impl TryFrom<&[u8]> for ProtoEvent {
                     0
                 };
                 Ok(Self::Enter { pos, serial })
+            }
+            EventType::EnterAt => {
+                let pos = decode_u8(&mut buf)?.try_into()?;
+                let serial = decode_u32(&mut buf)?;
+                let along = decode_f32(&mut buf)?;
+                if !along.is_finite() {
+                    return Err(ProtocolError::InvalidCoordinate(along));
+                }
+                Ok(Self::EnterAt {
+                    pos,
+                    serial,
+                    along: along.clamp(0.0, 1.0),
+                })
             }
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
@@ -448,6 +485,11 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_u8(buf, len, pos as u8);
                     encode_u32(buf, len, serial);
                 }
+                ProtoEvent::EnterAt { pos, serial, along } => {
+                    encode_u8(buf, len, pos as u8);
+                    encode_u32(buf, len, serial);
+                    encode_f32(buf, len, along);
+                }
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Hello {
@@ -507,6 +549,7 @@ decode_impl!(u8);
 decode_impl!(u128);
 decode_impl!(u32);
 decode_impl!(i32);
+decode_impl!(f32);
 decode_impl!(f64);
 
 macro_rules! encode_impl {
@@ -528,6 +571,7 @@ encode_impl!(u8);
 encode_impl!(u128);
 encode_impl!(u32);
 encode_impl!(i32);
+encode_impl!(f32);
 encode_impl!(f64);
 
 #[cfg(test)]
@@ -585,6 +629,11 @@ mod tests {
             ProtoEvent::Enter {
                 pos: Position::Right,
                 serial: 7,
+            },
+            ProtoEvent::EnterAt {
+                pos: Position::Left,
+                serial: 8,
+                along: 0.25,
             },
             ProtoEvent::Leave(0x0102_0304),
             ProtoEvent::Ack(0x0a0b_0c0d),
@@ -650,6 +699,15 @@ mod tests {
             }),
             vec![8, 2, 1, 2, 3, 4]
         );
+        // Event id 19, pos, serial, then the big-endian f32 coordinate (0.5).
+        assert_eq!(
+            encode(ProtoEvent::EnterAt {
+                pos: Position::Top,
+                serial: 0x0102_0304,
+                along: 0.5,
+            }),
+            vec![19, 2, 1, 2, 3, 4, 0x3f, 0x00, 0x00, 0x00]
+        );
         assert_eq!(encode(ProtoEvent::Leave(0x0102_0304)), vec![9, 1, 2, 3, 4]);
         assert_eq!(
             encode(ProtoEvent::Ack(0x0a0b_0c0d)),
@@ -690,6 +748,45 @@ mod tests {
         assert!(matches!(
             ProtoEvent::try_from(&[][..]),
             Err(ProtocolError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn enter_at_clamps_the_coordinate_into_range() {
+        // 1.5 and -0.5 are clamped to 1.0 and 0.0 instead of reaching the
+        // receiver as an out-of-range position.
+        let mut over = vec![19u8, Position::Right as u8, 0, 0, 0, 1];
+        over.extend_from_slice(&1.5f32.to_be_bytes());
+        let decoded = ProtoEvent::try_from(over.as_slice()).expect("decode");
+        assert_eq!(
+            encode(decoded),
+            encode(ProtoEvent::EnterAt {
+                pos: Position::Right,
+                serial: 1,
+                along: 1.0,
+            })
+        );
+
+        let mut under = vec![19u8, Position::Left as u8, 0, 0, 0, 2];
+        under.extend_from_slice(&(-0.5f32).to_be_bytes());
+        let decoded = ProtoEvent::try_from(under.as_slice()).expect("decode");
+        assert_eq!(
+            encode(decoded),
+            encode(ProtoEvent::EnterAt {
+                pos: Position::Left,
+                serial: 2,
+                along: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn enter_at_rejects_a_non_finite_coordinate() {
+        let mut bytes = vec![19u8, Position::Left as u8, 0, 0, 0, 3];
+        bytes.extend_from_slice(&f32::NAN.to_be_bytes());
+        assert!(matches!(
+            ProtoEvent::try_from(bytes.as_slice()),
+            Err(ProtocolError::InvalidCoordinate(value)) if value.is_nan()
         ));
     }
 
@@ -785,7 +882,7 @@ mod extra_tests {
     }
 
     fn random_event(rng: &mut Rng) -> ProtoEvent {
-        match rng.next_u32() % 12 {
+        match rng.next_u32() % 13 {
             0 => ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
                 time: rng.next_u32(),
                 dx: rng.next_f64(),
@@ -825,8 +922,13 @@ mod extra_tests {
                 pos: rng.position(),
                 serial: rng.next_u32(),
             },
-            9 => ProtoEvent::Leave(rng.next_u32()),
-            10 => ProtoEvent::Ack(rng.next_u32()),
+            9 => ProtoEvent::EnterAt {
+                pos: rng.position(),
+                serial: rng.next_u32(),
+                along: (rng.next_u32() as f32) / (u32::MAX as f32),
+            },
+            10 => ProtoEvent::Leave(rng.next_u32()),
+            11 => ProtoEvent::Ack(rng.next_u32()),
             _ => {
                 let mut commit = [0u8; 8];
                 for byte in commit.iter_mut() {
@@ -860,6 +962,7 @@ mod extra_tests {
         assert_eq!(EventType::AuthRequest as u8, 16);
         assert_eq!(EventType::AuthResponse as u8, 17);
         assert_eq!(EventType::AuthRevoke as u8, 18);
+        assert_eq!(EventType::EnterAt as u8, 19);
     }
 
     #[test]
@@ -901,6 +1004,7 @@ mod extra_tests {
             capabilities::CLIPBOARD,
             capabilities::PERMISSIONS,
             capabilities::SERIALIZED_LEAVE,
+            capabilities::EDGE_COORDINATE,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");
@@ -925,6 +1029,14 @@ mod extra_tests {
                     serial: 3,
                 },
                 "Enter",
+            ),
+            (
+                ProtoEvent::EnterAt {
+                    pos: Position::Left,
+                    serial: 3,
+                    along: 0.75,
+                },
+                "EnterAt",
             ),
             (ProtoEvent::Leave(1), "Leave"),
             (ProtoEvent::Ack(2), "Ack"),
