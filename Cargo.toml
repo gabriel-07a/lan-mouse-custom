@@ -9,6 +9,7 @@ members = [
     "lan-mouse-cli",
     "lan-mouse-gtk",
     "lan-mouse-proto",
+    "lan-mouse-test-support",
 ]
 
 [package]
@@ -30,6 +31,9 @@ shadow-rs = "1.2.0"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+lan-mouse-test-support = { path = "lan-mouse-test-support" }
 
 [dependencies]
 input-clipboard = { path = "input-clipboard", version = "0.1.0" }

@@ -843,6 +843,7 @@ mod tests {
 #[cfg(test)]
 mod extra_tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn encode(event: ProtoEvent) -> Vec<u8> {
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
@@ -1095,6 +1096,33 @@ mod extra_tests {
                     let _ = format!("{event}");
                 }
             }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_datagrams_never_panic_and_reencode_deterministically(
+            bytes in prop::collection::vec(any::<u8>(), 0..256)
+        ) {
+            if let Ok(event) = ProtoEvent::try_from(bytes.as_slice()) {
+                let encoded = encode(event);
+                let decoded = ProtoEvent::try_from(encoded.as_slice()).expect("re-decode");
+                prop_assert_eq!(encode(decoded), encoded);
+            }
+        }
+
+        #[test]
+        fn enter_at_coordinates_roundtrip_and_stay_in_range(along in -2.0f32..2.0) {
+            let event = ProtoEvent::EnterAt {
+                pos: Position::Left,
+                serial: 7,
+                along,
+            };
+            let encoded = encode(event);
+            let decoded = ProtoEvent::try_from(encoded.as_slice()).expect("decode");
+            let encoded_again = encode(decoded);
+            let decoded_again = ProtoEvent::try_from(encoded_again.as_slice()).expect("decode");
+            prop_assert_eq!(encode(decoded_again), encoded_again);
         }
     }
 

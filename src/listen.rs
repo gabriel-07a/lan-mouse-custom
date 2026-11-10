@@ -1005,6 +1005,88 @@ fn event_allowed(
 }
 
 #[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use lan_mouse_proto::Position;
+
+    fn devices() -> RwLock<DeviceStore> {
+        RwLock::new(DeviceStore::default())
+    }
+
+    fn authorized(fingerprint: &str) -> RwLock<HashMap<String, String>> {
+        RwLock::new(HashMap::from([(
+            fingerprint.to_string(),
+            "peer".to_string(),
+        )]))
+    }
+
+    fn enter(serial: u32) -> ProtoEvent {
+        ProtoEvent::Enter {
+            pos: Position::Left,
+            serial,
+        }
+    }
+
+    fn enter_at(serial: u32) -> ProtoEvent {
+        ProtoEvent::EnterAt {
+            pos: Position::Left,
+            serial,
+            along: 0.5,
+        }
+    }
+
+    #[test]
+    fn enter_at_is_gated_by_the_same_policy_as_enter() {
+        let fingerprint = "aa:bb";
+        let denied = RwLock::new(HashMap::new());
+        assert!(!event_allowed(&devices(), &denied, fingerprint, &enter(1)));
+        assert!(
+            !event_allowed(&devices(), &denied, fingerprint, &enter_at(2)),
+            "an unknown peer must not bypass the Enter policy via EnterAt"
+        );
+
+        let allowed = authorized(fingerprint);
+        assert!(event_allowed(&devices(), &allowed, fingerprint, &enter(3)));
+        assert!(event_allowed(
+            &devices(),
+            &allowed,
+            fingerprint,
+            &enter_at(4)
+        ));
+    }
+
+    #[test]
+    fn unknown_peers_cannot_inject_pointer_or_keyboard_but_bookkeeping_is_allowed() {
+        let fingerprint = "cc:dd";
+        let denied = RwLock::new(HashMap::new());
+        let motion = ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        }));
+        let key = ProtoEvent::Input(InputEvent::Keyboard(input_event::KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 1,
+        }));
+        assert!(!event_allowed(&devices(), &denied, fingerprint, &motion));
+        assert!(!event_allowed(&devices(), &denied, fingerprint, &key));
+        assert!(event_allowed(
+            &devices(),
+            &denied,
+            fingerprint,
+            &ProtoEvent::Ack(1)
+        ));
+        assert!(event_allowed(
+            &devices(),
+            &denied,
+            fingerprint,
+            &ProtoEvent::Leave(0)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod limiter_tests {
     use super::*;
 

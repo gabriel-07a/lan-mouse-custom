@@ -1528,6 +1528,13 @@ mod capture_handle_tests {
     }
 
     fn capture_task(captures: Vec<(CaptureHandle, Position, CaptureType)>) -> CaptureTask {
+        capture_task_with_manager(captures, ClientManager::default())
+    }
+
+    fn capture_task_with_manager(
+        captures: Vec<(CaptureHandle, Position, CaptureType)>,
+        manager: ClientManager,
+    ) -> CaptureTask {
         let (event_tx, _event_rx) = channel();
         let (_request_tx, request_rx) = channel();
         CaptureTask {
@@ -1536,7 +1543,7 @@ mod capture_handle_tests {
             cancellation_token: CancellationToken::new(),
             captures,
             coalescer: MotionCoalescer::new(0),
-            conn: LanMouseConnection::new(certificate(), ClientManager::default(), 1000),
+            conn: LanMouseConnection::new(certificate(), manager, 1000),
             enter: EnterState::default(),
             enter_along: None,
             handoff_begin_at: None,
@@ -1552,6 +1559,49 @@ mod capture_handle_tests {
             selected_backend: Default::default(),
             state: State::default(),
         }
+    }
+
+    #[test]
+    fn enter_event_uses_enter_at_only_when_the_peer_advertises_it() {
+        use crate::config::ConfigClient;
+        use lan_mouse_proto::{CAPABILITIES, Position as ProtoPosition};
+
+        let config = |active: bool| ConfigClient {
+            ips: std::collections::HashSet::new(),
+            hostname: None,
+            port: 4242,
+            pos: lan_mouse_ipc::Position::Left,
+            active,
+            enter_hook: None,
+            leave_hook: None,
+            sensitivity: 100,
+            fingerprint: None,
+        };
+
+        let modern = ClientManager::default();
+        let modern_handle = modern.add_with_config(config(true));
+        modern.set_peer_hello(modern_handle, Some(*b"fork0000"), 1, CAPABILITIES);
+        let mut task = capture_task_with_manager(vec![], modern);
+        task.enter_along = Some(0.25);
+        task.enter.begin(Instant::now(), Duration::from_secs(2));
+        match task.enter_event(modern_handle, ProtoPosition::Right) {
+            ProtoEvent::EnterAt { pos, along, .. } => {
+                assert_eq!(pos as u8, ProtoPosition::Right as u8);
+                assert_eq!(along, 0.25);
+            }
+            other => panic!("modern peer must get EnterAt, got {other:?}"),
+        }
+
+        let legacy = ClientManager::default();
+        let legacy_handle = legacy.add_with_config(config(true));
+        legacy.set_peer_hello(legacy_handle, Some(*b"legacy00"), 0, 0);
+        let mut task = capture_task_with_manager(vec![], legacy);
+        task.enter_along = Some(0.25);
+        task.enter.begin(Instant::now(), Duration::from_secs(2));
+        assert!(matches!(
+            task.enter_event(legacy_handle, ProtoPosition::Right),
+            ProtoEvent::Enter { .. }
+        ));
     }
 
     /// The retry timer may be 25-100 ms away, so the first input after a lost
