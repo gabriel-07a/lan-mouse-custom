@@ -1,950 +1,254 @@
-# Lan Mouse
+# Lan Mouse Custom
 
-> [!NOTE]
-> **Unofficial fork.** This is a modified version of
-> [Lan Mouse](https://github.com/feschber/lan-mouse) by its original
-> contributors, licensed under GPL-3.0-or-later. Modifications © 2026
-> Gabriel Arcanjo, made on 2026-11-03. See [NOTICE](NOTICE) for details.
-> This fork is not endorsed by the upstream project.
-
-[![CI](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/rust.yml/badge.svg)](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/rust.yml) [![Cachix](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/cachix.yml/badge.svg)](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/cachix.yml) [![Release](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/release.yml/badge.svg)](https://github.com/gabriel-07a/lan-mouse-custom/actions/workflows/release.yml)
-
-[![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
-
-Lan Mouse is a *cross-platform* mouse and keyboard sharing software similar to universal-control on Apple devices.
-It allows for using multiple PCs via a single set of mouse and keyboard.
-This is also known as a Software KVM switch.
-
-Goal of this project is to be an open-source alternative to proprietary tools like [Synergy 2/3](https://symless.com/synergy), [Share Mouse](https://www.sharemouse.com/de/)
-and other open source tools like [Deskflow](https://github.com/deskflow/deskflow) or [Input Leap](https://github.com/input-leap) (Synergy fork).
-
-Focus lies on performance, ease of use and a maintainable implementation that can be expanded to support additional backends for e.g. Android, iOS, ... in the future.
-
-***blazingly fast™*** because it's written in rust.
-
-- _Now with a fast GPUI frontend (GTK fallback still available)_
-
-> UI screenshot will be refreshed for the new GPUI frontend; the old
-> `screenshots/` files still show the legacy GTK layout.
-
-## Encryption
-
-Lan Mouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
-There are currently no mitigations in place for timing side-channel attacks.
-
-## OS Support
-
-Most current desktop environments and operating systems are fully supported, this includes
-- GNOME >= 45
-- KDE Plasma >= 6.1
-- Most wlroots based compositors, including Sway (>= 1.8), Hyprland and Wayfire
-- X11 (receive-only: input emulation and clipboard work, input capture is not implemented)
-- Windows
-
-
-### Caveats / Known Issues
-
-> [!Important]
-> - **X11**: input emulation and clipboard are supported. Clipboard support on X11 covers text, HTML and PNG images, including large payloads through the X11 INCR protocol in both directions; XFixes is used to detect every selection change when available (polling otherwise). **Input capture is not implemented** in this fork: an X11 session can receive input from peers but cannot send its own input to them.
+> **Fork pessoal e experimental.** Este repositório é uma versão modificada do
+> [Lan Mouse](https://github.com/feschber/lan-mouse), de seus contribuidores
+> originais, licenciado sob GPL-3.0-or-later. Modificações © 2026 Gabriel
+> Arcanjo. Veja [NOTICE](NOTICE) e [LICENSE](LICENSE). Este fork não é
+> endossado pelo projeto original.
 >
-> - **Sway / wlroots**: the wlroots emulation backend derives the compositor modifier state from the forwarded key events (and applies explicit modifier events when the sender provides them), so CTRL / SHIFT / ALT / SUPER work with any capture backend. If a modifier key still sticks on a wlroots receiver, report it with `LAN_MOUSE_LOG_LEVEL=debug` logs.
->
-> - **Wayfire**: If you are using [Wayfire](https://github.com/WayfireWM/wayfire), make sure to use a recent version (must be newer than October 23rd) and **add `shortcuts-inhibit` to the list of plugins in your wayfire config!**
-> Otherwise input capture will not work.
->
-> - **Windows**: The mouse cursor will be invisible when sending input to a Windows system if
-> there is no real mouse connected to the machine.
->
-> - **Windows pointer at the screen edge (10 and 11)**: pointer motion and barrier crossings
-> come from raw input (`WM_INPUT`), not from the low-level hook's clamped cursor position:
-> Windows stops the cursor at the edge pixel, so an "out of bounds" hook coordinate is not
-> reliable across OS versions and DPI scales. Raw deltas are also what drives motion while a
-> peer is controlled, and injected UI events (`SendInput`) are never mistaken for a local edge
-> crossing. If a pointer still sticks at an edge, run with `LAN_MOUSE_LOG_LEVEL=debug` and check
-> for the `ENTERED @ ...` line: without it the edge is not being treated as a barrier (usually
-> a missing client at that position or a display layout where that edge is not the outer one).
->
-> - **Local cursor while sending**: the pointer of the machine that currently controls a peer
-> is hidden, so the cursor appears to "move" to the other screen instead of sitting parked at
-> the edge. Windows and wlroots/layer-shell backends support this; on GNOME/Wayland the
-> pointer is compositor-owned (libei has no hide API), so it stays visible there. The cursor is
-> restored on every release/Leave/disconnect path, and a crash cannot leave it hidden (the
-> Windows overlay window is destroyed with the process).
+> A documentação completa do upstream (instalação por distro, dependências,
+> Nix, firewall, backends, etc.) foi preservada em
+> [README-upstream.md](README-upstream.md). Este README explica **o caso deste
+> fork**, o que mudou, o que foi testado e como contribuir.
 
-For more detailed information about os support see [Detailed OS Support](#detailed-os-support)
+Lan Mouse é um Software KVM: um conjunto de mouse e teclado controla vários PCs
+pela rede local, com o cursor atravessando a borda da tela — parecido com o
+Universal Control da Apple ou com dois monitores ligados no mesmo computador.
 
-### Android & IOS
+Este fork existe para resolver um problema bem específico meu: **tornar a
+passagem do cursor de um PC para o outro fluida o suficiente para parecer que
+os dois são monitores da mesma máquina**. Não é um produto, não é uma release
+oficial do upstream e não tem a intenção de substituir o projeto original.
 
-A proof of concept for an Android / IOS Application by [rohitsangwan01](https://github.com/rohitsangwan01) can be found [here](https://github.com/rohitsangwan01/lan-mouse-mobile).
-It can be used as a remote control for any device supported by Lan Mouse.
+---
 
-## Installation
+## O problema que este fork resolve
 
-<details>
-    <summary>Arch Linux</summary>
+Meu cenário é um PC com **Ubuntu 26.04 (Wayland/GNOME)** como máquina
+principal e um PC com **Windows 10/11** como secundário, na mesma rede local.
+O uso normal é mouse/teclado compartilhados, com o cursor cruzando a borda entre
+as telas.
 
-Lan Mouse can be installed from the [official repositories](https://archlinux.org/packages/extra/x86_64/lan-mouse/):
+Os sintomas que eu via:
+
+- o cursor **travava ou voltava sozinho** logo depois de entrar no outro PC;
+- ao cruzar a borda, o cursor **aparecia no centro da borda** (ou na posição
+  antiga do Windows) em vez de continuar de onde eu cruzei;
+- o **primeiro movimento** depois da travessia às vezes era perdido ou aplicado
+  antes do cursor ser posicionado, causando um salto;
+- cliques/teclas/scroll logo no início do hand-off podiam ser engolidos;
+- a conexão oscilava e, em alguns momentos, os dois PCs mostravam "conectado"
+  sem realmente estarem se controlando;
+- fechar a janela no Ubuntu matava a conexão/serviço em vez de continuar em
+  segundo plano;
+- o ping-pong de `Enter`/`Leave` na borda aparecia como travamento no cursor.
+
+Este fork ataca esses pontos um por um, sempre com mudanças **aditivas e
+negociadas por capability**, para não quebrar peers antigos.
+
+## O que mudou neste fork
+
+### 1. Handoff de borda (o foco principal)
+
+- **Coordenada de cruzamento no protocolo.** Peers novos anunciam a capability
+  `EDGE_COORDINATE` e enviam `EnterAt { pos, serial, along }`, em que `along` é
+  a posição normalizada (0.0 = topo/esquerda, 1.0 = base/direita) do ponto onde
+  o cursor cruzou. O receptor posiciona o cursor **exatamente nesse ponto**, em
+  vez de no centro da borda. Peers antigos continuam recebendo `Enter` e usando
+  o fallback antigo.
+- **Âncora exata na borda.** Removemos o recuo fixo de 24 px que fazia o cursor
+  "pular" para dentro da tela; o retorno continua protegido por uma margem
+  pequena (3 px no libei, 2 px no Windows) para não devolver controle por
+  trepidação.
+- **Multi-monitor.** No Windows a âncora escolhe o monitor cujo segmento de
+  borda contém a coordenada (layouts em L/buracos não caem no vazio); no libei
+  a região do monitor é escolhida pela mesma fração.
+- **Ordem de arming.** O receptor arma o backend **antes do `Ack` e de
+  qualquer input**, então o primeiro delta já parte da posição de entrada. O
+  serviço não re-arma depois (isso warpeava o cursor em cima do primeiro
+  movimento).
+- **Warm-up.** O backend de emulação é criado quando o cliente é ativado, para
+  o primeiro cruzamento não pagar o custo de criação (portal/libei/Windows).
+- **Leading edge.** O primeiro movimento do hand-off sai imediatamente, sem
+  esperar a janela de coalescing de 2 ms herdada do movimento na tela anterior.
+- **Fallbacks por backend.** X11 recebe o warp via `XWarpPointer`; X11 capture
+  continua sendo stub (só recebe); macOS é dormente; wlroots usa o caminho
+  relativo quando não há posicionamento absoluto.
+
+### 2. Handoff confiável (`Enter`/`Ack`/`Leave`)
+
+- `Enter` com serial + `Ack`, retransmissão e deduplicação.
+- Input não é mais transformado em `Enter` durante o handshake: o primeiro
+  clique/tecla/scroll não é perdido.
+- `Leave(serial)` com serial não-zero para pedidos de retorno, e `Leave(0)`
+  como confirmação; peers novos anunciam `SERIALIZED_LEAVE` para o receptor não
+  cancelar um capture recém-adquirido com uma confirmação atrasada.
+- Retry de `Enter`/`Leave` com orçamento limitado, sem loop infinito.
+- `EdgeReturnLatch` no receptor limita os pedidos de retorno por contato com a
+  borda.
+
+### 3. Rede e lag
+
+- Coalescing de movimento (agrupa deltas de poucos ms em um datagrama) para
+  reduzir pacotes no Wi-Fi.
+- Reconexão com backoff, timeouts e métricas de RTT/jitter/loss no frontend.
+- Correções de pacing do clipboard e de eventos de alta frequência.
+
+### 4. Fechar a janela mantendo o serviço
+
+- No Ubuntu, fechar a janela (X) agora encerra apenas o frontend; o daemon e a
+  conexão continuam rodando (contrato de exit code 3). O app pode ser reaberto
+  pelo atalho sem derrubar o peer.
+- O serviço pode rodar como serviço de usuário do systemd
+  (`lan-mouse-custom.service`), separado da janela.
+
+### 5. Compatibilidade
+
+- Todas as mudanças de protocolo são **capability-gated**; peers antigos
+  ignoram os bits novos e mantêm o comportamento anterior.
+- `PROTO_VERSION` continua 1; nenhum layout existente foi quebrado.
+
+## Status de teste (importante)
+
+Este fork foi testado **somente** nestas combinações:
+
+| Máquina principal (host) | Máquina secundária | Status |
+|---|---|---|
+| Ubuntu 26.04 (Wayland/GNOME) | Windows 10 | testado |
+| Ubuntu 26.04 (Wayland/GNOME) | Windows 11 | testado |
+
+Outras combinações **não foram validadas** por mim:
+
+- Windows ↔ Windows;
+- Linux ↔ Linux (Wayland/libei/layer-shell);
+- X11 como host (capture X11 é stub neste fork — só recebe);
+- macOS (código dormente);
+- wlroots/Sway/Hyprland como receptor (fallback relativo, sem posicionamento
+  absoluto de entrada);
+- múltiplos monitores/DPI misto em todas as combinações (há testes unitários de
+  mapeamento, mas falta validação real).
+
+Se você usa outra combinação e quiser testar, ótimo — é exatamente para isso
+que o fork está público. Só não trate como suporte oficial.
+
+## Como testar
+
+1. Baixe a release mais recente em
+   [Releases](https://github.com/gabriel-07a/lan-mouse-custom/releases).
+   A release de teste mais recente deste fork é
+   [`v0.2.14-handoff-coord2-ee9cee0`](https://github.com/gabriel-07a/lan-mouse-custom/releases/tag/v0.2.14-handoff-coord2-ee9cee0).
+   Há artefatos para Linux (`.tar.gz`, `.deb`) e Windows (`.zip` e instalador
+   `lan-mouse-custom-setup-x86_64.exe`), além de `SHA256SUMS.txt`.
+2. Instale/extraia os binários e abra o app nas duas máquinas.
+3. Adicione o outro PC como cliente (hostname ou IP), escolha a posição da tela
+   e autorize o certificado.
+4. Cruze a borda nos dois sentidos, em alturas diferentes (10%, 50%, 90%).
+5. Se algo estranhar, rode com log de debug:
+   ```sh
+   LAN_MOUSE_LOG_LEVEL=debug lan-mouse
+   ```
+   e procure as linhas `handoff:` — elas mostram a coordenada de entrada, o
+   tempo até o primeiro movimento e o caminho de retorno.
+
+### Build a partir do código
 
 ```sh
-pacman -S lan-mouse
-```
-
-The prerelease version (following `main`) is available on the AUR:
-
-```sh
-paru -S lan-mouse-git
-```
-</details>
-
-
-<details>
-    <summary>Nix (OS)</summary>
-
-- nixpkgs: [search.nixos.org](https://search.nixos.org/packages?channel=unstable&show=lan-mouse&from=0&size=50&sort=relevance&type=packages&query=lan-mouse)
-- flake: [README.md](./nix/README.md)
-</details>
-
-<details>
-    <summary>Fedora</summary>
-You can install Lan Mouse from the [Terra Repository](https://terra.fyralabs.com).
-
-
-After enabling Terra:
-
-```sh
-dnf install lan-mouse
-```
-</details>
-
-<details>
-    <summary>Windows</summary>
-
-Lan Mouse can be installed from the [winget community repositories](https://github.com/microsoft/winget-pkgs/tree/master/manifests/f/feschber/LanMouse):
-
-```sh
-winget install lan-mouse
-```
-
-The unofficial fork publishes its own installer
-(`lan-mouse-custom-setup-x86_64.exe`) in the releases of this repository.
-Its clean-install behavior is described in
-[Clean install, reset and uninstall](#clean-install-reset-and-uninstall).
-
-</details>
-
-<details>
-    <summary>Manual Installation</summary>
-
-First make sure to [install the necessary dependencies](#installing-dependencies-for-development--compiling-from-source).
-
-Precompiled release binaries for Windows and Linux are available in the [releases section](https://github.com/gabriel-07a/lan-mouse-custom/releases).
-For Windows, the depenedencies are included in the .zip file, for other operating systems see [Installing Dependencies](#installing-dependencies-for-development--compiling-from-source).
-
-Alternatively, the `lan-mouse` binary can be compiled from source (see below).
-
-### Installing desktop file, app icon and firewall rules (optional)
-```sh
-# install lan-mouse and its GPUI frontend (replace path/to/ with the correct path)
-sudo cp path/to/lan-mouse path/to/lan-mouse-gpui /usr/local/bin/
-
-# install app icon
-sudo mkdir -p /usr/local/share/icons/hicolor/scalable/apps
-sudo cp lan-mouse-gtk/resources/de.feschber.LanMouse.svg /usr/local/share/icons/hicolor/scalable/apps
-
-# update icon cache
-gtk-update-icon-cache /usr/local/share/icons/hicolor/
-
-# install desktop entry
-sudo mkdir -p /usr/local/share/applications
-sudo cp de.feschber.LanMouse.desktop /usr/local/share/applications
-
-# when using firewalld: install the service definition (it opens UDP 4242 for
-# the DTLS transport and UDP 4245 for discovery; edit it if you changed the
-# ports in config.toml)
-sudo cp firewall/lan-mouse.xml /etc/firewalld/services
-# -> enable the service in firewalld settings
-```
-
-Instead of downloading from the releases, the `lan-mouse` binary
-can be easily compiled via cargo or nix:
-
-### Compiling and installing manually:
-```sh
-# compile the service/CLI and the GPUI frontend (both are required: the
-# service starts lan-mouse-gpui from next to its own binary)
 cargo build --release
 cargo build --release --manifest-path lan-mouse-gpui/Cargo.toml
-
-# install both binaries next to each other
-sudo install -Dm755 target/release/lan-mouse /usr/local/bin/lan-mouse
-sudo install -Dm755 target/release/lan-mouse-gpui /usr/local/bin/lan-mouse-gpui
 ```
 
-### Compiling and installing via cargo:
+Os dois binários (`lan-mouse` e `lan-mouse-gpui`) precisam ficar lado a lado.
+Dependências por distro, Nix, firewall e instalação manual estão em
+[README-upstream.md](README-upstream.md).
+
+## Como contribuir
+
+Contribuições são bem-vindas, principalmente:
+
+- **testes em outras combinações de SO** (Windows ↔ Windows, Linux ↔ Linux,
+  X11, wlroots);
+- **relatos de handoff** com versão do SO, versão/commit do fork, tipo de
+  conexão (cabo/Wi-Fi) e o trecho do log com as linhas `handoff:`;
+- correções de posicionamento em multi-monitor/DPI misto;
+- resiliência a perda de pacotes no movimento (redundância/sequência);
+- documentação e melhorias de acessibilidade.
+
+Antes de abrir PR:
+
 ```sh
-# will end up in ~/.cargo/bin
-cargo install lan-mouse
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features
 ```
 
-### Compiling and installing via nix:
-```sh
-# both binaries end up in result/bin/ (lan-mouse and lan-mouse-gpui)
-nix-build
-```
-### Conditional compilation
-Support for other platforms is omitted automatically based on the active
-rust toolchain.
+Regras do fork:
 
-Additionally, available backends and frontends can be configured manually via
-[cargo features](https://doc.rust-lang.org/cargo/reference/features.html).
+- mudanças de protocolo devem ser aditivas ou gated por capability;
+- não quebrar peers antigos (upstream e builds anteriores do fork);
+- manter o escopo: o foco é handoff de borda fluido e confiável;
+- um PR por assunto, com teste proporcional e descrição do cenário testado.
 
-E.g. if only support for sway is needed, the following command produces
-an executable with support for only the `layer-shell` capture backend
-and `wlroots` emulation backend:
-```sh
-cargo build --no-default-features --features layer_shell_capture,wlroots_emulation
-```
-For a detailed list of available features, checkout the [Cargo.toml](./Cargo.toml)
-(note: the x11_capture feature is a stub in this fork - X11 only has input
-emulation; see the X11 caveat above).
-</details>
+Abra uma issue em
+[github.com/gabriel-07a/lan-mouse-custom/issues](https://github.com/gabriel-07a/lan-mouse-custom/issues)
+com o template informal: **o que aconteceu, em quais SOs, o que você esperava e
+os logs**. Se for uma combinação que eu não tenho, eu provavelmente vou pedir
+ajuda para validar.
 
+## Limitações conhecidas
 
+- **Windows**: o cursor pode ficar invisível quando não há mouse real conectado
+  (limitação do backend); UIPI/secure desktop não é contornado.
+- **X11**: capture não implementado neste fork; a máquina X11 só recebe input.
+- **macOS**: código dormente, não testado.
+- **wlroots**: entrada por coordenada usa fallback relativo quando o compositor
+  não oferece posicionamento absoluto.
+- **Perda de pacotes**: movimento ainda é delta puro; perda de um datagrama pode
+  causar um pequeno engasgo. Redundância/sequência ficou como trabalho futuro.
+- **Portal/GNOME**: a primeira captura pode pedir permissão; o token é
+  persistido quando o portal permite.
+- Este fork é **experimental**; releases de teste podem ser regeradas a
+  qualquer momento.
 
 ## Clean install, reset and uninstall
 
-Lan Mouse stores everything it persists for one user (devices, permissions,
-certificates, address rules, audit log, portal consent tokens) in directories
-named `lan-mouse`. A **package upgrade keeps this data on purpose**; a **fresh
-install** must not resurrect it. The exact paths per OS are listed in
+O fork mantém o comportamento do upstream: atualizar um pacote **preserva** os
+dados do usuário (devices, permissões, certificados, audit log e tokens de
+consentimento); uma instalação limpa não deve ressuscitar dados antigos. Os
+caminhos exatos por SO estão em
 [docs/audit-fresh-install.md](docs/audit-fresh-install.md).
 
-### Windows installer
-
-The Windows installer detects leftovers from older or portable builds in
-`%LOCALAPPDATA%\lan-mouse` and `%APPDATA%\lan-mouse`. Cleaning is
-**reversible**: the old directory is renamed to a timestamped sibling
-`lan-mouse.bak-<time>` instead of being deleted, so the next start shows no old
-PCs while the data can still be restored.
-
-* **Interactive install**: asks before cleaning (default **Yes**, so installing
-  a release starts fresh). Answer **No** to keep your devices and permissions
-  when upgrading.
-* **Silent install** (`setup.exe /S`): backs up the old configuration by
-  default. Pass `/KEEPUSERDATA` to keep it in place, `/CLEANUSERDATA` to force
-  the clean install, or `/PURGEUSERDATA` to delete it permanently.
-* **Uninstall**: stops the GUI and its daemon and moves the same two
-  directories to a backup (interactive asks, default **Yes**; silent uninstall
-  moves them too). `/KEEPUSERDATA` keeps them in place; `/PURGEUSERDATA`
-  deletes them permanently. Shortcuts, firewall rule and registry keys are
-  removed.
-
-Restore a backup by renaming it back, e.g. Explorer → rename
-`%LOCALAPPDATA%\lan-mouse.bak-<time>` to `lan-mouse`, or in PowerShell:
-
-```powershell
-Rename-Item "$env:LOCALAPPDATA\lan-mouse.bak-<time>" "lan-mouse"
-```
-
-Delete old `lan-mouse.bak-*` directories manually when you no longer need
-them. Quit Lan Mouse before installing/uninstalling manually; the installer
-stops a running instance for you (`taskkill /T /F`).
-
-### Reset (Linux and Windows)
-
-```sh
-lan-mouse --reset-config --dry-run   # show every path that would be moved
-lan-mouse --reset-config             # move them to .bak backups (reversible)
-lan-mouse --reset-config --purge     # delete them permanently
-```
-
-The default is reversible: every directory is renamed to a sibling
-`lan-mouse.bak-<unix timestamp>` (e.g. `~/.config/lan-mouse.bak-1762370000`),
-which hides the old devices from the next start. Restore it with
-`mv ~/.config/lan-mouse.bak-<timestamp> ~/.config/lan-mouse` (or use
-`--purge` if you are sure you never want the data back). The command only
-touches directories literally named `lan-mouse` (config, state, legacy
-portal-token cache), refuses to run while the service is
-running, never follows symlinks and does not touch custom `--config` /
-`--cert-path` locations. On Linux the helper script
-`scripts/install-clean.sh --dry-run` / `--yes` / `--purge` does the same when
-the binary is not installed anymore.
-
-On Debian/Ubuntu (`apt`), package upgrades and even `apt purge` keep the
-per-user data; the postrm explains the paths and the reset command. GNOME/KDE
-will ask for clipboard/input-capture/remote-desktop consent again after a
-reset.
-
-## Development
-
-### Git pre-commit hook
-
-This repository includes a local git hooks directory `.githooks/` with a `pre-commit` script that enforces formatting, lints, and tests before allowing a commit.  It is optional to enable it, but it will prevent you from committing code with failing unit tests or that needs clippy/fmt fixes. To enable the hook locally:
-
-1. Make the hook executable:
-
-```sh
-chmod +x .githooks/pre-commit
-```
-
-2. Point git to the hooks directory (one-time per clone):
-
-```sh
-git config core.hooksPath .githooks
-```
-
-The `pre-commit` script runs `cargo fmt --all` (and fails if files were modified), `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --all-features`.
-
-### Dependencies & Compiling from Source
-<details>
-    <summary>Ubuntu and derivatives</summary>
-
-```sh
-sudo apt install libx11-dev libxtst-dev libwayland-dev libxkbcommon-dev \
-    libxkbcommon-x11-dev libxcb1-dev libfontconfig1-dev libfreetype-dev
-```
-
-For a GPU-accelerated GPUI frontend also install the Vulkan/GL driver for your
-system (Mesa is usually already present on Ubuntu). The legacy GTK frontend is
-opt-in with `--features gtk` and needs `libgtk-4-dev libadwaita-1-dev`.
-</details>
-
-<details>
-    <summary>Arch and derivatives</summary>
-
-```sh
-sudo pacman -S libx11 libxtst wayland libxkbcommon libxcb fontconfig freetype2
-```
-</details>
-
-<details>
-    <summary>Fedora and derivatives</summary>
-
-```sh
-sudo dnf install libXtst-devel libX11-devel wayland-devel libxkbcommon-devel \
-    libxcb-devel fontconfig-devel freetype-devel
-```
-</details>
-<details>
-    <summary>Nix</summary>
-
-```sh
-nix-shell .
-```
-</details>
-<details>
-    <summary>Nix (flake)</summary>
-
-```sh
-nix develop
-```
-</details>
-
-<details>
-    <summary>Windows</summary>
-
-- Install [Rust](https://www.rust-lang.org/tools/install) with the **MSVC**
-  toolchain and the **Visual Studio Build Tools** (Desktop development with
-  C++ / Windows SDK). GPUI does not support MSYS2/MinGW.
-- Build the app and the GPUI frontend:
-
-```sh
-cargo build --release
-cargo build --release --manifest-path lan-mouse-gpui/Cargo.toml
-```
-
-- Put `lan-mouse.exe` and `lan-mouse-gpui.exe` in the same directory: the main
-  binary starts the frontend as a separate process and connects over the local
-  IPC socket.
-- The service/CLI and the GTK-less GPUI UI do not need GTK or gvsbuild anymore.
-  The legacy GTK frontend is opt-in with `--features gtk` and still requires
-  the old gvsbuild setup.
-</details>
-
-## Usage
-<details>
-    <summary>GPUI Frontend (default)</summary>
-
-By default Lan Mouse starts the fast GPUI frontend. It connects to the
-background service over the same local IPC channel as the GTK build and shows:
-
-- **Devices**: configured peers with live state, connect/disconnect, position
-  cycling, sensitivity, DNS resolution and edit/remove controls;
-- **This Computer**: hostname, IPv4 addresses, listening port and certificate
-  fingerprint for authorizing this machine on a peer;
-- **Network**: IPv4 discovery/scan and one-click add of discovered peers;
-- **Settings**: pending request approval with SAS/permission presets, capture
-  and emulation recovery, clipboard sync, pairing, authorized certificates,
-  address rules and per-device permissions.
-
-To connect a device, use **Add device** with its hostname or IPv4 address, or
-use **Network → Scan network**. Lan Mouse uses IPv4 only; IPv6 is intentionally
-not used or shown.
-
-On the *remote* device, authorize your *local* device for incoming traffic; the
-fingerprint to compare is shown in the This Computer card and the pending
-request card. Closing the window only closes the UI: the background service and
-the LAN connection keep running, and starting Lan Mouse again reopens the
-window against the same service. Use **Settings → Quit Lan Mouse** (or the tray
-menu while the window is open) to stop the service and the connection.
-
-The legacy GTK frontend remains available by building with `--features gtk`;
-the `LAN_MOUSE_FRONTEND=gpui` environment variable selects the GPUI frontend
-from a GTK-enabled build.
-<details>
-    <summary>Command Line Interface</summary>
-
-The cli interface can be accessed by passing `cli` as a commandline argument.
-Use
-```sh
-lan-mouse cli help
-```
- to list the available commands and
-```sh
-lan-mouse cli <cmd> help
-```
-for information on how to use a specific command.
-
-</details>
-
-<details>
-    <summary>Daemon Mode</summary>
-
-Lan Mouse can be launched in daemon mode to keep it running in the background (e.g. for use in a systemd-service).
-
-To do so, use the `daemon` subcommand:
-
-```sh
-lan-mouse daemon
-```
-</details>
-
-## Systemd Service
-
-In order to start lan-mouse with a graphical session automatically,
-the [systemd-service](service/lan-mouse.service) can be used. The `.deb`
-package already installs it (and both binaries); for a manual install, copy the
-file to `~/.config/systemd/user/` and enable the service:
-
-```sh
-cp service/lan-mouse.service ~/.config/systemd/user
-systemctl --user daemon-reload
-systemctl --user enable --now lan-mouse.service
-```
-> [!Important]
-> Make sure to point `ExecStart=/usr/bin/lan-mouse daemon` to the actual `lan-mouse` binary (in case it is not under `/usr/bin`, e.g. when installed manually).
-> The `daemon` subcommand runs the service only; it does not spawn the GPUI frontend.
-> The unit deliberately sets no `PrivateTmp`/`ProtectSystem` (the X11 socket lives in `/tmp/.X11-unix` and portals in `/run/user/$UID`); see the comments in the unit.
-
-
-## Configuration
-To automatically load clients on startup, the file `$XDG_CONFIG_HOME/lan-mouse/config.toml` is parsed.
-`$XDG_CONFIG_HOME` defaults to `~/.config/`.
-
-To create this file you can copy the following example config:
-
-### Example config
-> [!TIP]
-> key symbols in the release bind are named according
-> to their names in [input-event/src/scancode.rs#L172](input-event/src/scancode.rs#L176).
-> This is bound to change
-
-```toml
-# example configuration
-
-# configure release bind
-release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
-
-# optional port (defaults to 4242)
-port = 4242
-
-# optional UDP discovery/broadcast port (defaults to 4245)
-# discovery_port = 4245
-
-# list of authorized tls certificate fingerprints that
-# are accepted for incoming traffic
-[authorized_fingerprints]
-"bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80" = "iridium"
-
-# define a client on the right side with host name "iridium"
-[[clients]]
-# position (left | right | top | bottom)
-position = "right"
-# hostname
-hostname = "iridium"
-# activate this client immediately when lan-mouse is started
-activate_on_startup = true
-# optional list of (known) ip addresses
-ips = ["192.168.178.156"]
-
-# define a client on the left side with IP address 192.168.178.189
-[[clients]]
-position = "left"
-# The hostname is optional: When no hostname is specified,
-# at least one ip address needs to be specified.
-hostname = "thorium"
-# ips for ethernet and wifi
-ips = ["192.168.178.189", "192.168.178.172"]
-# optional port
-port = 4242
-```
-
-Where `left` can be either `left`, `right`, `top` or `bottom`.
-
-Each client may also carry the peer's certificate fingerprint:
-
-```toml
-[[clients]]
-position = "right"
-ips = ["192.168.178.156"]
-# pinned SHA-256 fingerprint of the peer certificate (optional)
-fingerprint = "bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80"
-```
-
-With a pinned fingerprint the outgoing connection verifies the server
-certificate and refuses a host that presents a different one (DHCP reuse, a
-wrong machine on that IP, or a man-in-the-middle). Without a pin the first
-successful connection learns and stores the fingerprint (trust on first use),
-so later connections are authenticated; `lan-mouse cli set-fingerprint <id>`
-can pin it explicitly and `set-fingerprint <id>` without a value clears it.
-
-### Device permissions and control direction
-
-Every authorized machine is a *device* keyed by its certificate fingerprint.
-Each device has **two independent directions**, and each direction has its own
-set of capabilities (`pointer`, `keyboard`, `clipboard`):
-
-- **incoming** — what that device may do on *this* machine. It is enforced
-  locally: keyboard/pointer/clipboard events that were not granted are dropped
-  before they reach the emulation backend.
-- **outgoing** — what *this* machine may do on the peer. It is a local guard:
-  the machine refuses to activate the link (and stops forwarding input) when
-  the direction or capability was not granted.
-
-This covers all direction combinations: "only this PC controls the other",
-"only the other controls this PC", "both control each other" (the default),
-optionally with different capabilities per direction, e.g. "the other machine
-may use the clipboard but not move my mouse".
-
-The GUI has a **Devices** section with one expandable row per device and
-checkboxes for each direction; the authorization dialog asks for the
-capabilities of both directions when a new device is approved. The CLI has:
-
-```sh
-lan-mouse cli devices                  # name, fingerprint, position, caps, state
-lan-mouse cli pending                 # devices waiting for approval
-lan-mouse cli allow <fingerprint> --name windows11 --position right \
-    --incoming pointer,keyboard,clipboard --outgoing pointer,keyboard
-lan-mouse cli deny <fingerprint> [--for 1h]  # deny permanently or for a while
-lan-mouse cli allow <fingerprint> --incoming keyboard --once  # session grant
-lan-mouse cli revoke <fingerprint>    # close sessions + deny
-lan-mouse cli rename <fingerprint> "desk pc"
-```
-
-`--once` grants access only for the current session: the record is never
-written to the config and is revoked as soon as the peer disconnects, so the
-device is asked again next time. `deny --for 1h` (or `30m`, `2d`) makes a
-temporary revocation that stops blocking when it expires.
-
-`--incoming`/`--outgoing` accept `pointer,keyboard,clipboard`, `all` or `none`;
-clipboard can also be split into `clipboard-read` (the peer may read this
-machine's clipboard) and `clipboard-write` (the peer may set it), while the
-legacy `clipboard` value grants both. `none` disables that direction. Policies
-are stored per device in the config:
-
-```toml
-[[devices]]
-fingerprint = "bc:05:ab:…"
-name = "windows11"
-
-[devices.incoming]          # what the peer may do here
-allowed = true
-capabilities = 7            # 1=pointer, 2=keyboard, 4=clipboard
-
-[devices.outgoing]          # what this PC may do there
-allowed = true
-capabilities = 7
-```
-
-Old configs are migrated on load: every entry in `authorized_fingerprints`
-becomes a device with full access in both directions (the previous behavior),
-so nothing changes until a policy is narrowed. A device can also be granted
-*connect-only* access (`allowed = true`, `capabilities = 0`): it may stay
-connected and answer pings but cannot inject any input.
-
-### Auto-authorizing address rules
-
-An address rule lets devices from an IP or CIDR connect without an approval
-prompt. Unlike the old `trusted_ips` allowlist, a rule carries the permissions
-the adopted device gets, so a whole subnet can be allowed to use the clipboard
-but not to control the mouse or keyboard:
-
-```toml
-[[address_rules]]
-address = "10.0.0.0/24"
-
-[address_rules.incoming]    # what devices from this range may do here
-allowed = true
-capabilities = 4            # clipboard only
-
-[address_rules.outgoing]    # what this PC may do there
-allowed = true
-capabilities = 0            # connect-only
-```
-
-```sh
-lan-mouse cli trust 10.0.0.0/24 --incoming clipboard --outgoing none
-lan-mouse cli trusted        # list rules and their permissions
-lan-mouse cli untrust 10.0.0.0/24
-```
-
-Rules that cover more than a local subnet (for example `10.0.0.0/8` or
-`0.0.0.0/0`) are accepted but logged and reported as a warning. The adopted
-device still appears in the device list with the rule's permissions and can be
-narrowed or revoked per device; `trusted_ips` from older configs is migrated to
-full-access rules so existing setups keep working.
-
-### Permission negotiation and verification code
-
-Peers from this fork advertise a `PERMISSIONS` capability and exchange
-`AuthRequest`/`AuthResponse` messages once connected, so each side learns the
-capabilities the other grants it (shown in the client state) without changing
-the enforcement model: grants are always enforced locally. Legacy peers never
-receive these events (they would close the connection on an unknown id), so
-interoperability is preserved.
-
-When a new device asks for approval, the dialog/CLI shows a **six-digit
-verification code** derived from both certificate fingerprints. Two machines
-that know each other's fingerprint display the same code; compare it out of
-band (screenshot, chat) before approving. If a known device later shows up with
-a **different certificate** for the same address or name, the frontend warns
-about the change, the request is flagged and the event is audited.
-
-### Kiosk mode
-
-Set `accept_incoming = false` to make this machine control-only: outgoing
-links and clipboard sends keep working, but every incoming handshake is
-rejected in the certificate callback, so authorized devices, address rules and
-an open pairing window cannot connect either.
-
-```toml
-accept_incoming = false
-```
-
-### Policy backup and transfer
-
-`export-policy` writes the persistent permission policy (devices, address
-rules and revocations, without link addresses or session state) as JSON;
-`import-policy` validates the whole file first and only then replaces the
-policy, so a malformed file changes nothing.
-
-```sh
-lan-mouse cli export-policy permits.json
-lan-mouse cli import-policy permits.json
-```
-
-Import and export are audited (`policy_exported`/`policy_imported`).
-
-### Local IPC security
-
-On Unix the frontend socket is protected twice: it lives in
-`$XDG_RUNTIME_DIR` (0700) and the listener verifies the peer UID through
-`SO_PEERCRED`, rejecting IPC clients running as another user. On Windows the
-frontend uses a loopback TCP socket, which cannot carry peer credentials; any
-local process that can connect to `127.0.0.1:5252` can talk to the service, so
-do not run untrusted software in the same session. The private key file gets
-`0400` permissions on Unix and a best-effort `icacls` restriction to the
-current user on Windows (`RW` removed for everyone else).
-
-### Connection limits
-
-The listener bounds abuse from the LAN even before a certificate is accepted:
-each IP may start at most 20 handshakes per minute (the connect side backs off
-to 5 s, so normal reconnects stay well below that), at most 32 handshakes can
-be in flight and at most 128 connections can be live at once. Rejected
-handshakes are only remembered for 60 s, so a stream of random certificates
-cannot grow the deduplication map forever. All limits are internal constants;
-they can be revisited if a large deployment needs more headroom.
-
-### Audit log
-
-Every permission change is appended to a JSON-lines audit log at
-`$XDG_STATE_HOME/lan-mouse/audit.jsonl` (`%LOCALAPPDATA%\lan-mouse\audit.jsonl` on Windows), rotated at 5 MB
-to `audit.jsonl.1`. It records grants (`grant_created`, `grant_updated`),
-`revoke`, `deny`, pairing windows and adopted devices, address-rule changes and
-TUF certificate pinning, with fingerprint, name, address and a short detail
-(source, capabilities, reason). The log never contains input or clipboard
-contents.
-
-```sh
-lan-mouse cli history --limit 20   # recent events, newest first
-lan-mouse doctor                  # prints the audit path and a recent count
-```
-
-## Two-way (mutual) operation
-
-Lan Mouse has **no fixed server/client role**: every instance listens for
-incoming connections *and* dials the clients configured in its own config.
-Either machine can therefore drive the other one — as long as both sides are
-configured.
-
-To let both machines control each other:
-
-1. Run lan-mouse on **both** machines.
-2. On each machine add the *other* one as a `[[clients]]` entry with the
-   mirrored position:
-   - on PC A: `position = "right"` for PC B,
-   - on PC B: `position = "left"` for PC A.
-3. Authorize each peer's certificate fingerprint on the receiving side
-   (`authorized_fingerprints`, or approve the prompt in the frontend).
-4. Allow the Lan Mouse UDP ports through the firewall on both machines:
-   `4242` for the DTLS transport and `4245` for discovery (both are
-   configurable in `config.toml`; see [firewall/lan-mouse.xml](firewall/lan-mouse.xml)).
-
-Only one side holds the input capture at a time: the machine whose cursor
-crossed the edge last takes control, and the other side releases its capture
-so events can never loop back. If only one side has a client entry, control
-works in one direction only.
-
-`lan-mouse doctor` prints the configured clients, the selected capture and
-emulation backends, the local fingerprint and warnings for common
-misconfigurations. Add `--probe` to also initialize the input backends, and
-`--json` for scripted use.
-
-### Network tuning
-
-- `motion_batch_ms` (default `4`, `0` disables): coalesces pointer motion into
-  small batches. On Wi-Fi this cuts the motion packet rate by roughly 4x with
-  less than 5 ms of added latency. Values above ~8 ms start to be noticeable.
-- `connect_grace_ms` (default `400`, `0` disables): how long an input event may
-  wait for a (re)connection before the capture is released. Keeps the mouse
-  grabbed during a short Wi-Fi hiccup instead of bouncing back to the local
-  screen immediately.
-
-Both options also exist as command line flags (`--motion-batch-ms`,
-`--connect-grace-ms`).
-
-Lan Mouse is **IPv4-only**: it listens on `0.0.0.0`, resolves peers to their
-IPv4 addresses and ignores AAAA records. IPv6 support was removed because it
-caused a second logical transport (and UI/state flapping) for dual-stack peers;
-every supported setup works over IPv4.
-
-## Clipboard
-
-Lan Mouse can synchronize the clipboard (plain text, HTML and PNG images)
-between authorized, connected peers.
-
-- Enabled by default. Toggle it in the frontend or with
-  `lan-mouse cli clipboard enable|disable`; `--no-clipboard` disables it at
-  startup.
-- Size limits are configurable under `[clipboard]` (defaults: 256 KiB text,
-  1 MiB HTML, 8 MiB image, 10 MiB per snapshot). Values are clamped to the
-  hard caps: 16 MiB per representation and 64 MiB per snapshot.
-- **Linux / Wayland (GNOME 50+)** uses the XDG desktop portal. The first run
-  asks for **"Allow Clipboard Access"**; the consent is stored in
-  `$XDG_STATE_HOME/lan-mouse/clipboard.token` (`~/.local/state/lan-mouse/`;
-  delete it to be asked again). Tokens left in `~/.cache/lan-mouse/` by older
-  builds are migrated automatically.
-- **Windows** uses the native clipboard. Images are
-  converted between the canonical PNG and `CF_DIB`/`CF_DIBV5`.
-- Content marked as secret by the source application (KDE password-manager hint, Windows
-  clipboard-history/cloud opt-outs) is never synchronized.
-- Clipboard sync only runs between authorized peers and stops immediately when
-  the toggle is off.
-
-```toml
-[clipboard]
-enabled = true
-max_text_bytes = 262144
-max_html_bytes = 1048576
-max_image_bytes = 8388608
-max_snapshot_bytes = 10485760
-```
-
-Clipboard backends: GNOME/KDE use the XDG portal, wlroots compositors use
-`wlr-data-control`, and X11 uses the `CLIPBOARD` selection (text, HTML and PNG,
-INCR for large payloads in both directions). macOS support (NSPasteboard, PNG
-plus a TIFF-to-PNG fallback) exists only as dormant, unshipped code and is not
-part of the supported matrix.
-
-### Pairing a new device
-
-A device only has to be approved once. Publishing the fingerprint by hand is
-not necessary:
-
-1. On the machine you are sitting at, add a client with the other machine's
-   address (GUI: *add client* → hostname/IP; CLI:
-   `lan-mouse cli add-client --ips 192.168.1.50 --position left --activate`).
-2. The other machine shows an **Unauthorized Device** window. Pick where this
-   device sits on its screen and press **Authorize**.
-3. That single approval stores the fingerprint *and* creates the client entry
-   for the reverse direction, using the address of the accepted connection, so
-   both machines can control each other without editing the config by hand.
-
-From a terminal the approval can also be granted with
-
-```sh
-lan-mouse cli authorize-device <sha256-fingerprint> --position left
-```
-
-which has the same effect: the fingerprint is trusted and a client for the
-peer is created and activated when it connects. A fingerprint that was
-authorized this way is never asked for again unless the peer regenerates its
-certificate.
-
-### Sensitivity per device
-
-Wayland reports raw pointer deltas while Windows reports accelerated
-ones, so the cursor speed differs between peer combinations. Each client has a
-`sensitivity` (percent, `100` = unchanged) that scales the forwarded motion:
-
-```toml
-[[clients]]
-hostname = "windows11"
-ips = ["192.168.166.166"]
-position = "right"
-sensitivity = 120   # 20% faster
-```
-
-The GUI exposes it in the client row; the CLI has
-`lan-mouse cli set-sensitivity <id> <percent>`. Fractional deltas from Wayland
-are accumulated instead of truncated, so slow movements are not lost on the
-integer-only Windows/X11 backends.
-
-Motion is carried in logical (96 DPI) pixels. A Windows sender divides the
-physical deltas reported by its hooks by the display scale, and a Windows
-receiver multiplies them by the scale of the monitor under the cursor, so a
-150% laptop and a 100% desktop move the pointer the same logical distance.
-`sensitivity` is applied on top of that, so it only has to compensate for
-pointer acceleration, not for display scaling. A scale change on the receiver
-is picked up without a restart when the cursor moves to another monitor (the
-per-monitor scale is cached for two seconds).
-
-### Pairing without a mouse on the other machine
-
-`lan-mouse cli pair --seconds 60 --incoming pointer,keyboard --outgoing none`
-(or the *Pairing mode* button in the GUI, which pairs with full access) opens a
-window during which **one** new connecting device is authorized with the
-configured permissions and, unless the outgoing direction is disabled, also
-gets a client entry for the reverse direction. Useful when the other computer
-has no mouse to click "approve". The window is single use: it closes as soon
-as the first device is accepted, and the frontend gets a **pairing review**
-listing what was adopted during the window (so it can be narrowed or revoked).
-After it closes, unknown devices need the normal approval again; already-seen
-ones are matched by certificate.
-
-Devices running this fork also announce themselves every 10 seconds with their
-certificate fingerprint, so they show up in the network table immediately and
-can be authorized in one click.
-
-### Revoking a device
-
-`lan-mouse cli remove-authorized-key <fingerprint>` (or the delete button in
-the *Authorized Certificates* list) does more than forget the fingerprint: it
-closes the live session, deactivates the outgoing link and adds the
-fingerprint to a deny list (`denied_fingerprints` in the config), so an open
-pairing window or a trusted address cannot silently re-authorize the same
-certificate. Authorizing the device again explicitly removes it from the deny
-list. Trusted addresses that cover more than a local subnet (for example
-`10.0.0.0/8` or `0.0.0.0/0`) are accepted but logged and reported as a warning:
-every certificate from that range is authorized without a prompt.
-
-### GNOME asks once per login
-
-On GNOME the `InputCapture` portal is still at **version 1**, which has no
-`restore_token`/`persist_mode`: the compositor asks for permission every time
-a capture session is created. This fork therefore creates exactly **one**
-capture session per daemon start and keeps it for the whole session, so the
-dialog appears once per login and never while you cross the screen edges.
-
-Click **Share** (and enable the toggle) once. If you cancel, input capture
-stays off until you re-enable it (`lan-mouse cli enable-capture`, or the
-button in the GUI) — the daemon does not retry, so it will not spam the
-dialog.
-
-The emulation (`RemoteDesktop`, portal v2) and clipboard sessions store their
-restore tokens under `$XDG_STATE_HOME/lan-mouse/` (`~/.local/state/lan-mouse/`),
-so they are only approved once; legacy tokens in `~/.cache/lan-mouse/` are
-migrated on first use.
-
-### Peers running an upstream release
-
-Peers advertise optional features in the `Pong` they send for the first `Ping`
-of a connection. The trailing bytes are ignored by older releases, so the
-negotiation itself can never break them. The `Hello` build handshake is only
-sent once a peer has proved that it understands it: released versions before
-`Hello` existed disconnect on an unknown event id, which used to turn the
-outgoing connection into a write-only one that the peer never answered.
-
-Everything this fork adds is negotiated:
-
-| Feature | Peer without the extension |
-| --- | --- |
-| `Enter` serial + acknowledgement | The handoff is sent once, exactly like upstream. Nothing waits for an `Ack` that a legacy peer never sends. |
-| Clipboard sync | No clipboard frame is offered, so a legacy peer never sees a frame it cannot decode. |
-| Ping liveness | A connection whose peer never answers a ping is kept for 30 rounds (about a minute) instead of being torn down after two. Some peers read a connection without ever writing to it. |
-
-Input sharing itself is wire-compatible in both directions, so mixed setups
-(this fork on one machine, an upstream release on the other) work for keyboard
-and mouse; only the features above degrade to upstream behaviour.
-
-## Roadmap
-- [x] Graphical frontend (GPUI default, GTK fallback)
-- [x] respect xdg-config-home for config file location.
-- [x] IP Address switching
-- [x] Liveness tracking Automatically ungrab mouse when client unreachable
-- [x] Liveness tracking: Automatically release keys, when server offline
-- [x] Libei Input Capture
-- [x] Windows Input Capture
-- [x] Encryption
-- [ ] X11 input capture (not implemented in this fork; X11 sessions are receive-only)
-- [x] Latency measurement and visualization (RTT per client)
-- [ ] Bandwidth usage measurement and visualization
-- [x] Clipboard support (text, HTML, PNG; portal + data-control + Windows/X11)
-
-
-## Detailed OS Support
-
-> **Supported platforms: Linux and Windows only.** macOS is no longer tested,
-> built by CI or supported. The macOS backend code is kept dormant in the tree
-> for reference and is not part of the supported matrix.
-
-In order to use a device for sending events, an **input-capture** backend is required, while receiving events requires
-a supported **input-emulation** *and* **input-capture** backend.
-
-A suitable backend is chosen automatically based on the active desktop environment / compositor.
-
-The following sections detail the emulation and capture backends provided by lan-mouse and their support in desktop environments / operating systems.
-
-### Input Emulation Support
-
-| Desktop / Backend | wlroots            | libei              | remote-desktop portal | windows            | x11                |
-|-------------------|--------------------|--------------------|-----------------------|--------------------|--------------------|
-| Wayland (wlroots) | :heavy_check_mark: |                    |                       |                    |                    |
-| Wayland (KDE)     |                    | :heavy_check_mark: | :heavy_check_mark:    |                    |                    |
-| Wayland (Gnome)   |                    | :heavy_check_mark: | :heavy_check_mark:    |                    |                    |
-| Windows           |                    |                    |                       | :heavy_check_mark: |                    |
-| X11               |                    |                    |                       |                    | :heavy_check_mark: |
-
-- `wlroots`: This backend makes use of the [wlr-virtual-pointer-unstable-v1](https://wayland.app/protocols/wlr-virtual-pointer-unstable-v1) and [virtual-keyboard-unstable-v1](https://wayland.app/protocols/virtual-keyboard-unstable-v1) protocols and is supported by most wlroots based compositors.
-- `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
-- `xdp`: This backend uses the [freedesktop remote-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/#gdbus-org.freedesktop.portal.RemoteDesktop) and is supported on GNOME and Plasma.
-- `x11`: Backend for X11 sessions.
-- `windows`: Backend for Windows.
-
-
-
-### Input Capture Support
-
-| Desktop / Backend | layer-shell        | libei              | windows            | x11                |
-|-------------------|--------------------|--------------------|--------------------|--------------------|
-| Wayland (wlroots) | :heavy_check_mark: |                    |                    |                    |
-| Wayland (KDE)     | :heavy_check_mark: | :heavy_check_mark: |                    |                    |
-| Wayland (Gnome)   |                    | :heavy_check_mark: |                    |                    |
-| Windows           |                    |                    | :heavy_check_mark: |                    |
-| X11               |                    |                    |                    |                    |
-
-- `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
-- `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
-- `windows`: Backend for input capture on Windows.
-- `x11`: **not implemented in this fork** - the X11 capture backend is a stub, so an X11 session can only receive input. (The XTest-based X11 *emulation* backend is listed in the emulation table above.)
+- **Windows installer**: detecta restos em `%LOCALAPPDATA%\lan-mouse` e
+  `%APPDATA%\lan-mouse` e renomeia para `lan-mouse.bak-<time>` em vez de apagar.
+  Opções: `/KEEPUSERDATA` (não mexe), `/CLEANUSERDATA` (limpa com backup) e
+  `/PURGEUSERDATA` (remove de vez). O instalador é o
+  `lan-mouse-custom-setup-x86_64.exe` das releases.
+- **Linux**: `scripts/install-clean.sh --dry-run` / `--yes` / `--purge` instala
+  os binários e limpa os dados do app com backup (quando aplicável).
+- **CLI**: `lan-mouse --reset-config` move os diretórios do app para um backup
+  `lan-mouse.bak-*`; use `lan-mouse --reset-config --purge` para apagar de vez
+  (com cuidado) e `--dry-run` para só listar o que seria movido/removido.
+
+Para o passo a passo completo (incluindo o que cada opção apaga), veja a seção
+correspondente em [README-upstream.md](README-upstream.md#clean-install-reset-and-uninstall).
+
+## Licença e créditos
+
+- Projeto original: [Lan Mouse](https://github.com/feschber/lan-mouse), de seus
+  contribuidores, sob GPL-3.0-or-later.
+- Este fork: modificações © 2026 Gabriel Arcanjo, também sob
+  GPL-3.0-or-later. Veja [NOTICE](NOTICE) e [LICENSE](LICENSE).
+- O upstream não endossa este fork; bugs específicos das minhas mudanças devem
+  ser reportados **aqui**, não no repositório original.
+
+---
+
+## English summary
+
+This is a personal, experimental fork of
+[Lan Mouse](https://github.com/feschber/lan-mouse) focused on making the
+edge-crossing hand-off between two PCs feel like moving between two monitors.
+It is only tested on **Ubuntu 26.04 (Wayland/GNOME) + Windows 10/11**; other OS
+combinations are untested. The upstream documentation is preserved in
+[README-upstream.md](README-upstream.md). Testers and contributors are welcome:
+please open an issue with your OS versions, connection type and the `handoff:`
+debug logs. Licensed GPL-3.0-or-later; see [NOTICE](NOTICE).
