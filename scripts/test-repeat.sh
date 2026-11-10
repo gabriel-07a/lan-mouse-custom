@@ -8,6 +8,9 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Repeated release/debug cycles must not fill the disk with incremental state.
+export CARGO_INCREMENTAL=0
+
 runs=5
 cargo_args=(--workspace)
 while [[ $# -gt 0 ]]; do
