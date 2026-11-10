@@ -1318,6 +1318,39 @@ mod absolute_tracker_tests {
     }
 
     #[test]
+    fn exact_entry_coordinate_does_not_return_on_inward_motion() {
+        // Parked exactly at the left edge pixel: the user's continued motion
+        // into the screen must move the cursor, not hand control back.
+        let mut tracker = AbsoluteTracker::new_with_entry(
+            PointerEdge::Left,
+            1,
+            vec![(0.0, 0.0, W, H)],
+            1.0,
+            1.0,
+            Some(0.5),
+        )
+        .expect("left tracker");
+        assert_eq!(tracker.absolute(), (0.0, 800.0));
+        assert_eq!(tracker.apply(100.0, 0.0), None);
+        assert_eq!(tracker.apply(50.0, 10.0), None);
+        // A real push back through the edge still hands control back.
+        assert_eq!(tracker.apply(-160.0, 0.0), Some(PointerEdge::Left));
+
+        let mut right = AbsoluteTracker::new_with_entry(
+            PointerEdge::Right,
+            1,
+            vec![(0.0, 0.0, W, H)],
+            1.0,
+            1.0,
+            Some(0.5),
+        )
+        .expect("right tracker");
+        assert_eq!(right.absolute(), (W - 1.0, 800.0));
+        assert_eq!(right.apply(-100.0, 0.0), None);
+        assert_eq!(right.apply(110.0, 0.0), Some(PointerEdge::Right));
+    }
+
+    #[test]
     fn moving_inside_the_screen_never_returns() {
         let mut tracker = tracker(PointerEdge::Left);
         assert_eq!(tracker.apply(100.0, 0.0), None);
