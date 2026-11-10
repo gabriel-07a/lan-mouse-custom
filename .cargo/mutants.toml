@@ -14,3 +14,13 @@ exclude_globs = [
   "lan-mouse-gtk/**",
   "lan-mouse-gpui/**",
 ]
+
+# Equivalent mutants that no test can distinguish (documented in
+# docs/testing/mutation.md):
+# - `1 << 0` and `1 >> 0` are both 1;
+# - the advertised capability bits are disjoint, so `a | b` and `a ^ b` are
+#   the same value for the fixed capability set.
+exclude_re = [
+  "replace << with >>",
+  "replace \\| with \\^",
+]
