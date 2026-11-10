@@ -741,6 +741,7 @@ impl EmulationProxy {
             next_id: 0,
             selected_backend,
             pending_remote: None,
+            handoff_armed_at: None,
             allow_portal,
             absolute_sensitivity: 1.0,
         };
@@ -856,6 +857,9 @@ struct EmulationTask {
     /// RemoteEnter/RemoteLeave received while the backend was still being
     /// created: they must not be dropped (the service does not re-send Enter).
     pending_remote: Option<(PointerEdge, Option<f32>)>,
+    /// When the backend was armed for the current hand-off; used to log the
+    /// first injected input latency (debug only).
+    handoff_armed_at: Option<Instant>,
     /// Whether the portal-backed backend may be selected (persisted consent or
     /// an explicit user enable).
     allow_portal: bool,
@@ -1026,6 +1030,12 @@ impl EmulationTask {
         if self.closed.contains(&addr) {
             return Ok(());
         }
+        if let Some(armed) = self.handoff_armed_at.take() {
+            log::debug!(
+                "handoff: first input applied {} us after arming",
+                armed.elapsed().as_micros()
+            );
+        }
         let handle = match self.handles.get(&addr) {
             Some(&handle) => handle,
             None => {
@@ -1113,6 +1123,7 @@ impl EmulationTask {
         // the edge so absolute tracking arms for this session.
         if let Some((edge, along)) = self.pending_remote {
             emulation.begin_remote_control(edge, along).await;
+            self.handoff_armed_at = Some(Instant::now());
         }
 
         // The input that triggered the (lazy) backend start is injected first so
@@ -1192,9 +1203,11 @@ impl EmulationTask {
                         // new backend instead of injecting relative-only input.
                         self.pending_remote = Some((edge, along));
                         emulation.begin_remote_control(edge, along).await;
+                        self.handoff_armed_at = Some(Instant::now());
                     }
                     ProxyRequest::RemoteLeave => {
                         self.pending_remote = None;
+                        self.handoff_armed_at = None;
                         emulation.end_remote_control().await;
                     }
                     ProxyRequest::SetAbsoluteSensitivity(gain) => {

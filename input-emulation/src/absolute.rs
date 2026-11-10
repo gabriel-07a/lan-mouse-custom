@@ -239,6 +239,92 @@ pub(crate) fn entry_anchor_fraction(
     }
 }
 
+/// Like [`entry_anchor_fraction`], but chooses the monitor whose edge segment
+/// contains `along` instead of clamping to the virtual-desktop bounding box.
+///
+/// Keeps the entry point on a real monitor for L-shaped or gapped layouts.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn entry_anchor_fraction_in_monitors(
+    screen: &VirtualScreen,
+    monitors: &[(i32, i32, i32, i32)],
+    edge: super::PointerEdge,
+    along: f32,
+    margin: i32,
+) -> (i32, i32) {
+    let along = f64::from(along.clamp(0.0, 1.0));
+    let (span_min, span_max) = match edge {
+        super::PointerEdge::Left | super::PointerEdge::Right => (screen.top, screen.bottom()),
+        super::PointerEdge::Top | super::PointerEdge::Bottom => (screen.left, screen.right()),
+    };
+    if span_max <= span_min {
+        return entry_anchor_fraction(screen, edge, along as f32, margin);
+    }
+    let point = f64::from(span_min) + along * f64::from(span_max - span_min);
+    let margin = margin.max(1);
+    let touches = |m: &(i32, i32, i32, i32)| {
+        let right = m.0.saturating_add(m.2).saturating_sub(1);
+        let bottom = m.1.saturating_add(m.3).saturating_sub(1);
+        match edge {
+            super::PointerEdge::Left => m.0 <= screen.left,
+            super::PointerEdge::Right => right >= screen.right(),
+            super::PointerEdge::Top => m.1 <= screen.top,
+            super::PointerEdge::Bottom => bottom >= screen.bottom(),
+        }
+    };
+    let mut best: Option<((i32, i32, i32, i32), f64)> = None;
+    for m in monitors
+        .iter()
+        .copied()
+        .filter(|m| m.2 > 0 && m.3 > 0)
+        .filter(touches)
+    {
+        let (lo, hi) = match edge {
+            super::PointerEdge::Left | super::PointerEdge::Right => {
+                (m.1, m.1.saturating_add(m.3).saturating_sub(1))
+            }
+            super::PointerEdge::Top | super::PointerEdge::Bottom => {
+                (m.0, m.0.saturating_add(m.2).saturating_sub(1))
+            }
+        };
+        let clamped = point.clamp(f64::from(lo), f64::from(hi));
+        let distance = (clamped - point).abs();
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_distance)| distance < *best_distance)
+        {
+            best = Some((m, distance));
+        }
+    }
+    let Some((m, _)) = best else {
+        return entry_anchor_fraction(screen, edge, along as f32, margin);
+    };
+    let (lo, hi) = match edge {
+        super::PointerEdge::Left | super::PointerEdge::Right => {
+            (m.1, m.1.saturating_add(m.3).saturating_sub(1))
+        }
+        super::PointerEdge::Top | super::PointerEdge::Bottom => {
+            (m.0, m.0.saturating_add(m.2).saturating_sub(1))
+        }
+    };
+    let anchor_along = point.clamp(f64::from(lo), f64::from(hi)).round() as i32;
+    match edge {
+        super::PointerEdge::Left => (m.0.saturating_add(margin), anchor_along),
+        super::PointerEdge::Right => (
+            m.0.saturating_add(m.2)
+                .saturating_sub(1)
+                .saturating_sub(margin),
+            anchor_along,
+        ),
+        super::PointerEdge::Top => (anchor_along, m.1.saturating_add(margin)),
+        super::PointerEdge::Bottom => (
+            anchor_along,
+            m.1.saturating_add(m.3)
+                .saturating_sub(1)
+                .saturating_sub(margin),
+        ),
+    }
+}
+
 /// Throttled, bounded retry latch for the return hand-off requests.
 ///
 /// The Windows backend asks the peer to release its capture whenever the
@@ -393,6 +479,45 @@ mod tests {
         assert_eq!(
             entry_anchor_fraction(&screen, super::super::PointerEdge::Bottom, 1.0, 1),
             (1919, 1078)
+        );
+    }
+
+    #[test]
+    fn entry_anchor_fraction_in_monitors_stays_on_the_touched_monitor() {
+        // L-shaped layout: top-left and bottom-right monitors only. The
+        // fraction is relative to the virtual desktop, but the anchor must land
+        // on a real monitor instead of the empty top-right/bottom-left gaps.
+        let monitors = [(0, 0, 1920, 1080), (1920, 1080, 1920, 1080)];
+        let screen = VirtualScreen::from_monitors(&monitors).expect("screen");
+        assert_eq!(
+            entry_anchor_fraction_in_monitors(
+                &screen,
+                &monitors,
+                super::super::PointerEdge::Right,
+                0.75,
+                1
+            ),
+            (3838, 1619)
+        );
+        assert_eq!(
+            entry_anchor_fraction_in_monitors(
+                &screen,
+                &monitors,
+                super::super::PointerEdge::Top,
+                0.25,
+                1
+            ),
+            (960, 1)
+        );
+        assert_eq!(
+            entry_anchor_fraction_in_monitors(
+                &screen,
+                &monitors,
+                super::super::PointerEdge::Bottom,
+                0.75,
+                1
+            ),
+            (2879, 2158)
         );
     }
 

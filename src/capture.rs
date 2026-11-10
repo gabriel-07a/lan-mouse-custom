@@ -108,6 +108,7 @@ impl Capture {
             conn,
             enter: EnterState::default(),
             enter_along: None,
+            handoff_begin_at: None,
             last_enter_pair: None,
             sensitivity: Default::default(),
             remote_peer: None,
@@ -392,6 +393,9 @@ struct CaptureTask {
     /// Normalised crossing coordinate along the entry edge for the current
     /// hand-off (`BeginAt`); reused by retries and repair `EnterAt` events.
     enter_along: Option<f32>,
+    /// When the current hand-off began; used to log the first motion latency
+    /// (debug only).
+    handoff_begin_at: Option<Instant>,
     /// Last time an unacknowledged `Enter` was paired with input, throttled by
     /// [`ENTER_PAIR_THROTTLE`] so the retransmission is repaired quickly
     /// without flooding the link.
@@ -838,6 +842,7 @@ impl CaptureTask {
         if event.is_begin() && Some(handle) != self.active_client {
             self.active_client.replace(handle);
             self.enter_along = event.begin_along();
+            self.handoff_begin_at = Some(Instant::now());
             // The first motion of the hand-off must not wait for a batch
             // window inherited from the movement on the previous screen.
             self.coalescer.arm_leading_edge();
@@ -1074,7 +1079,15 @@ impl CaptureTask {
             dx: motion.dx,
             dy: motion.dy,
         }));
-        self.send_unreliable(handle, event).await
+        let first_after_begin = self.handoff_begin_at.take();
+        let sent = self.send_unreliable(handle, event).await;
+        if let Some(begin) = first_after_begin {
+            log::debug!(
+                "handoff: Begin -> first motion sent in {} us",
+                begin.elapsed().as_micros()
+            );
+        }
+        sent
     }
 
     async fn send_unreliable(&mut self, handle: CaptureHandle, event: ProtoEvent) -> bool {
@@ -1526,6 +1539,7 @@ mod capture_handle_tests {
             conn: LanMouseConnection::new(certificate(), ClientManager::default(), 1000),
             enter: EnterState::default(),
             enter_along: None,
+            handoff_begin_at: None,
             last_enter_pair: None,
             sensitivity: HashMap::new(),
             outgoing_caps: HashMap::new(),

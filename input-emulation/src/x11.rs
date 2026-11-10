@@ -11,7 +11,7 @@ use input_event::{
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::X11EmulationCreationError};
+use super::{Emulation, EmulationHandle, PointerEdge, error::X11EmulationCreationError};
 
 /// X11 core-protocol keycodes are evdev keycodes shifted by 8.
 const X11_KEYCODE_OFFSET: u32 = 8;
@@ -110,6 +110,34 @@ impl X11Emulation {
     fn relative_motion(&self, dx: i32, dy: i32) {
         unsafe {
             xtest::XTestFakeRelativeMotionEvent(self.display, dx, dy, 0, 0);
+        }
+    }
+
+    /// Map a normalised crossing coordinate (0.0 = top/left, 1.0 =
+    /// bottom/right) to the exact pixel of `edge` on a `width` x `height`
+    /// screen.
+    fn entry_point(edge: PointerEdge, along: f32, width: i32, height: i32) -> Option<(i32, i32)> {
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let along = f64::from(along.clamp(0.0, 1.0));
+        let x = ((along * f64::from(width - 1)).round() as i32).clamp(0, width - 1);
+        let y = ((along * f64::from(height - 1)).round() as i32).clamp(0, height - 1);
+        Some(match edge {
+            PointerEdge::Left => (0, y),
+            PointerEdge::Right => (width - 1, y),
+            PointerEdge::Top => (x, 0),
+            PointerEdge::Bottom => (x, height - 1),
+        })
+    }
+
+    /// Warp the X11 pointer to the exact entry pixel (the relative XTest
+    /// stream then continues from there).
+    fn warp_to(&self, (x, y): (i32, i32)) {
+        unsafe {
+            let root = xlib::XDefaultRootWindow(self.display);
+            xlib::XWarpPointer(self.display, 0, root, 0, 0, 0, 0, x, y);
+            xlib::XFlush(self.display);
         }
     }
 
@@ -214,6 +242,19 @@ impl Drop for X11Emulation {
 
 #[async_trait]
 impl Emulation for X11Emulation {
+    async fn begin_remote_control(&mut self, edge: PointerEdge, along: Option<f32>) {
+        let Some(along) = along else {
+            return;
+        };
+        let screen = unsafe { xlib::XDefaultScreen(self.display) };
+        let width = unsafe { xlib::XDisplayWidth(self.display, screen) };
+        let height = unsafe { xlib::XDisplayHeight(self.display, screen) };
+        if let Some((x, y)) = Self::entry_point(edge, along, width, height) {
+            self.warp_to((x, y));
+            log::info!("absolute pointer armed at ({x},{y}) on the {edge:?} entry edge");
+        }
+    }
+
     async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
@@ -328,5 +369,29 @@ mod tests {
         );
         assert_eq!(X11Emulation::scroll_button(2, 1.0), None);
         assert_eq!(X11Emulation::scroll_button(255, -1.0), None);
+    }
+
+    #[test]
+    fn entry_point_maps_each_edge() {
+        assert_eq!(
+            X11Emulation::entry_point(PointerEdge::Left, 0.5, 1920, 1080),
+            Some((0, 540))
+        );
+        assert_eq!(
+            X11Emulation::entry_point(PointerEdge::Right, 0.5, 1920, 1080),
+            Some((1919, 540))
+        );
+        assert_eq!(
+            X11Emulation::entry_point(PointerEdge::Top, 0.5, 1920, 1080),
+            Some((960, 0))
+        );
+        assert_eq!(
+            X11Emulation::entry_point(PointerEdge::Bottom, 1.0, 1920, 1080),
+            Some((1919, 1079))
+        );
+        assert_eq!(
+            X11Emulation::entry_point(PointerEdge::Left, 0.5, 0, 1080),
+            None
+        );
     }
 }

@@ -929,10 +929,14 @@ impl Service {
                 // shared edge.
                 self.capture.release();
             }
-            EmulationEvent::EdgeReturn(pos) => self.request_return(pos),
+            EmulationEvent::EdgeReturn(pos) => {
+                log::debug!("handoff: return requested through {pos:?}");
+                self.request_return(pos);
+            }
             EmulationEvent::PeerLeft { addr, fingerprint } => {
                 // The peer confirmed it released its capture: the retried
                 // return hand-off is complete.
+                log::debug!("handoff: peer {addr} released, local control returned");
                 self.return_requests.confirmed(addr);
                 self.emulation.remote_leave();
                 self.peer_released(addr, &fingerprint);

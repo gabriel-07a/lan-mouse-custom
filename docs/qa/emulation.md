@@ -250,7 +250,9 @@ Goal: crossing into the other machine should feel like moving the pointer onto a
 3. **Receiver parks the cursor exactly at the crossing point.** `Emulation::begin_remote_control` now takes
    the optional `along`. libei picks the monitor region that contains the coordinate and anchors at the
    exact edge pixel (no more 24 px inset) while keeping `RETURN_MARGIN_PX`; Windows uses
-   `entry_anchor_fraction()` for the same purpose. `None` keeps the old edge-centre/current-cursor fallback.
+   `entry_anchor_fraction_in_monitors()`, which keeps the anchor on a real monitor in L-shaped layouts;
+   X11 warps with `XWarpPointer` before the relative stream continues. `None` keeps the old
+   edge-centre/current-cursor fallback.
 4. **Arming before the first injected motion.** The listener arms the backend directly when it handles
    `Enter`/`EnterAt`, before the `Ack` and before any queued `Input`, so the first delta starts from the
    entry coordinate. The service no longer re-arms on `Entered` (that warped the cursor after the first
@@ -259,3 +261,7 @@ Goal: crossing into the other machine should feel like moving the pointer onto a
 5. **Leading edge for the first motion.** `MotionCoalescer::arm_leading_edge()` makes the first motion of a
    hand-off flush immediately instead of waiting for the 2 ms batch window inherited from the previous
    screen.
+6. **Instrumentation.** With `LAN_MOUSE_LOG_LEVEL=debug` the log shows one line per hand-off:
+   `handoff: armed <edge> along <...> before Ack` on the receiver, `handoff: first input applied N us after
+   arming`, and on the sender `handoff: Begin -> first motion sent in N us`. The return path logs
+   `handoff: return requested through <edge>` and `handoff: peer <addr> released, local control returned`.

@@ -40,8 +40,8 @@ use windows::core::BOOL;
 use super::{
     EdgeReturnNotifier, Emulation, EmulationHandle, PointerEdge,
     absolute::{
-        ENTRY_ANCHOR_MARGIN, EdgeReturnLatch, VirtualScreen, entry_anchor, entry_anchor_fraction,
-        logical_to_physical, overshoot_edge,
+        ENTRY_ANCHOR_MARGIN, EdgeReturnLatch, VirtualScreen, entry_anchor,
+        entry_anchor_fraction_in_monitors, logical_to_physical, overshoot_edge,
     },
 };
 
@@ -145,7 +145,7 @@ impl WindowsEmulation {
             .screen_checked
             .is_none_or(|checked| checked.elapsed() > SCREEN_CACHE_TTL);
         if stale || self.screen.is_some_and(|screen| !screen.contains(cursor)) {
-            self.screen = unsafe { virtual_screen() };
+            self.screen = unsafe { virtual_screen() }.map(|(screen, _)| screen);
             self.screen_checked = Some(Instant::now());
         }
 
@@ -334,9 +334,11 @@ impl Emulation for WindowsEmulation {
         // of jitter, parked elsewhere the first deltas clamp at another edge
         // and the pointer looks frozen until the user pulls the other way.
         match unsafe { virtual_screen() } {
-            Some(screen) => {
+            Some((screen, monitors)) => {
                 let (x, y) = match along {
-                    Some(along) => entry_anchor_fraction(&screen, edge, along, 1),
+                    Some(along) => {
+                        entry_anchor_fraction_in_monitors(&screen, &monitors, edge, along, 1)
+                    }
                     None => {
                         let along = match cursor_pos() {
                             Some(point)
@@ -474,7 +476,7 @@ fn rel_mouse(dx: i32, dy: i32) {
 /// per-monitor-DPI-aware thread gets physical pixel coordinates from
 /// `GetCursorPos`. On a scaled display that mismatch makes the bottom part of
 /// the screen normalise to 65535, which sticks the pointer to the bottom edge.
-unsafe fn virtual_screen() -> Option<VirtualScreen> {
+unsafe fn virtual_screen() -> Option<(VirtualScreen, Vec<(i32, i32, i32, i32)>)> {
     let mut monitors: Vec<(i32, i32, i32, i32)> = Vec::new();
     let ok = unsafe {
         EnumDisplayMonitors(
@@ -487,15 +489,15 @@ unsafe fn virtual_screen() -> Option<VirtualScreen> {
     if !ok.as_bool() {
         return None;
     }
-    let screen = VirtualScreen::from_monitors(&monitors);
-    if screen.is_none() {
+    let Some(screen) = VirtualScreen::from_monitors(&monitors) else {
         warn_once(
             &SCREEN_ENUM_WARNED,
             "windows: could not enumerate the display monitors, \
              falling back to relative mouse movement",
         );
-    }
-    screen
+        return None;
+    };
+    Some((screen, monitors))
 }
 
 unsafe extern "system" fn monitor_enum_proc(
