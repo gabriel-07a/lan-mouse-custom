@@ -15,7 +15,9 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{
+    GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
@@ -390,6 +392,19 @@ fn start_routine(
         // The return value is the previous context (null when the thread had
         // none), not a success flag: keep the call unconditional.
         let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
+    // This thread owns the low level hooks and the RAWINPUT message pump. If a
+    // CPU hog (game, build, browser) saturates the machine while it runs at
+    // normal priority, the scheduler can delay the delivery of a mouse packet
+    // by a full quantum (~15 ms), which is felt as input lag. Raising the
+    // priority does not bypass the USB/ISR path, but it keeps the hook thread
+    // runnable as soon as the input is queued, which is what remote-desktop
+    // implementations do for their capture threads.
+    unsafe {
+        if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
+            log::warn!("could not raise the capture thread priority: {e}");
+        }
     }
 
     let mouse_proc: HOOKPROC = Some(mouse_proc);

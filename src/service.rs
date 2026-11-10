@@ -1323,6 +1323,12 @@ impl Service {
     fn request_handoff(&mut self, addr: SocketAddr) {
         let serial = self.next_return_serial();
         self.return_requests.request(addr, serial, Instant::now());
+        // DTLS application data is not retransmitted, so a single lost request
+        // stalls the hand-off until the retry timer. Send the first request
+        // twice: the peer answers both copies with the same `Leave(serial)`
+        // confirmation (the serial makes the request idempotent), so an
+        // isolated packet loss costs nothing visible.
+        self.emulation.send_leave_request(addr, serial);
         self.emulation.send_leave_request(addr, serial);
     }
 
