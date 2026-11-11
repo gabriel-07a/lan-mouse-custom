@@ -2537,9 +2537,7 @@ impl Service {
     /// client for that IP whose hostname is still blank or just the IP string,
     /// upgrade the client's hostname in-place so the UI shows the computer name.
     fn apply_discovered_hostname(&mut self, device: &DiscoveredDevice) {
-        let Some(hostname) = device.hostname.as_deref() else {
-            return;
-        };
+        let hostname = device.hostname.as_deref();
         // Address first, then certificate identity, then the display name:
         // a saved client created by pairing may have no configured address and
         // only its hostname, which is exactly the case where DNS failure made
@@ -2553,6 +2551,7 @@ impl Service {
                     .and_then(|fingerprint| self.client_with_fingerprint(fingerprint))
             })
             .or_else(|| {
+                let hostname = hostname?;
                 self.client_manager
                     .registered_clients()
                     .into_iter()
@@ -2566,9 +2565,10 @@ impl Service {
         let Some(handle) = handle else {
             return;
         };
-        let mut changed = self
-            .client_manager
-            .upgrade_hostname_from_discovery(handle, hostname);
+        let mut changed = hostname.is_some_and(|hostname| {
+            self.client_manager
+                .upgrade_hostname_from_discovery(handle, hostname)
+        });
         if self
             .client_manager
             .learn_address_from_discovery(handle, device.ip)
