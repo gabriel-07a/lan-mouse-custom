@@ -3092,6 +3092,7 @@ impl Dashboard {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .child(
@@ -3143,12 +3144,19 @@ impl Dashboard {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(format!(
-                        "listening port {} · build {}",
-                        self.port, local_commit
-                    )))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child(format!(
+                                "listening port {} · build {}",
+                                self.port, local_commit
+                            )),
+                    )
                     .child(self.action_button(
                         "change-port",
                         self.tr("Change port"),
@@ -3164,49 +3172,57 @@ impl Dashboard {
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap_2()
+                    .flex_col()
+                    .gap_1()
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(rgb(TEXT))
-                            .child(self.tr("Cursor speed while controlled remotely")),
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(TEXT))
+                                    .child(self.tr("Cursor speed while controlled remotely")),
+                            )
+                            .child(self.action_button(
+                                "abs-sensitivity-down",
+                                "-",
+                                0x1d2430,
+                                TEXT,
+                                cx,
+                                |this, _, _, _| {
+                                    let next = this.absolute_sensitivity.saturating_sub(10).max(10);
+                                    this.send(FrontendRequest::SetAbsoluteSensitivity(next));
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(TEXT))
+                                    .child(format!("{}%", self.absolute_sensitivity)),
+                            )
+                            .child(self.action_button(
+                                "abs-sensitivity-up",
+                                "+",
+                                0x1d2430,
+                                TEXT,
+                                cx,
+                                |this, _, _, _| {
+                                    let next = (this.absolute_sensitivity + 10).min(500);
+                                    this.send(FrontendRequest::SetAbsoluteSensitivity(next));
+                                },
+                            )),
                     )
-                    .child(self.action_button(
-                        "abs-sensitivity-down",
-                        "-",
-                        0x1d2430,
-                        TEXT,
-                        cx,
-                        |this, _, _, _| {
-                            let next = this.absolute_sensitivity.saturating_sub(10).max(10);
-                            this.send(FrontendRequest::SetAbsoluteSensitivity(next));
-                        },
-                    ))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(TEXT))
-                            .child(format!("{}%", self.absolute_sensitivity)),
-                    )
-                    .child(self.action_button(
-                        "abs-sensitivity-up",
-                        "+",
-                        0x1d2430,
-                        TEXT,
-                        cx,
-                        |this, _, _, _| {
-                            let next = (this.absolute_sensitivity + 10).min(500);
-                            this.send(FrontendRequest::SetAbsoluteSensitivity(next));
-                        },
-                    ))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(
+                    .child(div().w_full().text_xs().text_color(rgb(MUTED)).child(
                         self.tr("applies when another PC controls this computer; 100% = 1:1"),
                     )),
             )
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(self.action_button(
                         "save-config",
