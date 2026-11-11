@@ -872,75 +872,6 @@ async fn verify_connected_peer(
     }
 }
 
-/// Dial a pinned client, recovering from a rotated certificate.
-///
-/// A pinned certificate that no longer matches the peer makes the DTLS
-/// handshake fail. If the certificate the peer now presents is *already* a
-/// known/authorized device on this machine, the stored pin is stale (the peer
-/// reinstalled or was re-paired) and blocking the user until they delete and
-/// re-create the client is unnecessary and surprising. Re-pin to that known
-/// certificate and continue on the same transport.
-///
-/// Anything less than a known device keeps the original failure: a changed
-/// identity must never be trusted silently.
-async fn connect_with_certificate_rotation(
-    ctx: &ConnCtx,
-    handle: ClientHandle,
-    addrs: Vec<SocketAddr>,
-    expected: Option<String>,
-    cert: Certificate,
-) -> Result<(ArcConn, SocketAddr), LanMouseConnectionError> {
-    let first = connect_first(
-        addrs.clone(),
-        cert.clone(),
-        ADDRESS_TIMEOUT,
-        expected.clone(),
-    )
-    .await;
-    let first_error = match first {
-        Ok(connected) => return Ok(connected),
-        Err(error) => error,
-    };
-
-    // A pinned mismatch surfaces as a DTLS/WebRTC handshake failure, but the
-    // exact variant differs between platforms (the Windows stack can report a
-    // timeout instead). Retrying unpinned on these variants is safe because
-    // the resulting certificate is only accepted when it is already a known
-    // device; a plain unreachable-address error keeps its original failure.
-    if expected.is_none()
-        || !matches!(
-            &first_error,
-            LanMouseConnectionError::Dtls(_)
-                | LanMouseConnectionError::Webrtc(_)
-                | LanMouseConnectionError::Timeout
-        )
-    {
-        return Err(first_error);
-    }
-
-    let Ok((conn, addr)) = connect_first(addrs, cert, ADDRESS_TIMEOUT, None).await else {
-        return Err(first_error);
-    };
-    let Some(actual) = peer_fingerprint(&conn).await else {
-        let _ = conn.close().await;
-        return Err(first_error);
-    };
-    let known = ctx
-        .devices
-        .as_ref()
-        .is_some_and(|devices| devices.read().expect("lock").is_known(&actual));
-    if pin_decision(expected.as_deref().unwrap_or_default(), &actual, known) == PinDecision::Reject
-    {
-        log::warn!(
-            "client {handle} presented a changed certificate {actual} that is not a known device; keeping the pinned failure"
-        );
-        let _ = conn.close().await;
-        return Err(first_error);
-    }
-
-    Ok((conn, addr))
-}
-
 async fn connect_to_handle(
     ctx: &ConnCtx,
     handle: ClientHandle,
@@ -973,14 +904,13 @@ async fn connect_to_handle(
 
         log::info!("client ({handle}) connecting ... (ordered addresses: {addrs:?})");
         let expected = ctx.client_manager.fingerprint(handle);
-        let (conn, addr) = connect_with_certificate_rotation(
-            ctx,
-            handle,
-            addrs,
-            expected.clone(),
-            ctx.cert.clone(),
-        )
-        .await?;
+        // Dial without the DTLS verifier callback even when a pin exists: the
+        // callback behaves differently across DTLS stacks (Windows can
+        // complete or time out a mismatched handshake), and recovering from a
+        // rotated certificate needs a second handshake otherwise. The pin is
+        // enforced on the completed connection below, before it is installed
+        // or any application data is exchanged.
+        let (conn, addr) = connect_first(addrs, ctx.cert.clone(), ADDRESS_TIMEOUT, None).await?;
         verify_connected_peer(ctx, handle, &conn, expected.as_deref()).await?;
         log::info!("client ({handle}) connected @ {addr}");
 
