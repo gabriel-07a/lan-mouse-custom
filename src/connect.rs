@@ -41,6 +41,8 @@ pub(crate) enum LanMouseConnectionError {
     TargetEmulationDisabled,
     #[error("Connection timed out")]
     Timeout,
+    #[error("peer certificate mismatch: expected {expected}, got {actual}")]
+    CertificateMismatch { expected: String, actual: String },
 }
 
 /// Per-address DTLS handshake budget. Addresses are dialed one after the
@@ -804,6 +806,72 @@ async fn connect_first(
     Err(last_error)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinDecision {
+    Match,
+    /// Different certificate, but already a known/authorized device.
+    RotateKnown,
+    Reject,
+}
+
+/// Decide what a presented peer certificate means against the saved pin.
+fn pin_decision(expected: &str, actual: &str, actual_known: bool) -> PinDecision {
+    if expected.eq_ignore_ascii_case(actual) {
+        PinDecision::Match
+    } else if actual_known {
+        PinDecision::RotateKnown
+    } else {
+        PinDecision::Reject
+    }
+}
+
+/// Verify (and, for a known device, refresh) the certificate the peer actually
+/// presented.
+///
+/// The DTLS verifier is the first line of defence, but its callback behaviour
+/// differs between the Linux and Windows stacks; enforcing the pin again on the
+/// completed connection makes a rotated identity reliable everywhere.
+async fn verify_connected_peer(
+    ctx: &ConnCtx,
+    handle: ClientHandle,
+    conn: &ArcConn,
+    expected: Option<&str>,
+) -> Result<(), LanMouseConnectionError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let Some(actual) = peer_fingerprint(conn).await else {
+        let _ = conn.close().await;
+        return Err(LanMouseConnectionError::NotConnected);
+    };
+    let known = ctx
+        .devices
+        .as_ref()
+        .is_some_and(|devices| devices.read().expect("lock").is_known(&actual));
+    match pin_decision(expected, &actual, known) {
+        PinDecision::Match => Ok(()),
+        PinDecision::RotateKnown => {
+            log::warn!(
+                "client {handle} presented a rotated certificate already known as {actual}; re-pinning and connecting"
+            );
+            ctx.client_manager
+                .set_fingerprint(handle, Some(actual.clone()));
+            ctx.notify_state_changed(handle);
+            Ok(())
+        }
+        PinDecision::Reject => {
+            log::warn!(
+                "client {handle} presented a changed certificate {actual} that is not a known device; rejecting"
+            );
+            let _ = conn.close().await;
+            Err(LanMouseConnectionError::CertificateMismatch {
+                expected: expected.to_string(),
+                actual,
+            })
+        }
+    }
+}
+
 /// Dial a pinned client, recovering from a rotated certificate.
 ///
 /// A pinned certificate that no longer matches the peer makes the DTLS
@@ -861,7 +929,8 @@ async fn connect_with_certificate_rotation(
         .devices
         .as_ref()
         .is_some_and(|devices| devices.read().expect("lock").is_known(&actual));
-    if !known {
+    if pin_decision(expected.as_deref().unwrap_or_default(), &actual, known) == PinDecision::Reject
+    {
         log::warn!(
             "client {handle} presented a changed certificate {actual} that is not a known device; keeping the pinned failure"
         );
@@ -869,12 +938,6 @@ async fn connect_with_certificate_rotation(
         return Err(first_error);
     }
 
-    log::warn!(
-        "client {handle} presented a rotated certificate already known as {actual}; re-pinning and connecting"
-    );
-    ctx.client_manager
-        .set_fingerprint(handle, Some(actual.clone()));
-    ctx.notify_state_changed(handle);
     Ok((conn, addr))
 }
 
@@ -918,6 +981,7 @@ async fn connect_to_handle(
             ctx.cert.clone(),
         )
         .await?;
+        verify_connected_peer(ctx, handle, &conn, expected.as_deref()).await?;
         log::info!("client ({handle}) connected @ {addr}");
 
         // A dial can race the peer's AuthRevoke (or a local deactivate). The
@@ -2547,6 +2611,14 @@ mod tests {
                 listener.terminate().await;
             })
             .await;
+    }
+
+    #[test]
+    fn pin_decision_distinguishes_match_rotation_and_impersonation() {
+        assert_eq!(pin_decision("aa", "aa", false), PinDecision::Match);
+        assert_eq!(pin_decision("AA", "aa", false), PinDecision::Match);
+        assert_eq!(pin_decision("aa", "bb", true), PinDecision::RotateKnown);
+        assert_eq!(pin_decision("aa", "bb", false), PinDecision::Reject);
     }
 
     /// With a pinned fingerprint the dialer must refuse a server that
