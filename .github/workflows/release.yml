@@ -19,21 +19,21 @@ env:
 
 jobs:
   linux-release-build:
-    # ubuntu-22.04 runner images now fail the apt dependency step (persistent
-    # package/mirror issue). 24.04 provides the same GTK/wayland/X11 headers and
-    # is what the current CI images use.
+    # The hosted Ubuntu runner's apt step is currently failing/hanging before
+    # the build starts. Build inside a Debian bookworm Rust container instead:
+    # dependencies come from the container image's own apt, independent of the
+    # runner's package state.
     runs-on: ubuntu-24.04
+    container: rust:bookworm
     steps:
       - uses: actions/checkout@v4
       - name: install dependencies
-        # Skip `apt-get update`: the hosted runner already has package lists,
-        # and the update step currently hangs/fails on these images. The
-        # timeout keeps a broken mirror from stalling the release for hours.
         run: |
-          sudo timeout 180 apt-get install -y --no-install-recommends \
-            libx11-dev libxtst-dev \
-            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
-            libfontconfig1-dev libfreetype-dev librsvg2-bin imagemagick
+          apt-get update
+          timeout 300 apt-get install -y --no-install-recommends \
+            libx11-dev libxtst-dev libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libxcb1-dev libfontconfig1-dev \
+            libfreetype-dev librsvg2-bin imagemagick
       - name: Release build
         run: cargo build --release --locked
       - name: Build GPUI frontend
@@ -44,8 +44,6 @@ jobs:
           cp target/release/lan-mouse-gpui lan-mouse-gpui-linux-x86_64
           tar -czf lan-mouse-custom-linux-x86_64.tar.gz -C target/release lan-mouse lan-mouse-gpui
       - name: Build .deb
-        # cargo-bundle is not used: version 0.12 pulls in sigstore, which no
-        # longer compiles with current rustc.
         run: |
           version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           ./scripts/package-deb.sh "$version"
