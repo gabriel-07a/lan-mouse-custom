@@ -476,7 +476,10 @@ fn rel_mouse(dx: i32, dy: i32) {
 /// per-monitor-DPI-aware thread gets physical pixel coordinates from
 /// `GetCursorPos`. On a scaled display that mismatch makes the bottom part of
 /// the screen normalise to 65535, which sticks the pointer to the bottom edge.
-unsafe fn virtual_screen() -> Option<(VirtualScreen, Vec<(i32, i32, i32, i32)>)> {
+type MonitorRect = (i32, i32, i32, i32);
+type MonitorRects = Vec<MonitorRect>;
+
+unsafe fn virtual_screen() -> Option<(VirtualScreen, MonitorRects)> {
     let mut monitors: Vec<(i32, i32, i32, i32)> = Vec::new();
     let ok = unsafe {
         EnumDisplayMonitors(

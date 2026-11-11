@@ -834,9 +834,19 @@ async fn connect_with_certificate_rotation(
         Err(error) => error,
     };
 
-    // Only a DTLS failure can be a certificate mismatch; retrying on timeouts
-    // or an empty address set would just double the reconnect latency.
-    if expected.is_none() || !matches!(&first_error, LanMouseConnectionError::Dtls(_)) {
+    // A pinned mismatch surfaces as a DTLS/WebRTC handshake failure, but the
+    // exact variant differs between platforms (the Windows stack can report a
+    // timeout instead). Retrying unpinned on these variants is safe because
+    // the resulting certificate is only accepted when it is already a known
+    // device; a plain unreachable-address error keeps its original failure.
+    if expected.is_none()
+        || !matches!(
+            &first_error,
+            LanMouseConnectionError::Dtls(_)
+                | LanMouseConnectionError::Webrtc(_)
+                | LanMouseConnectionError::Timeout
+        )
+    {
         return Err(first_error);
     }
 
