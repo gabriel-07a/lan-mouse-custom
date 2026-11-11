@@ -927,7 +927,9 @@ impl Dashboard {
             add_focus: cx.focus_handle(),
             address_rules: Vec::new(),
             authorized: std::collections::HashMap::new(),
-            status: "Connecting to Lan Mouse service…".to_string(),
+            status: Language::load()
+                .tr("Connecting to Lan Mouse service…")
+                .to_string(),
             page: Page::Devices,
             selected_client: None,
             hostname: hostname::get()
@@ -984,7 +986,7 @@ impl Dashboard {
                 let _ = writer.request(FrontendRequest::ListHistory { limit: 20 });
                 let _ = writer.request(FrontendRequest::Sync);
                 self.writer = Some(writer);
-                self.status = "Connected to service".to_string();
+                self.status = self.tr("Connected to service").to_string();
                 log::info!("GPUI frontend connected to the Lan Mouse service");
             }
             BridgeMessage::Event(event) => self.handle_event(*event),
@@ -1457,7 +1459,7 @@ impl Dashboard {
             return;
         }
         self.scan_requested_at = Some(std::time::Instant::now());
-        self.status = "Scanning the local network…".to_string();
+        self.status = self.tr("Scanning the local network…").to_string();
         self.send(FrontendRequest::ScanNetwork);
     }
 
@@ -1974,7 +1976,7 @@ impl Dashboard {
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child("RTT history (last samples)"),
+                    .child(self.tr("RTT history (last samples)")),
             )
             .child(
                 div()
@@ -2354,34 +2356,36 @@ impl Dashboard {
         let focus = self.add_focus.clone();
         let (title, hint, fields) = match dialog.kind {
             SettingsDialogKind::Address => (
-                "Add allowed address",
-                "IPv4 address or CIDR. Tab switches fields, Enter saves, Esc cancels.",
+                self.tr("Add allowed address"),
+                self.tr("IPv4 address or CIDR. Tab switches fields, Enter saves, Esc cancels."),
                 vec![("address", dialog.address.clone())],
             ),
             SettingsDialogKind::Certificate => (
-                "Authorize certificate",
-                "Fingerprint and display name of the peer. Tab switches fields.",
+                self.tr("Authorize certificate"),
+                self.tr("Fingerprint and display name of the peer. Tab switches fields."),
                 vec![
                     ("name", dialog.name.clone()),
                     ("fingerprint", dialog.fingerprint.clone()),
                 ],
             ),
             SettingsDialogKind::Client { .. } => (
-                "Edit client",
-                "Hostname/IP and port. Leave the hostname empty to use the address.",
+                self.tr("Edit client"),
+                self.tr("Hostname/IP and port. Leave the hostname empty to use the address."),
                 vec![
                     ("hostname / IP", dialog.hostname.clone()),
                     ("port", dialog.port.clone()),
                 ],
             ),
             SettingsDialogKind::RenameDevice { .. } => (
-                "Rename device",
-                "Display name only; the certificate fingerprint stays the identity.",
+                self.tr("Rename device"),
+                self.tr("Display name only; the certificate fingerprint stays the identity."),
                 vec![("display name", dialog.name.clone())],
             ),
             SettingsDialogKind::Port => (
-                "Change listening port",
-                "The UDP listener is recreated on this port. Peers must use the same port.",
+                self.tr("Change listening port"),
+                self.tr(
+                    "The UDP listener is recreated on this port. Peers must use the same port.",
+                ),
                 vec![("port", dialog.port.clone())],
             ),
         };
@@ -2401,7 +2405,7 @@ impl Dashboard {
                     div()
                         .text_xs()
                         .text_color(rgb(if active { ACCENT } else { MUTED }))
-                        .child(label),
+                        .child(self.tr(label)),
                 )
                 .child(
                     div()
@@ -2444,7 +2448,7 @@ impl Dashboard {
                     .gap_2()
                     .child(self.action_button(
                         "settings-dialog-submit",
-                        "Save",
+                        self.tr("Save"),
                         ACCENT,
                         0x081018,
                         cx,
@@ -2452,7 +2456,7 @@ impl Dashboard {
                     ))
                     .child(self.action_button(
                         "settings-dialog-cancel",
-                        "Cancel",
+                        self.tr("Cancel"),
                         0x1d222a,
                         TEXT,
                         cx,
@@ -2673,7 +2677,7 @@ impl Dashboard {
                     ))
                     .child(self.action_button(
                         "add-dialog-cancel",
-                        "Cancel",
+                        self.tr("Cancel"),
                         0x1d222a,
                         TEXT,
                         cx,
@@ -2935,7 +2939,7 @@ impl Dashboard {
                             div()
                                 .text_2xl()
                                 .text_color(rgb(MUTED))
-                                .child("No devices yet"),
+                                .child(self.tr("No devices yet")),
                         )
                         .child(
                             div()
@@ -3022,7 +3026,7 @@ impl Dashboard {
                             .gap_2()
                             .child(self.action_button(
                                 "pairing-keep",
-                                "Keep",
+                                self.tr("Keep"),
                                 GREEN,
                                 0x081018,
                                 cx,
@@ -3030,7 +3034,7 @@ impl Dashboard {
                             ))
                             .child(self.action_button(
                                 "pairing-revoke",
-                                "Revoke",
+                                self.tr("Revoke"),
                                 0x3a2020,
                                 RED,
                                 cx,
@@ -3056,11 +3060,11 @@ impl Dashboard {
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(AMBER))
-                    .child(format!("Pairing review ({})", rows.len())),
+                    .child(format!("{} ({})", self.tr("Pairing review"), rows.len())),
             )
-            .child(div().text_xs().text_color(rgb(MUTED)).child(
-                "Devices adopted while the pairing window was open. Keep them or revoke access.",
-            ))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr(
+                self.tr("Devices adopted while the pairing window was open. Keep them or revoke access."),
+            )))
             .children(rows)
     }
 
@@ -3275,17 +3279,17 @@ impl Dashboard {
             .diagnostics
             .session_type
             .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| self.tr("unknown").to_string());
         let desktop = self
             .diagnostics
             .desktop
             .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| self.tr("unknown").to_string());
         let clipboard_backend = self
             .diagnostics
             .clipboard_backend
             .clone()
-            .unwrap_or_else(|| "unavailable".to_string());
+            .unwrap_or_else(|| self.tr("unavailable").to_string());
         let mut history_rows = Vec::new();
         let now_ms = unix_ms_now();
         for entry in self.history.iter().take(8) {
@@ -3327,8 +3331,11 @@ impl Dashboard {
         let exported = self
             .policy_export
             .as_ref()
-            .map(|json| format!("{} bytes ready", json.len()))
-            .unwrap_or_else(|| "not exported yet".to_string());
+            .map(|json| match self.language {
+                Language::PortugueseBrazil => format!("{} bytes prontos", json.len()),
+                Language::English => format!("{} bytes ready", json.len()),
+            })
+            .unwrap_or_else(|| self.tr("not exported yet").to_string());
         div()
             .flex()
             .flex_col()
@@ -3343,26 +3350,39 @@ impl Dashboard {
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child("Diagnostics & history"),
+                    .child(self.tr("Diagnostics & history")),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(format!(
-                        "capture: {capture} · emulation: {emulation} · session: {session} · desktop: {desktop} · clipboard: {clipboard_backend}"
-                    )),
+                    .child(match self.language {
+                        Language::PortugueseBrazil => format!(
+                            "captura: {capture} · emulação: {emulation} · sessão: {session} · desktop: {desktop} · clipboard: {clipboard_backend}"
+                        ),
+                        Language::English => format!(
+                            "capture: {capture} · emulation: {emulation} · session: {session} · desktop: {desktop} · clipboard: {clipboard_backend}"
+                        ),
+                    }),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(format!(
-                        "protocol v{} · capabilities {:#x} · port {}",
-                        self.diagnostics.proto_version,
-                        self.diagnostics.capabilities,
-                        self.diagnostics.port
-                    )),
+                    .child(match self.language {
+                        Language::PortugueseBrazil => format!(
+                            "protocolo v{} · capacidades {:#x} · porta {}",
+                            self.diagnostics.proto_version,
+                            self.diagnostics.capabilities,
+                            self.diagnostics.port
+                        ),
+                        Language::English => format!(
+                            "protocol v{} · capabilities {:#x} · port {}",
+                            self.diagnostics.proto_version,
+                            self.diagnostics.capabilities,
+                            self.diagnostics.port
+                        ),
+                    }),
             )
             .child(
                 div()
@@ -3370,7 +3390,7 @@ impl Dashboard {
                     .gap_2()
                     .child(self.action_button(
                         "export-policy",
-                        "Export policy",
+                        self.tr("Export policy"),
                         0x1d2430,
                         TEXT,
                         cx,
@@ -3380,7 +3400,7 @@ impl Dashboard {
                     ))
                     .child(self.action_button(
                         "copy-policy",
-                        "Copy exported",
+                        self.tr("Copy exported"),
                         0x1d2430,
                         TEXT,
                         cx,
@@ -3421,19 +3441,25 @@ impl Dashboard {
                     .child(self.tr("About")),
             )
             .child(div().text_sm().text_color(rgb(TEXT)).child(
-                "Lan Mouse — unofficial fork · GPUI frontend · GPL-3.0-or-later",
+                self.tr("Lan Mouse — unofficial fork · GPUI frontend · GPL-3.0-or-later"),
             ))
             .child(
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(format!(
-                        "build {commit} · frontend {} · {platform}",
-                        env!("CARGO_PKG_VERSION")
-                    )),
+                    .child(match self.language {
+                        Language::PortugueseBrazil => format!(
+                            "compilação {commit} · interface {} · {platform}",
+                            env!("CARGO_PKG_VERSION")
+                        ),
+                        Language::English => format!(
+                            "build {commit} · frontend {} · {platform}",
+                            env!("CARGO_PKG_VERSION")
+                        ),
+                    }),
             )
             .child(div().text_xs().text_color(rgb(MUTED)).child(
-                "The GTK frontend is still available as an opt-in fallback; the IPC/service protocol is unchanged.",
+                self.tr("The GTK frontend is still available as an opt-in fallback; the IPC/service protocol is unchanged."),
             ))
     }
 
@@ -3486,11 +3512,11 @@ impl Dashboard {
                             let verified =
                                 has_fresh_pong(&self.clients, &device.fingerprint, unix_ms_now());
                             let (label, color, background) = if verified {
-                                ("connected", GREEN, 0x173225u32)
+                                (self.tr("connected"), GREEN, 0x173225u32)
                             } else if device.connected {
-                                ("unconfirmed", AMBER, 0x342b12u32)
+                                (self.tr("unconfirmed"), AMBER, 0x342b12u32)
                             } else {
-                                ("offline", MUTED, 0x1d222au32)
+                                (self.tr("offline"), MUTED, 0x1d222au32)
                             };
                             div()
                                 .px_2()
@@ -3509,7 +3535,7 @@ impl Dashboard {
                         .gap_2()
                         .child(self.action_button(
                             "policy-none",
-                            "Block",
+                            self.tr("Block"),
                             0x3a2020,
                             RED,
                             cx,
@@ -3523,7 +3549,7 @@ impl Dashboard {
                         ))
                         .child(self.action_button(
                             "rename-device",
-                            "Rename",
+                            self.tr("Rename"),
                             0x1d2430,
                             TEXT,
                             cx,
@@ -3534,7 +3560,7 @@ impl Dashboard {
                         ))
                         .child(self.action_button(
                             "revoke-device",
-                            "Revoke",
+                            self.tr("Revoke"),
                             0x3a2020,
                             RED,
                             cx,
@@ -3552,7 +3578,7 @@ impl Dashboard {
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child(format!("Devices ({})", rows.len())),
+                    .child(format!("{} ({})", self.tr("Devices"), rows.len())),
             )
             .when(rows.is_empty(), |this| {
                 this.child(
@@ -3575,20 +3601,40 @@ impl Dashboard {
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let capture_label = if matches!(self.capture_status, Status::Enabled) {
-            "capture enabled"
+            self.tr("capture enabled")
         } else {
-            "capture disabled"
+            self.tr("capture disabled")
         };
         let emulation_label = if matches!(self.emulation_status, Status::Enabled) {
-            "emulation enabled"
+            self.tr("emulation enabled")
         } else {
-            "emulation disabled"
+            self.tr("emulation disabled")
         };
-        let clipboard_summary = self.clipboard_status.summary();
-        let pairing_label = if self.pairing_active {
-            "pairing window open"
+        let clipboard_summary = if !self.clipboard_status.enabled {
+            self.tr("disabled").to_string()
+        } else if !self.clipboard_status.available {
+            self.tr("backend unavailable").to_string()
         } else {
-            "open a 60 second pairing window"
+            let backend = self
+                .clipboard_status
+                .backend
+                .as_deref()
+                .unwrap_or("unknown backend");
+            match self.language {
+                Language::PortugueseBrazil => format!(
+                    "{backend} · {} recebidos · {} locais",
+                    self.clipboard_status.applied, self.clipboard_status.detected
+                ),
+                Language::English => format!(
+                    "{backend} · {} received · {} local",
+                    self.clipboard_status.applied, self.clipboard_status.detected
+                ),
+            }
+        };
+        let pairing_label = if self.pairing_active {
+            self.tr("pairing window open")
+        } else {
+            self.tr("open a 60 second pairing window")
         };
         let mut authorized = self
             .authorized
@@ -3801,13 +3847,14 @@ impl Dashboard {
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
                                     .child(format!(
-                                        "Authorized devices ({})",
+                                        "{} ({})",
+                                        self.tr("Authorized devices"),
                                         self.authorized.len()
                                     )),
                             )
                             .child(self.action_button(
                                 "add-certificate",
-                                "Add",
+                                self.tr("Add"),
                                 ACCENT,
                                 0x081018,
                                 cx,
@@ -3822,7 +3869,7 @@ impl Dashboard {
                             div()
                                 .text_sm()
                                 .text_color(rgb(MUTED))
-                                .child("No authorized devices."),
+                                .child(self.tr("No authorized devices.")),
                         )
                     })
                     .children(
@@ -3863,7 +3910,7 @@ impl Dashboard {
                                             .text_color(rgb(RED))
                                             .text_sm()
                                             .cursor_pointer()
-                                            .child("Remove")
+                                            .child(self.tr("Remove"))
                                             .on_click(cx.listener(move |this, _, _, _| {
                                                 this.send(FrontendRequest::RemoveAuthorizedKey(
                                                     remove_fp.clone(),
@@ -3898,13 +3945,14 @@ impl Dashboard {
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
                                     .child(format!(
-                                        "Allowed addresses ({})",
+                                        "{} ({})",
+                                        self.tr("Allowed addresses"),
                                         self.address_rules.len()
                                     )),
                             )
                             .child(self.action_button(
                                 "add-address-rule",
-                                "Add",
+                                self.tr("Add"),
                                 ACCENT,
                                 0x081018,
                                 cx,
@@ -3919,7 +3967,7 @@ impl Dashboard {
                             div()
                                 .text_sm()
                                 .text_color(rgb(MUTED))
-                                .child("No address rules."),
+                                .child(self.tr("No address rules.")),
                         )
                     })
                     .children(self.address_rules.clone().into_iter().map(|rule| {
@@ -3963,7 +4011,7 @@ impl Dashboard {
                                     .text_color(rgb(RED))
                                     .text_sm()
                                     .cursor_pointer()
-                                    .child("Remove")
+                                    .child(self.tr("Remove"))
                                     .on_click(cx.listener(move |this, _, _, _| {
                                         this.send(FrontendRequest::UntrustAddress(address.clone()))
                                     })),

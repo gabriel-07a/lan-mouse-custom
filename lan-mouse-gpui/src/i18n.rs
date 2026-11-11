@@ -102,6 +102,79 @@ impl Language {
                 "Copy fingerprint" => "Copiar fingerprint",
                 "Approve" => "Aprovar",
                 "No known devices." => "Nenhum dispositivo conhecido.",
+                "No devices yet" => "Nenhum dispositivo ainda",
+                "Unknown device" => "Dispositivo desconhecido",
+                "RTT history (last samples)" => "Histórico de RTT (últimas amostras)",
+                "Connecting to Lan Mouse service…" => "Conectando ao serviço do Lan Mouse…",
+                "Connected to service" => "Conectado ao serviço",
+                "Not connected to the Lan Mouse service yet" => {
+                    "Ainda não conectado ao serviço do Lan Mouse"
+                }
+                "Scanning the local network…" => "Procurando na rede local…",
+                "Add allowed address" => "Adicionar endereço permitido",
+                "IPv4 address or CIDR. Tab switches fields, Enter saves, Esc cancels." => {
+                    "Endereço IPv4 ou CIDR. Tab troca de campo, Enter salva, Esc cancela."
+                }
+                "Authorize certificate" => "Autorizar certificado",
+                "Fingerprint and display name of the peer. Tab switches fields." => {
+                    "Fingerprint e nome de exibição do peer. Tab troca de campo."
+                }
+                "Edit client" => "Editar cliente",
+                "Hostname/IP and port. Leave the hostname empty to use the address." => {
+                    "Hostname/IP e porta. Deixe o hostname vazio para usar o endereço."
+                }
+                "Rename device" => "Renomear dispositivo",
+                "Display name only; the certificate fingerprint stays the identity." => {
+                    "Apenas o nome de exibição; o fingerprint do certificado continua sendo a identidade."
+                }
+                "Change listening port" => "Mudar porta de escuta",
+                "The UDP listener is recreated on this port. Peers must use the same port." => {
+                    "O listener UDP é recriado nesta porta. Os peers precisam usar a mesma porta."
+                }
+                "Save" => "Salvar",
+                "display name" => "nome de exibição",
+                "address" => "endereço",
+                "unknown" => "desconhecido",
+                "unavailable" => "indisponível",
+                "unknown backend" => "backend desconhecido",
+                "backend unavailable" => "backend indisponível",
+                "disabled" => "desativado",
+                "enabled" => "ativado",
+                "capture enabled" => "captura ativada",
+                "capture disabled" => "captura desativada",
+                "emulation enabled" => "emulação ativada",
+                "emulation disabled" => "emulação desativada",
+                "pairing window open" => "janela de pareamento aberta",
+                "open a 60 second pairing window" => {
+                    "abrir uma janela de pareamento de 60 segundos"
+                }
+                "No authorized devices." => "Nenhum dispositivo autorizado.",
+                "No address rules." => "Nenhuma regra de endereço.",
+                "Allowed addresses" => "Endereços permitidos",
+                "Authorized devices" => "Dispositivos autorizados",
+                "⚠ broad range: this can auto-authorize devices outside your LAN" => {
+                    "⚠ faixa ampla: isto pode autorizar automaticamente dispositivos fora da sua LAN"
+                }
+                "Diagnostics & history" => "Diagnóstico e histórico",
+                "Export policy" => "Exportar política",
+                "Copy exported" => "Copiar exportado",
+                "not exported yet" => "ainda não exportado",
+                "connected" => "conectado",
+                "unconfirmed" => "não confirmado",
+                "Block" => "Bloquear",
+                "Rename" => "Renomear",
+                "Revoke" => "Revogar",
+                "Keep" => "Manter",
+                "Pairing review" => "Revisão de pareamento",
+                "Devices adopted while the pairing window was open. Keep them or revoke access." => {
+                    "Dispositivos adotados enquanto a janela de pareamento estava aberta. Mantenha-os ou revogue o acesso."
+                }
+                "The GTK frontend is still available as an opt-in fallback; the IPC/service protocol is unchanged." => {
+                    "A interface GTK continua disponível como fallback opcional; o protocolo IPC/serviço não mudou."
+                }
+                "Lan Mouse — unofficial fork · GPUI frontend · GPL-3.0-or-later" => {
+                    "Lan Mouse — fork não oficial · interface GPUI · GPL-3.0-or-later"
+                }
                 "Reenable" => "Reativar",
                 "Open" => "Abrir",
                 "Pairing…" => "Pareando…",
@@ -114,7 +187,6 @@ impl Language {
                     "Digite um hostname ou endereço IPv4. Tab troca de campo, Enter adiciona, Esc cancela."
                 }
                 "Deny" => "Negar",
-                "Block" => "Bloquear",
                 "Cursor speed while controlled remotely" => {
                     "Velocidade do cursor ao ser controlado remotamente"
                 }
