@@ -180,8 +180,18 @@ pub struct LibeiInputCapture {
 
 /// returns (start pos, end pos), inclusive
 fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
-    let (x, y) = (r.x_offset(), r.y_offset());
-    let (w, h) = (r.width() as i32, r.height() as i32);
+    barrier_position(
+        r.x_offset(),
+        r.y_offset(),
+        r.width() as i32,
+        r.height() as i32,
+        pos,
+    )
+}
+
+/// Pure geometry of a barrier for a region. Split from [`pos_to_barrier`] so
+/// the exact 1-pixel activation boundary can be tested without a portal.
+fn barrier_position(x: i32, y: i32, w: i32, h: i32, pos: Position) -> (i32, i32, i32, i32) {
     match pos {
         Position::Left => (x, y, x, y + h - 1),
         Position::Right => (x + w, y, x + w, y + h - 1),
@@ -1092,6 +1102,32 @@ mod tests {
         assert_eq!(clients, vec![Position::Right]);
         apply_client_event(&mut clients, LibeiNotifyEvent::Destroy(Position::Right));
         assert!(clients.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod portal_barrier_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn pointer_barriers_sit_exactly_at_the_screen_edge() {
+        assert_eq!(
+            barrier_position(0, 0, 1920, 1080, Position::Left),
+            (0, 0, 0, 1079)
+        );
+        assert_eq!(
+            barrier_position(0, 0, 1920, 1080, Position::Right),
+            (1920, 0, 1920, 1079),
+            "one pixel past the region; no dead zone before activation"
+        );
+        assert_eq!(
+            barrier_position(0, 0, 1920, 1080, Position::Top),
+            (0, 0, 1919, 0)
+        );
+        assert_eq!(
+            barrier_position(0, 0, 1920, 1080, Position::Bottom),
+            (0, 1080, 1919, 1080)
+        );
     }
 }
 

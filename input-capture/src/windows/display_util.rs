@@ -352,6 +352,28 @@ mod tests {
     }
 
     #[test]
+    fn a_single_outward_pixel_at_the_edge_is_a_crossing() {
+        let displays = [rect(0, 0, 1920, 1080)];
+        // Exactly one mouse count outward from the clamped edge pixel.
+        assert_eq!(
+            outward_edge_crossing((0, 500), (-1, 0), &displays),
+            Some(Position::Left)
+        );
+        assert_eq!(
+            outward_edge_crossing((1919, 500), (1, 0), &displays),
+            Some(Position::Right)
+        );
+        assert_eq!(
+            outward_edge_crossing((500, 0), (0, -1), &displays),
+            Some(Position::Top)
+        );
+        assert_eq!(
+            outward_edge_crossing((500, 1079), (0, 1), &displays),
+            Some(Position::Bottom)
+        );
+    }
+
+    #[test]
     fn movement_away_from_the_edge_is_not_a_crossing() {
         let displays = [rect(0, 0, 1920, 1080)];
         assert_eq!(outward_edge_crossing((0, 500), (3, 0), &displays), None);

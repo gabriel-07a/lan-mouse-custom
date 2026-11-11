@@ -47,7 +47,12 @@ use super::{CaptureEvent, Position, display_util};
 
 /// Ignore barrier crossings for a moment after a capture was released, so the
 /// hand-off does not immediately bounce back to the peer we just left.
-const RELEASE_COOLDOWN: Duration = Duration::from_millis(350);
+///
+/// Kept short: 350 ms made a deliberate quick return to the peer feel like the
+/// cursor had to "push" against the edge. A bounce is a same-edge activation
+/// immediately after release; 120 ms is enough to absorb accidental motion
+/// while keeping intentional crossings responsive.
+const RELEASE_COOLDOWN: Duration = Duration::from_millis(120);
 /// Ignore barrier crossings for this long after lan-mouse injected input: the
 /// remote peer is (just) driving this machine and its motion must not be
 /// mistaken for the local user crossing an edge.
@@ -219,14 +224,18 @@ fn show_hidden_pointer(point: (i32, i32)) {
     let Some(hwnd) = hidden_pointer_hwnd() else {
         return;
     };
+    // The overlay is a few pixels larger than the hotspot: the Win32 cursor
+    // hotspot is not guaranteed to be the top-left pixel for every scheme and
+    // DPI, and on Windows 10 a 1x1 window could miss it.
+    const OVERLAY: i32 = 5;
     let positioned = unsafe {
         SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
-            point.0,
-            point.1,
-            1,
-            1,
+            point.0 - OVERLAY / 2,
+            point.1 - OVERLAY / 2,
+            OVERLAY,
+            OVERLAY,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
     };
@@ -245,6 +254,7 @@ fn show_hidden_pointer(point: (i32, i32)) {
     }
     if !HIDDEN_POINTER_SHOWN.replace(true) {
         log::debug!("local pointer hidden while the peer is controlled");
+        log::info!(target: "handoff_trace", "controller.cursor_hidden");
     }
 }
 
@@ -258,6 +268,7 @@ fn hide_hidden_pointer() {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
         log::debug!("local pointer restored");
+        log::info!(target: "handoff_trace", "controller.cursor_restored");
     }
 }
 
@@ -541,8 +552,8 @@ fn start_routine(
             WS_POPUP,
             0,
             0,
-            1,
-            1,
+            5,
+            5,
             None,
             None,
             Some(instance),
@@ -728,6 +739,12 @@ unsafe fn try_activate_by_raw(dx: i32, dy: i32) {
     let Some(pos) = entered else {
         return;
     };
+    log::info!(
+        target: "handoff_trace",
+        "controller.edge_hit: pos={pos:?} cursor=({}, {}) delta=({dx}, {dy})",
+        cursor.x,
+        cursor.y
+    );
     if !edge_activation_allowed(remote_peer, pos) {
         return;
     }
@@ -873,6 +890,12 @@ unsafe fn handle_mouse_delta(dx: i32, dy: i32) {
             let (ex, ey) = ENTRY_POINT.get();
             unsafe {
                 let _ = SetCursorPos(ex, ey);
+                // Windows 10 may restore the arrow when the pointer window
+                // receives WM_SETCURSOR, or simply not deliver it for a
+                // stationary 1x1 overlay. Re-hiding on each captured report is
+                // cheap and makes the source cursor disappear consistently on
+                // both Windows 10 and 11.
+                SetCursor(None);
             }
         }
         None => unsafe { try_activate_by_raw(dx, dy) },
