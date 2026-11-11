@@ -1496,6 +1496,20 @@ mod tests {
     }
 
     #[test]
+    fn candidates_that_only_point_at_this_machine_leave_no_dial_target() {
+        let own = std::collections::HashSet::from([
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        ]);
+        let self_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 4242);
+        let self_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 4243);
+        assert!(
+            dialable_candidates([self_a, self_b], &own).is_empty(),
+            "no candidate may be dialed when every saved address belongs to this host"
+        );
+    }
+
+    #[test]
     fn outgoing_addrs_use_the_incoming_peer_address_when_dns_is_empty() {
         let incoming = sa("192.168.1.42", 54321);
         assert_eq!(

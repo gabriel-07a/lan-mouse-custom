@@ -100,6 +100,45 @@ pub(crate) fn should_notify_connection_attempt(
         || last_notified.is_none_or(|last| now.saturating_duration_since(last) >= cooldown)
 }
 
+/// Tracks when the frontend was last told about a pending connection request.
+///
+/// This state used to live inline in the service loop, which made the
+/// "dismissed request never reopens" bug untestable. Keeping it here gives the
+/// reconnect/retry sequence a deterministic unit test.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionAttemptNotifier {
+    notified: std::collections::HashMap<String, std::time::Instant>,
+}
+
+impl ConnectionAttemptNotifier {
+    /// Decide whether to reopen the approval prompt, and remember the attempt.
+    pub(crate) fn should_notify(
+        &mut self,
+        fingerprint: &str,
+        is_new: bool,
+        cert_changed: bool,
+        now: std::time::Instant,
+        cooldown: std::time::Duration,
+    ) -> bool {
+        let should = should_notify_connection_attempt(
+            is_new,
+            cert_changed,
+            self.notified.get(fingerprint).copied(),
+            now,
+            cooldown,
+        );
+        if should {
+            self.notified.insert(fingerprint.to_string(), now);
+        }
+        should
+    }
+
+    /// Forget the cooldown once the request was accepted or denied.
+    pub(crate) fn clear(&mut self, fingerprint: &str) {
+        self.notified.remove(fingerprint);
+    }
+}
+
 /// Auto-created reverse clients for the same certificate that should be merged
 /// into `handle`.
 pub(crate) fn duplicate_reverse_clients(
@@ -247,6 +286,58 @@ mod tests {
             now + cooldown,
             cooldown
         ));
+    }
+
+    #[test]
+    fn notifier_reopens_a_dismissed_request_after_cooldown_and_clears_on_decision() {
+        use std::time::{Duration, Instant};
+        let mut notifier = ConnectionAttemptNotifier::default();
+        let cooldown = Duration::from_secs(10);
+        let now = Instant::now();
+
+        assert!(notifier.should_notify("peer", true, false, now, cooldown));
+        assert!(
+            !notifier.should_notify("peer", false, false, now + Duration::from_secs(1), cooldown),
+            "handshake retries inside the cooldown must not reopen the modal"
+        );
+        assert!(
+            notifier.should_notify("peer", false, true, now + Duration::from_secs(2), cooldown),
+            "a changed certificate always opens the prompt"
+        );
+        assert!(
+            notifier.should_notify(
+                "peer",
+                false,
+                false,
+                now + Duration::from_secs(2) + cooldown,
+                cooldown
+            ),
+            "a dismissed request must become visible again after the cooldown"
+        );
+
+        notifier.clear("peer");
+        assert!(
+            notifier.should_notify(
+                "peer",
+                false,
+                false,
+                now + Duration::from_secs(2) + cooldown,
+                cooldown
+            ),
+            "accepting/denying clears the cooldown for a later explicit request"
+        );
+    }
+
+    #[test]
+    fn notifier_tracks_each_peer_independently() {
+        use std::time::{Duration, Instant};
+        let mut notifier = ConnectionAttemptNotifier::default();
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(10);
+        assert!(notifier.should_notify("a", true, false, now, cooldown));
+        assert!(notifier.should_notify("b", true, false, now, cooldown));
+        assert!(!notifier.should_notify("a", false, false, now, cooldown));
+        assert!(!notifier.should_notify("b", false, false, now, cooldown));
     }
 
     #[test]

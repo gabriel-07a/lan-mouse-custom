@@ -11,8 +11,8 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError, PairingWindow},
     service_core::{
-        BidirectionalAction, bidirectional_action, duplicate_reverse_clients, return_targets,
-        should_notify_connection_attempt,
+        BidirectionalAction, ConnectionAttemptNotifier, bidirectional_action,
+        duplicate_reverse_clients, return_targets,
     },
 };
 use futures::StreamExt;
@@ -105,9 +105,8 @@ pub struct Service {
     /// devices authorized with [`FrontendRequest::AuthorizeDevice`] whose
     /// reverse client entry must be created once their address is known
     pending_reverse: HashMap<String, (String, Position)>,
-    /// last time the frontend was told about a pending connection request, per
-    /// fingerprint (bounded by the number of live peers)
-    connection_attempt_notified: HashMap<String, Instant>,
+    /// prompt cooldown per fingerprint (see [`ConnectionAttemptNotifier`])
+    connection_attempt_notifier: ConnectionAttemptNotifier,
     /// results of network scans / probes, produced by background tasks
     discovery_rx: Receiver<DiscoveryEvent>,
     discovery_tx: Sender<DiscoveryEvent>,
@@ -283,7 +282,7 @@ impl Service {
             learned_fingerprints: Default::default(),
             auto_reverse_clients: Default::default(),
             pending_reverse: Default::default(),
-            connection_attempt_notified: Default::default(),
+            connection_attempt_notifier: Default::default(),
             discovery_rx,
             discovery_tx,
             announced_rx,
@@ -820,16 +819,13 @@ impl Service {
                 // handshake retry made the modal reopen continuously; never
                 // reopening it left a dismissed request invisible forever, so
                 // clicking Connect on the other PC appeared to send nothing.
-                let now = Instant::now();
-                if should_notify_connection_attempt(
+                if self.connection_attempt_notifier.should_notify(
+                    &fingerprint,
                     is_new,
                     previous_fingerprint.is_some(),
-                    self.connection_attempt_notified.get(&fingerprint).copied(),
-                    now,
+                    Instant::now(),
                     CONNECTION_ATTEMPT_PROMPT_COOLDOWN,
                 ) {
-                    self.connection_attempt_notified
-                        .insert(fingerprint.clone(), now);
                     self.notify_frontend(FrontendEvent::ConnectionAttempt {
                         addr,
                         fingerprint: fingerprint.clone(),
@@ -1914,7 +1910,7 @@ impl Service {
             .write()
             .expect("lock")
             .pending_remove(&fingerprint);
-        self.connection_attempt_notified.remove(&fingerprint);
+        self.connection_attempt_notifier.clear(&fingerprint);
         let name = name
             .filter(|name| !name.trim().is_empty())
             .or_else(|| pending.as_ref().and_then(|pending| pending.name.clone()))
