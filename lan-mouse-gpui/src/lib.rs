@@ -2209,20 +2209,15 @@ impl Render for Dashboard {
             Page::Settings => self.render_settings(cx).into_any_element(),
         };
 
-        // Explicit height is required for overflow_y_scroll: without a bounded
-        // parent the page grows to its content and is clipped by the window.
-        let chrome_height = if cfg!(target_os = "linux") {
-            34.0 + 64.0
-        } else {
-            64.0
-        };
-        let content_height = (window.viewport_size().height - px(chrome_height)).max(px(120.0));
-
-        let shell = div().flex().flex_grow().child(sidebar).child(
+        // Use a real flex chain rather than subtracting a guessed chrome
+        // height: the titlebar/banner heights vary, and a fixed content height
+        // clipped the bottom of the Settings cards (the extension row made the
+        // card taller than the old estimate).
+        let shell = div().flex().flex_1().child(sidebar).child(
             div()
                 .flex()
                 .flex_col()
-                .flex_grow()
+                .flex_1()
                 .child(
                     div()
                         .h(px(64.0))
@@ -2286,8 +2281,7 @@ impl Render for Dashboard {
                 .child(
                     div()
                         .w_full()
-                        .h(content_height)
-                        .flex_none()
+                        .flex_1()
                         .overflow_hidden()
                         .child(content),
                 ),
