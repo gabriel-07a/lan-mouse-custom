@@ -26,9 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install dependencies
+        # Skip `apt-get update`: the hosted runner already has package lists,
+        # and the update step currently hangs/fails on these images. The
+        # timeout keeps a broken mirror from stalling the release for hours.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libx11-dev libxtst-dev \
+          sudo timeout 180 apt-get install -y --no-install-recommends \
+            libx11-dev libxtst-dev \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
             libfontconfig1-dev libfreetype-dev librsvg2-bin imagemagick
       - name: Release build
