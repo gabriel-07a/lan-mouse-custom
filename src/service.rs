@@ -2540,14 +2540,48 @@ impl Service {
         let Some(hostname) = device.hostname.as_deref() else {
             return;
         };
-        if let Some(handle) = self.client_with_ip(device.ip) {
-            if self
-                .client_manager
-                .upgrade_hostname_from_discovery(handle, hostname)
-            {
-                self.broadcast_client(handle);
-                self.save_config();
-            }
+        // Address first, then certificate identity, then the display name:
+        // a saved client created by pairing may have no configured address and
+        // only its hostname, which is exactly the case where DNS failure made
+        // Connect fail until the device was deleted and re-added.
+        let handle = self
+            .client_with_ip(device.ip)
+            .or_else(|| {
+                device
+                    .fingerprint
+                    .as_deref()
+                    .and_then(|fingerprint| self.client_with_fingerprint(fingerprint))
+            })
+            .or_else(|| {
+                self.client_manager
+                    .registered_clients()
+                    .into_iter()
+                    .find(|handle| {
+                        self.client_manager
+                            .get_state(*handle)
+                            .and_then(|(config, _)| config.hostname.clone())
+                            .is_some_and(|name| name.eq_ignore_ascii_case(hostname))
+                    })
+            });
+        let Some(handle) = handle else {
+            return;
+        };
+        let mut changed = self
+            .client_manager
+            .upgrade_hostname_from_discovery(handle, hostname);
+        if self
+            .client_manager
+            .learn_address_from_discovery(handle, device.ip)
+        {
+            log::info!(
+                "learned address {} for saved client {handle} from discovery",
+                device.ip
+            );
+            changed = true;
+        }
+        if changed {
+            self.broadcast_client(handle);
+            self.save_config();
         }
     }
 

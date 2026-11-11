@@ -804,6 +804,70 @@ async fn connect_first(
     Err(last_error)
 }
 
+/// Dial a pinned client, recovering from a rotated certificate.
+///
+/// A pinned certificate that no longer matches the peer makes the DTLS
+/// handshake fail. If the certificate the peer now presents is *already* a
+/// known/authorized device on this machine, the stored pin is stale (the peer
+/// reinstalled or was re-paired) and blocking the user until they delete and
+/// re-create the client is unnecessary and surprising. Re-pin to that known
+/// certificate and continue on the same transport.
+///
+/// Anything less than a known device keeps the original failure: a changed
+/// identity must never be trusted silently.
+async fn connect_with_certificate_rotation(
+    ctx: &ConnCtx,
+    handle: ClientHandle,
+    addrs: Vec<SocketAddr>,
+    expected: Option<String>,
+    cert: Certificate,
+) -> Result<(ArcConn, SocketAddr), LanMouseConnectionError> {
+    let first = connect_first(
+        addrs.clone(),
+        cert.clone(),
+        ADDRESS_TIMEOUT,
+        expected.clone(),
+    )
+    .await;
+    let first_error = match first {
+        Ok(connected) => return Ok(connected),
+        Err(error) => error,
+    };
+
+    // Only a DTLS failure can be a certificate mismatch; retrying on timeouts
+    // or an empty address set would just double the reconnect latency.
+    if expected.is_none() || !matches!(&first_error, LanMouseConnectionError::Dtls(_)) {
+        return Err(first_error);
+    }
+
+    let Ok((conn, addr)) = connect_first(addrs, cert, ADDRESS_TIMEOUT, None).await else {
+        return Err(first_error);
+    };
+    let Some(actual) = peer_fingerprint(&conn).await else {
+        let _ = conn.close().await;
+        return Err(first_error);
+    };
+    let known = ctx
+        .devices
+        .as_ref()
+        .is_some_and(|devices| devices.read().expect("lock").is_known(&actual));
+    if !known {
+        log::warn!(
+            "client {handle} presented a changed certificate {actual} that is not a known device; keeping the pinned failure"
+        );
+        let _ = conn.close().await;
+        return Err(first_error);
+    }
+
+    log::warn!(
+        "client {handle} presented a rotated certificate already known as {actual}; re-pinning and connecting"
+    );
+    ctx.client_manager
+        .set_fingerprint(handle, Some(actual.clone()));
+    ctx.notify_state_changed(handle);
+    Ok((conn, addr))
+}
+
 async fn connect_to_handle(
     ctx: &ConnCtx,
     handle: ClientHandle,
@@ -836,8 +900,14 @@ async fn connect_to_handle(
 
         log::info!("client ({handle}) connecting ... (ordered addresses: {addrs:?})");
         let expected = ctx.client_manager.fingerprint(handle);
-        let (conn, addr) =
-            connect_first(addrs, ctx.cert.clone(), ADDRESS_TIMEOUT, expected.clone()).await?;
+        let (conn, addr) = connect_with_certificate_rotation(
+            ctx,
+            handle,
+            addrs,
+            expected.clone(),
+            ctx.cert.clone(),
+        )
+        .await?;
         log::info!("client ({handle}) connected @ {addr}");
 
         // A dial can race the peer's AuthRevoke (or a local deactivate). The
@@ -3137,6 +3207,75 @@ mod tests {
                 assert_eq!(event.0, Capabilities::POINTER.0);
                 assert_eq!(event.1, Capabilities::KEYBOARD.0);
                 assert_eq!(event.2, client_fp);
+            })
+            .await;
+    }
+
+    /// Regression: a saved client whose pinned certificate no longer matches
+    /// the peer (the peer was reinstalled/re-paired) used to fail every
+    /// Connect until the user deleted and re-added the device. If the new
+    /// certificate is already a known/authorized device, the stale pin must be
+    /// refreshed and the connection allowed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_saved_client_with_a_rotated_certificate_repins_a_known_device() {
+        use crate::devices::{Device, DeviceSource, DeviceStore};
+        use std::sync::RwLock;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("rotation-listener");
+                let actual_fp = crypto::certificate_fingerprint(&listener_cert);
+                let client_cert = unique_cert("rotation-client");
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+                let stale_fp = crypto::certificate_fingerprint(&unique_cert("rotation-stale"));
+
+                let listener = listener_with_authorized(port, listener_cert, vec![client_fp]).await;
+                let (clipboard_tx, _clipboard_rx) = local_channel::mpsc::channel();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    listener,
+                    clipboard_tx,
+                    None,
+                );
+
+                let (manager, handle) = client_manager_for(port);
+                // The config has a stale pin from before the peer's identity
+                // changed.
+                manager.set_fingerprint(handle, Some(stale_fp));
+
+                let mut devices = DeviceStore::default();
+                devices.put(Device {
+                    fingerprint: actual_fp.clone(),
+                    name: "peer".into(),
+                    incoming: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                    outgoing: lan_mouse_ipc::DirectionPolicy::allow_all(),
+                    source: DeviceSource::Manual,
+                });
+                let mut conn = LanMouseConnection::new(client_cert, manager.clone(), 3000);
+                conn.set_device_store(Arc::new(RwLock::new(devices)));
+                conn.ensure_connected(handle);
+
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline
+                    && (manager.active_addr(handle).is_none()
+                        || manager.fingerprint(handle).as_deref() != Some(actual_fp.as_str()))
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+
+                assert_eq!(
+                    manager.fingerprint(handle),
+                    Some(actual_fp.clone()),
+                    "the stale pin must be refreshed to the known peer certificate"
+                );
+                assert!(
+                    manager.active_addr(handle).is_some(),
+                    "the saved client must reconnect after the pin refresh"
+                );
+
+                emulation.terminate().await;
             })
             .await;
     }

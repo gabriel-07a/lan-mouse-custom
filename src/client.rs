@@ -223,6 +223,32 @@ impl ClientManager {
         added
     }
 
+    /// Persist an address discovered for a client that has no configured
+    /// address yet.
+    ///
+    /// A saved client created by pairing often has only a hostname; if
+    /// hostname resolution is unavailable after a restart, Connect has no
+    /// candidate address and fails until the user deletes and re-adds the
+    /// device. Discovery just proved the address, so keep it as a fallback.
+    /// Only fills an empty address list: a user-configured address is never
+    /// overwritten.
+    pub(crate) fn learn_address_from_discovery(&self, handle: ClientHandle, ip: IpAddr) -> bool {
+        if !ip.is_ipv4() {
+            return false;
+        }
+        let mut added = false;
+        if let Some((c, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            if c.fix_ips.is_empty() && !c.hostname.as_deref().is_some_and(|h| h.trim().is_empty()) {
+                c.fix_ips.push(ip);
+                added = true;
+            }
+        }
+        if added {
+            self.update_ips(handle);
+        }
+        added
+    }
+
     fn update_ips(&self, handle: ClientHandle) {
         if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             // Lan Mouse is IPv4-only: an AAAA record must not create a
@@ -666,6 +692,35 @@ mod tests {
         assert_eq!(config.pos, Position::Right);
         assert!(state.active);
         assert_eq!(state.ips, HashSet::from([ip(10)]));
+    }
+
+    #[test]
+    fn discovery_fills_only_an_empty_saved_address_list() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        manager.set_hostname(handle, Some("peer".to_string()));
+        assert!(manager.learn_address_from_discovery(handle, ip(10)));
+        assert_eq!(
+            manager.get_ips(handle),
+            Some(std::collections::HashSet::from([ip(10)]))
+        );
+        let (config, _) = manager.get_state(handle).expect("client");
+        assert_eq!(
+            config.fix_ips,
+            vec![ip(10)],
+            "the learned address must persist"
+        );
+
+        // A user-configured address is never overwritten.
+        let configured = manager.add_client();
+        manager.set_fix_ips(configured, vec![ip(11)]);
+        assert!(!manager.learn_address_from_discovery(configured, ip(12)));
+        let (config, _) = manager.get_state(configured).expect("client");
+        assert_eq!(config.fix_ips, vec![ip(11)]);
+
+        // IPv6 is ignored, matching the rest of the address bookkeeping.
+        let v6 = manager.add_client();
+        assert!(!manager.learn_address_from_discovery(v6, "fd00::1".parse().expect("ipv6")));
     }
 
     #[test]
