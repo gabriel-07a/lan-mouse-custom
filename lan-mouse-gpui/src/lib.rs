@@ -597,6 +597,32 @@ enum PendingAdd {
     },
 }
 
+/// Whether a `Created` event is the empty client produced by `Create`.
+///
+/// `Created` is also emitted for auto-reverse clients and for every entry on a
+/// config reload. Applying a pending Add to one of those was the Network-page
+/// bug where "Add" configured the wrong card (or appeared to pick another IP)
+/// while the real new client stayed empty.
+fn is_fresh_client_config(config: &ClientConfig) -> bool {
+    config
+        .hostname
+        .as_deref()
+        .is_none_or(|name| name.trim().is_empty())
+        && config.fix_ips.is_empty()
+        && config.fingerprint.is_none()
+        && config.port == lan_mouse_ipc::DEFAULT_PORT
+}
+
+/// Consume the pending Add only when `Created` belongs to the empty client we
+/// just asked the service to create.
+fn take_pending_add(pending: &mut Option<PendingAdd>, config: &ClientConfig) -> Option<PendingAdd> {
+    if is_fresh_client_config(config) {
+        pending.take()
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AddDeviceDialog {
     hostname: String,
@@ -812,6 +838,15 @@ enum Page {
     Settings,
 }
 
+/// Per-device element id for the Network "Add" button.
+///
+/// All rows used the same static `add-discovered` id. GPUI dispatches clicks
+/// through element ids, so every row could resolve to the first row's hitbox
+/// and Add configured another IP (or appeared to do nothing).
+fn network_add_id(ip: std::net::IpAddr, port: u16) -> SharedString {
+    SharedString::from(format!("add-discovered-{ip}-{port}"))
+}
+
 impl Dashboard {
     fn new(cx: &mut Context<Self>, local_commit: [u8; 8]) -> Self {
         let (tx, rx) = async_channel::unbounded();
@@ -958,8 +993,10 @@ impl Dashboard {
             }
             FrontendEvent::Created(handle, config, state) => {
                 self.remember_metrics(handle, &state);
+                // Decide against the config before it is moved into the map.
+                let pending_for_created = take_pending_add(&mut self.pending_add, &config);
                 self.clients.insert(handle, (config, state));
-                if let Some(pending) = self.pending_add.take() {
+                if let Some(pending) = pending_for_created {
                     match pending {
                         PendingAdd::Discovered {
                             ip,
@@ -1979,7 +2016,7 @@ impl Dashboard {
             )
             .when(!device.configured, |this| {
                 this.child(self.action_button(
-                    "add-discovered",
+                    network_add_id(device.ip, port),
                     "Add",
                     ACCENT,
                     0x081018,
@@ -2241,7 +2278,7 @@ impl Dashboard {
 
     fn action_button(
         &self,
-        id: &'static str,
+        id: impl Into<SharedString>,
         label: &'static str,
         background: u32,
         foreground: u32,
@@ -2249,7 +2286,7 @@ impl Dashboard {
         handler: impl Fn(&mut Self, &gpui::ClickEvent, &mut Window, &mut Context<Self>) + 'static,
     ) -> gpui::Stateful<gpui::Div> {
         div()
-            .id(SharedString::from(id))
+            .id(id.into())
             .px_3()
             .py_2()
             .rounded_md()
@@ -4339,6 +4376,57 @@ mod tests {
         assert_eq!(format_timestamp_age(now_secs - 90_000, now_ms), "1d ago");
         // Clock skew (timestamp in the future) must not underflow.
         assert_eq!(format_timestamp_age(now_secs + 60, now_ms), "0s ago");
+    }
+
+    #[test]
+    fn pending_add_is_not_consumed_by_an_unrelated_created_event() {
+        let mut pending = Some(PendingAdd::Manual {
+            hostname: "DESKTOP-GABRIEL".to_string(),
+            port: 4242,
+            fingerprint: None,
+            position: Position::Left,
+        });
+        let auto_reverse = ClientConfig {
+            hostname: Some("DESKTOP-GABRIEL".to_string()),
+            fix_ips: vec!["192.168.1.42".parse().expect("ip")],
+            ..ClientConfig::default()
+        };
+        assert!(
+            take_pending_add(&mut pending, &auto_reverse).is_none(),
+            "an auto-reverse/config-reload Created must not steal the pending Add"
+        );
+        assert!(pending.is_some());
+
+        let fresh = ClientConfig::default();
+        assert!(take_pending_add(&mut pending, &fresh).is_some());
+        assert!(
+            pending.is_none(),
+            "the empty Create response consumes it exactly once"
+        );
+    }
+
+    #[test]
+    fn fresh_client_detection_rejects_configured_entries() {
+        assert!(is_fresh_client_config(&ClientConfig::default()));
+        let configured_port = ClientConfig {
+            port: 4243,
+            ..ClientConfig::default()
+        };
+        assert!(!is_fresh_client_config(&configured_port));
+        let configured_pin = ClientConfig {
+            fingerprint: Some("aa".to_string()),
+            ..ClientConfig::default()
+        };
+        assert!(!is_fresh_client_config(&configured_pin));
+    }
+
+    #[test]
+    fn network_add_buttons_have_unique_element_ids() {
+        let a: std::net::IpAddr = "192.168.1.42".parse().expect("ip");
+        let b: std::net::IpAddr = "192.168.1.43".parse().expect("ip");
+        assert_ne!(network_add_id(a, 4242), network_add_id(b, 4242));
+        assert_ne!(network_add_id(a, 4242), network_add_id(a, 4243));
+        assert_eq!(network_add_id(a, 4242), network_add_id(a, 4242));
     }
 
     #[test]
