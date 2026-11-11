@@ -13,7 +13,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     rc::Rc,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -723,6 +723,31 @@ async fn connect(
     }
 }
 
+/// Loopback plus the non-loopback IPv4 addresses of this machine.
+fn local_ip_addresses() -> std::collections::HashSet<IpAddr> {
+    let mut addresses = std::collections::HashSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    for interface in crate::discovery::local_interfaces() {
+        addresses.insert(IpAddr::V4(interface.addr));
+    }
+    addresses
+}
+
+/// Remove addresses that point back at this machine.
+///
+/// A saved client can end up with a stale address that was later leased to
+/// this machine (DHCP change), or a bad manual entry. Dialing it would connect
+/// to our own listener, which shows the permission request on the wrong PC
+/// ("it asks me to authorize myself") instead of reaching the peer.
+fn dialable_candidates(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    own: &std::collections::HashSet<IpAddr>,
+) -> Vec<SocketAddr> {
+    addresses
+        .into_iter()
+        .filter(|address| address.ip().is_loopback() || !own.contains(&address.ip()))
+        .collect()
+}
+
 /// Order the candidate addresses of a client for one connection attempt.
 ///
 /// The address that established the previous session (remembered per client
@@ -897,8 +922,14 @@ async fn connect_to_handle(
             ctx.client_manager.clear_preferred_addr(handle);
             preferred = None;
         }
-        let addrs = outgoing_addrs(ips, port, incoming, preferred);
+        let addrs = dialable_candidates(
+            outgoing_addrs(ips, port, incoming, preferred),
+            &local_ip_addresses(),
+        );
         if addrs.is_empty() {
+            log::warn!(
+                "client {handle} has no dialable address: every candidate points at this machine"
+            );
             return Err(LanMouseConnectionError::NotConnected);
         }
 
@@ -1446,6 +1477,21 @@ mod tests {
         assert_eq!(
             dial_order([v4, other], Some(sa("192.168.1.99", 4242))),
             vec![other, v4]
+        );
+    }
+
+    #[test]
+    fn candidates_never_dial_this_machine() {
+        let own = std::collections::HashSet::from([
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ]);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)), 4242);
+        let wrong_self = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 4242);
+        assert_eq!(
+            dialable_candidates([wrong_self, peer], &own),
+            vec![peer],
+            "a saved address that now belongs to this machine must not be dialed"
         );
     }
 

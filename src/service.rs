@@ -12,6 +12,7 @@ use crate::{
     listen::{LanMouseListener, ListenerCreationError, PairingWindow},
     service_core::{
         BidirectionalAction, bidirectional_action, duplicate_reverse_clients, return_targets,
+        should_notify_connection_attempt,
     },
 };
 use futures::StreamExt;
@@ -104,6 +105,9 @@ pub struct Service {
     /// devices authorized with [`FrontendRequest::AuthorizeDevice`] whose
     /// reverse client entry must be created once their address is known
     pending_reverse: HashMap<String, (String, Position)>,
+    /// last time the frontend was told about a pending connection request, per
+    /// fingerprint (bounded by the number of live peers)
+    connection_attempt_notified: HashMap<String, Instant>,
     /// results of network scans / probes, produced by background tasks
     discovery_rx: Receiver<DiscoveryEvent>,
     discovery_tx: Sender<DiscoveryEvent>,
@@ -279,6 +283,7 @@ impl Service {
             learned_fingerprints: Default::default(),
             auto_reverse_clients: Default::default(),
             pending_reverse: Default::default(),
+            connection_attempt_notified: Default::default(),
             discovery_rx,
             discovery_tx,
             announced_rx,
@@ -810,11 +815,21 @@ impl Service {
                 if is_new {
                     log::info!("connection request from {addr} ({fingerprint})");
                 }
-                // Only open the approval dialog for a genuinely new request (or
-                // when the identity of an existing request changed). Re-emitting
-                // ConnectionAttempt for every 2 s handshake retry made the modal
-                // reopen continuously and looked like "it keeps asking".
-                if is_new || previous_fingerprint.is_some() {
+                // Reopen the approval dialog for a new request, a changed
+                // identity, or after a cooldown. Re-emitting on every 2 s
+                // handshake retry made the modal reopen continuously; never
+                // reopening it left a dismissed request invisible forever, so
+                // clicking Connect on the other PC appeared to send nothing.
+                let now = Instant::now();
+                if should_notify_connection_attempt(
+                    is_new,
+                    previous_fingerprint.is_some(),
+                    self.connection_attempt_notified.get(&fingerprint).copied(),
+                    now,
+                    CONNECTION_ATTEMPT_PROMPT_COOLDOWN,
+                ) {
+                    self.connection_attempt_notified
+                        .insert(fingerprint.clone(), now);
                     self.notify_frontend(FrontendEvent::ConnectionAttempt {
                         addr,
                         fingerprint: fingerprint.clone(),
@@ -1899,6 +1914,7 @@ impl Service {
             .write()
             .expect("lock")
             .pending_remove(&fingerprint);
+        self.connection_attempt_notified.remove(&fingerprint);
         let name = name
             .filter(|name| !name.trim().is_empty())
             .or_else(|| pending.as_ref().and_then(|pending| pending.name.clone()))
@@ -3254,6 +3270,9 @@ async fn wait_for_sigterm(signal: &mut Option<tokio::signal::unix::Signal>) {
     }
 }
 
+/// How often an unanswered return hand-off request is retried.
+/// Minimum time between reopening the same connection-request prompt.
+const CONNECTION_ATTEMPT_PROMPT_COOLDOWN: Duration = Duration::from_secs(10);
 /// How often an unanswered return hand-off request is retried.
 const RETURN_RETRY_INTERVAL: Duration = Duration::from_millis(300);
 /// Maximum number of retransmissions per hand-off episode. A peer that is

@@ -81,6 +81,25 @@ pub(crate) fn return_targets(
     }
 }
 
+/// Whether an incoming connection request should reopen the frontend prompt.
+///
+/// `is_new`/`cert_changed` are always worth a prompt. An existing pending
+/// request used to suppress the prompt forever: dismissing the dialog left the
+/// entry in the store, and later Connect clicks produced no visible request on
+/// the other PC. Reopening after a bounded cooldown keeps handshake retries
+/// from spamming the modal while still making a deliberate retry visible.
+pub(crate) fn should_notify_connection_attempt(
+    is_new: bool,
+    cert_changed: bool,
+    last_notified: Option<std::time::Instant>,
+    now: std::time::Instant,
+    cooldown: std::time::Duration,
+) -> bool {
+    is_new
+        || cert_changed
+        || last_notified.is_none_or(|last| now.saturating_duration_since(last) >= cooldown)
+}
+
 /// Auto-created reverse clients for the same certificate that should be merged
 /// into `handle`.
 pub(crate) fn duplicate_reverse_clients(
@@ -191,6 +210,43 @@ mod tests {
             "the kept handle and other certificates must not be merged"
         );
         assert!(duplicate_reverse_clients(&candidates, 5, "missing").is_empty());
+    }
+
+    #[test]
+    fn connection_attempt_prompt_reopens_after_the_cooldown() {
+        let now = std::time::Instant::now();
+        let cooldown = std::time::Duration::from_secs(10);
+        assert!(should_notify_connection_attempt(
+            true,
+            false,
+            Some(now),
+            now,
+            cooldown
+        ));
+        assert!(should_notify_connection_attempt(
+            false,
+            true,
+            Some(now),
+            now,
+            cooldown
+        ));
+        assert!(should_notify_connection_attempt(
+            false, false, None, now, cooldown
+        ));
+        assert!(!should_notify_connection_attempt(
+            false,
+            false,
+            Some(now),
+            now,
+            cooldown
+        ));
+        assert!(should_notify_connection_attempt(
+            false,
+            false,
+            Some(now),
+            now + cooldown,
+            cooldown
+        ));
     }
 
     #[test]
