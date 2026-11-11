@@ -106,8 +106,10 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
   movimento).
 - **Warm-up.** O backend de emulação é criado quando o cliente é ativado, para
   o primeiro cruzamento não pagar o custo de criação (portal/libei/Windows).
-- **Leading edge.** O primeiro movimento do hand-off sai imediatamente, sem
-  esperar a janela de coalescing de 2 ms herdada do movimento na tela anterior.
+- **Leading edge + burst.** O primeiro movimento do hand-off sai imediatamente
+  e os primeiros **40 ms** do cruzamento também são enviados sem batching, para
+  a entrada não parecer "travada" no Wi‑Fi. Depois disso o coalescing normal
+  volta ao lote configurado.
 - **Fallbacks por backend.** X11 recebe o warp via `XWarpPointer`; X11 capture
   continua sendo stub (só recebe); macOS é dormente; wlroots usa o caminho
   relativo quando não há posicionamento absoluto.
@@ -234,6 +236,21 @@ Abra uma issue em
 com o template informal: **o que aconteceu, em quais SOs, o que você esperava e
 os logs**. Se for uma combinação que eu não tenho, eu provavelmente vou pedir
 ajuda para validar.
+
+### Cursor escondido no PC de origem (GNOME Wayland)
+
+- Em GNOME Wayland, um cliente comum não consegue esconder o cursor global.
+  O app instala automaticamente uma extensão opcional do GNOME Shell em
+  `~/.local/share/gnome-shell/extensions/lan-mouse-cursor@lan-mouse-custom/`
+  e habilita o UUID em `org.gnome.shell enabled-extensions`.
+- A extensão esconde o cursor enquanto o serviço mantém o heartbeat
+  `$XDG_RUNTIME_DIR/lan-mouse/cursor-hide` (captura de saída ativa). Se o
+  serviço cair, o heartbeat expira em 3 s e o cursor volta.
+- **É preciso sair e entrar na sessão uma vez** depois da instalação; o
+  Wayland não carrega extensões novas em tempo real. O app mostra um aviso
+  quando esse logout é necessário.
+- Em layer-shell (Sway/Hyprland) o cursor já é escondido pelo grab; X11 usa o
+  caminho nativo quando disponível.
 
 ## Limitações conhecidas
 

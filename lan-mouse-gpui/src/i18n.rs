@@ -88,6 +88,39 @@ impl Language {
                 "English" => "English",
                 "Português (Brasil)" => "Português (Brasil)",
                 "General" => "Geral",
+                "Cursor hiding extension active" => "Extensão de esconder o cursor ativa",
+                "Cursor hiding extension installed but not enabled" => {
+                    "Extensão de esconder o cursor instalada, mas não ativada"
+                }
+                "Log out and back in once if the cursor is still visible." => {
+                    "Saia e entre na sessão uma vez se o cursor ainda estiver visível."
+                }
+                "Enable it and log out/in once to hide the cursor on this PC." => {
+                    "Ative a extensão e saia/entre uma vez para esconder o cursor neste PC."
+                }
+                "Hide the local cursor on GNOME Wayland" => {
+                    "Esconder o cursor local no GNOME Wayland"
+                }
+                "Installs the optional GNOME Shell extension. Wayland loads it after a logout/login." => {
+                    "Instala a extensão opcional do GNOME Shell. O Wayland a carrega após sair e entrar."
+                }
+                "Reinstall extension" => "Reinstalar extensão",
+                "Enable extension" => "Ativar extensão",
+                "Install extension" => "Instalar extensão",
+                "Local cursor while controlling another PC" => {
+                    "Cursor local enquanto controla outro PC"
+                }
+                "Extension installed. Log out and back in to activate it." => {
+                    "Extensão instalada. Saia e entre na sessão para ativá-la."
+                }
+                "Extension installation failed" => "Falha ao instalar a extensão",
+                "Cursor hiding extension needs a logout" => {
+                    "A extensão de cursor precisa sair e entrar na sessão"
+                }
+                "The GNOME Shell extension was installed. Log out and back in once to activate it." => {
+                    "A extensão do GNOME Shell foi instalada. Saia e entre na sessão uma vez para ativá-la."
+                }
+                "OK" => "OK",
                 "Input" => "Entrada",
                 "Clipboard" => "Área de transferência",
                 "Pairing" => "Pareamento",

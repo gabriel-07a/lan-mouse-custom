@@ -1,3 +1,4 @@
+use crate::cursor_hide::CursorHide;
 use crate::{
     audit::{AuditLog, AuditRecord},
     capture::{Capture, CaptureType, ICaptureEvent},
@@ -147,6 +148,8 @@ pub struct Service {
     pending_frontend_events: VecDeque<FrontendEvent>,
     /// status of input capture (enabled / disabled)
     capture_status: Status,
+    /// GNOME Wayland cursor-hide heartbeat state file
+    cursor_hide: CursorHide,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
     /// keep track of registered connections to avoid duplicate barriers
@@ -302,6 +305,7 @@ impl Service {
             discovery_port,
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
+            cursor_hide: CursorHide::new(),
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
@@ -345,6 +349,8 @@ impl Service {
         let mut return_retry = tokio::time::interval(RETURN_RETRY_INTERVAL);
         return_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         return_retry.tick().await;
+        let mut cursor_hide_tick = tokio::time::interval(crate::cursor_hide::HEARTBEAT_INTERVAL);
+        cursor_hide_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // systemd `stop`, desktop logout and the Windows service wrapper use
         // SIGTERM; without this the process died without releasing keys or
         // tearing the backends down.
@@ -371,6 +377,7 @@ impl Service {
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
+                _ = cursor_hide_tick.tick() => self.cursor_hide.tick(),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.discovery_rx.recv() => self.handle_discovery_event(event),
                 event = self.announced_rx.recv() => {
@@ -1181,6 +1188,7 @@ impl Service {
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
+                self.cursor_hide.set_active(false);
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::CaptureEnabled => {
@@ -1189,10 +1197,12 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
+                self.cursor_hide.set_active(true);
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
+                self.cursor_hide.set_active(false);
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
         }

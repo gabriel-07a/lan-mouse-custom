@@ -7,6 +7,7 @@ mod coalesce;
 pub mod config;
 mod connect;
 mod crypto;
+mod cursor_hide;
 mod devices;
 mod discovery;
 mod dns;

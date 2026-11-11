@@ -38,6 +38,16 @@ for size in 32 48 128 256 512; do
         "$stage/usr/share/icons/hicolor/${size}x${size}/apps/de.feschber.LanMouse.png"
 done
 
+# Optional GNOME Shell extension: hides the local cursor on Wayland while a
+# peer is controlled. It is installed system-wide; the app enables it per user
+# after an explicit prompt (GNOME Wayland requires a logout/login once).
+install -Dm644 \
+    "linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/extension.js" \
+    "$stage/usr/share/gnome-shell/extensions/lan-mouse-cursor@lan-mouse-custom/extension.js"
+install -Dm644 \
+    "linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/metadata.json" \
+    "$stage/usr/share/gnome-shell/extensions/lan-mouse-cursor@lan-mouse-custom/metadata.json"
+
 # systemd user unit: enable with `systemctl --user enable --now lan-mouse.service`.
 install -Dm644 service/lan-mouse.service \
     "$stage/usr/lib/systemd/user/lan-mouse.service"

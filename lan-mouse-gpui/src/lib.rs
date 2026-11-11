@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod cursor_extension;
 mod i18n;
 
 use gpui::{
@@ -825,6 +826,8 @@ struct Dashboard {
     pairing_review: Vec<DeviceView>,
     local_commit: [u8; 8],
     diagnostics: Diagnostics,
+    /// Optional GNOME Wayland extension used to hide the local cursor.
+    cursor_extension: cursor_extension::CursorExtensionState,
     metric_history: HashMap<ClientHandle, VecDeque<MetricSample>>,
     history: Vec<HistoryEntry>,
     policy_export: Option<String>,
@@ -914,6 +917,20 @@ impl Dashboard {
         })
         .detach();
 
+        // On GNOME Wayland the cursor can only be hidden by the bundled Shell
+        // extension. Install/enable it on first run and tell the user that one
+        // logout/login is required for the Shell to load it.
+        let mut cursor_extension = cursor_extension::detect();
+        if cursor_extension.needed && (!cursor_extension.enabled || cursor_extension.hint.is_some())
+        {
+            match cursor_extension::install() {
+                Ok(state) => cursor_extension = state,
+                Err(error) => {
+                    log::warn!("could not install the GNOME cursor extension: {error}");
+                }
+            }
+        }
+
         Self {
             writer: None,
             language: Language::load(),
@@ -947,6 +964,7 @@ impl Dashboard {
             pairing_review: Vec::new(),
             local_commit,
             diagnostics: Diagnostics::default(),
+            cursor_extension,
             metric_history: HashMap::new(),
             history: Vec::new(),
             policy_export: None,
@@ -2081,6 +2099,53 @@ impl Dashboard {
     }
 }
 
+impl Dashboard {
+    fn render_cursor_extension_banner(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_6()
+            .py_2()
+            .bg(rgb(0x2a2415))
+            .border_b_1()
+            .border_color(rgb(0x5a4a20))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(self.tr("Cursor hiding extension needs a logout")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(self.tr(
+                                "The GNOME Shell extension was installed. Log out and back in once to activate it.",
+                            )),
+                    ),
+            )
+            .child(self.action_button(
+                "cursor-extension-banner-ok",
+                self.tr("OK"),
+                0x1d2430,
+                TEXT,
+                cx,
+                |this, _, _, cx| {
+                    this.cursor_extension.hint = None;
+                    cx.notify();
+                },
+            ))
+    }
+}
+
 impl Render for Dashboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rem_size = px(16.0);
@@ -2214,6 +2279,9 @@ impl Render for Dashboard {
                 )
                 .when(self.settings_dialog.is_some(), |this| {
                     this.child(self.render_settings_dialog(cx))
+                })
+                .when(self.cursor_extension.hint.is_some(), |this| {
+                    this.child(self.render_cursor_extension_banner(cx))
                 })
                 .child(
                     div()
@@ -3069,6 +3137,22 @@ impl Dashboard {
             .children(rows)
     }
 
+    /// Install/enable the bundled GNOME cursor-hiding extension.
+    fn install_cursor_extension(&mut self, cx: &mut Context<Self>) {
+        match cursor_extension::install() {
+            Ok(state) => {
+                self.cursor_extension = state;
+                self.status = self
+                    .tr("Extension installed. Log out and back in to activate it.")
+                    .to_string();
+            }
+            Err(error) => {
+                self.status = format!("{}: {error}", self.tr("Extension installation failed"));
+            }
+        }
+        cx.notify();
+    }
+
     fn render_settings_general(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let local_commit = String::from_utf8_lossy(&self.local_commit)
             .trim_matches('\0')
@@ -3139,6 +3223,63 @@ impl Dashboard {
                         |this, _, _, cx| this.set_language(Language::PortugueseBrazil, cx),
                     )),
             )
+            .when(self.cursor_extension.needed, |this| {
+                let extension = self.cursor_extension.clone();
+                let (label, hint) = if extension.enabled {
+                    (
+                        self.tr("Cursor hiding extension active"),
+                        self.tr("Log out and back in once if the cursor is still visible."),
+                    )
+                } else if extension.installed {
+                    (
+                        self.tr("Cursor hiding extension installed but not enabled"),
+                        self.tr("Enable it and log out/in once to hide the cursor on this PC."),
+                    )
+                } else {
+                    (
+                        self.tr("Hide the local cursor on GNOME Wayland"),
+                        self.tr(
+                            "Installs the optional GNOME Shell extension. Wayland loads it after a logout/login.",
+                        ),
+                    )
+                };
+                let button = if extension.enabled {
+                    self.tr("Reinstall extension")
+                } else if extension.installed {
+                    self.tr("Enable extension")
+                } else {
+                    self.tr("Install extension")
+                };
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT))
+                                        .child(self.tr("Local cursor while controlling another PC")),
+                                )
+                                .child(self.action_button(
+                                    "install-cursor-extension",
+                                    button,
+                                    0x1d2430,
+                                    TEXT,
+                                    cx,
+                                    |this, _, _, cx| this.install_cursor_extension(cx),
+                                )),
+                        )
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(label))
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(hint)),
+                )
+            })
             .child(
                 div()
                     .text_sm()
