@@ -13,7 +13,10 @@ use lan_mouse_ipc::{
 };
 
 mod ui_state;
-use ui_state::{LINK_FRESH_WINDOW_MS, LinkState, RowAction, link_state, row_action};
+use ui_state::{
+    LINK_FRESH_WINDOW_MS, LinkState, RowAction, link_state, outgoing_sensitivity_visible,
+    row_action,
+};
 
 /// UI zoom applied to every layout/font size.
 ///
@@ -1621,6 +1624,10 @@ impl Dashboard {
         };
         let position = peer.position;
         let sensitivity = peer.sensitivity;
+        // Outgoing sensitivity only matters when this machine may control the
+        // peer. A purely receiving client (the other PC drives this one) would
+        // show a control that cannot have any effect.
+        let show_sensitivity = outgoing_sensitivity_visible(peer.active);
         let primary = peer.primary;
         let action_members = peer.members.clone();
         let edit_members = peer.members.clone();
@@ -1784,12 +1791,6 @@ impl Dashboard {
                             .child(div().text_xs().text_color(rgb(MUTED)).child("Side"))
                             .children(sides)
                     })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(format!("sensitivity {sensitivity}%")),
-                    )
                     .child(self.action_button(
                         "edit-client",
                         "Edit",
@@ -1809,26 +1810,34 @@ impl Dashboard {
                         cx,
                         move |this, _, _, _| this.resolve_dns(&dns_members),
                     ))
-                    .child(self.action_button(
-                        "sensitivity-down",
-                        "-",
-                        0x1d222a,
-                        TEXT,
-                        cx,
-                        move |this, _, _, _| {
-                            this.adjust_sensitivity(&sensitivity_down_members, sensitivity, -10)
-                        },
-                    ))
-                    .child(self.action_button(
-                        "sensitivity-up",
-                        "+",
-                        0x1d222a,
-                        TEXT,
-                        cx,
-                        move |this, _, _, _| {
-                            this.adjust_sensitivity(&sensitivity_up_members, sensitivity, 10)
-                        },
-                    ))
+                    .when(show_sensitivity, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(format!("sensitivity {sensitivity}%")),
+                        )
+                        .child(self.action_button(
+                            "sensitivity-down",
+                            "-",
+                            0x1d222a,
+                            TEXT,
+                            cx,
+                            move |this, _, _, _| {
+                                this.adjust_sensitivity(&sensitivity_down_members, sensitivity, -10)
+                            },
+                        ))
+                        .child(self.action_button(
+                            "sensitivity-up",
+                            "+",
+                            0x1d222a,
+                            TEXT,
+                            cx,
+                            move |this, _, _, _| {
+                                this.adjust_sensitivity(&sensitivity_up_members, sensitivity, 10)
+                            },
+                        ))
+                    })
                     .child(self.action_button(
                         "delete-client",
                         "Remove",
@@ -3015,7 +3024,7 @@ impl Dashboard {
                         div()
                             .text_sm()
                             .text_color(rgb(TEXT))
-                            .child("Incoming pointer sensitivity"),
+                            .child("Cursor speed while controlled remotely"),
                     )
                     .child(self.action_button(
                         "abs-sensitivity-down",
@@ -3049,7 +3058,7 @@ impl Dashboard {
                         div()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child("applies to input received from other machines; 100% = 1:1"),
+                            .child("applies when another PC controls this computer; 100% = 1:1"),
                     ),
             )
             .child(
@@ -4330,6 +4339,15 @@ mod tests {
         assert_eq!(format_timestamp_age(now_secs - 90_000, now_ms), "1d ago");
         // Clock skew (timestamp in the future) must not underflow.
         assert_eq!(format_timestamp_age(now_secs + 60, now_ms), "0s ago");
+    }
+
+    #[test]
+    fn outgoing_sensitivity_is_only_offered_by_the_controlling_side() {
+        assert!(outgoing_sensitivity_visible(true));
+        assert!(
+            !outgoing_sensitivity_visible(false),
+            "a receiving-only client must not show the outgoing sensitivity control"
+        );
     }
 
     #[test]

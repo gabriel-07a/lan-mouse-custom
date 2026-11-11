@@ -195,7 +195,7 @@ Pointer velocity comes from the wire timestamp when the capture backend provides
 arrival time (Windows/macOS report time = 0); real pauses keep their duration.
 
 A persisted sensitivity percentage (default 100 = screen-relative 1:1, clamped 10..500) scales the mapping for
-personal taste. It is adjustable in the GPUI Settings page ("Incoming pointer sensitivity", -/+ 10% steps,
+personal taste. It is adjustable in the GPUI Settings page ("Cursor speed while controlled remotely", -/+ 10% steps,
 applied live and saved), in config.toml (absolute_pointer_sensitivity) or through the CLI:
 "lan-mouse cli set-absolute-sensitivity <percent>". LAN_MOUSE_ABSOLUTE_SCALE overrides it temporarily.
 The arm log line shows the effective gain: "absolute pointer armed at ... gain 1.00x (accel mirrored)".

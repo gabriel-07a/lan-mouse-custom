@@ -146,3 +146,11 @@ pub(crate) fn row_action(state: LinkState, active: bool) -> RowAction {
         LinkState::Receiving => RowAction::Disconnect,
     }
 }
+
+/// Whether the per-device outgoing sensitivity control is meaningful.
+///
+/// It scales motion sent to the peer, so a device that only receives input
+/// (the other PC controls this one) must not offer it.
+pub(crate) fn outgoing_sensitivity_visible(active: bool) -> bool {
+    active
+}
