@@ -18,6 +18,7 @@
 //! fields are event-specific (`elapsed_us`, `gap_us`, `dx`, `dy`, ...).
 
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     path::PathBuf,
@@ -47,6 +48,36 @@ fn trace_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
     base.map(|base| base.join("lan-mouse").join("handoff-trace.jsonl"))
+}
+
+/// Last `Enter` serial seen from each receiver peer, so input/gap events can
+/// carry the same serial even though the emulation layer does not receive it.
+fn receiver_serials() -> &'static Mutex<HashMap<String, u32>> {
+    static SERIALS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    SERIALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remember the serial of the current incoming hand-off.
+pub(crate) fn set_receiver_serial(peer: &str, serial: u32) {
+    if !enabled() {
+        return;
+    }
+    let mut serials = receiver_serials()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if serials.len() > 1024 {
+        serials.clear();
+    }
+    serials.insert(peer.to_string(), serial);
+}
+
+/// Serial associated with the current receiver session, if already seen.
+pub(crate) fn receiver_serial(peer: &str) -> Option<u32> {
+    receiver_serials()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(peer)
+        .copied()
 }
 
 fn writer() -> &'static Mutex<Option<BufWriter<File>>> {

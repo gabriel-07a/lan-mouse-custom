@@ -419,6 +419,7 @@ impl ListenTask {
         along: Option<f32>,
         last_enter: &mut EnterDeduper,
     ) {
+        handoff_trace::set_receiver_serial(&addr.to_string(), serial);
         handoff_trace::event(
             "receiver",
             "receiver.enter_received",
@@ -1126,7 +1127,7 @@ impl EmulationTask {
             handoff_trace::event(
                 "receiver",
                 "receiver.first_input",
-                None,
+                handoff_trace::receiver_serial(&addr.to_string()),
                 Some(&addr.to_string()),
                 &[("elapsed_us", elapsed.as_micros().to_string())],
             );
@@ -1141,7 +1142,7 @@ impl EmulationTask {
                     handoff_trace::event(
                         "receiver",
                         "receiver.input_gap_exceeded",
-                        None,
+                        handoff_trace::receiver_serial(&addr.to_string()),
                         Some(&addr.to_string()),
                         &[
                             ("gap_us", gap.as_micros().to_string()),
@@ -1165,10 +1166,27 @@ impl EmulationTask {
                 handle
             }
         };
-        emulation
+        let inject_started = Instant::now();
+        let result = emulation
             .consume(event, handle)
             .await
-            .map_err(InputEmulationError::from)
+            .map_err(InputEmulationError::from);
+        let inject_us = inject_started.elapsed().as_micros();
+        if handoff_trace::enabled()
+            && self
+                .trace_window_until
+                .is_some_and(|until| Instant::now() < until)
+        {
+            let peer = addr.to_string();
+            handoff_trace::event(
+                "receiver",
+                "receiver.input_applied",
+                handoff_trace::receiver_serial(&peer),
+                Some(&peer),
+                &[("inject_us", inject_us.to_string())],
+            );
+        }
+        result
     }
 
     /// Create the emulation backend while preserving semantic requests that
