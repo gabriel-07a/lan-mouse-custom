@@ -19,7 +19,10 @@ env:
 
 jobs:
   linux-release-build:
-    runs-on: ubuntu-22.04
+    # ubuntu-22.04 runner images now fail the apt dependency step (persistent
+    # package/mirror issue). 24.04 provides the same GTK/wayland/X11 headers and
+    # is what the current CI images use.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: install dependencies
