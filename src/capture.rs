@@ -15,6 +15,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
+use crate::handoff_trace;
 use crate::{
     coalesce::MotionCoalescer,
     connect::{LanMouseConnection, LanMouseConnectionError},
@@ -948,6 +949,14 @@ impl CaptureTask {
             self.active_client.replace(handle);
             self.enter_along = event.begin_along();
             self.handoff_begin_at = Some(Instant::now());
+            handoff_trace::trace(
+                "capture.begin",
+                format_args!(
+                    "client={handle} pos={:?} along={:?}",
+                    self.get_pos(handle),
+                    self.enter_along
+                ),
+            );
             // The first motion of the hand-off must not wait for a batch
             // window inherited from the movement on the previous screen.
             self.coalescer.arm_leading_edge();
@@ -1037,7 +1046,18 @@ impl CaptureTask {
 
         let event = match event {
             CaptureEvent::Begin | CaptureEvent::BeginAt(_) => {
-                self.enter_event(handle, opposite_pos)
+                let event = self.enter_event(handle, opposite_pos);
+                handoff_trace::trace(
+                    "capture.enter_queued",
+                    format_args!(
+                        "client={handle} serial={} elapsed_us={}",
+                        self.enter.serial(),
+                        self.handoff_begin_at
+                            .map(|begin| begin.elapsed().as_micros())
+                            .unwrap_or_default()
+                    ),
+                );
+                event
             }
             CaptureEvent::Input(e) => ProtoEvent::Input(e),
         };
@@ -1072,6 +1092,18 @@ impl CaptureTask {
             is_release_event(&event) && self.conn.peer_supports_enter_ack(handle);
         match self.conn.send_with_grace(event, handle, budget).await {
             Ok(()) => {
+                if is_begin {
+                    handoff_trace::trace(
+                        "capture.enter_sent",
+                        format_args!(
+                            "client={handle} serial={} elapsed_us={}",
+                            self.enter.serial(),
+                            self.handoff_begin_at
+                                .map(|begin| begin.elapsed().as_micros())
+                                .unwrap_or_default()
+                        ),
+                    );
+                }
                 self.disconnected_since = None;
                 // A single lost `Enter` stalls the hand-off until the retry
                 // timer. Sending a second copy on the same path mirrors the
@@ -1187,9 +1219,19 @@ impl CaptureTask {
         let first_after_begin = self.handoff_begin_at.take();
         let sent = self.send_unreliable(handle, event).await;
         if let Some(begin) = first_after_begin {
+            let elapsed = begin.elapsed();
             log::debug!(
                 "handoff: Begin -> first motion sent in {} us",
-                begin.elapsed().as_micros()
+                elapsed.as_micros()
+            );
+            handoff_trace::trace(
+                "capture.first_motion_sent",
+                format_args!(
+                    "client={handle} elapsed_us={} dx={} dy={}",
+                    elapsed.as_micros(),
+                    motion.dx,
+                    motion.dy
+                ),
             );
         }
         sent

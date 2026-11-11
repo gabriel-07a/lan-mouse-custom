@@ -21,6 +21,14 @@ use std::{
 
 use input_capture::CaptureHandle;
 
+/// How long after a hand-off begins every motion event is sent immediately.
+///
+/// The hand-off itself is a burst of movement: the user crosses the edge and
+/// keeps moving. Waiting for the first 30-40 ms of that burst on a batch timer
+/// is felt as a stutter on the client. After the window, normal batching takes
+/// over and the packet rate drops again.
+const HANDOFF_BURST_WINDOW: Duration = Duration::from_millis(40);
+
 /// A coalesced pointer motion: the sum of the deltas and the time of the
 /// most recent event.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -39,6 +47,9 @@ pub(crate) struct MotionCoalescer {
     /// when a capture begins so the first movement of a hand-off does not
     /// wait for the batch window inherited from the previous screen.
     leading_edge: bool,
+    /// While set and not elapsed, every motion is flushed immediately. Covers
+    /// the initial crossing burst, not just the very first event.
+    burst_until: Option<Instant>,
     events_in: u64,
     batches_out: u64,
 }
@@ -50,6 +61,7 @@ impl MotionCoalescer {
             pending: HashMap::new(),
             last_flush: Instant::now(),
             leading_edge: false,
+            burst_until: None,
             events_in: 0,
             batches_out: 0,
         }
@@ -59,9 +71,13 @@ impl MotionCoalescer {
         self.batch.is_some()
     }
 
-    /// Flush the next motion immediately (used at the start of a hand-off).
+    /// Flush the next motions immediately (used at the start of a hand-off).
+    ///
+    /// The first event arms a short burst window so the whole initial crossing
+    /// movement is delivered without batching, not only its first delta.
     pub(crate) fn arm_leading_edge(&mut self) {
         self.leading_edge = true;
+        self.burst_until = None;
     }
 
     /// The batch window, or `None` when coalescing is disabled.
@@ -94,12 +110,19 @@ impl MotionCoalescer {
             }
         }
 
+        if self.leading_edge {
+            self.leading_edge = false;
+            self.burst_until = Some(now + HANDOFF_BURST_WINDOW);
+            return true;
+        }
+        if self.burst_until.is_some_and(|until| now < until) {
+            return true;
+        }
         let due = match self.batch {
             Some(batch) => now.saturating_duration_since(self.last_flush) >= batch,
             None => false,
         };
-        if due || self.leading_edge {
-            self.leading_edge = false;
+        if due {
             return true;
         }
         false
@@ -211,8 +234,10 @@ mod tests {
     }
 
     #[test]
-    fn leading_edge_flushes_the_first_motion_of_a_handoff() {
-        let mut c = MotionCoalescer::new(2);
+    fn leading_edge_flushes_the_first_motions_of_a_handoff_burst() {
+        // Long batch window so the assertion after the burst is about the
+        // burst condition, not the normal 2 ms timer.
+        let mut c = MotionCoalescer::new(60_000);
         let t0 = Instant::now();
         c.push(1, 0, 1.0, 0.0, t0);
         assert!(c.take(1).is_some(), "flush before the hand-off");
@@ -222,8 +247,18 @@ mod tests {
             "the first motion after a Begin must not wait for the batch window"
         );
         assert!(
-            !c.push(1, 2, 1.0, 0.0, t0 + Duration::from_micros(200)),
-            "only the first motion gets the leading edge"
+            c.push(1, 2, 1.0, 0.0, t0 + Duration::from_micros(200)),
+            "the initial crossing burst must also be immediate"
+        );
+        assert!(
+            !c.push(
+                1,
+                3,
+                1.0,
+                0.0,
+                t0 + HANDOFF_BURST_WINDOW + Duration::from_micros(100)
+            ),
+            "after the burst window normal batching resumes"
         );
     }
 

@@ -103,6 +103,11 @@ Checklist mínimo:
 - [ ] se mexeu na wire, teste de compatibilidade com peer antigo;
 - [ ] atualizou `docs/testing/regressions.md` quando aplicável.
 
+## Diagnóstico de handoff
+
+Consulte [handoff-trace.md](handoff-trace.md) para capturar a latência
+`Begin → Enter → arm → Ack → primeiro input` com `LAN_MOUSE_HANDOFF_TRACE=1`.
+
 ## Próximos passos do plano de testes
 
 1. Infra de fakes (transporte em memória, capture/emulation/listener/frontend)

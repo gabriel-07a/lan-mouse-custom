@@ -1,5 +1,6 @@
 use crate::config::local_commit;
 use crate::devices::DeviceStore;
+use crate::handoff_trace;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCommand, ListenerCreationError};
 use futures::{FutureExt, StreamExt};
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, PointerEdge};
@@ -418,6 +419,10 @@ impl ListenTask {
         along: Option<f32>,
         last_enter: &mut EnterDeduper,
     ) {
+        handoff_trace::trace(
+            "receiver.enter_received",
+            format_args!("addr={addr} serial={serial} pos={pos:?} along={along:?}"),
+        );
         if last_enter.is_duplicate(addr, serial) {
             log::debug!("duplicate Enter({serial}) from {addr}, re-acking");
             self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
@@ -430,6 +435,10 @@ impl ListenTask {
         self.emulation_proxy.open(addr);
         let edge = to_pointer_edge(to_ipc_pos(pos));
         self.emulation_proxy.begin_remote_control(edge, along);
+        handoff_trace::trace(
+            "receiver.armed",
+            format_args!("addr={addr} serial={serial} edge={edge:?} along={along:?}"),
+        );
         log::debug!("handoff: armed {edge:?} along {along:?} before Ack");
         log::info!("releasing capture: {addr} entered this device");
         // Publish the hand-off before the Ack gives the peer permission to
@@ -450,6 +459,10 @@ impl ListenTask {
             .ok()
             .unwrap_or_default();
         self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
+        handoff_trace::trace(
+            "receiver.ack_sent",
+            format_args!("addr={addr} serial={serial}"),
+        );
     }
 
     /// Tell the peer that this is a deliberate user disconnect.
@@ -798,6 +811,8 @@ impl EmulationProxy {
             selected_backend,
             pending_remote: None,
             handoff_armed_at: None,
+            trace_window_until: None,
+            trace_last_input: None,
             allow_portal,
             absolute_sensitivity: 1.0,
         };
@@ -916,6 +931,9 @@ struct EmulationTask {
     /// When the backend was armed for the current hand-off; used to log the
     /// first injected input latency (debug only).
     handoff_armed_at: Option<Instant>,
+    /// Input-gap instrumentation window after a hand-off (opt-in trace).
+    trace_window_until: Option<Instant>,
+    trace_last_input: Option<Instant>,
     /// Whether the portal-backed backend may be selected (persisted consent or
     /// an explicit user enable).
     allow_portal: bool,
@@ -1086,11 +1104,36 @@ impl EmulationTask {
         if self.closed.contains(&addr) {
             return Ok(());
         }
+        let now = Instant::now();
         if let Some(armed) = self.handoff_armed_at.take() {
+            let elapsed = armed.elapsed();
             log::debug!(
                 "handoff: first input applied {} us after arming",
-                armed.elapsed().as_micros()
+                elapsed.as_micros()
             );
+            handoff_trace::trace(
+                "receiver.first_input",
+                format_args!("addr={addr} elapsed_us={}", elapsed.as_micros()),
+            );
+            if handoff_trace::enabled() {
+                self.trace_window_until = Some(now + Duration::from_millis(300));
+                self.trace_last_input = Some(now);
+            }
+        } else if self.trace_window_until.is_some_and(|until| now < until) {
+            if let Some(last) = self.trace_last_input {
+                let gap = now.saturating_duration_since(last);
+                if gap > handoff_trace::INPUT_GAP_WARN {
+                    handoff_trace::trace(
+                        "receiver.input_gap_exceeded",
+                        format_args!(
+                            "addr={addr} gap_us={} threshold_us={}",
+                            gap.as_micros(),
+                            handoff_trace::INPUT_GAP_WARN.as_micros()
+                        ),
+                    );
+                }
+            }
+            self.trace_last_input = Some(now);
         }
         let handle = match self.handles.get(&addr) {
             Some(&handle) => handle,

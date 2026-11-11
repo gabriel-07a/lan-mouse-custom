@@ -13,6 +13,7 @@ mod dns;
 pub mod doctor;
 mod emulation;
 pub mod emulation_test;
+mod handoff_trace;
 mod listen;
 mod reset;
 pub mod service;
