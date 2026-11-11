@@ -24,7 +24,7 @@ keeps the tray working and isolates UI crashes from the input service.
 ## Implemented
 
 - Device dashboard with live state, connect/disconnect, position cycling,
-  sensitivity, DNS, edit and remove.
+  sensitivity, edit and remove.
 - This Computer card with hostname, IPv4 addresses, port, fingerprint and
   copy-address/copy-fingerprint actions.
 - Add-device dialog (hostname/IP, port, optional fingerprint).

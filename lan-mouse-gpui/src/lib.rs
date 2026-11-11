@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod i18n;
+
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent,
     MouseButton, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowDecorations,
     WindowOptions, div, prelude::*, rgb, size,
 };
+use i18n::Language;
 use lan_mouse_ipc::{
     AddressRuleView, ClientConfig, ClientHandle, ClientState, ClipboardStatus, DeviceView,
     Diagnostics, DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest,
@@ -795,6 +798,7 @@ enum BridgeMessage {
 
 struct Dashboard {
     writer: Option<FrontendRequestWriter>,
+    language: Language,
     clients: HashMap<ClientHandle, (ClientConfig, ClientState)>,
     pending: Vec<PendingView>,
     devices: Vec<DeviceView>,
@@ -912,6 +916,7 @@ impl Dashboard {
 
         Self {
             writer: None,
+            language: Language::load(),
             clients: HashMap::new(),
             pending: Vec::new(),
             devices: Vec::new(),
@@ -947,6 +952,23 @@ impl Dashboard {
             scan_requested_at: None,
             first_frame_logged: false,
         }
+    }
+
+    fn tr(&self, english: &'static str) -> &'static str {
+        self.language.tr(english)
+    }
+
+    fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        language.save();
+        self.status = match language {
+            Language::English => "Language: English".to_string(),
+            Language::PortugueseBrazil => "Idioma: Português (Brasil)".to_string(),
+        };
+        cx.notify();
     }
 
     fn handle_bridge(&mut self, message: BridgeMessage) {
@@ -1439,12 +1461,6 @@ impl Dashboard {
         self.send(FrontendRequest::ScanNetwork);
     }
 
-    fn resolve_dns(&mut self, members: &[ClientHandle]) {
-        for handle in members {
-            self.send(FrontendRequest::ResolveDns(*handle));
-        }
-    }
-
     fn delete_peer(&mut self, members: &[ClientHandle]) {
         for handle in members {
             self.send(FrontendRequest::Delete(*handle));
@@ -1627,28 +1643,59 @@ impl Dashboard {
         // Explain the state using only the evidence available. A handshake is
         // never described as "connected" and a stale link says how long the peer
         // has been silent.
-        let detail = match state {
-            LinkState::Disabled => "offline".to_string(),
-            LinkState::Connecting if peer.has_outgoing => {
-                format!("link to {display_endpoint} up — waiting for a reply")
-            }
-            LinkState::Connecting => format!("trying {display_endpoint} — no answer yet"),
-            LinkState::Reconnecting => {
-                format!("no reply for {stale_secs}s — reconnecting…{link_metrics}{last_pong}")
-            }
-            LinkState::ConnectedDegraded => {
-                format!("link up{link_metrics}{last_pong} — emulation disabled on the other PC")
-            }
-            LinkState::Connected => format!("link healthy{link_metrics}{last_pong}"),
-            LinkState::ConnectedBidirectional => {
-                format!("link healthy (bidirectional){link_metrics}{last_pong}")
-            }
-            LinkState::Receiving if peer.active => {
-                "incoming session — outgoing connection still being established".to_string()
-            }
-            LinkState::Receiving => {
-                "incoming session — input is applied only while it enters this screen".to_string()
-            }
+        let detail = match self.language {
+            Language::English => match state {
+                LinkState::Disabled => "offline".to_string(),
+                LinkState::Connecting if peer.has_outgoing => {
+                    format!("link to {display_endpoint} up — waiting for a reply")
+                }
+                LinkState::Connecting => format!("trying {display_endpoint} — no answer yet"),
+                LinkState::Reconnecting => {
+                    format!("no reply for {stale_secs}s — reconnecting…{link_metrics}{last_pong}")
+                }
+                LinkState::ConnectedDegraded => {
+                    format!("link up{link_metrics}{last_pong} — emulation disabled on the other PC")
+                }
+                LinkState::Connected => format!("link healthy{link_metrics}{last_pong}"),
+                LinkState::ConnectedBidirectional => {
+                    format!("link healthy (bidirectional){link_metrics}{last_pong}")
+                }
+                LinkState::Receiving if peer.active => {
+                    "incoming session — outgoing connection still being established".to_string()
+                }
+                LinkState::Receiving => {
+                    "incoming session — input is applied only while it enters this screen"
+                        .to_string()
+                }
+            },
+            Language::PortugueseBrazil => match state {
+                LinkState::Disabled => "offline".to_string(),
+                LinkState::Connecting if peer.has_outgoing => {
+                    format!("link para {display_endpoint} ativo — aguardando resposta")
+                }
+                LinkState::Connecting => {
+                    format!("tentando {display_endpoint} — sem resposta ainda")
+                }
+                LinkState::Reconnecting => {
+                    format!(
+                        "sem resposta há {stale_secs}s — reconectando…{link_metrics}{last_pong}"
+                    )
+                }
+                LinkState::ConnectedDegraded => {
+                    format!("link ativo{link_metrics}{last_pong} — emulação desativada no outro PC")
+                }
+                LinkState::Connected => format!("link saudável{link_metrics}{last_pong}"),
+                LinkState::ConnectedBidirectional => {
+                    format!("link saudável (bidirecional){link_metrics}{last_pong}")
+                }
+                LinkState::Receiving if peer.active => {
+                    "sessão de entrada — conexão de saída ainda sendo estabelecida".to_string()
+                }
+                LinkState::Receiving => {
+                    "sessão de entrada — o input só é aplicado enquanto entra nesta tela"
+                        .to_string()
+                }
+            },
         };
         let (state_color, state_bg) = if state.is_degraded() {
             (AMBER, 0x342b12)
@@ -1668,7 +1715,6 @@ impl Dashboard {
         let primary = peer.primary;
         let action_members = peer.members.clone();
         let edit_members = peer.members.clone();
-        let dns_members = peer.members.clone();
         let position_members = peer.members.clone();
         let sensitivity_down_members = peer.members.clone();
         let sensitivity_up_members = peer.members.clone();
@@ -1746,7 +1792,7 @@ impl Dashboard {
                                 }))
                                 .text_sm()
                                 .cursor_pointer()
-                                .child(action.label())
+                                .child(self.tr(action.label()))
                                 .on_click(cx.listener(move |this, _, _, _| {
                                     this.apply_row_action(&action_members, action)
                                 })),
@@ -1770,7 +1816,9 @@ impl Dashboard {
                                 .text_xs()
                                 .text_color(rgb(AMBER))
                                 .truncate()
-                                .child("build mismatch with this peer; update both machines"),
+                                .child(
+                                    self.tr("build mismatch with this peer; update both machines"),
+                                ),
                         )
                     })
                     .when(peer.last_error.is_some(), |this| {
@@ -1781,7 +1829,8 @@ impl Dashboard {
                                 .text_color(rgb(RED))
                                 .truncate()
                                 .child(format!(
-                                    "last error: {}",
+                                    "{} {}",
+                                    self.tr("last error:"),
                                     peer.last_error.clone().unwrap_or_default()
                                 )),
                         )
@@ -1825,12 +1874,17 @@ impl Dashboard {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_xs().text_color(rgb(MUTED)).child("Side"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(self.tr("Side")),
+                            )
                             .children(sides)
                     })
                     .child(self.action_button(
                         "edit-client",
-                        "Edit",
+                        self.tr("Edit"),
                         0x1d2430,
                         TEXT,
                         cx,
@@ -1839,21 +1893,15 @@ impl Dashboard {
                             window.focus(&this.add_focus);
                         },
                     ))
-                    .child(self.action_button(
-                        "resolve-dns",
-                        "DNS",
-                        0x1d222a,
-                        TEXT,
-                        cx,
-                        move |this, _, _, _| this.resolve_dns(&dns_members),
-                    ))
                     .when(show_sensitivity, |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(MUTED))
-                                .child(format!("sensitivity {sensitivity}%")),
-                        )
+                        this.child(div().text_xs().text_color(rgb(MUTED)).child(
+                            match self.language {
+                                Language::PortugueseBrazil => {
+                                    format!("sensibilidade {sensitivity}%")
+                                }
+                                Language::English => format!("sensitivity {sensitivity}%"),
+                            },
+                        ))
                         .child(self.action_button(
                             "sensitivity-down",
                             "-",
@@ -1877,7 +1925,7 @@ impl Dashboard {
                     })
                     .child(self.action_button(
                         "delete-client",
-                        "Remove",
+                        self.tr("Remove"),
                         0x3a2020,
                         RED,
                         cx,
@@ -1950,11 +1998,12 @@ impl Dashboard {
             .unwrap_or_else(|| device.ip.to_string());
         let port = device.port.unwrap_or(lan_mouse_ipc::DEFAULT_PORT);
         let status = if device.configured {
-            "configured".to_string()
+            self.tr("configured").to_string()
         } else if device.lan_mouse {
-            "Lan Mouse available".to_string()
+            self.tr("Lan Mouse available").to_string()
         } else {
-            "host reachable (Lan Mouse not confirmed)".to_string()
+            self.tr("host reachable (Lan Mouse not confirmed)")
+                .to_string()
         };
         let version = device
             .version
@@ -1962,9 +2011,9 @@ impl Dashboard {
             .map(|version| format!(" · build {version}"))
             .unwrap_or_default();
         let verification = match device.fingerprint.as_ref() {
-            Some(_) if device.fingerprint_verified => "fingerprint verified",
-            Some(_) => "fingerprint not verified",
-            None => "fingerprint unavailable",
+            Some(_) if device.fingerprint_verified => self.tr("fingerprint verified"),
+            Some(_) => self.tr("fingerprint not verified"),
+            None => self.tr("fingerprint unavailable"),
         };
         let verification_color = if device.fingerprint_verified {
             GREEN
@@ -2017,7 +2066,7 @@ impl Dashboard {
             .when(!device.configured, |this| {
                 this.child(self.action_button(
                     network_add_id(device.ip, port),
-                    "Add",
+                    self.tr("Add"),
                     ACCENT,
                     0x081018,
                     cx,
@@ -2062,9 +2111,9 @@ impl Render for Dashboard {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(self.sidebar_item(Page::Devices, "Devices", "◉", cx))
-                    .child(self.sidebar_item(Page::Network, "Network", "⌁", cx))
-                    .child(self.sidebar_item(Page::Settings, "Settings", "⚙", cx)),
+                    .child(self.sidebar_item(Page::Devices, self.tr("Devices"), "◉", cx))
+                    .child(self.sidebar_item(Page::Network, self.tr("Network"), "⌁", cx))
+                    .child(self.sidebar_item(Page::Settings, self.tr("Settings"), "⚙", cx)),
             )
             .child(div().flex_grow())
             .child(
@@ -2121,9 +2170,9 @@ impl Render for Dashboard {
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT))
                                 .child(match self.page {
-                                    Page::Devices => "Devices",
-                                    Page::Network => "Network",
-                                    Page::Settings => "Settings",
+                                    Page::Devices => self.tr("Devices"),
+                                    Page::Network => self.tr("Network"),
+                                    Page::Settings => self.tr("Settings"),
                                 }),
                         )
                         .when(self.page == Page::Devices, |this| {
@@ -2137,7 +2186,7 @@ impl Render for Dashboard {
                                     .text_color(rgb(0x081018))
                                     .text_sm()
                                     .cursor_pointer()
-                                    .child("+ Add device")
+                                    .child(self.tr("+ Add device"))
                                     .on_click(cx.listener(|this, _, window, _| {
                                         this.add_device();
                                         window.focus(&this.add_focus);
@@ -2155,7 +2204,7 @@ impl Render for Dashboard {
                                     .text_color(rgb(0x081018))
                                     .text_sm()
                                     .cursor_pointer()
-                                    .child("Scan network")
+                                    .child(self.tr("Scan network"))
                                     .on_click(cx.listener(|this, _, _, _| this.start_scan())),
                             )
                         }),
@@ -2439,11 +2488,11 @@ impl Dashboard {
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child("Add device"),
+                    .child(self.tr("Add device")),
             )
-            .child(div().text_xs().text_color(rgb(MUTED)).child(
+            .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr(
                 "Type a hostname or IPv4 address. Tab switches fields, Enter adds, Esc cancels.",
-            ))
+            )))
             .child(
                 div()
                     .flex()
@@ -2451,7 +2500,7 @@ impl Dashboard {
                     .gap_2()
                     .child(self.action_button(
                         "add-field-host",
-                        "Host",
+                        self.tr("Host"),
                         0x1d2430,
                         if host_active { ACCENT } else { TEXT },
                         cx,
@@ -2464,7 +2513,7 @@ impl Dashboard {
                     ))
                     .child(self.action_button(
                         "add-field-port",
-                        "Port",
+                        self.tr("Port"),
                         0x1d2430,
                         if port_active { ACCENT } else { TEXT },
                         cx,
@@ -2477,7 +2526,7 @@ impl Dashboard {
                     ))
                     .child(self.action_button(
                         "add-field-fingerprint",
-                        "Fingerprint",
+                        self.tr("Fingerprint"),
                         0x1d2430,
                         if fp_active { ACCENT } else { TEXT },
                         cx,
@@ -2498,7 +2547,7 @@ impl Dashboard {
                         div()
                             .text_xs()
                             .text_color(rgb(if host_active { ACCENT } else { MUTED }))
-                            .child("hostname / IP"),
+                            .child(self.tr("hostname / IP")),
                     )
                     .child(
                         div()
@@ -2516,7 +2565,7 @@ impl Dashboard {
                         div()
                             .text_xs()
                             .text_color(rgb(if port_active { ACCENT } else { MUTED }))
-                            .child("port"),
+                            .child(self.tr("port")),
                     )
                     .child(
                         div()
@@ -2674,7 +2723,7 @@ impl Dashboard {
                             .text_base()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child(format!("{} (this computer)", self.hostname)),
+                            .child(format!("{} ({})", self.hostname, self.tr("this computer"))),
                     )
                     .child(
                         div()
@@ -2684,7 +2733,7 @@ impl Dashboard {
                             .bg(rgb(0x173225))
                             .text_color(rgb(GREEN))
                             .text_xs()
-                            .child(format!("port {}", self.port)),
+                            .child(format!("{} {}", self.tr("port"), self.port)),
                     ),
             )
             .child(div().text_sm().text_color(rgb(MUTED)).child(ips))
@@ -2692,7 +2741,7 @@ impl Dashboard {
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(format!("certificate {fingerprint}")),
+                    .child(format!("{} {fingerprint}", self.tr("certificate"))),
             )
             .child(
                 div()
@@ -2700,7 +2749,7 @@ impl Dashboard {
                     .gap_2()
                     .child(self.action_button(
                         "copy-address",
-                        "Copy address",
+                        self.tr("Copy address"),
                         0x1d2430,
                         TEXT,
                         cx,
@@ -2712,7 +2761,7 @@ impl Dashboard {
                     ))
                     .child(self.action_button(
                         "copy-fingerprint",
-                        "Copy fingerprint",
+                        self.tr("Copy fingerprint"),
                         0x1d2430,
                         TEXT,
                         cx,
@@ -2800,9 +2849,9 @@ impl Dashboard {
                         .child(self.action_button(
                             "approve-pending",
                             if cert_changed {
-                                "Trust new certificate"
+                                self.tr("Trust new certificate")
                             } else {
-                                "Approve"
+                                self.tr("Approve")
                             },
                             GREEN,
                             0x081018,
@@ -2811,7 +2860,7 @@ impl Dashboard {
                         ))
                         .child(self.action_button(
                             "deny-pending",
-                            "Deny",
+                            self.tr("Deny"),
                             0x3a2020,
                             RED,
                             cx,
@@ -2840,17 +2889,33 @@ impl Dashboard {
             .gap_3()
             .p_6()
             .overflow_y_scroll()
-            .child(div().flex().items_center().justify_between().child(
-                div().text_sm().text_color(rgb(MUTED)).child(format!(
-                    "{} configured device(s){}",
-                    self.clients.len(),
-                    if pending > 0 {
-                        format!(" · {pending} pending request(s)")
-                    } else {
-                        String::new()
-                    }
-                )),
-            ))
+            .child(
+                div().flex().items_center().justify_between().child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(match self.language {
+                            Language::PortugueseBrazil => format!(
+                                "{} dispositivo(s) configurado(s){}",
+                                self.clients.len(),
+                                if pending > 0 {
+                                    format!(" · {pending} pedido(s) pendente(s)")
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            Language::English => format!(
+                                "{} configured device(s){}",
+                                self.clients.len(),
+                                if pending > 0 {
+                                    format!(" · {pending} pending request(s)")
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                        }),
+                ),
+            )
             .when(self.add_dialog.is_some(), |this| {
                 this.child(self.render_add_dialog(cx))
             })
@@ -2895,7 +2960,7 @@ impl Dashboard {
                 div()
                     .text_sm()
                     .text_color(rgb(MUTED))
-                    .child("Find Lan Mouse instances on the local IPv4 network."),
+                    .child(self.tr("Find Lan Mouse instances on the local IPv4 network.")),
             )
             .when(self.discovered.is_empty(), |this| {
                 this.child(
@@ -2909,7 +2974,7 @@ impl Dashboard {
                             div()
                                 .text_sm()
                                 .text_color(rgb(MUTED))
-                                .child("No devices discovered yet. Press Scan network."),
+                                .child(self.tr("No devices discovered yet. Press Scan network.")),
                         ),
                 )
             })
@@ -3022,7 +3087,51 @@ impl Dashboard {
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child("General"),
+                    .child(self.tr("General")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(self.tr("Language")),
+                    )
+                    .child(self.action_button(
+                        "language-en",
+                        "English",
+                        if self.language == Language::English {
+                            ACCENT
+                        } else {
+                            0x1d2430
+                        },
+                        if self.language == Language::English {
+                            0x081018
+                        } else {
+                            TEXT
+                        },
+                        cx,
+                        |this, _, _, cx| this.set_language(Language::English, cx),
+                    ))
+                    .child(self.action_button(
+                        "language-ptbr",
+                        "Português (Brasil)",
+                        if self.language == Language::PortugueseBrazil {
+                            ACCENT
+                        } else {
+                            0x1d2430
+                        },
+                        if self.language == Language::PortugueseBrazil {
+                            0x081018
+                        } else {
+                            TEXT
+                        },
+                        cx,
+                        |this, _, _, cx| this.set_language(Language::PortugueseBrazil, cx),
+                    )),
             )
             .child(
                 div()
@@ -3042,7 +3151,7 @@ impl Dashboard {
                     )))
                     .child(self.action_button(
                         "change-port",
-                        "Change port",
+                        self.tr("Change port"),
                         0x1d2430,
                         TEXT,
                         cx,
@@ -3061,7 +3170,7 @@ impl Dashboard {
                         div()
                             .text_sm()
                             .text_color(rgb(TEXT))
-                            .child("Cursor speed while controlled remotely"),
+                            .child(self.tr("Cursor speed while controlled remotely")),
                     )
                     .child(self.action_button(
                         "abs-sensitivity-down",
@@ -3091,12 +3200,9 @@ impl Dashboard {
                             this.send(FrontendRequest::SetAbsoluteSensitivity(next));
                         },
                     ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("applies when another PC controls this computer; 100% = 1:1"),
-                    ),
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(
+                        self.tr("applies when another PC controls this computer; 100% = 1:1"),
+                    )),
             )
             .child(
                 div()
@@ -3104,7 +3210,7 @@ impl Dashboard {
                     .gap_2()
                     .child(self.action_button(
                         "save-config",
-                        "Save configuration",
+                        self.tr("Save configuration"),
                         ACCENT,
                         0x081018,
                         cx,
@@ -3112,7 +3218,7 @@ impl Dashboard {
                     ))
                     .child(self.action_button(
                         "refresh-history",
-                        "Refresh history",
+                        self.tr("Refresh history"),
                         0x1d2430,
                         TEXT,
                         cx,
@@ -3120,7 +3226,7 @@ impl Dashboard {
                     ))
                     .child(self.action_button(
                         "quit-app",
-                        "Quit Lan Mouse",
+                        self.tr("Quit Lan Mouse"),
                         0x3a2020,
                         RED,
                         cx,
@@ -3296,7 +3402,7 @@ impl Dashboard {
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child("About"),
+                    .child(self.tr("About")),
             )
             .child(div().text_sm().text_color(rgb(TEXT)).child(
                 "Lan Mouse — unofficial fork · GPUI frontend · GPL-3.0-or-later",
@@ -3444,7 +3550,7 @@ impl Dashboard {
                             div()
                                 .text_sm()
                                 .text_color(rgb(MUTED))
-                                .child("No known devices."),
+                                .child(self.tr("No known devices.")),
                         ),
                 )
             })
@@ -3522,7 +3628,7 @@ impl Dashboard {
                             .text_base()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child("Input"),
+                            .child(self.tr("Input")),
                     )
                     .child(
                         div()
@@ -3537,7 +3643,7 @@ impl Dashboard {
                             )
                             .child(self.action_button(
                                 "enable-capture",
-                                "Reenable",
+                                self.tr("Reenable"),
                                 ACCENT,
                                 0x081018,
                                 cx,
@@ -3557,7 +3663,7 @@ impl Dashboard {
                             )
                             .child(self.action_button(
                                 "enable-emulation",
-                                "Reenable",
+                                self.tr("Reenable"),
                                 ACCENT,
                                 0x081018,
                                 cx,
@@ -3580,7 +3686,7 @@ impl Dashboard {
                             .text_base()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child("Clipboard"),
+                            .child(self.tr("Clipboard")),
                     )
                     .child(
                         div()
@@ -3596,9 +3702,9 @@ impl Dashboard {
                             .child(self.action_button(
                                 "toggle-clipboard",
                                 if self.clipboard_status.enabled {
-                                    "Disable"
+                                    self.tr("Disable")
                                 } else {
-                                    "Enable"
+                                    self.tr("Enable")
                                 },
                                 ACCENT,
                                 0x081018,
@@ -3622,7 +3728,7 @@ impl Dashboard {
                             .text_base()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child("Pairing"),
+                            .child(self.tr("Pairing")),
                     )
                     .child(
                         div()
@@ -3643,13 +3749,13 @@ impl Dashboard {
                                         .bg(rgb(0x1d222a))
                                         .text_color(rgb(MUTED))
                                         .text_sm()
-                                        .child("Pairing…"),
+                                        .child(self.tr("Pairing…")),
                                 )
                             })
                             .when(!self.pairing_active, |this| {
                                 this.child(self.action_button(
                                     "start-pairing",
-                                    "Open",
+                                    self.tr("Open"),
                                     ACCENT,
                                     0x081018,
                                     cx,
