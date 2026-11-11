@@ -9,10 +9,20 @@ import Gio from 'gi://Gio';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const HEARTBEAT_MS = 3_000;
+const EXTENSION_VERSION = '2';
 const POLL_MS = 100;
 
 export default class LanMouseCursorExtension extends Extension {
     enable() {
+        // Clutter.Stage has no global cursor API; Mutter's CursorTracker can
+        // inhibit cursor visibility for the compositor.
+        try {
+            this._cursorTracker = global.backend.get_cursor_tracker();
+        } catch (_error) {
+            this._cursorTracker = null;
+        }
+        this._inhibited = false;
+
         const runtime = `${GLib.get_user_runtime_dir()}/lan-mouse`;
         this._stateFile = Gio.File.new_for_path(`${runtime}/cursor-hide`);
         this._loadedFile = Gio.File.new_for_path(
@@ -22,7 +32,7 @@ export default class LanMouseCursorExtension extends Extension {
         // running Shell"; without a logout/login the file does not exist yet.
         try {
             GLib.mkdir_with_parents(runtime, 0o700);
-            GLib.file_set_contents(this._loadedFile.get_path(), '1');
+            GLib.file_set_contents(this._loadedFile.get_path(), EXTENSION_VERSION);
         } catch (_error) {}
 
         this._pollId = GLib.timeout_add(
@@ -42,13 +52,31 @@ export default class LanMouseCursorExtension extends Extension {
             this._pollId = 0;
         }
         this._stateFile = null;
+        this._setInhibited(false);
+        this._cursorTracker = null;
         if (this._loadedFile) {
             try {
                 this._loadedFile.delete(null);
             } catch (_error) {}
             this._loadedFile = null;
         }
-        global.stage.set_cursor_visible(true);
+    }
+
+    _setInhibited(inhibit) {
+        if (!this._cursorTracker) {
+            return;
+        }
+        try {
+            if (inhibit && !this._inhibited) {
+                this._cursorTracker.inhibit_cursor_visibility();
+                this._inhibited = true;
+            } else if (!inhibit && this._inhibited) {
+                this._cursorTracker.uninhibit_cursor_visibility();
+                this._inhibited = false;
+            }
+        } catch (error) {
+            console.error(`Lan Mouse cursor extension: ${error}`);
+        }
     }
 
     _sync() {
@@ -65,6 +93,6 @@ export default class LanMouseCursorExtension extends Extension {
         } catch (_error) {
             hide = false;
         }
-        global.stage.set_cursor_visible(!hide);
+        this._setInhibited(hide);
     }
 }

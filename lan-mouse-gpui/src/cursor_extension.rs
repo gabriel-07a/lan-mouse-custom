@@ -9,6 +9,9 @@
 use std::{fs, path::PathBuf, process::Command};
 
 pub(crate) const UUID: &str = "lan-mouse-cursor@lan-mouse-custom";
+/// Bumped whenever the bundled extension source changes; the extension writes
+/// it into its loaded marker so the app can detect an outdated loaded version.
+const EXTENSION_VERSION: &str = "2";
 
 const EXTENSION_JS: &str =
     include_str!("../../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/extension.js");
@@ -94,7 +97,10 @@ fn user_extension_dir() -> Option<PathBuf> {
 fn extension_loaded() -> bool {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .is_some_and(|runtime| runtime.join("lan-mouse/cursor-extension-loaded").is_file())
+        .is_some_and(|runtime| {
+            std::fs::read_to_string(runtime.join("lan-mouse/cursor-extension-loaded"))
+                .is_ok_and(|version| version.trim() == EXTENSION_VERSION)
+        })
 }
 
 fn extension_installed() -> bool {
