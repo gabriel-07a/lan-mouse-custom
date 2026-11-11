@@ -398,6 +398,7 @@ impl Service {
                         // (release/re-grab loop at the screen edge).
                         if !self.client_manager.is_active(handle) {
                             self.capture.destroy(handle);
+                            self.cursor_hide.leave(handle);
                         }
                         // A successful outgoing connection with an unpinned
                         // client learns the peer certificate (TOFU) and pins
@@ -913,8 +914,7 @@ impl Service {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
                 if self.incoming_conns.is_empty() {
-                    self.capture.set_remote_peer(None);
-                    self.emulation.remote_leave();
+                    self.release_after_incoming_session();
                 }
             }
             EmulationEvent::PortChanged(port) => match port {
@@ -1188,7 +1188,7 @@ impl Service {
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
-                self.cursor_hide.set_active(false);
+                self.cursor_hide.clear();
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::CaptureEnabled => {
@@ -1197,12 +1197,12 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
-                self.cursor_hide.set_active(true);
+                self.cursor_hide.enter(handle);
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
-                self.cursor_hide.set_active(false);
+                self.cursor_hide.leave(handle);
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
         }
@@ -2873,8 +2873,29 @@ impl Service {
         }
     }
 
+    /// Force the local capture to release and drop all remote-control state
+    /// after the last incoming session ends. A portal/libei capture left
+    /// activated used to keep the compositor pointer latched at the last
+    /// barrier after an explicit disconnect; only killing the daemon released
+    /// it. Releasing here is idempotent and safe when no session is active.
+    fn release_after_incoming_session(&mut self) {
+        let plan = incoming_teardown_plan(self.cursor_hide.is_active());
+        self.capture.set_remote_peer(None);
+        if plan.release_capture {
+            // A portal/libei grab left activated used to keep the compositor
+            // pointer latched after an explicit disconnect; killing the daemon
+            // was the only way out. Release is idempotent.
+            self.capture.release();
+        }
+        self.emulation.remote_leave();
+        if plan.clear_cursor_hide {
+            self.cursor_hide.clear();
+        }
+    }
+
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
+        self.cursor_hide.leave(handle);
         if self.client_manager.deactivate_client(handle) {
             self.capture.destroy(handle);
             self.broadcast_client(handle);
@@ -2896,6 +2917,7 @@ impl Service {
         let incoming_addr = self.client_manager.incoming_addr(handle);
         let had_incoming = incoming_addr.is_some();
         // Mark inactive first so the reconnect loop cannot revive the link.
+        self.cursor_hide.leave(handle);
         let was_active = self.client_manager.deactivate_client(handle);
         // Close the outgoing transport with an explicit AuthRevoke (only when
         // there was one; a receiving-only client has no outgoing transport).
@@ -2922,7 +2944,7 @@ impl Service {
         self.capture.destroy(handle);
         self.client_manager.set_incoming_addr(handle, None);
         if self.incoming_conns.is_empty() {
-            self.capture.set_remote_peer(None);
+            self.release_after_incoming_session();
         }
         if user_initiated && had_incoming {
             if let Some(fingerprint) = fingerprint.as_deref() {
@@ -3397,16 +3419,54 @@ fn history_entry_from_record(record: AuditRecord) -> HistoryEntry {
     }
 }
 
+/// What an incoming-session teardown must do. Kept pure so the disconnect
+/// regression can be tested without constructing the whole service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IncomingTeardownPlan {
+    release_capture: bool,
+    clear_cursor_hide: bool,
+}
+
+fn incoming_teardown_plan(outgoing_capture_active: bool) -> IncomingTeardownPlan {
+    IncomingTeardownPlan {
+        // Releasing a still-active outgoing capture would drop control of a
+        // peer that has nothing to do with the incoming session that ended.
+        release_capture: !outgoing_capture_active,
+        clear_cursor_hide: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        RETURN_MAX_ATTEMPTS, RETURN_RETRY_INTERVAL, ReturnHandoff, reverse_client_compatible,
+        IncomingTeardownPlan, RETURN_MAX_ATTEMPTS, RETURN_RETRY_INTERVAL, ReturnHandoff,
+        incoming_teardown_plan, reverse_client_compatible,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)), 4242)
+    }
+
+    #[test]
+    fn incoming_teardown_always_clears_the_cursor_and_releases_a_stale_grab() {
+        assert_eq!(
+            incoming_teardown_plan(false),
+            IncomingTeardownPlan {
+                release_capture: true,
+                clear_cursor_hide: true,
+            },
+            "the explicit-disconnect-to-top-edge regression: release the portal grab"
+        );
+        assert_eq!(
+            incoming_teardown_plan(true),
+            IncomingTeardownPlan {
+                release_capture: false,
+                clear_cursor_hide: true,
+            },
+            "an active outgoing capture must not be released"
+        );
     }
 
     #[test]

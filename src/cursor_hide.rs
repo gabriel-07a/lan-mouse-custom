@@ -5,6 +5,7 @@
 //! hides the cursor while `mtime` is recent. If the service crashes, the file
 //! stops being refreshed and the extension restores the cursor after 3 s.
 
+use lan_mouse_ipc::ClientHandle;
 use std::{
     fs,
     path::PathBuf,
@@ -18,6 +19,10 @@ pub(crate) struct CursorHide {
     path: Option<PathBuf>,
     active: bool,
     last_touch: Option<Instant>,
+    /// The outgoing capture that currently owns the hidden cursor. Tracking it
+    /// lets a disconnect clear the heartbeat even when no `ClientLeft` event is
+    /// delivered (transport drop, explicit disconnect, capture teardown).
+    owner: Option<ClientHandle>,
 }
 
 impl CursorHide {
@@ -41,6 +46,7 @@ impl CursorHide {
             path,
             active: false,
             last_touch: None,
+            owner: None,
         }
     }
 
@@ -50,7 +56,35 @@ impl CursorHide {
             path,
             active: false,
             last_touch: None,
+            owner: None,
         }
+    }
+
+    /// An outgoing capture began for `handle`; hide the cursor until it ends.
+    pub(crate) fn enter(&mut self, handle: ClientHandle) {
+        if self.owner == Some(handle) {
+            return;
+        }
+        self.owner = Some(handle);
+        self.set_active(true);
+    }
+
+    /// The capture for `handle` ended. A different handle must not clear it.
+    pub(crate) fn leave(&mut self, handle: ClientHandle) {
+        if self.owner == Some(handle) {
+            self.clear();
+        }
+    }
+
+    /// Whether an outgoing capture currently owns the hidden cursor.
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Disconnect/teardown: never leave the cursor hidden for a dead session.
+    pub(crate) fn clear(&mut self) {
+        self.owner = None;
+        self.set_active(false);
     }
 
     /// While true, keep the heartbeat fresh; the extension hides the cursor.
@@ -146,6 +180,22 @@ mod tests {
         assert!(path.exists(), "active capture must publish the heartbeat");
         hide.set_active(false);
         assert!(!path.exists(), "releasing the capture must remove it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disconnect_clears_the_heartbeat_for_the_owning_handle() {
+        let (dir, path) = temp_path("disconnect");
+        {
+            let mut hide = CursorHide::with_path(Some(path.clone()));
+            hide.enter(7);
+            assert!(path.exists());
+            // A different client leaving must not hide/clear the wrong session.
+            hide.leave(8);
+            assert!(path.exists());
+            hide.clear();
+            assert!(!path.exists());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
