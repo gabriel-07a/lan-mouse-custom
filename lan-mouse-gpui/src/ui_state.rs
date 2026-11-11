@@ -154,3 +154,13 @@ pub(crate) fn row_action(state: LinkState, active: bool) -> RowAction {
 pub(crate) fn outgoing_sensitivity_visible(active: bool) -> bool {
     active
 }
+
+/// Whether the screen-side selector is meaningful on this peer card.
+///
+/// The side describes where the *peer's* screen is relative to this machine,
+/// which only matters when this machine can control the peer. A purely
+/// receiving client (an incoming session driving this screen) has no use for
+/// it and should not show the selector.
+pub(crate) fn side_selector_visible(active: bool, receiving: bool) -> bool {
+    active && !receiving
+}

@@ -18,7 +18,7 @@ use lan_mouse_ipc::{
 mod ui_state;
 use ui_state::{
     LINK_FRESH_WINDOW_MS, LinkState, RowAction, link_state, outgoing_sensitivity_visible,
-    row_action,
+    row_action, side_selector_visible,
 };
 
 /// UI zoom applied to every layout/font size.
@@ -1714,6 +1714,7 @@ impl Dashboard {
         // peer. A purely receiving client (the other PC drives this one) would
         // show a control that cannot have any effect.
         let show_sensitivity = outgoing_sensitivity_visible(peer.active);
+        let show_side_selector = side_selector_visible(peer.active, state == LinkState::Receiving);
         let primary = peer.primary;
         let action_members = peer.members.clone();
         let edit_members = peer.members.clone();
@@ -1844,45 +1845,47 @@ impl Dashboard {
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child({
-                        // Clearly labelled side selector. Changing the side used
-                        // to be hidden behind a button that silently cycled
-                        // left -> right -> top -> bottom.
-                        let mut sides: Vec<gpui::AnyElement> = Vec::new();
-                        for side in SIDES {
-                            let side_members = position_members.clone();
-                            let is_current = side == position;
-                            sides.push(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "side-{}-{primary}",
-                                        position_label(side)
-                                    )))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(if is_current { 0x1b2a3a } else { 0x1d222a }))
-                                    .text_color(rgb(if is_current { ACCENT } else { TEXT }))
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .child(position_label(side))
-                                    .on_click(cx.listener(move |this, _, _, _| {
-                                        this.set_position(&side_members, side)
-                                    }))
-                                    .into_any_element(),
-                            );
-                        }
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(self.tr("Side")),
-                            )
-                            .children(sides)
+                    .when(show_side_selector, |this| {
+                        this.child({
+                            // Clearly labelled side selector. Changing the side used
+                            // to be hidden behind a button that silently cycled
+                            // left -> right -> top -> bottom.
+                            let mut sides: Vec<gpui::AnyElement> = Vec::new();
+                            for side in SIDES {
+                                let side_members = position_members.clone();
+                                let is_current = side == position;
+                                sides.push(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "side-{}-{primary}",
+                                            position_label(side)
+                                        )))
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(if is_current { 0x1b2a3a } else { 0x1d222a }))
+                                        .text_color(rgb(if is_current { ACCENT } else { TEXT }))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child(position_label(side))
+                                        .on_click(cx.listener(move |this, _, _, _| {
+                                            this.set_position(&side_members, side)
+                                        }))
+                                        .into_any_element(),
+                                );
+                            }
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child(self.tr("Side")),
+                                )
+                                .children(sides)
+                        })
                     })
                     .child(self.action_button(
                         "edit-client",
@@ -4597,6 +4600,13 @@ mod tests {
         assert_ne!(network_add_id(a, 4242), network_add_id(b, 4242));
         assert_ne!(network_add_id(a, 4242), network_add_id(a, 4243));
         assert_eq!(network_add_id(a, 4242), network_add_id(a, 4242));
+    }
+
+    #[test]
+    fn side_selector_is_hidden_for_a_receiving_only_client() {
+        assert!(side_selector_visible(true, false));
+        assert!(!side_selector_visible(true, true));
+        assert!(!side_selector_visible(false, false));
     }
 
     #[test]
