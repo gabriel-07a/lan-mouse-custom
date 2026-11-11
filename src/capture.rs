@@ -197,6 +197,8 @@ impl Capture {
             enter: EnterState::default(),
             enter_along: None,
             handoff_begin_at: None,
+            trace_window_until: None,
+            trace_last_motion: None,
             last_enter_pair: None,
             sensitivity: Default::default(),
             remote_peer: None,
@@ -484,6 +486,10 @@ struct CaptureTask {
     /// When the current hand-off began; used to log the first motion latency
     /// (debug only).
     handoff_begin_at: Option<Instant>,
+    /// Opt-in trace: local capture-to-capture motion gaps during the first
+    /// 500 ms after a Begin, to separate source cadence from network jitter.
+    trace_window_until: Option<Instant>,
+    trace_last_motion: Option<Instant>,
     /// Last time an unacknowledged `Enter` was paired with input, throttled by
     /// [`ENTER_PAIR_THROTTLE`] so the retransmission is repaired quickly
     /// without flooding the link.
@@ -949,6 +955,10 @@ impl CaptureTask {
             self.active_client.replace(handle);
             self.enter_along = event.begin_along();
             self.handoff_begin_at = Some(Instant::now());
+            if handoff_trace::enabled() {
+                self.trace_window_until = Some(Instant::now() + Duration::from_millis(500));
+                self.trace_last_motion = None;
+            }
             handoff_trace::event(
                 "controller",
                 "capture.begin",
@@ -1011,6 +1021,26 @@ impl CaptureTask {
             if let CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })) =
                 event
             {
+                if handoff_trace::enabled()
+                    && self
+                        .trace_window_until
+                        .is_some_and(|until| Instant::now() < until)
+                {
+                    let now = Instant::now();
+                    if let Some(last) = self.trace_last_motion {
+                        let gap = now.saturating_duration_since(last);
+                        if gap > handoff_trace::INPUT_GAP_WARN {
+                            handoff_trace::event(
+                                "controller",
+                                "controller.input_gap_exceeded",
+                                Some(self.enter.serial()),
+                                Some(&format!("client {handle}")),
+                                &[("gap_us", gap.as_micros().to_string())],
+                            );
+                        }
+                    }
+                    self.trace_last_motion = Some(now);
+                }
                 let due = self.coalescer.push(handle, time, dx, dy, Instant::now());
                 if due && !self.flush_motion().await {
                     log::warn!("releasing capture: failed to send coalesced motion");
@@ -1717,6 +1747,8 @@ mod capture_handle_tests {
             enter: EnterState::default(),
             enter_along: None,
             handoff_begin_at: None,
+            trace_window_until: None,
+            trace_last_motion: None,
             last_enter_pair: None,
             sensitivity: HashMap::new(),
             outgoing_caps: HashMap::new(),
