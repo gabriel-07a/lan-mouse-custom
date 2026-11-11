@@ -949,13 +949,15 @@ impl CaptureTask {
             self.active_client.replace(handle);
             self.enter_along = event.begin_along();
             self.handoff_begin_at = Some(Instant::now());
-            handoff_trace::trace(
+            handoff_trace::event(
+                "controller",
                 "capture.begin",
-                format_args!(
-                    "client={handle} pos={:?} along={:?}",
-                    self.get_pos(handle),
-                    self.enter_along
-                ),
+                None,
+                Some(&format!("client {handle}")),
+                &[
+                    ("pos", format!("{:?}", self.get_pos(handle))),
+                    ("along", format!("{:?}", self.enter_along)),
+                ],
             );
             // The first motion of the hand-off must not wait for a batch
             // window inherited from the movement on the previous screen.
@@ -1047,15 +1049,18 @@ impl CaptureTask {
         let event = match event {
             CaptureEvent::Begin | CaptureEvent::BeginAt(_) => {
                 let event = self.enter_event(handle, opposite_pos);
-                handoff_trace::trace(
+                handoff_trace::event(
+                    "controller",
                     "capture.enter_queued",
-                    format_args!(
-                        "client={handle} serial={} elapsed_us={}",
-                        self.enter.serial(),
+                    Some(self.enter.serial()),
+                    Some(&format!("client {handle}")),
+                    &[(
+                        "elapsed_us",
                         self.handoff_begin_at
                             .map(|begin| begin.elapsed().as_micros())
                             .unwrap_or_default()
-                    ),
+                            .to_string(),
+                    )],
                 );
                 event
             }
@@ -1093,15 +1098,18 @@ impl CaptureTask {
         match self.conn.send_with_grace(event, handle, budget).await {
             Ok(()) => {
                 if is_begin {
-                    handoff_trace::trace(
+                    handoff_trace::event(
+                        "controller",
                         "capture.enter_sent",
-                        format_args!(
-                            "client={handle} serial={} elapsed_us={}",
-                            self.enter.serial(),
+                        Some(self.enter.serial()),
+                        Some(&format!("client {handle}")),
+                        &[(
+                            "elapsed_us",
                             self.handoff_begin_at
                                 .map(|begin| begin.elapsed().as_micros())
                                 .unwrap_or_default()
-                        ),
+                                .to_string(),
+                        )],
                     );
                 }
                 self.disconnected_since = None;
@@ -1224,14 +1232,16 @@ impl CaptureTask {
                 "handoff: Begin -> first motion sent in {} us",
                 elapsed.as_micros()
             );
-            handoff_trace::trace(
+            handoff_trace::event(
+                "controller",
                 "capture.first_motion_sent",
-                format_args!(
-                    "client={handle} elapsed_us={} dx={} dy={}",
-                    elapsed.as_micros(),
-                    motion.dx,
-                    motion.dy
-                ),
+                Some(self.enter.serial()),
+                Some(&format!("client {handle}")),
+                &[
+                    ("elapsed_us", elapsed.as_micros().to_string()),
+                    ("dx", motion.dx.to_string()),
+                    ("dy", motion.dy.to_string()),
+                ],
             );
         }
         sent

@@ -1,8 +1,30 @@
 # Handoff trace (cursor stutter diagnosis)
 
-`LAN_MOUSE_HANDOFF_TRACE=1` enables a small number of structured log lines
-(`target=handoff_trace`) around the mouse hand-off. It is independent of
-`LAN_MOUSE_LOG_LEVEL`; leave normal logging at `info` to avoid noise.
+`LAN_MOUSE_HANDOFF_TRACE=1` enables a small number of structured JSON Lines
+around the mouse hand-off. It is independent of `LAN_MOUSE_LOG_LEVEL`; leave
+normal logging at `info` to avoid noise.
+
+The detailed file is written to:
+
+- Linux: `${XDG_CACHE_HOME:-~/.cache}/lan-mouse/handoff-trace.jsonl`
+- Windows: `%LOCALAPPDATA%\lan-mouse\handoff-trace.jsonl`
+
+It rotates at 5 MiB (one `.1` backup). `LAN_MOUSE_HANDOFF_TRACE_FILE` overrides
+the path. The journal only gets a compact one-line summary per event; use the
+file for analysis.
+
+Schema:
+
+```json
+{"ts_unix_us":1700000000000000,"role":"receiver","stage":"receiver.armed",
+ "serial":109,"peer":"192.168.1.42:52706","edge":"Right","along":"0.37"}
+```
+
+Summarize sessions with:
+
+```sh
+scripts/analyze-handoff-trace.py
+```
 
 ## Stages
 
@@ -36,6 +58,8 @@ systemctl --user set-environment LAN_MOUSE_HANDOFF_TRACE=1
 systemctl --user restart lan-mouse-custom.service
 # reproduce the crossing, then:
 journalctl --user -u lan-mouse-custom.service --since "5 min ago" | grep handoff_trace
+# detailed structured file:
+scripts/analyze-handoff-trace.py
 ```
 
 Disable afterwards:
@@ -67,3 +91,17 @@ If `enter_received` arrives late while `capute.begin` was immediate, the loss
 is on Wi-Fi/capture activation. If `first_input` is late after `armed`, the
 receiver/injection path is the bottleneck. If gaps only appear after the first
 40 ms burst, the steady-state batching/network is the bottleneck.
+
+## Baseline observed (2026-11-11, Wi-Fi)
+
+Captured on the Ubuntu receiver while a Windows peer was the controller:
+
+- `receiver.enter_received → receiver.armed → receiver.ack_sent` happened in
+  the same millisecond, so the listener/arming path is not the bottleneck;
+- `receiver.first_input` was **5–12 ms** after arming;
+- during movement, the median gap between injected inputs was **~8.5 ms**
+  (roughly 125 Hz), with outliers of **20–65 ms** throughout the session.
+
+That points at the sender's input cadence/network delivery (and Wi-Fi jitter)
+rather than capture activation on the receiver. The sender-side fixes in this
+branch (40 ms handoff burst, Windows DSCP EF marking) target exactly that.

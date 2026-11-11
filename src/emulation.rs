@@ -419,9 +419,12 @@ impl ListenTask {
         along: Option<f32>,
         last_enter: &mut EnterDeduper,
     ) {
-        handoff_trace::trace(
+        handoff_trace::event(
+            "receiver",
             "receiver.enter_received",
-            format_args!("addr={addr} serial={serial} pos={pos:?} along={along:?}"),
+            Some(serial),
+            Some(&addr.to_string()),
+            &[("pos", format!("{pos:?}")), ("along", format!("{along:?}"))],
         );
         if last_enter.is_duplicate(addr, serial) {
             log::debug!("duplicate Enter({serial}) from {addr}, re-acking");
@@ -435,9 +438,15 @@ impl ListenTask {
         self.emulation_proxy.open(addr);
         let edge = to_pointer_edge(to_ipc_pos(pos));
         self.emulation_proxy.begin_remote_control(edge, along);
-        handoff_trace::trace(
+        handoff_trace::event(
+            "receiver",
             "receiver.armed",
-            format_args!("addr={addr} serial={serial} edge={edge:?} along={along:?}"),
+            Some(serial),
+            Some(&addr.to_string()),
+            &[
+                ("edge", format!("{edge:?}")),
+                ("along", format!("{along:?}")),
+            ],
         );
         log::debug!("handoff: armed {edge:?} along {along:?} before Ack");
         log::info!("releasing capture: {addr} entered this device");
@@ -459,9 +468,12 @@ impl ListenTask {
             .ok()
             .unwrap_or_default();
         self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
-        handoff_trace::trace(
+        handoff_trace::event(
+            "receiver",
             "receiver.ack_sent",
-            format_args!("addr={addr} serial={serial}"),
+            Some(serial),
+            Some(&addr.to_string()),
+            &[],
         );
     }
 
@@ -1111,9 +1123,12 @@ impl EmulationTask {
                 "handoff: first input applied {} us after arming",
                 elapsed.as_micros()
             );
-            handoff_trace::trace(
+            handoff_trace::event(
+                "receiver",
                 "receiver.first_input",
-                format_args!("addr={addr} elapsed_us={}", elapsed.as_micros()),
+                None,
+                Some(&addr.to_string()),
+                &[("elapsed_us", elapsed.as_micros().to_string())],
             );
             if handoff_trace::enabled() {
                 self.trace_window_until = Some(now + Duration::from_millis(300));
@@ -1123,13 +1138,18 @@ impl EmulationTask {
             if let Some(last) = self.trace_last_input {
                 let gap = now.saturating_duration_since(last);
                 if gap > handoff_trace::INPUT_GAP_WARN {
-                    handoff_trace::trace(
+                    handoff_trace::event(
+                        "receiver",
                         "receiver.input_gap_exceeded",
-                        format_args!(
-                            "addr={addr} gap_us={} threshold_us={}",
-                            gap.as_micros(),
-                            handoff_trace::INPUT_GAP_WARN.as_micros()
-                        ),
+                        None,
+                        Some(&addr.to_string()),
+                        &[
+                            ("gap_us", gap.as_micros().to_string()),
+                            (
+                                "threshold_us",
+                                handoff_trace::INPUT_GAP_WARN.as_micros().to_string(),
+                            ),
+                        ],
                     );
                 }
             }

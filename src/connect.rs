@@ -632,7 +632,22 @@ pub(crate) fn configure_low_latency_udp(socket: &UdpSocket) {
             );
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{
+            IP_TOS, IPPROTO_IP, IPPROTO_IPV6, IPV6_TCLASS, SOCKET, setsockopt,
+        };
+        let raw = SOCKET(socket.as_raw_socket() as usize);
+        let tos: i32 = 0xB8; // DSCP EF (46) << 2
+        let bytes = tos.to_ne_bytes();
+        unsafe {
+            // IPv4 and IPv6 sockets: the irrelevant call fails harmlessly.
+            let _ = setsockopt(raw, IPPROTO_IP.0, IP_TOS, Some(&bytes));
+            let _ = setsockopt(raw, IPPROTO_IPV6.0, IPV6_TCLASS, Some(&bytes));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = socket;
 }
 
