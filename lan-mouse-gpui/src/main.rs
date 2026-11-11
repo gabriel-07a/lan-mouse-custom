@@ -27,7 +27,9 @@ fn main() {
         Ok(lan_mouse_gpui::FrontendExit::Quit) => {
             // Explicit quit: the Dashboard already asked the service to shut
             // down over IPC, and the launcher stops a daemon it spawned itself.
-            std::process::exit(0);
+            // Use a dedicated code so a crash/minimize exit (0 or other) can
+            // never be mistaken for a deliberate quit.
+            std::process::exit(lan_mouse_ipc::FRONTEND_EXIT_QUIT);
         }
         Ok(lan_mouse_gpui::FrontendExit::WindowClosed) => {
             // The window was closed, not the application: exit with the code

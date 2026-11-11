@@ -46,7 +46,7 @@ Found: **0 × P1, 7 × P2, 22 × P3** (29 total). Fixed: **28**. Open (reported,
 | FE-19 | P3 | lan-mouse-gtk/src/window.rs (hostname/port entries) | GTK sends `UpdateHostname`/`UpdatePort` on every keystroke ⇒ one IPC request + config save + State broadcast per char (UI-triggered request churn). | No debounce on text entries. | **Not changed** (behaviour is correct, only chatty; a debounce is QoL/UX, not a correctness fix). Reported for follow-up. | — | open (reported) |
 | FE-20 | P3 | lan-mouse-gpui/src/lib.rs (history rows) | History printed raw Unix-ms timestamp. | No formatting. | Human-readable age ("5s ago"/"2h ago"). | `timestamp_age_is_human_readable` | fixed |
 | FE-21 | P3 | lan-mouse-gpui/src/lib.rs (`run`) | `open_window(...).expect(...)` panicked (release `panic=abort`) when window creation failed (no compositor/GPU init failure) instead of reporting. | `expect` on fallible startup. | Log the error, `cx.quit()`, return; launcher reports the non-zero/failed frontend. | code review | fixed |
-| FE-22 | P3 | lan-mouse-gpui/src/lib.rs (tray Quit) | Tray "Quit" used `std::process::exit(0)` (skips log flush/drop). | Prototype shortcut. | Route through `cx.quit()` so `Application::run` returns and main exits 0 (launcher then stops the daemon). | code review | fixed |
+| FE-22 | P3 | lan-mouse-gpui/src/lib.rs (tray Quit) | Tray "Quit" used `std::process::exit(0)` (skips log flush/drop). | Prototype shortcut. | Route through `cx.quit()` so `Application::run` returns and main exits 0 (launcher then stops the daemon via the explicit `FRONTEND_EXIT_QUIT` code). | code review | fixed |
 | FE-23 | P3 | lan-mouse-gtk/src/window.rs (`Window::request`) | `frontend_request_writer.as_mut().unwrap()` panics if a callback fires before the writer is installed / after teardown. Not reachable via current construction order (latent). | Unwrap on a state option. | Log + drop the request. | code review | fixed |
 | FE-24 | P3 | lan-mouse-gtk/src/lib.rs (event loop) | Service EOF made `process::exit(1)` silently (no log, no message). | Abrupt exit path. | `log::error!` before exiting (a GTK UI without the service is useless; behaviour kept). | code review | fixed |
 | FE-25 | P3 | lan-mouse-gpui/src/lib.rs (`sticky_endpoint`) | No endpoint debounce: the service can rewrite `active_addr` per Pong, so a dual-stack peer's card could flap IPv4↔IPv6. GTK has the 3 s sticky endpoint. | Card showed the raw `active_addr`. | Per-group 3 s debounce (`ENDPOINT_STICKY_WINDOW`, same algorithm as GTK); cleared on loss/delete/enumerate. | `endpoint_debounce_does_not_flap_between_families` | fixed |
@@ -191,9 +191,28 @@ window close from an explicit quit and exits with `lan_mouse_ipc::FRONTEND_EXIT_
 former; the launcher sees that code and deliberately leaves the daemon child running, so the service and
 the LAN connection survive. The tray and Settings "Quit Lan Mouse" actions send
 `FrontendRequest::Shutdown` over IPC (which also covers a service started by systemd or by an earlier
-launch, where the launcher does not own the child) and exit with code 0; the launcher then stops its own
-child as before. Starting Lan Mouse again reuses the running service and reopens the window.
+launch, where the launcher does not own the child) and exit with `FRONTEND_EXIT_QUIT` (4); the launcher
+then stops its own child as before. Starting Lan Mouse again reuses the running service and reopens the window.
 
 Limitation: GPUI 0.2.2 cannot keep a process alive with zero windows, so the tray icon itself goes away
 with the window; the app icon is the way back to the UI. A persistent tray would require moving the tray
 into the service/launcher process or patching GPUI's last-window quit behaviour.
+
+## R-19: minimizing on Windows 10/11 dropped the peer connection
+
+Reported: on Windows 10 and 11, minimizing the Lan Mouse window closed the LAN
+connection to the other PC.
+
+Root cause: the launcher treated any frontend exit other than the dedicated
+window-close code as a quit (zero/unknown codes, crashes while minimized) and
+stopped the daemon child it had started. A frontend that exited (or was killed
+by the GPU/driver while minimized) therefore severed the service and the link.
+
+Fix: explicit quit now has its own exit code (`FRONTEND_EXIT_QUIT = 4`); every
+other frontend outcome (`FRONTEND_EXIT_KEEP_SERVICE`, zero, unknown, signal)
+keeps the daemon and the connection running. The window minimize path itself
+does not touch the service. Reopening Lan Mouse reuses the still-running
+service.
+
+Regression test: `src/main.rs::a_minimized_or_killed_frontend_keeps_the_service_running`
+(plus `a_closed_window_keeps_the_service_running`).

@@ -33,10 +33,18 @@ pub use listen::AsyncFrontendListener;
 /// stops it when the frontend exits. Closing the window is not an application
 /// quit: the frontend exits with this code so the launcher leaves the daemon
 /// alone, and launching Lan Mouse again reopens the window against the still
-/// running service. An explicit quit exits with code 0 and stops the service
-/// (asked to shut down over IPC by the frontend, plus the launcher's own child
-/// cleanup).
+/// running service. An explicit quit uses [`FRONTEND_EXIT_QUIT`] and stops the
+/// service (asked to shut down over IPC by the frontend, plus the launcher's
+/// own child cleanup).
 pub const FRONTEND_EXIT_KEEP_SERVICE: i32 = 3;
+
+/// Exit code the GPUI frontend uses for an explicit "Quit Lan Mouse".
+///
+/// This is the only frontend exit that may stop the daemon. Any other exit
+/// (window minimized/closed, GPU crash, killed process) must leave the service
+/// and the LAN connection running; otherwise minimizing the window on Windows
+/// severed the peer link because the launcher cleaned up its daemon child.
+pub const FRONTEND_EXIT_QUIT: i32 = 4;
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {

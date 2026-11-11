@@ -27,6 +27,7 @@ de hardware/portal; `todo` = teste ainda a criar na fase correspondente.
 | R-16 | Ao clicar Connect com o peer desligado e ir para Configurações, o cursor travava no topo da tela | o backend de captura já armava o grab no `Begin`, mas sem transporte o `Enter` nunca saía; o ponteiro ficava preso até o timeout e o compositor podia reativar o ciclo | `src/capture.rs::a_begin_without_a_connection_does_not_leave_the_pointer_grabbed` (L0) | coberto |
 | R-17 | Cliente salvo com certificado antigo: todo Connect falhava e só funcionava apagando e pareando de novo | o pin DTLS antigo rejeitava o certificado novo do peer, mesmo quando esse certificado já era um dispositivo conhecido/autorizado | `src/connect.rs::a_saved_client_with_a_rotated_certificate_repins_a_known_device` (L2) | coberto |
 | R-18 | Cliente salvo só com hostname (sem IP) falhava ao conectar depois de reiniciar | o IP aprendido numa sessão de entrada era mantido apenas em memória; sem DNS o dial ficava sem candidato até apagar e re-adicionar | `src/client.rs::discovery_fills_only_an_empty_saved_address_list` + `apply_discovered_hostname` (L0/L2) | coberto |
+| R-19 | No Windows 10/11, minimizar o app derrubava a conexão com o outro PC | a saída inesperada/minimizada do frontend era tratada como quit e o launcher parava o daemon; agora só o código explícito de quit para o serviço | `src/main.rs::a_minimized_or_killed_frontend_keeps_the_service_running` (L0) | coberto |
 
 ## Como adicionar uma regressão
 

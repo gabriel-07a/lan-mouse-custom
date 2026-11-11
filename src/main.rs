@@ -42,9 +42,6 @@ enum LanMouseError {
     #[cfg(feature = "gtk")]
     #[error(transparent)]
     Gtk(#[from] GtkError),
-    #[cfg(any(feature = "gtk", feature = "gpui"))]
-    #[error("GPUI frontend failed: {0}")]
-    GpuiFrontend(String),
     #[error(transparent)]
     Cli(#[from] CliError),
     #[error(transparent)]
@@ -188,15 +185,29 @@ enum FrontendExit {
 
 /// Map the frontend exit code to what the launcher must do with the daemon.
 ///
-/// `None` means the process was killed by a signal (or exited with an
-/// unexpected code): that is not a clean window close, so the daemon is
-/// stopped like on any other failure.
+/// Only the explicit-quit code stops the service. Every other outcome —
+/// including a zero/unknown code, a signal, or a crash while the window is
+/// minimized — keeps the daemon and the LAN connection alive. This used to be
+/// the opposite for unexpected codes: minimizing the Windows frontend ended
+/// the frontend process, the launcher then killed its daemon child, and the
+/// peer connection dropped.
 #[cfg(any(feature = "gtk", feature = "gpui"))]
-fn classify_frontend_exit(code: Option<i32>) -> Option<FrontendExit> {
+fn classify_frontend_exit(code: Option<i32>) -> FrontendExit {
     match code {
-        Some(lan_mouse_ipc::FRONTEND_EXIT_KEEP_SERVICE) => Some(FrontendExit::KeepService),
-        Some(0) => Some(FrontendExit::Quit),
-        _ => None,
+        Some(lan_mouse_ipc::FRONTEND_EXIT_QUIT) => FrontendExit::Quit,
+        Some(lan_mouse_ipc::FRONTEND_EXIT_KEEP_SERVICE) => FrontendExit::KeepService,
+        Some(other) => {
+            log::warn!(
+                "frontend exited with unexpected code {other}; keeping the service and connection running"
+            );
+            FrontendExit::KeepService
+        }
+        None => {
+            log::warn!(
+                "frontend terminated without an exit code; keeping the service and connection running"
+            );
+            FrontendExit::KeepService
+        }
     }
 }
 
@@ -210,8 +221,7 @@ fn run_gpui_frontend() -> Result<FrontendExit, LanMouseError> {
             String::from_utf8_lossy(&config::local_commit()).to_string(),
         )
         .status()?;
-    classify_frontend_exit(status.code())
-        .ok_or_else(|| LanMouseError::GpuiFrontend(format!("{frontend:?} exited with {status}")))
+    Ok(classify_frontend_exit(status.code()))
 }
 
 #[cfg(any(feature = "gtk", feature = "gpui"))]
@@ -459,7 +469,7 @@ mod frontend_exit_tests {
     fn a_closed_window_keeps_the_service_running() {
         assert_eq!(
             classify_frontend_exit(Some(lan_mouse_ipc::FRONTEND_EXIT_KEEP_SERVICE)),
-            Some(FrontendExit::KeepService),
+            FrontendExit::KeepService,
             "the window-close exit code must leave the daemon alone"
         );
     }
@@ -467,21 +477,21 @@ mod frontend_exit_tests {
     #[test]
     fn an_explicit_quit_stops_the_service() {
         assert_eq!(
-            classify_frontend_exit(Some(0)),
-            Some(FrontendExit::Quit),
-            "a regular exit is the user quitting the app"
+            classify_frontend_exit(Some(lan_mouse_ipc::FRONTEND_EXIT_QUIT)),
+            FrontendExit::Quit,
+            "only the explicit-quit code may stop the daemon"
         );
     }
 
     #[test]
-    fn crashes_and_signals_are_not_treated_as_a_window_close() {
-        assert_eq!(classify_frontend_exit(Some(1)), None);
-        assert_eq!(classify_frontend_exit(Some(2)), None);
-        assert_eq!(
-            classify_frontend_exit(None),
-            None,
-            "a frontend killed by a signal must not leave the daemon running"
-        );
+    fn a_minimized_or_killed_frontend_keeps_the_service_running() {
+        for code in [None, Some(0), Some(1), Some(2)] {
+            assert_eq!(
+                classify_frontend_exit(code),
+                FrontendExit::KeepService,
+                "frontend exit {code:?} must not cut the LAN connection"
+            );
+        }
     }
 }
 
