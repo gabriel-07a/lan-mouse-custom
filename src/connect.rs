@@ -442,6 +442,15 @@ impl LanMouseConnection {
         self.sender.peer_rtt_ms(handle)
     }
 
+    /// Whether a DTLS transport is currently established for `handle`.
+    ///
+    /// The capture task uses this before arming a grab: with no transport the
+    /// `Enter` cannot be delivered, and grabbing the local pointer would leave
+    /// it locked at the edge until the retry timeout.
+    pub(crate) fn is_connected(&self, handle: ClientHandle) -> bool {
+        self.sender.ctx.client_manager.active_addr(handle).is_some()
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn send(
         &self,

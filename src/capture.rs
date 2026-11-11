@@ -30,6 +30,7 @@ pub(crate) trait CaptureConnection {
     fn peer_supports_serialized_leave(&self, handle: CaptureHandle) -> bool;
     fn peer_supports_edge_coordinate(&self, handle: CaptureHandle) -> bool;
     fn peer_rtt_ms(&self, handle: CaptureHandle) -> Option<u32>;
+    fn is_connected(&self, handle: CaptureHandle) -> bool;
     fn ensure_connected(&self, handle: CaptureHandle);
     async fn send_with_grace(
         &self,
@@ -63,6 +64,10 @@ impl CaptureConnection for LanMouseConnection {
 
     fn peer_rtt_ms(&self, handle: CaptureHandle) -> Option<u32> {
         LanMouseConnection::peer_rtt_ms(self, handle)
+    }
+
+    fn is_connected(&self, handle: CaptureHandle) -> bool {
+        LanMouseConnection::is_connected(self, handle)
     }
 
     fn ensure_connected(&self, handle: CaptureHandle) {
@@ -922,6 +927,24 @@ impl CaptureTask {
 
         // activated a new client
         if event.is_begin() && Some(handle) != self.active_client {
+            // The peer is unreachable (e.g. the user clicked Connect while the
+            // other machine is off). The backend has already grabbed/locked
+            // the local pointer for this begin, but without a transport the
+            // `Enter` cannot be delivered; taking the capture would hold the
+            // pointer at the edge until the retry timeout and fight the
+            // compositor on release. Give the backend back immediately and
+            // retry only on a fresh crossing once connected.
+            if !self.conn.is_connected(handle) {
+                log::info!(
+                    "releasing capture before grabbing: client {handle} has no established connection"
+                );
+                self.active_client = None;
+                self.state = State::WaitingForAck;
+                self.enter.reset();
+                self.disconnected_since = None;
+                capture.release().await?;
+                return Ok(());
+            }
             self.active_client.replace(handle);
             self.enter_along = event.begin_along();
             self.handoff_begin_at = Some(Instant::now());
@@ -1781,6 +1804,7 @@ mod capture_handle_tests {
         supports_ack: bool,
         supports_serialized_leave: bool,
         supports_edge_coordinate: bool,
+        connected: bool,
     }
 
     impl FakeConnection {
@@ -1790,6 +1814,7 @@ mod capture_handle_tests {
                 supports_ack: true,
                 supports_serialized_leave: true,
                 supports_edge_coordinate: true,
+                connected: true,
             }
         }
     }
@@ -1812,6 +1837,10 @@ mod capture_handle_tests {
             Some(2)
         }
 
+        fn is_connected(&self, _handle: CaptureHandle) -> bool {
+            self.connected
+        }
+
         fn ensure_connected(&self, _handle: CaptureHandle) {}
 
         async fn send_with_grace(
@@ -1820,6 +1849,9 @@ mod capture_handle_tests {
             _handle: CaptureHandle,
             _grace: Duration,
         ) -> Result<(), LanMouseConnectionError> {
+            if !self.connected {
+                return Err(LanMouseConnectionError::NotConnected);
+            }
             self.sent.borrow_mut().push(event);
             Ok(())
         }
@@ -1829,6 +1861,9 @@ mod capture_handle_tests {
             event: ProtoEvent,
             _handle: CaptureHandle,
         ) -> Result<(), LanMouseConnectionError> {
+            if !self.connected {
+                return Err(LanMouseConnectionError::NotConnected);
+            }
             self.sent.borrow_mut().push(event);
             Ok(())
         }
@@ -1919,6 +1954,48 @@ mod capture_handle_tests {
             "legacy peer must get Enter: {:?}",
             sent.borrow()
         );
+        capture.terminate().await.expect("terminate");
+    }
+
+    /// Regression: clicking Connect while the peer is unreachable installs
+    /// capture barriers for the active client. Reaching the edge used to arm
+    /// the grab and send `Enter` into a dead link, leaving the local pointer
+    /// locked at the edge until the retry timeout (and fighting the compositor
+    /// on release). A begin without an established transport must give the
+    /// backend back immediately, before taking the grab.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_begin_without_a_connection_does_not_leave_the_pointer_grabbed() {
+        let fake = FakeConnection {
+            connected: false,
+            ..FakeConnection::new()
+        };
+        let sent = fake.sent.clone();
+        let mut task = capture_task_with_connection(
+            vec![(7, Position::Top, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("a disconnected begin must release, not fail");
+
+        assert!(
+            task.active_client.is_none(),
+            "the capture must not stay armed for an unreachable peer"
+        );
+        assert!(
+            matches!(task.state, State::WaitingForAck),
+            "state must be reset, not left as Sending/Waiting for a dead peer"
+        );
+        assert!(
+            sent.borrow().is_empty(),
+            "no Enter may be sent into a link that is not connected"
+        );
+        assert_eq!(task.enter.awaiting_ack(), None);
+
         capture.terminate().await.expect("terminate");
     }
 }

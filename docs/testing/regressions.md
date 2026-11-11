@@ -24,6 +24,7 @@ de hardware/portal; `todo` = teste ainda a criar na fase correspondente.
 | R-13 | E2E do pipeline (capture→emu) era intermitente | backend lazy respondia `alive=false` no primeiro Pong; `Enter` recusado | `full_capture_to_emulation_and_clipboard_pipeline_e2e` com warm-up determinístico (L3) | coberto |
 | R-14 | Build mismatch entre peers não era visível | frontend não comparava commit do peer | `lan-mouse-gpui` link state/detail tests (L0) — ampliar cobertura | coberto/parcial |
 | R-15 | Cursor ficava preso no client ao voltar | estado de sessão/captura preso após troca de endereço/família | testes manuais + testes de sessão (L3/L5); precisa ampliar | manual |
+| R-16 | Ao clicar Connect com o peer desligado e ir para Configurações, o cursor travava no topo da tela | o backend de captura já armava o grab no `Begin`, mas sem transporte o `Enter` nunca saía; o ponteiro ficava preso até o timeout e o compositor podia reativar o ciclo | `src/capture.rs::a_begin_without_a_connection_does_not_leave_the_pointer_grabbed` (L0) | coberto |
 
 ## Como adicionar uma regressão
 
