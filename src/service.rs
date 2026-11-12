@@ -544,6 +544,44 @@ impl Service {
                 self.add_client();
                 self.save_config();
             }
+            FrontendRequest::AddClient {
+                hostname,
+                fix_ips,
+                port,
+                position,
+                fingerprint,
+            } => {
+                let fingerprint = match fingerprint {
+                    Some(fingerprint) => match crypto::normalize_fingerprint(&fingerprint) {
+                        Some(fingerprint) => Some(fingerprint),
+                        None => {
+                            self.notify_frontend(FrontendEvent::Error(format!(
+                                "invalid fingerprint: {fingerprint}"
+                            )));
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let handle = self.client_manager.add_client();
+                let config = lan_mouse_ipc::ClientConfig {
+                    hostname,
+                    fix_ips,
+                    port,
+                    pos: position,
+                    fingerprint,
+                    ..Default::default()
+                };
+                self.client_manager.set_config(handle, config);
+                let (config, state) = self
+                    .client_manager
+                    .get_state(handle)
+                    .expect("newly added client must exist");
+                log::info!("added client {handle} atomically");
+                self.notify_frontend(FrontendEvent::Created(handle, config, state));
+                self.activate_client(handle);
+                self.save_config();
+            }
             FrontendRequest::Delete(handle) => {
                 self.remove_client(handle);
                 self.save_config();

@@ -586,48 +586,6 @@ fn default_route_ipv4() -> Option<std::net::Ipv4Addr> {
 }
 
 #[derive(Clone, Debug)]
-enum PendingAdd {
-    Discovered {
-        ip: std::net::IpAddr,
-        port: u16,
-        position: Position,
-        fingerprint: Option<String>,
-    },
-    Manual {
-        hostname: String,
-        port: u16,
-        fingerprint: Option<String>,
-        position: Position,
-    },
-}
-
-/// Whether a `Created` event is the empty client produced by `Create`.
-///
-/// `Created` is also emitted for auto-reverse clients and for every entry on a
-/// config reload. Applying a pending Add to one of those was the Network-page
-/// bug where "Add" configured the wrong card (or appeared to pick another IP)
-/// while the real new client stayed empty.
-fn is_fresh_client_config(config: &ClientConfig) -> bool {
-    config
-        .hostname
-        .as_deref()
-        .is_none_or(|name| name.trim().is_empty())
-        && config.fix_ips.is_empty()
-        && config.fingerprint.is_none()
-        && config.port == lan_mouse_ipc::DEFAULT_PORT
-}
-
-/// Consume the pending Add only when `Created` belongs to the empty client we
-/// just asked the service to create.
-fn take_pending_add(pending: &mut Option<PendingAdd>, config: &ClientConfig) -> Option<PendingAdd> {
-    if is_fresh_client_config(config) {
-        pending.take()
-    } else {
-        None
-    }
-}
-
-#[derive(Clone, Debug)]
 struct AddDeviceDialog {
     hostname: String,
     port: String,
@@ -804,7 +762,6 @@ struct Dashboard {
     pending: Vec<PendingView>,
     devices: Vec<DeviceView>,
     discovered: Vec<DiscoveredDevice>,
-    pending_add: Option<PendingAdd>,
     add_dialog: Option<AddDeviceDialog>,
     settings_dialog: Option<SettingsDialog>,
     add_focus: FocusHandle,
@@ -833,6 +790,10 @@ struct Dashboard {
     policy_export: Option<String>,
     /// Debounced endpoint shown per logical peer (first member handle).
     shown_endpoints: HashMap<ClientHandle, EndpointUi>,
+    /// A discovered device whose Add request is awaiting the service.
+    adding_device: Option<(std::net::IpAddr, u16, std::time::Instant)>,
+    /// Visible result of the last Network Add attempt: `(message, success)`.
+    add_notice: Option<(String, bool)>,
     /// When the user last requested a network scan (rate limit).
     scan_requested_at: Option<std::time::Instant>,
     first_frame_logged: bool,
@@ -910,7 +871,13 @@ impl Dashboard {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                if this
+                    .update(cx, |this, cx| {
+                        this.expire_add_request();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -938,7 +905,6 @@ impl Dashboard {
             pending: Vec::new(),
             devices: Vec::new(),
             discovered: Vec::new(),
-            pending_add: None,
             add_dialog: None,
             settings_dialog: None,
             add_focus: cx.focus_handle(),
@@ -969,9 +935,37 @@ impl Dashboard {
             history: Vec::new(),
             policy_export: None,
             shown_endpoints: HashMap::new(),
+            adding_device: None,
+            add_notice: None,
             scan_requested_at: None,
             first_frame_logged: false,
         }
+    }
+
+    /// Clear a stuck Add indicator if the service never answered.
+    fn expire_add_request(&mut self) {
+        let Some((ip, port, started)) = self.adding_device else {
+            return;
+        };
+        if started.elapsed() < std::time::Duration::from_secs(6) {
+            return;
+        }
+        self.adding_device = None;
+        self.add_notice = Some((
+            match self.language {
+                Language::PortugueseBrazil => {
+                    format!("Não foi possível adicionar {ip}:{port} (sem resposta do serviço)")
+                }
+                Language::English => format!(
+                    "Could not add {ip}:{port} (the service did not answer)"
+                ),
+            },
+            false,
+        ));
+    }
+
+    fn set_add_notice(&mut self, message: String, success: bool) {
+        self.add_notice = Some((message, success));
     }
 
     fn tr(&self, english: &'static str) -> &'static str {
@@ -1036,51 +1030,16 @@ impl Dashboard {
             FrontendEvent::Created(handle, config, state) => {
                 self.remember_metrics(handle, &state);
                 // Decide against the config before it is moved into the map.
-                let pending_for_created = take_pending_add(&mut self.pending_add, &config);
-                self.clients.insert(handle, (config, state));
-                if let Some(pending) = pending_for_created {
-                    match pending {
-                        PendingAdd::Discovered {
-                            ip,
-                            port,
-                            position,
-                            fingerprint,
-                        } => {
-                            self.send(FrontendRequest::UpdateFixIps(handle, vec![ip]));
-                            self.send(FrontendRequest::UpdatePort(handle, port));
-                            self.send(FrontendRequest::UpdatePosition(handle, position));
-                            if let Some(fingerprint) = fingerprint {
-                                self.send(FrontendRequest::UpdateFingerprint(
-                                    handle,
-                                    Some(fingerprint),
-                                ));
-                            }
-                        }
-                        PendingAdd::Manual {
-                            hostname,
-                            port,
-                            fingerprint,
-                            position,
-                        } => {
-                            let hostname = hostname.trim();
-                            if !hostname.is_empty() {
-                                self.send(FrontendRequest::UpdateHostname(
-                                    handle,
-                                    Some(hostname.to_string()),
-                                ));
-                            }
-                            self.send(FrontendRequest::UpdatePort(handle, port));
-                            if let Some(fingerprint) = fingerprint {
-                                self.send(FrontendRequest::UpdateFingerprint(
-                                    handle,
-                                    Some(fingerprint),
-                                ));
-                            }
-                            self.send(FrontendRequest::UpdatePosition(handle, position));
-                        }
-                    }
-                    self.send(FrontendRequest::Activate(handle, true));
+                if self.adding_device.is_some() {
+                    self.adding_device = None;
+                    let message = match self.language {
+                        Language::PortugueseBrazil => "Dispositivo adicionado — conectando…",
+                        Language::English => "Device added — connecting…",
+                    };
+                    self.status = message.to_string();
+                    self.set_add_notice(message.to_string(), true);
                 }
+                self.clients.insert(handle, (config, state));
             }
             FrontendEvent::State(handle, config, state) => {
                 self.remember_metrics(handle, &state);
@@ -1099,10 +1058,14 @@ impl Dashboard {
                 self.status = format!("Service connected (IPC v{ipc_version})");
             }
             FrontendEvent::Error(error) => {
-                self.status = error;
+                self.status = error.clone();
+                if self.adding_device.is_some() {
+                    self.adding_device = None;
+                    self.set_add_notice(error, false);
+                }
                 // A failed create must not leave a half-configured pending add
                 // around to be applied to an unrelated client later.
-                self.pending_add = None;
+                self.adding_device = None;
             }
             FrontendEvent::Devices(devices) => self.devices = devices,
             FrontendEvent::NetworkScan(devices) => self.discovered = devices,
@@ -1361,13 +1324,6 @@ impl Dashboard {
     }
 
     fn submit_add_dialog(&mut self) {
-        if self.pending_add.is_some() {
-            // A second `Create` would be answered with another `Created` event,
-            // and the single pending-add slot cannot be matched to either one;
-            // the two clients would end up with the wrong address/config.
-            self.status = "Waiting for the service to answer the previous add request".to_string();
-            return;
-        }
         let Some(dialog) = self.add_dialog.take() else {
             return;
         };
@@ -1386,13 +1342,20 @@ impl Dashboard {
         } else {
             Some(dialog.fingerprint.trim().to_string())
         };
-        self.pending_add = Some(PendingAdd::Manual {
-            hostname: dialog.hostname,
+        self.adding_device = None;
+        let adding = match self.language {
+            Language::PortugueseBrazil => "Adicionando dispositivo…".to_string(),
+            Language::English => "Adding device…".to_string(),
+        };
+        self.status = adding.clone();
+        self.set_add_notice(adding, true);
+        self.send(FrontendRequest::AddClient {
+            hostname: Some(dialog.hostname),
+            fix_ips: Vec::new(),
             port,
-            fingerprint,
             position: dialog.position,
+            fingerprint,
         });
-        self.send(FrontendRequest::Create);
     }
 
     fn on_add_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1432,17 +1395,26 @@ impl Dashboard {
     }
 
     fn add_discovered(&mut self, ip: std::net::IpAddr, port: u16, fingerprint: Option<String>) {
-        if self.pending_add.is_some() {
-            self.status = "Waiting for the service to answer the previous add request".to_string();
+        if self.adding_device.is_some() {
+            self.status = self
+                .tr("Waiting for the previous add request to finish")
+                .to_string();
             return;
         }
-        self.pending_add = Some(PendingAdd::Discovered {
-            ip,
+        self.adding_device = Some((ip, port, std::time::Instant::now()));
+        let adding = match self.language {
+            Language::PortugueseBrazil => format!("Adicionando {ip}:{port}…"),
+            Language::English => format!("Adding {ip}:{port}…"),
+        };
+        self.status = adding.clone();
+        self.set_add_notice(adding, true);
+        self.send(FrontendRequest::AddClient {
+            hostname: None,
+            fix_ips: vec![ip],
             port,
             position: Position::Left,
             fingerprint,
         });
-        self.send(FrontendRequest::Create);
     }
 
     /// Place a peer on the given screen side.
@@ -2041,6 +2013,9 @@ impl Dashboard {
         } else {
             AMBER
         };
+        let adding = self
+            .adding_device
+            .is_some_and(|(ip, add_port, _)| ip == device.ip && add_port == port);
         let last_seen = device
             .last_seen
             .map(|seen| {
@@ -2087,12 +2062,18 @@ impl Dashboard {
             .when(!device.configured, |this| {
                 this.child(self.action_button(
                     network_add_id(device.ip, port),
-                    self.tr("Add"),
-                    ACCENT,
-                    0x081018,
+                    if adding {
+                        self.tr("Adding…")
+                    } else {
+                        self.tr("Add")
+                    },
+                    if adding { 0x1d2430 } else { ACCENT },
+                    if adding { MUTED } else { 0x081018 },
                     cx,
                     move |this, _, _, _| {
-                        this.add_discovered(device.ip, port, device.fingerprint.clone())
+                        if !adding {
+                            this.add_discovered(device.ip, port, device.fingerprint.clone())
+                        }
                     },
                 ))
             })
@@ -2100,6 +2081,45 @@ impl Dashboard {
 }
 
 impl Dashboard {
+    fn render_add_notice(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let Some((message, success)) = &self.add_notice else {
+            return div().into_any_element();
+        };
+        let (background, border) = if *success {
+            (0x173225, 0x2d6a45)
+        } else {
+            (0x342020, 0x6a2d2d)
+        };
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_6()
+            .py_2()
+            .bg(rgb(background))
+            .border_b_1()
+            .border_color(rgb(border))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .child(message.clone()),
+            )
+            .child(self.action_button(
+                "dismiss-add-notice",
+                self.tr("OK"),
+                0x1d2430,
+                TEXT,
+                cx,
+                |this, _, _, cx| {
+                    this.add_notice = None;
+                    cx.notify();
+                },
+            ))
+            .into_any_element()
+    }
+
     fn render_cursor_extension_banner(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         div()
             .flex()
@@ -2278,6 +2298,9 @@ impl Render for Dashboard {
                             )
                         }),
                 )
+                .when(self.add_notice.is_some(), |this| {
+                    this.child(self.render_add_notice(cx))
+                })
                 .when(self.settings_dialog.is_some(), |this| {
                     this.child(self.render_settings_dialog(cx))
                 })
@@ -4743,48 +4766,6 @@ mod tests {
         assert_eq!(format_timestamp_age(now_secs - 90_000, now_ms), "1d ago");
         // Clock skew (timestamp in the future) must not underflow.
         assert_eq!(format_timestamp_age(now_secs + 60, now_ms), "0s ago");
-    }
-
-    #[test]
-    fn pending_add_is_not_consumed_by_an_unrelated_created_event() {
-        let mut pending = Some(PendingAdd::Manual {
-            hostname: "DESKTOP-GABRIEL".to_string(),
-            port: 4242,
-            fingerprint: None,
-            position: Position::Left,
-        });
-        let auto_reverse = ClientConfig {
-            hostname: Some("DESKTOP-GABRIEL".to_string()),
-            fix_ips: vec!["192.168.1.42".parse().expect("ip")],
-            ..ClientConfig::default()
-        };
-        assert!(
-            take_pending_add(&mut pending, &auto_reverse).is_none(),
-            "an auto-reverse/config-reload Created must not steal the pending Add"
-        );
-        assert!(pending.is_some());
-
-        let fresh = ClientConfig::default();
-        assert!(take_pending_add(&mut pending, &fresh).is_some());
-        assert!(
-            pending.is_none(),
-            "the empty Create response consumes it exactly once"
-        );
-    }
-
-    #[test]
-    fn fresh_client_detection_rejects_configured_entries() {
-        assert!(is_fresh_client_config(&ClientConfig::default()));
-        let configured_port = ClientConfig {
-            port: 4243,
-            ..ClientConfig::default()
-        };
-        assert!(!is_fresh_client_config(&configured_port));
-        let configured_pin = ClientConfig {
-            fingerprint: Some("aa".to_string()),
-            ..ClientConfig::default()
-        };
-        assert!(!is_fresh_client_config(&configured_pin));
     }
 
     #[test]

@@ -769,6 +769,18 @@ pub enum FrontendRequest {
     Activate(ClientHandle, bool),
     /// add a new client
     Create,
+    /// Add a client atomically with every field already configured.
+    ///
+    /// The Network "Add" button used `Create` followed by several update
+    /// requests; a slow/partial update could leave an empty client that never
+    /// connected. This variant applies the whole config before activation.
+    AddClient {
+        hostname: Option<String>,
+        fix_ips: Vec<IpAddr>,
+        port: u16,
+        position: Position,
+        fingerprint: Option<String>,
+    },
     /// change the listen port (recreate udp listener)
     ChangePort(u16),
     /// remove a client
@@ -951,6 +963,22 @@ mod tests {
         let re_encoded = serde_json::to_value(&decoded).expect("re-serialize");
         assert_eq!(encoded, re_encoded);
         decoded
+    }
+
+    #[test]
+    fn add_client_request_round_trips_with_all_fields() {
+        let request = FrontendRequest::AddClient {
+            hostname: Some("peer".to_string()),
+            fix_ips: vec!["192.0.2.1".parse().expect("ip")],
+            port: 4242,
+            position: Position::Left,
+            fingerprint: Some("aa:bb".to_string()),
+        };
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(value["AddClient"]["position"], "left");
+        assert_eq!(value["AddClient"]["port"], 4242);
+        assert_eq!(value["AddClient"]["fix_ips"][0], "192.0.2.1");
+        json_roundtrip(request);
     }
 
     #[test]
