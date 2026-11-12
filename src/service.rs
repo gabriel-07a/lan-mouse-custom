@@ -3117,7 +3117,10 @@ impl Service {
         if was_active {
             self.capture.destroy(handle);
         }
-        if self.client_manager.active_clients().is_empty() && self.incoming_conns.is_empty() {
+        if should_release_after_last_client(
+            self.client_manager.active_clients().len(),
+            self.incoming_conns.len(),
+        ) {
             // No session of either direction remains: do not leave a portal
             // grab/barrier or a hidden-cursor heartbeat behind after removing
             // the last client.
@@ -3465,6 +3468,12 @@ fn history_entry_from_record(record: AuditRecord) -> HistoryEntry {
     }
 }
 
+/// Whether removing a client must also release the local capture/portal.
+/// Only when no active outgoing client and no incoming session remain.
+fn should_release_after_last_client(active_clients: usize, incoming_sessions: usize) -> bool {
+    active_clients == 0 && incoming_sessions == 0
+}
+
 /// What an incoming-session teardown must do. Kept pure so the disconnect
 /// regression can be tested without constructing the whole service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3486,13 +3495,40 @@ fn incoming_teardown_plan(outgoing_capture_active: bool) -> IncomingTeardownPlan
 mod tests {
     use super::{
         IncomingTeardownPlan, RETURN_MAX_ATTEMPTS, RETURN_RETRY_INTERVAL, ReturnHandoff,
-        incoming_teardown_plan, reverse_client_compatible,
+        incoming_teardown_plan, reverse_client_compatible, should_release_after_last_client,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)), 4242)
+    }
+
+    #[test]
+    fn removing_a_client_releases_the_portal_only_after_the_last_session() {
+        assert!(should_release_after_last_client(0, 0));
+        assert!(!should_release_after_last_client(1, 0));
+        assert!(!should_release_after_last_client(0, 1));
+    }
+
+    /// Regression for the idle cursor latch: `activate_client` used to call
+    /// `emulation.warm_up()` unconditionally, opening the GNOME RemoteDesktop
+    /// portal just by starting Lan Mouse. Keep the call out of that function;
+    /// incoming hand-offs warm the backend on `Entered` instead.
+    #[test]
+    fn activating_a_client_does_not_open_the_emulation_portal() {
+        let source = include_str!("service.rs");
+        let start = source.find("fn activate_client").expect("activate_client");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    fn change_port")
+            .or_else(|| rest.find("\n    fn "))
+            .expect("next method");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("warm_up"),
+            "activate_client must not call emulation.warm_up: {body}"
+        );
     }
 
     #[test]
