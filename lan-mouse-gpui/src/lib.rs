@@ -2213,11 +2213,17 @@ impl Render for Dashboard {
         // height: the titlebar/banner heights vary, and a fixed content height
         // clipped the bottom of the Settings cards (the extension row made the
         // card taller than the old estimate).
-        let shell = div().flex().flex_1().child(sidebar).child(
+        let shell = div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(sidebar)
+            .child(
             div()
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_h(px(0.0))
                 .child(
                     div()
                         .h(px(64.0))
@@ -2280,9 +2286,12 @@ impl Render for Dashboard {
                 })
                 .child(
                     div()
+                        .id("content-scroll")
                         .w_full()
                         .flex_1()
-                        .overflow_hidden()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .scrollbar_width(px(8.0))
                         .child(content),
                 ),
         );
@@ -3804,12 +3813,11 @@ impl Dashboard {
         };
         div()
             .id("settings-page")
-            .size_full()
+            .w_full()
             .flex()
             .flex_col()
             .gap_4()
             .p_6()
-            .overflow_y_scroll()
             .child(self.render_settings_general(cx))
             .child(
                 div()
