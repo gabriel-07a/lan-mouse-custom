@@ -103,6 +103,10 @@ Checklist mínimo:
 - [ ] se mexeu na wire, teste de compatibilidade com peer antigo;
 - [ ] atualizou `docs/testing/regressions.md` quando aplicável.
 
+## Handoff no Windows
+
+Veja [windows-handoff.md](windows-handoff.md) para a matriz Windows 10/11 e a cobertura automatizada do retorno por coordenada.
+
 ## Diagnóstico de handoff
 
 Consulte [handoff-trace.md](handoff-trace.md) para capturar a latência

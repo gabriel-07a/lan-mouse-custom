@@ -934,6 +934,7 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
+                self.incoming_peer_caps.remove(&addr);
                 self.return_requests.forget(addr);
                 self.expire_session_grants(addr);
                 let _ = self.clipboard_peer_events.send(addr);
@@ -1409,6 +1410,10 @@ impl Service {
             .get(&addr)
             .is_some_and(|caps| caps & lan_mouse_proto::capabilities::RETURN_COORDINATE != 0);
         let along = supported.then_some(along).flatten();
+        log::info!(
+            "handoff: return request to {addr}: supported={supported} along={along:?} caps={:?}",
+            self.incoming_peer_caps.get(&addr)
+        );
         let serial = self.next_return_serial();
         self.return_requests
             .request(addr, serial, along, Instant::now());
@@ -1590,7 +1595,11 @@ impl Service {
             .map(|(k, _)| *k)?;
         self.capture.destroy(handle);
         self.incoming_conns.remove(&addr);
-        self.incoming_peer_caps.remove(&addr);
+        // Keep the peer capabilities for the lifetime of the transport: a
+        // return hand-off removes the incoming capture zone but does not
+        // trigger a new Hello. Dropping the caps there made every hand-off
+        // after the first fall back to plain Leave, losing the return
+        // coordinate. Entries are removed when the transport disconnects.
         self.incoming_conn_info
             .remove(&handle)
             .map(|incoming| incoming.addr)

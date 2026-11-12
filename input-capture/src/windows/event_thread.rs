@@ -646,13 +646,25 @@ fn release_active_client() {
     release_active_client_at(None);
 }
 
+/// Whether a release request still owns an active capture and may warp the
+/// returning pointer. Split out so the stale-LeaveAt guard is testable on
+/// Windows without a real desktop session.
+fn release_should_warp(active: bool) -> bool {
+    active
+}
+
 fn release_active_client_at(target: Option<(i32, i32)>) {
-    if ACTIVE_CLIENT.take().is_some() {
-        // Cooldown: the pointer is still parked at the edge when control is
-        // handed back, so the next outgoing movement must not immediately
-        // re-enter the peer ("ping-pong" at the shared border).
-        LAST_RELEASE.replace(Some(Instant::now()));
+    // A retried LeaveAt can arrive after the capture was already released.
+    // Never warp the cursor in that case: only the release that actually owns
+    // the active capture may position the returning pointer.
+    let had_active = ACTIVE_CLIENT.take().is_some();
+    if !release_should_warp(had_active) {
+        return;
     }
+    // Cooldown: the pointer is still parked at the edge when control is
+    // handed back, so the next outgoing movement must not immediately
+    // re-enter the peer ("ping-pong" at the shared border).
+    LAST_RELEASE.replace(Some(Instant::now()));
     PREV_POS.replace(None);
     hide_hidden_pointer();
     if let Some((x, y)) = target {
@@ -1339,5 +1351,45 @@ mod tests {
             Some(Position::Top),
             Position::Bottom
         ));
+    }
+}
+
+#[cfg(test)]
+mod release_return_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_live_capture_moves_the_returning_cursor() {
+        assert!(release_should_warp(true));
+        assert!(
+            !release_should_warp(false),
+            "stale LeaveAt retries must not warp"
+        );
+    }
+
+    #[test]
+    fn return_fraction_maps_to_the_outer_desktop_edge() {
+        let displays = [
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            RECT {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1080,
+            },
+        ];
+        assert_eq!(
+            display_util::point_for_edge_fraction(&displays, Position::Right, 0.5),
+            Some((3839, 540))
+        );
+        assert_eq!(
+            display_util::point_for_edge_fraction(&displays, Position::Bottom, 1.0),
+            Some((3840, 1079))
+        );
     }
 }
