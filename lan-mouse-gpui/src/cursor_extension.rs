@@ -11,7 +11,7 @@ use std::{fs, path::PathBuf, process::Command};
 pub(crate) const UUID: &str = "lan-mouse-cursor@lan-mouse-custom";
 /// Bumped whenever the bundled extension source changes; the extension writes
 /// it into its loaded marker so the app can detect an outdated loaded version.
-const EXTENSION_VERSION: &str = "2";
+const EXTENSION_VERSION: &str = "3";
 
 const EXTENSION_JS: &str =
     include_str!("../../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/extension.js");

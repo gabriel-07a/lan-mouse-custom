@@ -9,21 +9,22 @@ import Gio from 'gi://Gio';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const HEARTBEAT_MS = 3_000;
-const EXTENSION_VERSION = '2';
+const EXTENSION_VERSION = '3';
 const POLL_MS = 100;
 
 export default class LanMouseCursorExtension extends Extension {
     enable() {
-        // Clutter.Stage has no global cursor API; Mutter's CursorTracker can
-        // inhibit cursor visibility for the compositor.
-        try {
-            this._cursorTracker = global.backend.get_cursor_tracker();
-        } catch (_error) {
-            this._cursorTracker = null;
-        }
+        // Resolve the tracker lazily: extensions are enabled early during
+        // Shell startup, and `global.backend` may not be ready at this exact
+        // moment. A one-shot lookup here could silently leave cursor hiding
+        // disabled for the whole session.
+        this._cursorTracker = null;
+        this._trackerError = '';
         this._inhibited = false;
+        this._lastStatus = '';
 
         const runtime = `${GLib.get_user_runtime_dir()}/lan-mouse`;
+        this._runtimeDir = runtime;
         this._stateFile = Gio.File.new_for_path(`${runtime}/cursor-hide`);
         this._loadedFile = Gio.File.new_for_path(
             `${runtime}/cursor-extension-loaded`
@@ -34,6 +35,7 @@ export default class LanMouseCursorExtension extends Extension {
             GLib.mkdir_with_parents(runtime, 0o700);
             GLib.file_set_contents(this._loadedFile.get_path(), EXTENSION_VERSION);
         } catch (_error) {}
+        this._writeStatus('loaded');
 
         this._pollId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
@@ -54,6 +56,7 @@ export default class LanMouseCursorExtension extends Extension {
         this._stateFile = null;
         this._setInhibited(false);
         this._cursorTracker = null;
+        this._runtimeDir = null;
         if (this._loadedFile) {
             try {
                 this._loadedFile.delete(null);
@@ -62,7 +65,52 @@ export default class LanMouseCursorExtension extends Extension {
         }
     }
 
+    _resolveTracker() {
+        if (this._cursorTracker) {
+            return true;
+        }
+        try {
+            if (global.backend?.get_cursor_tracker) {
+                this._cursorTracker = global.backend.get_cursor_tracker();
+            } else if (global.display?.get_cursor_tracker) {
+                this._cursorTracker = global.display.get_cursor_tracker();
+            }
+        } catch (error) {
+            this._trackerError = String(error);
+        }
+        if (!this._cursorTracker && !this._trackerError) {
+            this._trackerError = 'Mutter CursorTracker unavailable';
+        }
+        return this._cursorTracker !== null;
+    }
+
+    _writeStatus(state) {
+        if (!this._runtimeDir) {
+            return;
+        }
+        const status = `tracker=${this._cursorTracker ? 1 : 0} inhibited=${
+            this._inhibited ? 1 : 0
+        } state=${state} error=${this._trackerError}`;
+        if (status === this._lastStatus) {
+            return;
+        }
+        this._lastStatus = status;
+        try {
+            GLib.file_set_contents(
+                `${this._runtimeDir}/cursor-extension-status`,
+                status
+            );
+        } catch (_error) {}
+        if (!this._cursorTracker) {
+            console.warn(`Lan Mouse cursor extension: ${status}`);
+        }
+    }
+
     _setInhibited(inhibit) {
+        if (inhibit && !this._resolveTracker()) {
+            this._writeStatus('no-tracker');
+            return;
+        }
         if (!this._cursorTracker) {
             return;
         }
@@ -70,12 +118,18 @@ export default class LanMouseCursorExtension extends Extension {
             if (inhibit && !this._inhibited) {
                 this._cursorTracker.inhibit_cursor_visibility();
                 this._inhibited = true;
+                this._writeStatus('inhibited');
             } else if (!inhibit && this._inhibited) {
                 this._cursorTracker.uninhibit_cursor_visibility();
                 this._inhibited = false;
+                this._writeStatus('visible');
             }
         } catch (error) {
+            this._trackerError = String(error);
+            this._cursorTracker = null;
+            this._inhibited = false;
             console.error(`Lan Mouse cursor extension: ${error}`);
+            this._writeStatus('error');
         }
     }
 
