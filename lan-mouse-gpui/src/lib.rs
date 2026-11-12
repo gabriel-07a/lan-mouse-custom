@@ -2290,7 +2290,7 @@ impl Render for Dashboard {
                         .w_full()
                         .flex_1()
                         .min_h(px(0.0))
-                        .overflow_y_scroll()
+                        .overflow_scroll()
                         .scrollbar_width(px(8.0))
                         .child(content),
                 ),
@@ -3461,12 +3461,16 @@ impl Dashboard {
                     .gap_1()
                     .child(
                         div()
+                            .min_w(px(0.0))
+                            .truncate()
                             .text_sm()
                             .text_color(rgb(TEXT))
                             .child(format!("{} · {subject}", entry.event)),
                     )
                     .child(
                         div()
+                            .min_w(px(0.0))
+                            .truncate()
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .child(format!("{when} {detail}")),
@@ -3814,10 +3818,12 @@ impl Dashboard {
         div()
             .id("settings-page")
             .w_full()
+            .min_w(px(0.0))
             .flex()
             .flex_col()
             .gap_4()
             .p_6()
+            .pb_12()
             .child(self.render_settings_general(cx))
             .child(
                 div()
@@ -4196,7 +4202,13 @@ fn main_window_options(cx: &mut App) -> WindowOptions {
                 f32::from(display.bounds().size.height),
             )
         });
-    let (width, height) = clamp_window_to_screen((f32::from(px(980.0)), f32::from(px(720.0))), display);
+    let desired = (f32::from(px(980.0)), f32::from(px(720.0)));
+    let (width, height) = clamp_window_to_screen(desired, display);
+    log::info!(
+        "window size: ui_scale={:.2} desired={:?} display={display:?} clamped=({width}, {height})",
+        ui_scale(),
+        desired
+    );
     let bounds = Bounds::centered(None, size(gpui::px(width), gpui::px(height)), cx);
     let min_width = f32::from(px(880.0)).min(width);
     let min_height = f32::from(px(600.0)).min(height);
