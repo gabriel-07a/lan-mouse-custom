@@ -4212,8 +4212,18 @@ fn main_window_options(cx: &mut App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(gpui::px(width), gpui::px(height)), cx);
     let min_width = f32::from(px(880.0)).min(width);
     let min_height = f32::from(px(600.0)).min(height);
+    // Wayland's GPUI backend does not expose the primary display here, so the
+    // manual clamp above cannot see the work area. Open maximized on Linux so
+    // the compositor fits the window inside the panel/usable area instead of
+    // centering a too-tall window whose bottom (Settings) is unreachable. The
+    // bounds remain the restore size when the user unmaximizes.
+    let window_bounds = if cfg!(target_os = "linux") {
+        WindowBounds::Maximized(bounds)
+    } else {
+        WindowBounds::Windowed(bounds)
+    };
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(window_bounds),
         window_min_size: Some(size(gpui::px(min_width), gpui::px(min_height))),
         titlebar: Some(TitlebarOptions {
             title: Some("Lan Mouse".into()),
