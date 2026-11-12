@@ -154,6 +154,9 @@ pub struct Service {
     emulation_status: Status,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
+    /// Capabilities advertised by incoming peers (from Hello), used to gate
+    /// the LeaveAt return-coordinate extension.
+    incoming_peer_caps: HashMap<SocketAddr, u32>,
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
@@ -309,6 +312,7 @@ impl Service {
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
+            incoming_peer_caps: Default::default(),
             next_trigger_handle: 0,
             return_requests: Default::default(),
             return_serial: 0,
@@ -988,9 +992,9 @@ impl Service {
                 // shared edge.
                 self.capture.release();
             }
-            EmulationEvent::EdgeReturn(pos) => {
-                log::debug!("handoff: return requested through {pos:?}");
-                self.request_return(pos);
+            EmulationEvent::EdgeReturn { pos, along } => {
+                log::debug!("handoff: return requested through {pos:?} along {along:?}");
+                self.request_return(pos, along);
             }
             EmulationEvent::PeerLeft { addr, fingerprint } => {
                 // The peer confirmed it released its capture: the retried
@@ -1196,6 +1200,7 @@ impl Service {
                 proto_version,
                 capabilities,
             } => {
+                self.incoming_peer_caps.insert(addr, capabilities);
                 // Map the peer's source addr back to its client handle
                 // and stamp the version.
                 if let Some(handle) = self.client_for_incoming(addr) {
@@ -1221,7 +1226,7 @@ impl Service {
                     .get(&handle)
                     .map(|incoming| incoming.addr)
                 {
-                    self.request_handoff(addr);
+                    self.request_handoff(addr, None);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
@@ -1353,7 +1358,7 @@ impl Service {
     /// remote pointer was pushed past `pos` (the edge it originally entered
     /// through). This is the return hand-off: without it the peer keeps the
     /// local pointer grabbed on its side of the shared edge.
-    fn request_return(&mut self, pos: Position) {
+    fn request_return(&mut self, pos: Position, along: Option<f32>) {
         let incoming: Vec<(SocketAddr, Position)> = self
             .incoming_conn_info
             .values()
@@ -1365,7 +1370,7 @@ impl Service {
                 "return hand-off through {pos:?} did not match the live edge; using the only incoming session {addr}"
             );
             log::info!("handing control back: remote pointer left through {pos:?} ({addr})");
-            self.request_handoff(addr);
+            self.request_handoff(addr, along);
             return;
         }
         if targets.matching.is_empty() {
@@ -1374,22 +1379,28 @@ impl Service {
         }
         for addr in targets.matching {
             log::info!("handing control back: remote pointer left through {pos:?} ({addr})");
-            self.request_handoff(addr);
+            self.request_handoff(addr, along);
         }
     }
 
     /// Ask the peer at addr to release its capture, retrying until it
     /// confirms with Leave (see ReturnHandoff).
-    fn request_handoff(&mut self, addr: SocketAddr) {
+    fn request_handoff(&mut self, addr: SocketAddr, along: Option<f32>) {
+        let supported = self
+            .incoming_peer_caps
+            .get(&addr)
+            .is_some_and(|caps| caps & lan_mouse_proto::capabilities::RETURN_COORDINATE != 0);
+        let along = supported.then_some(along).flatten();
         let serial = self.next_return_serial();
-        self.return_requests.request(addr, serial, Instant::now());
+        self.return_requests
+            .request(addr, serial, along, Instant::now());
         // DTLS application data is not retransmitted, so a single lost request
         // stalls the hand-off until the retry timer. Send the first request
         // twice: the peer answers both copies with the same `Leave(serial)`
         // confirmation (the serial makes the request idempotent), so an
         // isolated packet loss costs nothing visible.
-        self.emulation.send_leave_request(addr, serial);
-        self.emulation.send_leave_request(addr, serial);
+        self.emulation.send_leave_request(addr, serial, along);
+        self.emulation.send_leave_request(addr, serial, along);
     }
 
     fn next_return_serial(&mut self) -> u32 {
@@ -1406,13 +1417,13 @@ impl Service {
     /// the ones that exhausted their retry budget.
     fn retry_return_requests(&mut self) {
         let due = self.return_requests.due(Instant::now());
-        for (addr, serial) in due {
+        for (addr, serial, along) in due {
             if !self.incoming_conns.contains(&addr) {
                 self.return_requests.forget(addr);
                 continue;
             }
             log::debug!("retrying return hand-off request to {addr} (serial {serial})");
-            self.emulation.send_leave_request(addr, serial);
+            self.emulation.send_leave_request(addr, serial, along);
         }
         for addr in self.return_requests.take_exhausted() {
             self.abort_return_handoff(addr);
@@ -1561,6 +1572,7 @@ impl Service {
             .map(|(k, _)| *k)?;
         self.capture.destroy(handle);
         self.incoming_conns.remove(&addr);
+        self.incoming_peer_caps.remove(&addr);
         self.incoming_conn_info
             .remove(&handle)
             .map(|incoming| incoming.addr)
@@ -3375,6 +3387,8 @@ struct ReturnHandoff {
 #[derive(Debug)]
 struct HandoffRequest {
     serial: u32,
+    /// Return coordinate for this episode (None for legacy peers).
+    along: Option<f32>,
     attempts: u32,
     last_sent: Instant,
 }
@@ -3382,7 +3396,7 @@ struct HandoffRequest {
 impl ReturnHandoff {
     /// Record a (re)newed request for `addr`. A retried request keeps the same
     /// serial; a new episode (new capture crossing) uses a new one.
-    fn request(&mut self, addr: SocketAddr, serial: u32, now: Instant) {
+    fn request(&mut self, addr: SocketAddr, serial: u32, along: Option<f32>, now: Instant) {
         match self.pending.get_mut(&addr) {
             Some(existing) => {
                 if existing.serial == serial {
@@ -3395,6 +3409,7 @@ impl ReturnHandoff {
                     // budget instead of inheriting the previous one's near
                     // exhaustion (worst case one direct send + one retry).
                     existing.serial = serial;
+                    existing.along = along;
                     existing.attempts = 1;
                 }
                 existing.last_sent = now;
@@ -3404,6 +3419,7 @@ impl ReturnHandoff {
                     addr,
                     HandoffRequest {
                         serial,
+                        along,
                         attempts: 1,
                         last_sent: now,
                     },
@@ -3427,7 +3443,7 @@ impl ReturnHandoff {
     /// Requests that are due for a retry. Exhausted ones are dropped from
     /// `pending` and reported through [`Self::take_exhausted`] so the caller
     /// can close their session.
-    fn due(&mut self, now: Instant) -> Vec<(SocketAddr, u32)> {
+    fn due(&mut self, now: Instant) -> Vec<(SocketAddr, u32, Option<f32>)> {
         let mut due = Vec::new();
         let Self { pending, exhausted } = self;
         pending.retain(|addr, request| {
@@ -3438,7 +3454,7 @@ impl ReturnHandoff {
             if now.duration_since(request.last_sent) >= RETURN_RETRY_INTERVAL {
                 request.attempts = request.attempts.saturating_add(1);
                 request.last_sent = now;
-                due.push((*addr, request.serial));
+                due.push((*addr, request.serial, request.along));
             }
             true
         });
@@ -3555,7 +3571,7 @@ mod tests {
     fn a_confirmed_handoff_is_forgotten() {
         let mut handoff = ReturnHandoff::default();
         let now = Instant::now();
-        handoff.request(addr(1), 7, now);
+        handoff.request(addr(1), 7, None, now);
         assert!(handoff.is_pending(addr(1)));
         handoff.confirmed(addr(1));
         assert!(!handoff.is_pending(addr(1)));
@@ -3566,7 +3582,7 @@ mod tests {
     fn a_handoff_is_retried_only_after_the_interval() {
         let mut handoff = ReturnHandoff::default();
         let now = Instant::now();
-        handoff.request(addr(1), 7, now);
+        handoff.request(addr(1), 7, None, now);
         assert!(
             handoff.due(now).is_empty(),
             "the request was just sent directly; no immediate retry"
@@ -3577,7 +3593,7 @@ mod tests {
         );
         assert_eq!(
             handoff.due(now + RETURN_RETRY_INTERVAL),
-            vec![(addr(1), 7)],
+            vec![(addr(1), 7, None)],
             "the same serial is retried (the peer re-confirms on a retried request)"
         );
     }
@@ -3586,7 +3602,7 @@ mod tests {
     fn handoff_retries_are_bounded() {
         let mut handoff = ReturnHandoff::default();
         let mut now = Instant::now();
-        handoff.request(addr(1), 1, now);
+        handoff.request(addr(1), 1, None, now);
         let mut retries = 0;
         for _ in 0..100 {
             now += RETURN_RETRY_INTERVAL;
@@ -3610,7 +3626,7 @@ mod tests {
     fn exhaustion_is_reported_exactly_once() {
         let mut handoff = ReturnHandoff::default();
         let mut now = Instant::now();
-        handoff.request(addr(1), 1, now);
+        handoff.request(addr(1), 1, None, now);
         for _ in 0..100 {
             now += RETURN_RETRY_INTERVAL;
             let _ = handoff.due(now);
@@ -3633,13 +3649,13 @@ mod tests {
     fn a_new_crossing_resets_the_retry_budget() {
         let mut handoff = ReturnHandoff::default();
         let mut now = Instant::now();
-        handoff.request(addr(1), 1, now);
+        handoff.request(addr(1), 1, None, now);
         // Spend almost the whole budget on the first episode.
         for _ in 0..(RETURN_MAX_ATTEMPTS - 2) {
             now += RETURN_RETRY_INTERVAL;
             let _ = handoff.due(now);
         }
-        handoff.request(addr(1), 2, now);
+        handoff.request(addr(1), 2, None, now);
         let mut retries = 0;
         for _ in 0..100 {
             now += RETURN_RETRY_INTERVAL;
@@ -3656,28 +3672,42 @@ mod tests {
     fn a_later_crossing_starts_a_new_episode() {
         let mut handoff = ReturnHandoff::default();
         let mut now = Instant::now();
-        handoff.request(addr(1), 1, now);
+        handoff.request(addr(1), 1, None, now);
         for _ in 0..100 {
             now += RETURN_RETRY_INTERVAL;
             let _ = handoff.due(now);
         }
         // The user crosses again: a fresh request must be retried again.
-        handoff.request(addr(1), 2, now);
-        assert_eq!(handoff.due(now + RETURN_RETRY_INTERVAL), vec![(addr(1), 2)]);
+        handoff.request(addr(1), 2, None, now);
+        assert_eq!(
+            handoff.due(now + RETURN_RETRY_INTERVAL),
+            vec![(addr(1), 2, None)]
+        );
+    }
+
+    #[test]
+    fn retry_preserves_the_return_coordinate() {
+        let mut handoff = ReturnHandoff::default();
+        let now = Instant::now();
+        handoff.request(addr(1), 7, Some(0.375), now);
+        assert_eq!(
+            handoff.due(now + RETURN_RETRY_INTERVAL),
+            vec![(addr(1), 7, Some(0.375))]
+        );
     }
 
     #[test]
     fn handoffs_are_tracked_per_session() {
         let mut handoff = ReturnHandoff::default();
         let now = Instant::now();
-        handoff.request(addr(1), 1, now);
-        handoff.request(addr(2), 2, now);
+        handoff.request(addr(1), 1, None, now);
+        handoff.request(addr(2), 2, None, now);
         handoff.confirmed(addr(1));
         let mut due = handoff.due(now + RETURN_RETRY_INTERVAL);
-        due.sort_by_key(|(addr, _)| addr.port());
+        due.sort_by_key(|(addr, ..)| addr.port());
         assert_eq!(
             due,
-            vec![(addr(2), 2)],
+            vec![(addr(2), 2, None)],
             "only the unconfirmed session retries"
         );
     }

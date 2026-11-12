@@ -673,7 +673,7 @@ impl CaptureTask {
                 } => {
                     if !self.flush_motion().await {
                         log::warn!("releasing capture: failed to send coalesced motion");
-                        self.release_capture(capture).await?;
+                        self.release_capture(capture, None).await?;
                     }
                 },
                 _ = enter_retry.tick() => {
@@ -685,7 +685,7 @@ impl CaptureTask {
                                 since.elapsed()
                             );
                             self.disconnected_since = None;
-                            self.release_capture(capture).await?;
+                            self.release_capture(capture, None).await?;
                         }
                     }
                 },
@@ -712,7 +712,7 @@ impl CaptureTask {
                                     log::warn!(
                                         "releasing capture: failed to send buffered motion"
                                     );
-                                    self.release_capture(capture).await?;
+                                    self.release_capture(capture, None).await?;
                                 }
                             } else {
                                 log::debug!(
@@ -747,7 +747,7 @@ impl CaptureTask {
                                     log::info!(
                                         "releasing capture: left remote client device region (Leave({serial}))"
                                     );
-                                    self.release_capture(capture).await?;
+                                    self.release_capture(capture, None).await?;
                                 } else {
                                     log::debug!(
                                         "ignoring release confirmation Leave(0) from client {handle}"
@@ -764,6 +764,23 @@ impl CaptureTask {
                                 }
                             }
                         },
+                        ProtoEvent::LeaveAt { serial, along } => {
+                            if self.active_client == Some(handle) {
+                                log::info!(
+                                    "releasing capture at return coordinate {along:.3} (LeaveAt({serial}))"
+                                );
+                                self.release_capture(capture, Some(along)).await?;
+                            } else if serial != 0 {
+                                log::debug!(
+                                    "re-confirming capture release to {handle} (retried LeaveAt({serial}))"
+                                );
+                                if let Err(e) =
+                                    self.conn.send_now(ProtoEvent::Leave(0), handle).await
+                                {
+                                    log::debug!("failed to re-confirm release: {e}");
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 },
@@ -782,7 +799,7 @@ impl CaptureTask {
                         capture.set_remote_peer(peer.map(to_capture_pos));
                     }
                     CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Release => self.release_capture(capture, None).await?,
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
@@ -796,7 +813,7 @@ impl CaptureTask {
                         // `cli deactivate` (or a hostname change
                         // re-creating the client) would skip leave_hook.
                         if self.active_client == Some(h) {
-                            self.release_capture(capture).await?;
+                            self.release_capture(capture, None).await?;
                         }
                         self.remove_capture(h);
                         capture.destroy(h).await?;
@@ -811,7 +828,7 @@ impl CaptureTask {
                     // Leave, otherwise the peer keeps phantom-held keys and a
                     // grabbed pointer until its watchdog fires.
                     if self.active_client.is_some() {
-                        if let Err(e) = self.release_capture(capture).await {
+                        if let Err(e) = self.release_capture(capture, None).await {
                             log::warn!("failed to release the capture on shutdown: {e}");
                         }
                     }
@@ -900,7 +917,7 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
-            return self.release_capture(capture).await;
+            return self.release_capture(capture, None).await;
         }
 
         if !self.outgoing_event_allowed(handle, &event) {
@@ -1044,7 +1061,7 @@ impl CaptureTask {
                 let due = self.coalescer.push(handle, time, dx, dy, Instant::now());
                 if due && !self.flush_motion().await {
                     log::warn!("releasing capture: failed to send coalesced motion");
-                    return self.release_capture(capture).await;
+                    return self.release_capture(capture, None).await;
                 }
                 return Ok(());
             }
@@ -1057,7 +1074,7 @@ impl CaptureTask {
             && !event.is_begin()
             && !self.flush_handle(handle).await
         {
-            return self.release_capture(capture).await;
+            return self.release_capture(capture, None).await;
         }
 
         let Some(pos) = self.get_pos(handle) else {
@@ -1167,7 +1184,7 @@ impl CaptureTask {
                     // fires and active_client is cleared (without this the
                     // active_client field would stay stale until the next
                     // Begin from a different handle).
-                    self.release_capture(capture).await?;
+                    self.release_capture(capture, None).await?;
                 } else {
                     log::debug!(
                         "discrete send to client {handle} deferred ({e}); within grace window"
@@ -1310,7 +1327,7 @@ impl CaptureTask {
                 if let Some(handle) = self.active_client {
                     log::warn!("client {handle} did not acknowledge Enter, releasing capture");
                 }
-                return self.release_capture(capture).await;
+                return self.release_capture(capture, None).await;
             }
             EnterTick::Retransmit => {}
         }
@@ -1330,7 +1347,11 @@ impl CaptureTask {
         Ok(())
     }
 
-    async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+    async fn release_capture(
+        &mut self,
+        capture: &mut InputCapture,
+        return_along: Option<f32>,
+    ) -> Result<(), CaptureError> {
         // Deliver pending motion before the synthesized key-up events and
         // `Leave` so the peer never observes an out-of-order button/key.
         // Teardown uses the non-blocking send path: releasing a connection
@@ -1342,6 +1363,9 @@ impl CaptureTask {
         self.state = State::WaitingForAck;
         self.enter.reset();
 
+        // Remember where this capture lives before clearing it: the peer's
+        // return coordinate is relative to that edge.
+        let active_pos = self.active_client.and_then(|handle| self.get_pos(handle));
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Surface the leave to the service layer so it can fire
@@ -1397,7 +1421,11 @@ impl CaptureTask {
                 let _ = self.conn.send_now(ProtoEvent::Leave(0), handle).await;
             }
         }
-        capture.release().await
+        if let (Some(pos), Some(along)) = (active_pos, return_along) {
+            capture.release_at(pos, along).await
+        } else {
+            capture.release().await
+        }
     }
 }
 

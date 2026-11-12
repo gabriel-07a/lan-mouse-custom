@@ -745,6 +745,10 @@ impl Capture for LayerShellInputCapture {
         inner.flush_events().map(|_| ())
     }
 
+    async fn release_at(&mut self, _pos: Position, _along: f32) -> Result<(), CaptureError> {
+        self.release().await
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         // Make sure a grab that is still active does not outlive the backend.
         let inner = self.0.get_mut();

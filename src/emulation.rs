@@ -133,7 +133,11 @@ pub(crate) enum EmulationEvent {
     /// The remote pointer was pushed past one of our screen edges, detected by
     /// the emulation backend that injects the peer's input. The peer must
     /// release its capture so the cursor can come back (return hand-off).
-    EdgeReturn(lan_mouse_ipc::Position),
+    EdgeReturn {
+        pos: lan_mouse_ipc::Position,
+        /// Normalised position along the edge where the remote pointer exited.
+        along: Option<f32>,
+    },
     /// The peer driving this machine released its capture (`Leave`). Its
     /// incoming capture zones can be dropped and, once no session is left, the
     /// local capture may resume.
@@ -187,7 +191,7 @@ fn session_addrs_for_fingerprint(
 
 enum EmulationRequest {
     Reenable,
-    Release(SocketAddr, u32),
+    Release(SocketAddr, u32, Option<f32>),
     /// close an active incoming connection (device revoked): also tells the
     /// peer this was an explicit user disconnect so it stops reconnecting
     Disconnect(SocketAddr),
@@ -215,7 +219,7 @@ enum EmulationRequest {
 /// channel. The emulation loop must not poll `recv()` once that happens: a
 /// closed unbounded receiver returns `Ready(None)` immediately forever and
 /// would spin a CPU core at 100% (Linux/macOS/Dummy backends).
-fn edge_return_notifier_active(rx: &UnboundedReceiver<PointerEdge>) -> bool {
+fn edge_return_notifier_active(rx: &UnboundedReceiver<(PointerEdge, Option<f32>)>) -> bool {
     !rx.is_closed()
 }
 
@@ -266,9 +270,9 @@ impl Emulation {
     /// A non-zero `serial` marks the request as retried: the peer answers it
     /// again even if it already released, which is what lets the requester
     /// recover from a lost `Leave`.
-    pub(crate) fn send_leave_request(&self, addr: SocketAddr, serial: u32) {
+    pub(crate) fn send_leave_request(&self, addr: SocketAddr, serial: u32, along: Option<f32>) {
         self.request_tx
-            .send(EmulationRequest::Release(addr, serial))
+            .send(EmulationRequest::Release(addr, serial, along))
             .ok()
             .unwrap_or_default();
     }
@@ -689,8 +693,12 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr, serial) => {
-                        self.listener.reply(addr, ProtoEvent::Leave(serial)).await
+                    EmulationRequest::Release(addr, serial, along) => {
+                        let event = match along {
+                            Some(along) => ProtoEvent::LeaveAt { serial, along },
+                            None => ProtoEvent::Leave(serial),
+                        };
+                        self.listener.reply(addr, event).await
                     }
                     EmulationRequest::Disconnect(addr) => {
                         // Tell the peer this is an explicit user disconnect so
@@ -1293,7 +1301,7 @@ impl EmulationTask {
     async fn do_emulation_session(
         &mut self,
         emulation: &mut InputEmulation,
-        edge_return_rx: &mut UnboundedReceiver<PointerEdge>,
+        edge_return_rx: &mut UnboundedReceiver<(PointerEdge, Option<f32>)>,
     ) -> Result<(), InputEmulationError> {
         loop {
             tokio::select! {
@@ -1303,10 +1311,15 @@ impl EmulationTask {
                 // `recv()` would return `Ready(None)` forever and spin a CPU
                 // core at 100% (Linux/macOS/Dummy backends).
                 edge = edge_return_rx.recv(), if edge_return_notifier_active(edge_return_rx) => {
-                    if let Some(edge) = edge {
-                        log::debug!("emulation observed a return hand-off through {edge:?}");
+                    if let Some((edge, along)) = edge {
+                        log::debug!(
+                            "emulation observed a return hand-off through {edge:?} (along {along:?})"
+                        );
                         self.event_tx
-                            .send(EmulationEvent::EdgeReturn(edge_to_ipc_pos(edge)))
+                            .send(EmulationEvent::EdgeReturn {
+                                pos: edge_to_ipc_pos(edge),
+                                along,
+                            })
                             .ok()
                             .unwrap_or_default();
                     } else {
@@ -1471,7 +1484,7 @@ mod edge_return_guard_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn closed_edge_return_channel_is_disabled() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PointerEdge>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(PointerEdge, Option<f32>)>();
         assert!(edge_return_notifier_active(&rx));
         drop(tx);
         assert!(!edge_return_notifier_active(&rx));
@@ -1479,7 +1492,7 @@ mod edge_return_guard_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn closed_edge_return_arm_does_not_busy_loop() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PointerEdge>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(PointerEdge, Option<f32>)>();
         drop(tx);
         let mut arm_polls = 0usize;
         let result = tokio::time::timeout(Duration::from_millis(100), async {

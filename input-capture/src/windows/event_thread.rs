@@ -81,6 +81,13 @@ impl EventThread {
         self.signal(RequestType::Release);
     }
 
+    /// Release the capture and put the real cursor back at `along` on `pos`
+    /// (return hand-off coordinate). The request is processed on the hook
+    /// thread because the display layout lives there.
+    pub(crate) fn release_capture_at(&self, pos: Position, along: f32) {
+        self.client_update(ClientUpdate::ReleaseAt(pos, along));
+    }
+
     /// Tell the hook thread which edge a remote peer entered through and is
     /// currently controlling this machine from.
     ///
@@ -179,6 +186,7 @@ enum ClientUpdate {
     Create(Position),
     Destroy(Position),
     RemotePeer(Option<Position>),
+    ReleaseAt(Position, f32),
 }
 
 fn try_send_event(
@@ -635,6 +643,10 @@ fn start_routine(
 }
 
 fn release_active_client() {
+    release_active_client_at(None);
+}
+
+fn release_active_client_at(target: Option<(i32, i32)>) {
     if ACTIVE_CLIENT.take().is_some() {
         // Cooldown: the pointer is still parked at the edge when control is
         // handed back, so the next outgoing movement must not immediately
@@ -643,6 +655,12 @@ fn release_active_client() {
     }
     PREV_POS.replace(None);
     hide_hidden_pointer();
+    if let Some((x, y)) = target {
+        unsafe {
+            let _ = SetCursorPos(x, y);
+        }
+        log::debug!("returned cursor to ({x}, {y})");
+    }
 }
 
 /// Enter the client registered at `pos`.
@@ -1162,6 +1180,12 @@ fn update_clients(request: ClientUpdate) {
                 release_active_client();
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
+        }
+        ClientUpdate::ReleaseAt(pos, along) => {
+            let target = DISPLAYS.with_borrow(|(displays, _, _)| {
+                super::display_util::point_for_edge_fraction(displays, pos, along)
+            });
+            release_active_client_at(target);
         }
         ClientUpdate::RemotePeer(peer) => {
             REMOTE_PEER.set(peer);

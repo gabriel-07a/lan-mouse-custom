@@ -16,7 +16,7 @@ use reis::{
     tokio::EiConvertEventStream,
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     env, fs, io,
     num::NonZeroU32,
@@ -162,6 +162,11 @@ fn write_token_to(dir: &Path, name: &str, token: &str) -> io::Result<()> {
 enum LibeiNotifyEvent {
     Create(Position),
     Destroy(Position),
+}
+
+thread_local! {
+    /// Return coordinate supplied by the peer for the next release.
+    static RETURN_TARGET: RefCell<Option<(Position, f32)>> = const { RefCell::new(None) };
 }
 
 pub struct LibeiInputCapture {
@@ -585,7 +590,9 @@ where
         tokio::select! {
             _ = cancellation_token.cancelled() => return Ok(()),
             _ = notify_release.notified() => {
-                // Not capturing right now; nothing to hand back.
+                // Not capturing right now; nothing to hand back, and a target
+                // left for this release must not affect the next activation.
+                let _ = RETURN_TARGET.with(|target| target.borrow_mut().take());
                 log::debug!("release requested while no capture is active");
             }
             _ = zones_changed.next() => {
@@ -612,8 +619,16 @@ where
                     // Stale barrier (all clients were disabled): give the
                     // compositor its capture back immediately and keep waiting.
                     log::debug!("activation without an enabled client; releasing");
-                    release_capture(input_capture, session, activated_event, Position::Left)
-                        .await?;
+                    release_capture(
+                        input_capture,
+                        session,
+                        activated_event,
+                        Position::Left,
+                        None,
+                        &barriers,
+                        &pos_for_barrier_id,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -666,7 +681,16 @@ where
                 // screen.
                 if !active_clients.contains(&pos) {
                     log::debug!("activation on unconfigured edge {pos:?}; releasing");
-                    release_capture(input_capture, session, activated_event, pos).await?;
+                    release_capture(
+                        input_capture,
+                        session,
+                        activated_event,
+                        pos,
+                        None,
+                        &barriers,
+                        &pos_for_barrier_id,
+                    )
+                    .await?;
                     continue;
                 }
                 current_pos.replace(Some(pos));
@@ -729,7 +753,17 @@ where
                     }
                 }
 
-                release_capture(input_capture, session, activated_event, pos).await?;
+                let target = RETURN_TARGET.with(|target| target.borrow_mut().take());
+                release_capture(
+                    input_capture,
+                    session,
+                    activated_event,
+                    pos,
+                    target,
+                    &barriers,
+                    &pos_for_barrier_id,
+                )
+                .await?;
                 // No client is being driven anymore: input events that arrive
                 // before the next activation must not be forwarded with the
                 // previous client's position.
@@ -747,6 +781,9 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
+    return_target: Option<(Position, f32)>,
+    barriers: &[ICBarrier],
+    pos_for_barrier_id: &HashMap<BarrierID, Position>,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
@@ -757,24 +794,88 @@ async fn release_capture(
     // releases the capture at the current position (the cursor may re-enter
     // once, which the next activation/release cycle handles) instead of
     // aborting the capture task with a panic.
-    match activated.cursor_position() {
-        Some((x, y)) => {
-            log::debug!("client entered @ ({x}, {y})");
-            let (dx, dy) = match current_pos {
-                // offset cursor position to not enter again immediately
-                Position::Left => (1., 0.),
-                Position::Right => (-1., 0.),
-                Position::Top => (0., 1.),
-                Position::Bottom => (0., -1.),
-            };
-            // release 1px to the right of the entered zone
-            release_options =
-                release_options.set_cursor_position(Some((x as f64 + dx, y as f64 + dy)));
+    if let Some((target_pos, along)) = return_target {
+        if let Some((x, y)) =
+            point_for_edge_fraction(barriers, pos_for_barrier_id, target_pos, along)
+        {
+            log::debug!("returning cursor to ({x}, {y}) on {target_pos:?} (along {along:.3})");
+            release_options = release_options.set_cursor_position(Some((x, y)));
         }
-        None => log::warn!("compositor did not report a cursor position for the capture release"),
+    } else {
+        match activated.cursor_position() {
+            Some((x, y)) => {
+                log::debug!("client entered @ ({x}, {y})");
+                let (dx, dy) = match current_pos {
+                    // offset cursor position to not enter again immediately
+                    Position::Left => (1., 0.),
+                    Position::Right => (-1., 0.),
+                    Position::Top => (0., 1.),
+                    Position::Bottom => (0., -1.),
+                };
+                // release 1px to the right of the entered zone
+                release_options =
+                    release_options.set_cursor_position(Some((x as f64 + dx, y as f64 + dy)));
+            }
+            None => {
+                log::warn!("compositor did not report a cursor position for the capture release")
+            }
+        }
     }
     input_capture.release(session, release_options).await?;
     Ok(())
+}
+
+/// Map a normalised return coordinate back to a point on the outer edge.
+/// Barriers are per-region edge segments; use their bounding span along the
+/// requested edge.
+fn point_for_edge_fraction(
+    barriers: &[ICBarrier],
+    pos_for_barrier_id: &HashMap<BarrierID, Position>,
+    pos: Position,
+    along: f32,
+) -> Option<(f64, f64)> {
+    let mut points = barriers
+        .iter()
+        .filter(|barrier| pos_for_barrier_id.get(&barrier.barrier_id) == Some(&pos));
+    let first = points.next()?;
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        first.position.0,
+        first.position.1,
+        first.position.2,
+        first.position.3,
+    );
+    for barrier in points {
+        min_x = min_x.min(barrier.position.0);
+        min_y = min_y.min(barrier.position.1);
+        max_x = max_x.max(barrier.position.2);
+        max_y = max_y.max(barrier.position.3);
+    }
+    let along = f64::from(along.clamp(0.0, 1.0));
+    Some(match pos {
+        Position::Left | Position::Right => {
+            // Barriers sit just outside the region (right/bottom include the
+            // edge coordinate); keep the restored cursor on the last pixel
+            // that is actually inside the layout.
+            let x = if pos == Position::Left {
+                min_x
+            } else {
+                max_x.saturating_sub(1)
+            };
+            let y0 = f64::from(min_y);
+            let y1 = f64::from(max_y);
+            (f64::from(x), y0 + along * (y1 - y0))
+        }
+        Position::Top | Position::Bottom => {
+            let y = if pos == Position::Top {
+                min_y
+            } else {
+                max_y.saturating_sub(1)
+            };
+            let x0 = f64::from(min_x);
+            let x1 = f64::from(max_x);
+            (x0 + along * (x1 - x0), f64::from(y))
+        }
+    })
 }
 
 /// Normalised position of `point` along the layout edge `pos`, using the
@@ -910,6 +1011,12 @@ impl LanMouseInputCapture for LibeiInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        self.notify_release.notify_waiters();
+        Ok(())
+    }
+
+    async fn release_at(&mut self, pos: Position, along: f32) -> Result<(), CaptureError> {
+        RETURN_TARGET.with(|target| *target.borrow_mut() = Some((pos, along)));
         self.notify_release.notify_waiters();
         Ok(())
     }
@@ -1127,6 +1234,35 @@ mod portal_barrier_geometry_tests {
         assert_eq!(
             barrier_position(0, 0, 1920, 1080, Position::Bottom),
             (0, 1080, 1919, 1080)
+        );
+    }
+}
+
+#[cfg(test)]
+mod libei_return_coordinate_tests {
+    use super::*;
+    use std::num::NonZeroU32;
+
+    #[test]
+    fn return_point_uses_the_edge_span() {
+        let barriers = [
+            ICBarrier::new(NonZeroU32::new(1).expect("id"), (0, 0, 0, 1079)),
+            ICBarrier::new(NonZeroU32::new(2).expect("id"), (1920, 0, 1920, 1079)),
+        ];
+        let mut mapping = HashMap::new();
+        mapping.insert(NonZeroU32::new(1).expect("id"), Position::Left);
+        mapping.insert(NonZeroU32::new(2).expect("id"), Position::Right);
+        assert_eq!(
+            point_for_edge_fraction(&barriers, &mapping, Position::Left, 0.0),
+            Some((0.0, 0.0))
+        );
+        assert_eq!(
+            point_for_edge_fraction(&barriers, &mapping, Position::Right, 0.5),
+            Some((1919.0, 539.5))
+        );
+        assert_eq!(
+            point_for_edge_fraction(&barriers, &mapping, Position::Right, 1.0),
+            Some((1919.0, 1079.0))
         );
     }
 }

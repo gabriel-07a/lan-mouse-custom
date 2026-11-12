@@ -851,6 +851,10 @@ impl Capture for MacOSInputCapture {
         Ok(())
     }
 
+    async fn release_at(&mut self, _pos: Position, _along: f32) -> Result<(), CaptureError> {
+        self.release().await
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         // Stop the CFRunLoop so the event-tap thread exits and the producer
         // task can drain; Drop repeats this, it is idempotent.

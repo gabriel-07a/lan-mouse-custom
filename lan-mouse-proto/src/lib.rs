@@ -55,6 +55,11 @@ pub mod capabilities {
     /// Legacy peers close the connection on an unknown event id, so this event
     /// must only be sent when the peer advertised this bit.
     pub const EDGE_COORDINATE: u32 = 1 << 7;
+    /// The peer understands [`super::ProtoEvent::LeaveAt`] and can put the
+    /// returning cursor back at the exact point along the exit edge. Legacy
+    /// peers close the connection on an unknown event id, so this event must
+    /// only be sent when the peer advertised this bit.
+    pub const RETURN_COORDINATE: u32 = 1 << 8;
 }
 
 /// Features this build can use when the peer also advertises them.
@@ -62,7 +67,8 @@ pub const CAPABILITIES: u32 = capabilities::ENTER_ACK
     | capabilities::CLIPBOARD
     | capabilities::PERMISSIONS
     | capabilities::SERIALIZED_LEAVE
-    | capabilities::EDGE_COORDINATE;
+    | capabilities::EDGE_COORDINATE
+    | capabilities::RETURN_COORDINATE;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -125,6 +131,12 @@ pub enum ProtoEvent {
     /// notify a client that the cursor left its region
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Leave(u32),
+    /// Like [`ProtoEvent::Leave`], but also carries the normalised position
+    /// along the edge where the remote pointer exited (`along`: 0.0 =
+    /// top/left, 1.0 = bottom/right). Only sent to peers advertising
+    /// [`capabilities::RETURN_COORDINATE`], so the host can put its cursor back
+    /// at that point instead of the old entry point.
+    LeaveAt { serial: u32, along: f32 },
     /// acknowledge of an [`ProtoEvent::Enter`] or [`ProtoEvent::Leave`] event
     Ack(u32),
     /// Input event
@@ -191,6 +203,9 @@ impl Display for ProtoEvent {
                 write!(f, "EnterAt({pos}, {serial}, along={along:.3})")
             }
             ProtoEvent::Leave(s) => write!(f, "Leave({s})"),
+            ProtoEvent::LeaveAt { serial, along } => {
+                write!(f, "LeaveAt({serial}, along={along:.4})")
+            }
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
             ProtoEvent::Ping => write!(f, "ping"),
@@ -260,6 +275,7 @@ pub enum EventType {
     AuthResponse = 17,
     AuthRevoke = 18,
     EnterAt = 19,
+    LeaveAt = 20,
 }
 
 impl ProtoEvent {
@@ -282,6 +298,7 @@ impl ProtoEvent {
             ProtoEvent::Enter { .. } => EventType::Enter,
             ProtoEvent::EnterAt { .. } => EventType::EnterAt,
             ProtoEvent::Leave(_) => EventType::Leave,
+            ProtoEvent::LeaveAt { .. } => EventType::LeaveAt,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
             ProtoEvent::AuthRequest { .. } => EventType::AuthRequest,
@@ -376,6 +393,17 @@ impl TryFrom<&[u8]> for ProtoEvent {
                 })
             }
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
+            EventType::LeaveAt => {
+                let serial = decode_u32(&mut buf)?;
+                let along = decode_f32(&mut buf)?;
+                if !along.is_finite() {
+                    return Err(ProtocolError::InvalidCoordinate(along));
+                }
+                Ok(Self::LeaveAt {
+                    serial,
+                    along: along.clamp(0.0, 1.0),
+                })
+            }
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
             EventType::Hello => {
                 let mut commit = [0u8; 8];
@@ -491,6 +519,10 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_f32(buf, len, along);
                 }
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
+                ProtoEvent::LeaveAt { serial, along } => {
+                    encode_u32(buf, len, serial);
+                    encode_f32(buf, len, along);
+                }
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Hello {
                     commit,
@@ -636,6 +668,10 @@ mod tests {
                 along: 0.25,
             },
             ProtoEvent::Leave(0x0102_0304),
+            ProtoEvent::LeaveAt {
+                serial: 0x0203_0405,
+                along: 0.75,
+            },
             ProtoEvent::Ack(0x0a0b_0c0d),
             ProtoEvent::Hello {
                 commit: *b"abcdefgh",
@@ -709,6 +745,14 @@ mod tests {
             vec![19, 2, 1, 2, 3, 4, 0x3f, 0x00, 0x00, 0x00]
         );
         assert_eq!(encode(ProtoEvent::Leave(0x0102_0304)), vec![9, 1, 2, 3, 4]);
+        // Event id 20, serial, then the big-endian f32 coordinate (0.75).
+        assert_eq!(
+            encode(ProtoEvent::LeaveAt {
+                serial: 0x0102_0304,
+                along: 0.75,
+            }),
+            vec![20, 1, 2, 3, 4, 0x3f, 0x40, 0x00, 0x00]
+        );
         assert_eq!(
             encode(ProtoEvent::Ack(0x0a0b_0c0d)),
             vec![10, 0x0a, 0x0b, 0x0c, 0x0d]
@@ -957,6 +1001,7 @@ mod extra_tests {
         assert_eq!(EventType::Pong as u8, 7);
         assert_eq!(EventType::Enter as u8, 8);
         assert_eq!(EventType::Leave as u8, 9);
+        assert_eq!(EventType::LeaveAt as u8, 20);
         assert_eq!(EventType::Ack as u8, 10);
         assert_eq!(EventType::Hello as u8, 11);
         // Clipboard frames reserve 12-15; new events must start at 16.
@@ -1006,6 +1051,7 @@ mod extra_tests {
             capabilities::PERMISSIONS,
             capabilities::SERIALIZED_LEAVE,
             capabilities::EDGE_COORDINATE,
+            capabilities::RETURN_COORDINATE,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");
@@ -1027,6 +1073,7 @@ mod extra_tests {
                 | capabilities::PERMISSIONS
                 | capabilities::SERIALIZED_LEAVE
                 | capabilities::EDGE_COORDINATE
+                | capabilities::RETURN_COORDINATE
         );
     }
 

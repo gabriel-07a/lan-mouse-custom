@@ -462,6 +462,23 @@ impl AbsoluteTracker {
         (self.x as f32, self.y as f32)
     }
 
+    /// Normalised position along the entry edge where the pointer currently
+    /// is. Used to let the host restore its cursor at the return coordinate.
+    fn return_along(&self) -> Option<f32> {
+        let (x0, y0, x1, y1) = self.entry;
+        let along = match self.edge {
+            PointerEdge::Left | PointerEdge::Right => {
+                let span = f64::from((y1 - y0).max(1.0)) - 1.0;
+                ((self.y - f64::from(y0)) / span).clamp(0.0, 1.0)
+            }
+            PointerEdge::Top | PointerEdge::Bottom => {
+                let span = f64::from((x1 - x0).max(1.0)) - 1.0;
+                ((self.x - f64::from(x0)) / span).clamp(0.0, 1.0)
+            }
+        };
+        along.is_finite().then_some(along as f32)
+    }
+
     /// Snap a layout position into the region that contains it, or the
     /// nearest one (used both for detection bookkeeping and the sent value).
     fn snap(&self, x: f64, y: f64) -> (f64, f64) {
@@ -891,11 +908,13 @@ impl Emulation for LibeiEmulation {
                             self.context
                                 .flush()
                                 .map_err(|e| io::Error::new(e.kind(), e))?;
+                            let return_along =
+                                fired.is_some().then(|| tracker.return_along()).flatten();
                             self.absolute = Some(tracker);
                             if let Some(edge) = fired {
                                 log::info!("pushed past the {edge:?} edge; handing control back");
                                 if let Some(notifier) = &self.edge_return {
-                                    let _ = notifier.send(edge);
+                                    let _ = notifier.send((edge, return_along));
                                 }
                             }
                             return Ok(());

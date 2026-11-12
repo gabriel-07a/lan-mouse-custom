@@ -180,7 +180,8 @@ impl WindowsEmulation {
             // Reporting every edge made the other PC take control back when
             // the cursor merely reached the top/bottom/opposite side.
             Some(edge) if self.remote_edge.is_none_or(|entry| entry == edge) => {
-                self.request_edge_return(edge)
+                let along = screen.edge_along(edge, requested);
+                self.request_edge_return(edge, Some(along))
             }
             Some(_) => self.edge_return_latch.clear(),
             // Back inside the screen: the next edge contact is a new hand-off.
@@ -383,14 +384,14 @@ impl WindowsEmulation {
     /// [`EdgeReturnLatch`]): a lost `Leave` is retried a few times, but a peer
     /// that keeps pushing at the edge cannot generate an unbounded stream of
     /// hand-off requests.
-    fn request_edge_return(&mut self, edge: PointerEdge) {
+    fn request_edge_return(&mut self, edge: PointerEdge, along: Option<f32>) {
         let Some(notifier) = &self.edge_return else {
             return;
         };
         let Some(attempt) = self.edge_return_latch.request(edge, Instant::now()) else {
             return;
         };
-        if notifier.send(edge).is_ok() {
+        if notifier.send((edge, along)).is_ok() {
             log::debug!(
                 "remote pointer pushed past the {edge:?} edge: requesting hand-off \
                  (attempt {attempt})"

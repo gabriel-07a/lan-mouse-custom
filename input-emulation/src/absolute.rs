@@ -79,6 +79,24 @@ impl VirtualScreen {
         (self.left..=self.right()).contains(&x) && (self.top..=self.bottom()).contains(&y)
     }
 
+    /// Normalised position (`0.0..=1.0`) of `point` along `edge` of the virtual
+    /// desktop. Used to tell the capturing peer where to put the returning cursor.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn edge_along(&self, edge: super::PointerEdge, point: (i32, i32)) -> f32 {
+        let (x, y) = point;
+        let along = match edge {
+            super::PointerEdge::Left | super::PointerEdge::Right => {
+                let span = f64::from(self.height.saturating_sub(1).max(1));
+                (f64::from(y - self.top) / span).clamp(0.0, 1.0)
+            }
+            super::PointerEdge::Top | super::PointerEdge::Bottom => {
+                let span = f64::from(self.width.saturating_sub(1).max(1));
+                (f64::from(x - self.left) / span).clamp(0.0, 1.0)
+            }
+        };
+        along as f32
+    }
+
     /// Clamp a point to the virtual desktop so the pointer cannot wrap.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn clamp(&self, (x, y): (i32, i32)) -> (i32, i32) {
@@ -407,6 +425,22 @@ mod tests {
         assert_eq!(
             overshoot_edge(&screen(), (500, 1085)),
             Some(super::super::PointerEdge::Bottom)
+        );
+    }
+
+    #[test]
+    fn edge_along_maps_the_return_coordinate() {
+        let screen = screen();
+        assert_eq!(
+            screen.edge_along(super::super::PointerEdge::Right, (1920, 0)),
+            0.0
+        );
+        assert!(
+            (screen.edge_along(super::super::PointerEdge::Right, (1920, 540)) - 0.5).abs() < 0.001
+        );
+        assert_eq!(
+            screen.edge_along(super::super::PointerEdge::Bottom, (1920, 1080)),
+            1.0
         );
     }
 

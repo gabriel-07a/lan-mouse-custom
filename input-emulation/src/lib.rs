@@ -93,8 +93,10 @@ pub enum PointerEdge {
     Bottom,
 }
 
-/// Channel used by a backend to report [`PointerEdge`] return requests.
-pub type EdgeReturnNotifier = tokio::sync::mpsc::UnboundedSender<PointerEdge>;
+/// Channel used by a backend to report a return request: the edge and,
+/// when the backend can compute it, the normalised position along that edge
+/// (0.0 = top/left, 1.0 = bottom/right).
+pub type EdgeReturnNotifier = tokio::sync::mpsc::UnboundedSender<(PointerEdge, Option<f32>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {

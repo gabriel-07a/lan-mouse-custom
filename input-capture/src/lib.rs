@@ -220,6 +220,13 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// Release the capture and restore the local cursor at the return
+    /// coordinate supplied by the peer.
+    pub async fn release_at(&mut self, pos: Position, along: f32) -> Result<(), CaptureError> {
+        self.pressed_keys.clear();
+        self.capture.release_at(pos, along).await
+    }
+
     /// Tell the backend which edge a remote peer entered through and is
     /// currently driving this machine from (`None` = no peer is driving us).
     pub fn set_remote_peer(&mut self, peer: Option<Position>) {
@@ -369,6 +376,12 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
 
+    /// Release the mouse and, when the peer supplied a return coordinate,
+    /// restore the local cursor at `along` (0.0 = top/left) of `pos`.
+    ///
+    /// Backends without a cursor-warp API can just call `release`.
+    async fn release_at(&mut self, pos: Position, along: f32) -> Result<(), CaptureError>;
+
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
 
@@ -497,6 +510,10 @@ mod tests {
         }
 
         async fn release(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        async fn release_at(&mut self, _pos: Position, _along: f32) -> Result<(), CaptureError> {
             Ok(())
         }
 
