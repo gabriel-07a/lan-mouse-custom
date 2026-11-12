@@ -888,17 +888,25 @@ async fn read_loop(ctx: ReadLoopCtx) -> Result<(), Error> {
             return Ok(());
         }
         if n > 0 && is_clipboard_frame(b[0]) {
-            let clipboard_policy = incoming_policy(&devices, &authorized, &fingerprint);
-            if !(clipboard_policy.allowed && clipboard_policy.capabilities.allows_clipboard_write())
-            {
-                blocked = blocked.saturating_add(1);
-                log::debug!(
-                    "dropping clipboard frame from {addr}: device has no clipboard permission"
-                );
-                continue;
-            }
             match ClipboardFrame::decode(&b[..n]) {
                 Ok(frame) => {
+                    // Only content frames are governed by the peer's
+                    // clipboard-write permission. `Ack`/`Cancel` are control
+                    // replies for a transfer *this* machine started; dropping
+                    // them made the opposite direction time out for a device
+                    // that may write but not read the clipboard.
+                    if frame.is_content() {
+                        let clipboard_policy = incoming_policy(&devices, &authorized, &fingerprint);
+                        if !(clipboard_policy.allowed
+                            && clipboard_policy.capabilities.allows_clipboard_write())
+                        {
+                            blocked = blocked.saturating_add(1);
+                            log::debug!(
+                                "dropping clipboard frame from {addr}: device has no clipboard permission"
+                            );
+                            continue;
+                        }
+                    }
                     if dtls_tx
                         .send(ListenEvent::Clipboard { frame, addr })
                         .is_err()

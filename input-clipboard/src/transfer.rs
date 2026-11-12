@@ -20,7 +20,13 @@ use crate::{ClipboardSnapshot, Error, Format, Limits};
 /// current window.
 pub const ACK_TIMEOUT: Duration = Duration::from_millis(120);
 /// Abort after this many windows without any progress.
-pub const MAX_WINDOW_ATTEMPTS: u8 = 10;
+///
+/// The retransmission delay grows with every unanswered window (see
+/// [`retransmission_delay`]), so this is several seconds of tolerance for a
+/// slow link or a short Wi-Fi hiccup while still failing well before a user
+/// would conclude the transfer hung. The sync layer additionally re-offers a
+/// failed copy, see `ClipboardSync`'s pending retry.
+pub const MAX_WINDOW_ATTEMPTS: u8 = 6;
 /// Maximum number of chunks emitted in a single [`OutgoingTransfer::poll`]
 /// burst so bulk transfers do not flood the low-latency UDP socket at once.
 pub const MAX_CHUNKS_PER_BURST: usize = 6;
@@ -32,6 +38,22 @@ pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn chunk_count(total: u32) -> u32 {
     total.div_ceil(CHUNK_SIZE as u32)
+}
+
+/// Wait before retransmitting a window that has not made progress for
+/// `attempts` windows.
+///
+/// The first couple of retries are fast (an isolated lost datagram is cheap to
+/// repair), then the delay doubles so a congested Wi-Fi link, a scheduling
+/// stall or a peer that is briefly busy does not exhaust the retry budget in
+/// little more than a second.
+pub fn retransmission_delay(attempts: u8) -> Duration {
+    let factor = match attempts {
+        0..=2 => 1,
+        3..=4 => 2,
+        _ => 4,
+    };
+    ACK_TIMEOUT * factor
 }
 
 /// Sender side of one snapshot to one peer.
@@ -92,6 +114,33 @@ impl OutgoingTransfer {
         self.serial
     }
 
+    /// Hash of the snapshot this transfer carries.
+    pub fn hash(&self) -> [u8; 32] {
+        self.hash
+    }
+
+    /// The snapshot this transfer carries, for re-offering after a failure.
+    pub fn snapshot(&self) -> ClipboardSnapshot {
+        let mut snapshot = ClipboardSnapshot::new();
+        for item in &self.items {
+            snapshot.insert(item.format, item.data.clone());
+        }
+        snapshot
+    }
+
+    fn offer_frame(&self) -> ClipboardFrame {
+        ClipboardFrame::Offer {
+            serial: self.serial,
+            origin: self.origin,
+            hash: self.hash,
+            items: self
+                .items
+                .iter()
+                .map(|item| (item.format.id(), item.data.len() as u32))
+                .collect(),
+        }
+    }
+
     /// Frames that should be sent now (offer and/or a paced slice of the current window).
     pub fn poll(&mut self, now: Instant) -> Vec<ClipboardFrame> {
         let mut out = Vec::new();
@@ -108,32 +157,26 @@ impl OutgoingTransfer {
         let window_end =
             (self.items[self.current].base + ACK_WINDOW).min(self.items[self.current].total_chunks);
         let window_sweep_pending = self.items[self.current].cursor < window_end;
-        let timeout_due = self.items[self.current]
-            .last_send
-            .is_none_or(|last| now.duration_since(last) >= ACK_TIMEOUT);
+        let retransmission_due = self.items[self.current].last_send.is_none_or(|last| {
+            now.duration_since(last) >= retransmission_delay(self.items[self.current].attempts)
+        });
 
-        // The offer is re-sent until the peer acknowledges at least one chunk:
-        // losing the single offer would otherwise stall the whole transfer.
-        // While a window sweep is still in progress (`window_sweep_pending`),
-        // only send the offer once at the start of the transfer.
-        if !self.acked_any && (!self.offer_sent || (!window_sweep_pending && timeout_due)) {
-            let items = self
-                .items
-                .iter()
-                .map(|item| (item.format.id(), item.data.len() as u32))
-                .collect();
-            out.push(ClipboardFrame::Offer {
-                serial: self.serial,
-                origin: self.origin,
-                hash: self.hash,
-                items,
-            });
+        // The offer is re-sent with every retransmission round, not only until
+        // the first acknowledgement. A receiver that lost its transfer state
+        // (clipboard sync toggled off/on, clipboard backend restarted) ignores
+        // retransmitted chunks until it sees the offer again; without this the
+        // sender could only give up and the user's copy would be lost.
+        // Every peer build that speaks the clipboard extension already handles
+        // a repeated offer by re-acknowledging the in-flight transfer, so this
+        // needs no capability negotiation or wire change.
+        if (!self.acked_any && !self.offer_sent) || (!window_sweep_pending && retransmission_due) {
+            out.push(self.offer_frame());
             self.offer_sent = true;
         }
 
         let item = &mut self.items[self.current];
         if !window_sweep_pending {
-            if !timeout_due {
+            if !retransmission_due {
                 return out;
             }
             item.cursor = item.base;
@@ -444,7 +487,7 @@ fn window(item: &IncomingItem) -> (u32, u32) {
 mod tests {
     use super::*;
     use crate::ClipboardSnapshot;
-    use lan_mouse_proto::clipboard::MIME_TEXT;
+    use lan_mouse_proto::clipboard::{MIME_PNG, MIME_TEXT};
 
     fn snapshot() -> ClipboardSnapshot {
         ClipboardSnapshot::from_items([
@@ -481,17 +524,26 @@ mod tests {
                         hash,
                         items,
                     } => {
-                        receiver = Some(
-                            IncomingTransfer::from_offer(
-                                serial,
-                                origin,
-                                hash,
-                                &items,
-                                &Limits::default(),
-                                now,
-                            )
-                            .expect("accept offer"),
-                        );
+                        // A repeated offer for the transfer already in flight
+                        // must not reset the receiver (production re-acks it).
+                        let repeated = receiver.as_ref().is_some_and(|current| {
+                            current.serial() == serial
+                                && current.origin() == origin
+                                && current.hash() == hash
+                        });
+                        if !repeated {
+                            receiver = Some(
+                                IncomingTransfer::from_offer(
+                                    serial,
+                                    origin,
+                                    hash,
+                                    &items,
+                                    &Limits::default(),
+                                    now,
+                                )
+                                .expect("accept offer"),
+                            );
+                        }
                     }
                     ClipboardFrame::Chunk {
                         serial,
@@ -726,5 +778,113 @@ mod tests {
                 .any(|f| matches!(f, ClipboardFrame::Offer { .. })),
             "offer should not be resent before ACK_TIMEOUT while sweeping the initial window"
         );
+    }
+
+    #[test]
+    fn retransmission_backoff_grows_but_stays_bounded() {
+        assert_eq!(retransmission_delay(1), ACK_TIMEOUT);
+        assert_eq!(retransmission_delay(2), ACK_TIMEOUT);
+        assert_eq!(retransmission_delay(3), ACK_TIMEOUT * 2);
+        assert_eq!(retransmission_delay(4), ACK_TIMEOUT * 2);
+        assert_eq!(retransmission_delay(5), ACK_TIMEOUT * 4);
+        assert_eq!(retransmission_delay(MAX_WINDOW_ATTEMPTS), ACK_TIMEOUT * 4);
+        // Every retransmission round is slower than the previous one or equal,
+        // and the whole budget is a few seconds rather than a few hundred ms.
+        let total: Duration = (1..=MAX_WINDOW_ATTEMPTS).map(retransmission_delay).sum();
+        assert!(
+            total >= Duration::from_millis(1_500),
+            "retry budget too small for a Wi-Fi hiccup: {total:?}"
+        );
+        assert!(
+            total <= Duration::from_secs(3),
+            "retry budget too large to surface a failed transfer: {total:?}"
+        );
+    }
+
+    /// The offer must be repeated in every retransmission round, also after
+    /// the peer acknowledged part of the transfer: a receiver that lost its
+    /// transfer state (sync reset or backend restart) only rebuilds it from
+    /// the offer, and would otherwise ignore the retransmitted chunks forever.
+    #[test]
+    fn offer_is_repeated_with_every_retransmission_round() {
+        let payload = ClipboardSnapshot::from_items([(Format::Png, vec![0x5a; CHUNK_SIZE * 40])]);
+        let mut sender = OutgoingTransfer::new(3, 0, &payload);
+        let t0 = Instant::now();
+        let first = sender.poll(t0);
+        assert!(
+            first
+                .iter()
+                .any(|frame| matches!(frame, ClipboardFrame::Offer { .. })),
+            "the first burst must carry the offer"
+        );
+        // The peer acknowledges the first burst: the transfer now has progress
+        // (`acked_any` is set) and the offer used to stop being retransmitted.
+        assert!(sender.on_ack(3, MIME_PNG, MAX_CHUNKS_PER_BURST as u32, 0));
+
+        let mut now = t0;
+        let mut last_chunk_at = t0;
+        for _ in 0..20 {
+            now += Duration::from_millis(10);
+            let frames = sender.poll(now);
+            if frames
+                .iter()
+                .any(|frame| matches!(frame, ClipboardFrame::Chunk { .. }))
+            {
+                last_chunk_at = now;
+            } else {
+                break;
+            }
+        }
+
+        let retransmission = sender.poll(last_chunk_at + retransmission_delay(2));
+        assert!(
+            retransmission
+                .iter()
+                .any(|frame| matches!(frame, ClipboardFrame::Offer { .. })),
+            "a retransmission round after progress must repeat the offer"
+        );
+        assert!(
+            retransmission
+                .iter()
+                .any(|frame| matches!(frame, ClipboardFrame::Chunk { .. })),
+            "the same round must also retransmit the unacknowledged window"
+        );
+    }
+
+    /// A stalled transfer is retried for a few seconds (so a short link hiccup
+    /// is absorbed instead of losing the copy) but still fails in bounded time.
+    #[test]
+    fn stalled_transfer_fails_after_the_backoff_budget_without_hanging() {
+        let source = ClipboardSnapshot::from_items([(Format::Text, b"stalled".to_vec())]);
+        let mut sender = OutgoingTransfer::new(5, 0, &source);
+        let t0 = Instant::now();
+        let mut now = t0;
+        sender.poll(now);
+        let mut failed_at = None;
+        for _ in 0..500 {
+            now += Duration::from_millis(10);
+            sender.poll(now);
+            if sender.is_failed() {
+                failed_at = Some(now.duration_since(t0));
+                break;
+            }
+        }
+        let failed_at = failed_at.expect("a silent peer must not stall a transfer forever");
+        assert!(
+            failed_at >= Duration::from_millis(1_500),
+            "gave up before a Wi-Fi hiccup could recover: {failed_at:?}"
+        );
+        assert!(
+            failed_at <= Duration::from_secs(3),
+            "took too long to surface a failed transfer: {failed_at:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_accessor_returns_the_transferred_content() {
+        let source = snapshot();
+        let sender = OutgoingTransfer::new(1, 0, &source);
+        assert_eq!(sender.snapshot(), source);
+        assert_eq!(sender.snapshot().hash(), source.hash());
     }
 }

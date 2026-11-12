@@ -38,6 +38,13 @@ const PIPE_TIMEOUT: Duration = Duration::from_secs(10);
 const MIME_TIMEOUT: Duration = Duration::from_secs(2);
 /// Total budget for reading one clipboard selection.
 const SELECTION_BUDGET: Duration = Duration::from_secs(4);
+/// Extra attempts when an owner-change event could not be read at all.
+const SELECTION_RETRY_ATTEMPTS: u32 = 2;
+/// Delay between retries of a failed selection read.
+const SELECTION_RETRY_DELAY: Duration = Duration::from_millis(60);
+/// Only retry while the initial attempt was fast: a slow read means the
+/// selection itself is problematic, not that the read raced the new owner.
+const SELECTION_RETRY_BUDGET: Duration = Duration::from_millis(500);
 
 /// Check whether the desktop exposes the clipboard portal.
 ///
@@ -199,8 +206,13 @@ impl PortalClipboard {
                                 continue;
                             }
                             *task_mimes.borrow_mut() = event.mime_types().to_vec();
+                            // The owner-change signal can arrive before the
+                            // application serves the new selection data; a
+                            // single failed read used to drop the user's copy
+                            // silently (the next Ctrl+C produced a new event).
                             if let Some(snapshot) =
-                                read_selection(&task_clipboard, &session, event.mime_types()).await
+                                read_selection_retrying(&task_clipboard, &session, event.mime_types())
+                                    .await
                             {
                                 if !snapshot.is_empty() {
                                     let _ = tx.send(snapshot);
@@ -372,6 +384,31 @@ async fn read_selection(
         }
     }
     (!snapshot.is_empty()).then_some(snapshot)
+}
+
+/// Retry an owner-change read that returned nothing.
+///
+/// Retrying is safe because the read reads the current selection, not a stale
+/// event payload. The loop is bounded by both attempts and the elapsed time so
+/// a clipboard without supported formats does not delay the watcher.
+async fn read_selection_retrying(
+    clipboard: &AshpdClipboard,
+    session: &Session<RemoteDesktop>,
+    mime_types: &[String],
+) -> Option<ClipboardSnapshot> {
+    let started = Instant::now();
+    let mut snapshot = read_selection(clipboard, session, mime_types).await;
+    let mut attempt = 0;
+    while snapshot.is_none() && should_retry_selection_read(attempt, started.elapsed()) {
+        attempt += 1;
+        tokio::time::sleep(SELECTION_RETRY_DELAY).await;
+        snapshot = read_selection(clipboard, session, mime_types).await;
+    }
+    snapshot
+}
+
+fn should_retry_selection_read(attempt: u32, elapsed: Duration) -> bool {
+    attempt < SELECTION_RETRY_ATTEMPTS && elapsed < SELECTION_RETRY_BUDGET
 }
 
 async fn serve_transfer(
@@ -613,6 +650,19 @@ mod mime_tests {
         let text = mimes.iter().position(|m| m.contains("text/plain")).unwrap();
         let png = mimes.iter().position(|m| m == "image/png").unwrap();
         assert!(text < png);
+    }
+
+    #[test]
+    fn a_failed_selection_read_is_retried_but_bounded() {
+        // A fast failure (the owner did not publish data yet) is retried.
+        assert!(should_retry_selection_read(0, Duration::from_millis(10)));
+        assert!(should_retry_selection_read(1, Duration::from_millis(100)));
+        // The attempt cap and the time budget both stop the retry loop.
+        assert!(!should_retry_selection_read(
+            SELECTION_RETRY_ATTEMPTS,
+            Duration::from_millis(10)
+        ));
+        assert!(!should_retry_selection_read(0, SELECTION_RETRY_BUDGET));
     }
 
     #[test]

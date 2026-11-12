@@ -155,8 +155,9 @@ pub struct Service {
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// Capabilities advertised by incoming peers (from Hello), used to gate
-    /// the LeaveAt return-coordinate extension.
-    incoming_peer_caps: HashMap<SocketAddr, u32>,
+    /// the LeaveAt return-coordinate extension and shared with the clipboard
+    /// task so peers that dialed us can receive the current clipboard.
+    incoming_peer_caps: Arc<RwLock<HashMap<SocketAddr, u32>>>,
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
@@ -245,6 +246,9 @@ impl Service {
         let clipboard_limits = Rc::new(Cell::new(config.clipboard_limits()));
         let (clipboard_status_tx, clipboard_status_rx) = local_channel::mpsc::channel();
         let (clipboard_peer_tx, clipboard_peer_rx) = local_channel::mpsc::channel();
+        // Populated from each incoming peer's Hello; the clipboard task reads
+        // it to register peers that dialed us but have no outgoing link.
+        let incoming_peer_caps: Arc<RwLock<HashMap<SocketAddr, u32>>> = Default::default();
         let clipboard = crate::clipboard::ClipboardTask::new(
             client_manager.clone(),
             clipboard_sender,
@@ -252,6 +256,7 @@ impl Service {
             clipboard_from_listener_rx,
             clipboard_from_connection.expect("clipboard receiver"),
             clipboard_peer_rx,
+            incoming_peer_caps.clone(),
             clipboard_limits.clone(),
             clipboard_enabled.clone(),
             clipboard_status_tx,
@@ -312,7 +317,7 @@ impl Service {
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
-            incoming_peer_caps: Default::default(),
+            incoming_peer_caps,
             next_trigger_handle: 0,
             return_requests: Default::default(),
             return_serial: 0,
@@ -934,7 +939,7 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
-                self.incoming_peer_caps.remove(&addr);
+                self.incoming_peer_caps.write().expect("lock").remove(&addr);
                 self.return_requests.forget(addr);
                 self.expire_session_grants(addr);
                 let _ = self.clipboard_peer_events.send(addr);
@@ -1203,7 +1208,10 @@ impl Service {
                 capabilities,
                 app_version,
             } => {
-                self.incoming_peer_caps.insert(addr, capabilities);
+                self.incoming_peer_caps
+                    .write()
+                    .expect("lock")
+                    .insert(addr, capabilities);
                 // Map the peer's source addr back to its client handle
                 // and stamp the version.
                 if let Some(handle) = self.client_for_incoming(addr) {
@@ -1405,14 +1413,17 @@ impl Service {
     /// Ask the peer at addr to release its capture, retrying until it
     /// confirms with Leave (see ReturnHandoff).
     fn request_handoff(&mut self, addr: SocketAddr, along: Option<f32>) {
-        let supported = self
+        let caps = self
             .incoming_peer_caps
+            .read()
+            .expect("lock")
             .get(&addr)
-            .is_some_and(|caps| caps & lan_mouse_proto::capabilities::RETURN_COORDINATE != 0);
+            .copied();
+        let supported =
+            caps.is_some_and(|caps| caps & lan_mouse_proto::capabilities::RETURN_COORDINATE != 0);
         let along = supported.then_some(along).flatten();
         log::info!(
-            "handoff: return request to {addr}: supported={supported} along={along:?} caps={:?}",
-            self.incoming_peer_caps.get(&addr)
+            "handoff: return request to {addr}: supported={supported} along={along:?} caps={caps:?}"
         );
         let serial = self.next_return_serial();
         self.return_requests

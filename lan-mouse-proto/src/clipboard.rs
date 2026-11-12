@@ -102,6 +102,17 @@ impl ClipboardFrame {
         }
     }
 
+    /// Whether this frame carries clipboard content (and is therefore governed
+    /// by the peer's clipboard permissions).
+    ///
+    /// `Ack`/`Cancel` are protocol control for a transfer the peer already
+    /// sent: they carry no clipboard data, so a read/write policy gate must
+    /// never drop them (that would make the opposite-direction transfer time
+    /// out even though the content itself was allowed).
+    pub fn is_content(&self) -> bool {
+        matches!(self, Self::Offer { .. } | Self::Chunk { .. })
+    }
+
     /// Encode into a freshly allocated buffer of exactly the right size.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
@@ -419,6 +430,33 @@ mod tests {
             assert_eq!(frame.serial(), 7);
         }
         assert_eq!(offer().type_id(), FRAME_OFFER);
+    }
+
+    #[test]
+    fn only_data_frames_are_content() {
+        assert!(offer().is_content());
+        assert!(
+            ClipboardFrame::Chunk {
+                serial: 1,
+                mime: MIME_TEXT,
+                offset: 0,
+                total: 1,
+                data: vec![0],
+            }
+            .is_content()
+        );
+        // Control replies for a transfer the peer already started are not
+        // governed by a clipboard-content permission gate.
+        assert!(
+            !ClipboardFrame::Ack {
+                serial: 1,
+                mime: MIME_TEXT,
+                base: 0,
+                bitmap: 0,
+            }
+            .is_content()
+        );
+        assert!(!ClipboardFrame::Cancel { serial: 1 }.is_content());
     }
 
     #[test]

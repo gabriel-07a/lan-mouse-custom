@@ -42,6 +42,16 @@ const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
 const CF_DIBV5: u32 = 17;
 const MAX_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
+/// Extra attempts when a clipboard-change notification could not be read.
+///
+/// Windows posts `WM_CLIPBOARDUPDATE` after the data is published, but a
+/// clipboard manager (history, Office, a remote-desktop tool) can hold the
+/// clipboard open for a moment. The notification is consumed by this point, so
+/// giving up would silently lose the user's copy until the next Ctrl+C.
+const READ_RETRY_ATTEMPTS: u32 = 3;
+/// Delay between retries of a failed post-change read (the read itself already
+/// retries `OpenClipboard` for ~200 ms).
+const READ_RETRY_DELAY: Duration = Duration::from_millis(40);
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 /// Sender of the clipboard-change notification, set while the listener
@@ -256,7 +266,21 @@ impl Clipboard for WindowsClipboard {
                     if sequence == self.own_sequence {
                         continue;
                     }
-                    return self.read().await.map(Some);
+                    // A transient read failure must not consume the change:
+                    // retry a few times before reporting an error.
+                    let mut last_error = None;
+                    for attempt in 0..=READ_RETRY_ATTEMPTS {
+                        match self.read().await {
+                            Ok(snapshot) => return Ok(Some(snapshot)),
+                            Err(error) => {
+                                last_error = Some(error);
+                                if attempt < READ_RETRY_ATTEMPTS {
+                                    tokio::time::sleep(READ_RETRY_DELAY).await;
+                                }
+                            }
+                        }
+                    }
+                    return Err(last_error.expect("at least one read attempt"));
                 }
                 None => return Ok(None),
             }

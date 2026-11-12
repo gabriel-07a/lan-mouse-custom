@@ -8,7 +8,7 @@
 //! This crate is deliberately free of OS-specific code for now: the in-memory
 //! backend is used by tests, and the OS backends are added in later phases.
 
-use std::{cell::RefCell, collections::BTreeMap, fmt::Display, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, fmt::Display, rc::Rc, time::Duration};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -228,6 +228,38 @@ pub trait Clipboard {
     async fn changed(&mut self) -> Result<Option<ClipboardSnapshot>, Error>;
 }
 
+/// How many times a failed post-change read is retried before giving up.
+pub const CHANGE_READ_RETRIES: u32 = 4;
+/// Base delay between retries of a failed post-change read (it grows linearly:
+/// 1x, 2x, 3x, 4x).
+pub const CHANGE_READ_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Read the clipboard after a change notification whose first read failed.
+///
+/// The OS notification has already been consumed at this point, so dropping
+/// the read would silently lose the user's copy: on Windows another
+/// application (clipboard history, Office, a remote-desktop tool) can hold the
+/// clipboard open for a few hundred milliseconds, and the portal can race the
+/// owner's data. The backoff is small and bounded, so a genuinely broken
+/// backend cannot stall the sync task.
+pub async fn read_retrying(
+    clipboard: &mut dyn Clipboard,
+    retries: u32,
+    backoff: Duration,
+) -> Result<ClipboardSnapshot, Error> {
+    let mut result = clipboard.read().await;
+    for attempt in 1..=retries {
+        if result.is_ok() {
+            return result;
+        }
+        if !backoff.is_zero() {
+            tokio::time::sleep(backoff * attempt).await;
+        }
+        result = clipboard.read().await;
+    }
+    result
+}
+
 /// Backend used when no OS integration is available. It never produces a
 /// change and ignores writes, so the sync task stays idle.
 #[derive(Debug, Default)]
@@ -399,6 +431,8 @@ pub async fn default_backend() -> Result<Box<dyn Clipboard>, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn sample() -> ClipboardSnapshot {
@@ -476,5 +510,81 @@ mod tests {
         let timeout =
             tokio::time::timeout(std::time::Duration::from_millis(50), backend.changed()).await;
         assert!(timeout.is_err(), "remote write woke the local watcher");
+    }
+
+    /// Clipboard backend that fails a scripted number of reads before it
+    /// returns `snapshot`, like a Windows clipboard briefly held open by
+    /// another application.
+    #[derive(Default)]
+    struct FlakyClipboard {
+        failures: Cell<u32>,
+        reads: Cell<u32>,
+        snapshot: ClipboardSnapshot,
+    }
+
+    #[async_trait(?Send)]
+    impl Clipboard for FlakyClipboard {
+        async fn read(&mut self) -> Result<ClipboardSnapshot, Error> {
+            self.reads.set(self.reads.get() + 1);
+            if self.failures.get() > 0 {
+                self.failures.set(self.failures.get() - 1);
+                return Err(Error::Backend("clipboard is busy".into()));
+            }
+            Ok(self.snapshot.clone())
+        }
+
+        async fn write(&mut self, _snapshot: &ClipboardSnapshot) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn changed(&mut self) -> Result<Option<ClipboardSnapshot>, Error> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_read_failure_is_retried_until_it_succeeds() {
+        let mut clipboard = FlakyClipboard {
+            failures: Cell::new(2),
+            snapshot: sample(),
+            ..Default::default()
+        };
+        let result = read_retrying(&mut clipboard, 3, Duration::ZERO).await;
+        assert_eq!(result.expect("eventually readable"), sample());
+        assert_eq!(clipboard.reads.get(), 3, "two failures, then success");
+    }
+
+    #[tokio::test]
+    async fn a_transient_read_failure_is_bounded() {
+        let mut clipboard = FlakyClipboard {
+            failures: Cell::new(u32::MAX),
+            snapshot: sample(),
+            ..Default::default()
+        };
+        assert!(
+            read_retrying(&mut clipboard, 2, Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            clipboard.reads.get(),
+            3,
+            "the initial attempt plus two retries, never more"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_read_is_not_retried() {
+        let mut clipboard = FlakyClipboard {
+            snapshot: sample(),
+            ..Default::default()
+        };
+        assert_eq!(
+            read_retrying(&mut clipboard, 4, Duration::from_millis(10))
+                .await
+                .expect("read"),
+            sample()
+        );
+        assert_eq!(clipboard.reads.get(), 1);
     }
 }
