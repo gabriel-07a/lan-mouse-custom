@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub use lan_mouse_proto::AppVersion;
 use serde::{Deserialize, Serialize};
 
 mod connect;
@@ -288,6 +289,120 @@ pub struct ClientState {
     /// the peer side)
     #[serde(default)]
     pub peer_outgoing_caps: Option<u8>,
+    /// application version advertised by the peer, when it sent version info
+    #[serde(default)]
+    pub peer_app_version: Option<AppVersion>,
+    /// version/build compatibility with this peer
+    #[serde(default)]
+    pub compatibility: PeerCompatibility,
+}
+
+/// Compatibility of the peer's app/protocol with this build.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerCompatibility {
+    /// The handshake has not supplied version information yet.
+    #[default]
+    Unknown,
+    Compatible,
+    /// Can connect, but the user should know; the service may require consent.
+    Warning {
+        reason: String,
+    },
+    /// Must not be used for input; the service closes the session.
+    Incompatible {
+        reason: String,
+    },
+}
+
+impl PeerCompatibility {
+    pub fn incompatible(&self) -> bool {
+        matches!(self, Self::Incompatible { .. })
+    }
+
+    pub fn warning(&self) -> Option<&str> {
+        match self {
+            Self::Warning { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Warning { reason } | Self::Incompatible { reason } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Evaluate whether a peer may be used. Protocol/major differences are hard
+/// failures; build/minor differences are warnings. `strict` upgrades every
+/// difference to an incompatibility.
+pub fn evaluate_compatibility(
+    local_proto: u8,
+    peer_proto: u8,
+    local_version: AppVersion,
+    peer_version: Option<AppVersion>,
+    local_commit: &str,
+    peer_commit: Option<&str>,
+    strict: bool,
+) -> PeerCompatibility {
+    // Protocol 0 is the legacy no-Hello/no-version case; it is handled as an
+    // unknown-version warning below, not as a wire mismatch.
+    if peer_proto != local_proto && peer_proto != 0 {
+        return PeerCompatibility::Incompatible {
+            reason: format!("wire protocol mismatch: local v{local_proto}, peer v{peer_proto}"),
+        };
+    }
+    let Some(peer_version) = peer_version else {
+        return if strict {
+            PeerCompatibility::Incompatible {
+                reason: "peer did not report its app version (legacy build); strict version matching is enabled".to_string(),
+            }
+        } else {
+            PeerCompatibility::Warning {
+                reason: "peer did not report its app version (legacy build)".to_string(),
+            }
+        };
+    };
+    if peer_version.major != local_version.major {
+        return PeerCompatibility::Incompatible {
+            reason: format!(
+                "app major version mismatch: local {local_version}, peer {peer_version}"
+            ),
+        };
+    }
+    if strict && peer_version != local_version {
+        return PeerCompatibility::Incompatible {
+            reason: format!(
+                "version mismatch (strict mode): local {local_version}, peer {peer_version}"
+            ),
+        };
+    }
+    if peer_version.minor != local_version.minor {
+        return PeerCompatibility::Warning {
+            reason: format!(
+                "app minor version differs: local {local_version}, peer {peer_version}"
+            ),
+        };
+    }
+    if let Some(peer_commit) = peer_commit {
+        if !local_commit.trim_matches('\0').is_empty()
+            && peer_commit.trim_matches('\0') != local_commit.trim_matches('\0')
+        {
+            return if strict {
+                PeerCompatibility::Incompatible {
+                    reason: format!(
+                        "different build commit (strict mode): local {local_commit}, peer {peer_commit}"
+                    ),
+                }
+            } else {
+                PeerCompatibility::Warning {
+                    reason: "different build commit (same app version)".to_string(),
+                }
+            };
+        }
+    }
+    PeerCompatibility::Compatible
 }
 
 /// Bitset of input capabilities granted in one direction.
@@ -1046,6 +1161,8 @@ mod tests {
             )),
             peer_incoming_caps: Some(0b101),
             peer_outgoing_caps: Some(0b011),
+            peer_app_version: None,
+            compatibility: PeerCompatibility::Unknown,
         };
         let decoded = json_roundtrip(state);
         assert_eq!(decoded.rtt_ms, Some(12));
@@ -1847,5 +1964,81 @@ mod ipc_tests {
         drop(stream);
         drop(server);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compatibility_rejects_protocol_and_major_mismatches() {
+        let local = AppVersion::new(0, 2, 15);
+        assert!(matches!(
+            evaluate_compatibility(1, 2, local, Some(local), "local", Some("local"), false),
+            PeerCompatibility::Incompatible { .. }
+        ));
+        assert!(matches!(
+            evaluate_compatibility(
+                1,
+                1,
+                local,
+                Some(AppVersion::new(1, 0, 0)),
+                "local",
+                Some("local"),
+                false
+            ),
+            PeerCompatibility::Incompatible { .. }
+        ));
+    }
+
+    #[test]
+    fn compatibility_warns_on_minor_build_and_legacy_differences() {
+        let local = AppVersion::new(0, 2, 15);
+        assert!(
+            evaluate_compatibility(
+                1,
+                1,
+                local,
+                Some(AppVersion::new(0, 3, 0)),
+                "local",
+                Some("local"),
+                false
+            )
+            .warning()
+            .is_some()
+        );
+        assert!(
+            evaluate_compatibility(1, 1, local, Some(local), "local", Some("peer"), false)
+                .warning()
+                .is_some()
+        );
+        assert!(
+            evaluate_compatibility(1, 1, local, None, "local", None, false)
+                .warning()
+                .is_some()
+        );
+        assert_eq!(
+            evaluate_compatibility(1, 1, local, Some(local), "same", Some("same"), false),
+            PeerCompatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn strict_compatibility_blocks_version_build_and_legacy_differences() {
+        let local = AppVersion::new(0, 2, 15);
+        for compatibility in [
+            evaluate_compatibility(
+                1,
+                1,
+                local,
+                Some(AppVersion::new(0, 2, 14)),
+                "local",
+                Some("local"),
+                true,
+            ),
+            evaluate_compatibility(1, 1, local, Some(local), "local", Some("peer"), true),
+            evaluate_compatibility(1, 1, local, None, "local", None, true),
+        ] {
+            assert!(
+                compatibility.incompatible(),
+                "strict mode must reject every difference: {compatibility:?}"
+            );
+        }
     }
 }

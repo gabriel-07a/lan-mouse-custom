@@ -326,6 +326,8 @@ struct PeerAggregate {
     jitter_ms: Option<u32>,
     loss_percent: Option<u8>,
     peer_commit: Option<[u8; 8]>,
+    peer_app_version: Option<lan_mouse_ipc::AppVersion>,
+    compatibility: lan_mouse_ipc::PeerCompatibility,
     last_error: Option<String>,
 }
 
@@ -397,6 +399,17 @@ fn aggregate_peer(members: &[(ClientHandle, ClientConfig, ClientState)]) -> Opti
         jitter_ms: link_state.jitter_ms,
         loss_percent: link_state.loss_percent,
         peer_commit: members.iter().find_map(|(_, _, state)| state.peer_commit),
+        peer_app_version: members.iter().find_map(|(_, _, state)| state.peer_app_version),
+        compatibility: members
+            .iter()
+            .map(|(_, _, state)| state.compatibility.clone())
+            .max_by_key(|compatibility| match compatibility {
+                lan_mouse_ipc::PeerCompatibility::Incompatible { .. } => 3,
+                lan_mouse_ipc::PeerCompatibility::Warning { .. } => 2,
+                lan_mouse_ipc::PeerCompatibility::Compatible => 1,
+                lan_mouse_ipc::PeerCompatibility::Unknown => 0,
+            })
+            .unwrap_or_default(),
         last_error: link_state.last_error.clone().or_else(|| {
             members
                 .iter()
@@ -1814,6 +1827,32 @@ impl Dashboard {
                                 ),
                         )
                     })
+                    .when(
+                        matches!(
+                            peer.compatibility,
+                            lan_mouse_ipc::PeerCompatibility::Warning { .. }
+                                | lan_mouse_ipc::PeerCompatibility::Incompatible { .. }
+                        ),
+                        |this| {
+                            let (text, color) = match &peer.compatibility {
+                                lan_mouse_ipc::PeerCompatibility::Incompatible { reason } => {
+                                    (format!("peer incompatible: {reason}"), RED)
+                                }
+                                lan_mouse_ipc::PeerCompatibility::Warning { reason } => {
+                                    (format!("warning: {reason}"), AMBER)
+                                }
+                                _ => unreachable!(),
+                            };
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .text_xs()
+                                    .text_color(rgb(color))
+                                    .truncate()
+                                    .child(text),
+                            )
+                        },
+                    )
                     .when(peer.last_error.is_some(), |this| {
                         this.child(
                             div()

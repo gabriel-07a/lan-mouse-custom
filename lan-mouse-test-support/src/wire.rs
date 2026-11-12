@@ -81,6 +81,7 @@ mod tests {
                 commit,
                 proto_version,
                 capabilities,
+                ..
             } => {
                 assert_eq!(commit, *b"legacy00");
                 assert_eq!(proto_version, 0);

@@ -60,6 +60,10 @@ pub mod capabilities {
     /// peers close the connection on an unknown event id, so this event must
     /// only be sent when the peer advertised this bit.
     pub const RETURN_COORDINATE: u32 = 1 << 8;
+    /// The peer appends its application version to [`super::ProtoEvent::Hello`]
+    /// so both ends can reject incompatible application versions before input
+    /// is forwarded.
+    pub const VERSION_INFO: u32 = 1 << 9;
 }
 
 /// Features this build can use when the peer also advertises them.
@@ -68,7 +72,8 @@ pub const CAPABILITIES: u32 = capabilities::ENTER_ACK
     | capabilities::PERMISSIONS
     | capabilities::SERIALIZED_LEAVE
     | capabilities::EDGE_COORDINATE
-    | capabilities::RETURN_COORDINATE;
+    | capabilities::RETURN_COORDINATE
+    | capabilities::VERSION_INFO;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -106,6 +111,55 @@ impl Display for Position {
             Position::Bottom => "bottom",
         };
         write!(f, "{pos}")
+    }
+}
+
+/// Application version exchanged in [`ProtoEvent::Hello`].
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct AppVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+impl AppVersion {
+    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    /// Parse a Cargo `CARGO_PKG_VERSION` string. Invalid segments become 0;
+    /// compatibility policy treats a malformed/absent version as legacy.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut parts = value.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.split('-').next()?.parse().ok()?;
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+impl Display for AppVersion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
     }
 }
 
@@ -170,6 +224,9 @@ pub enum ProtoEvent {
         commit: [u8; 8],
         proto_version: u8,
         capabilities: u32,
+        /// Optional application version appended by new peers. `None` for
+        /// legacy peers (and preserved as such through roundtrips).
+        app_version: Option<AppVersion>,
     },
     /// Announces or updates the permissions this side grants to the peer and
     /// expects from it. Only sent when the peer advertises
@@ -227,9 +284,16 @@ impl Display for ProtoEvent {
                 commit,
                 proto_version,
                 capabilities,
+                app_version,
             } => {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
-                write!(f, "Hello({s}, v{proto_version}, caps={capabilities:#x})")
+                let version = app_version
+                    .map(|version| format!(", app={version}"))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "Hello({s}, v{proto_version}, caps={capabilities:#x}{version})"
+                )
             }
             ProtoEvent::AuthRequest {
                 session_id,
@@ -420,10 +484,20 @@ impl TryFrom<&[u8]> for ProtoEvent {
                 } else {
                     0
                 };
+                let app_version = if buf.len() >= 6 {
+                    Some(AppVersion {
+                        major: decode_u16(&mut buf)?,
+                        minor: decode_u16(&mut buf)?,
+                        patch: decode_u16(&mut buf)?,
+                    })
+                } else {
+                    None
+                };
                 Ok(Self::Hello {
                     commit,
                     proto_version,
                     capabilities,
+                    app_version,
                 })
             }
             EventType::AuthRequest => Ok(Self::AuthRequest {
@@ -528,12 +602,20 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     commit,
                     proto_version,
                     capabilities,
+                    app_version,
                 } => {
                     for b in commit.iter() {
                         encode_u8(buf, len, *b);
                     }
                     encode_u8(buf, len, proto_version);
                     encode_u32(buf, len, capabilities);
+                    if let Some(version) = app_version {
+                        // Only new decoders read this trailing metadata; old
+                        // peers stop after capabilities, as before.
+                        encode_u16(buf, len, version.major);
+                        encode_u16(buf, len, version.minor);
+                        encode_u16(buf, len, version.patch);
+                    }
                 }
                 ProtoEvent::AuthRequest {
                     session_id,
@@ -578,6 +660,7 @@ macro_rules! decode_impl {
 }
 
 decode_impl!(u8);
+decode_impl!(u16);
 decode_impl!(u128);
 decode_impl!(u32);
 decode_impl!(i32);
@@ -600,6 +683,7 @@ macro_rules! encode_impl {
 }
 
 encode_impl!(u8);
+encode_impl!(u16);
 encode_impl!(u128);
 encode_impl!(u32);
 encode_impl!(i32);
@@ -677,6 +761,7 @@ mod tests {
                 commit: *b"abcdefgh",
                 proto_version: PROTO_VERSION,
                 capabilities: CAPABILITIES,
+                app_version: Some(AppVersion::new(0, 2, 15)),
             },
             ProtoEvent::AuthRequest {
                 session_id: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
@@ -762,6 +847,7 @@ mod tests {
                 commit: *b"abcdefgh",
                 proto_version: 1,
                 capabilities: 0x0102_0304,
+                app_version: None,
             }),
             vec![
                 11, b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h', 1, 1, 2, 3, 4
@@ -857,6 +943,7 @@ mod tests {
                 commit: *b"abcdefgh",
                 proto_version: 0,
                 capabilities: 0,
+                app_version: None,
             })
         );
     }
@@ -983,6 +1070,7 @@ mod extra_tests {
                     commit,
                     proto_version: (rng.next_u32() % 256) as u8,
                     capabilities: rng.next_u32(),
+                    app_version: None,
                 }
             }
         }
@@ -1052,6 +1140,7 @@ mod extra_tests {
             capabilities::SERIALIZED_LEAVE,
             capabilities::EDGE_COORDINATE,
             capabilities::RETURN_COORDINATE,
+            capabilities::VERSION_INFO,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");
@@ -1074,6 +1163,7 @@ mod extra_tests {
                 | capabilities::SERIALIZED_LEAVE
                 | capabilities::EDGE_COORDINATE
                 | capabilities::RETURN_COORDINATE
+                | capabilities::VERSION_INFO
         );
     }
 
@@ -1242,6 +1332,7 @@ mod extra_tests {
                 commit,
                 proto_version,
                 capabilities,
+                ..
             } => {
                 assert_eq!(&commit, b"future!!");
                 assert_eq!(proto_version, 255);

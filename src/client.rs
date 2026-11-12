@@ -576,13 +576,45 @@ impl ClientManager {
         commit: Option<[u8; 8]>,
         proto_version: u8,
         capabilities: u32,
+        app_version: Option<lan_mouse_proto::AppVersion>,
     ) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.peer_commit = commit;
             s.peer_proto_version = proto_version;
             s.peer_capabilities = capabilities;
             s.peer_caps_known = true;
+            s.peer_app_version = app_version;
+            if commit.is_none() && proto_version == 0 && app_version.is_none() {
+                s.compatibility = lan_mouse_ipc::PeerCompatibility::Unknown;
+                return;
+            }
+            let local = env!("CARGO_PKG_VERSION");
+            let local_version = lan_mouse_proto::AppVersion::parse(local).unwrap_or_default();
+            let local_commit = crate::config::local_commit();
+            let local_commit_text = String::from_utf8_lossy(&local_commit).to_string();
+            let peer_commit_text =
+                commit.map(|commit| String::from_utf8_lossy(&commit).to_string());
+            s.compatibility = lan_mouse_ipc::evaluate_compatibility(
+                lan_mouse_proto::PROTO_VERSION,
+                proto_version,
+                local_version,
+                app_version,
+                &local_commit_text,
+                peer_commit_text.as_deref(),
+                false,
+            );
         }
+    }
+
+    pub(crate) fn peer_compatibility(
+        &self,
+        handle: ClientHandle,
+    ) -> lan_mouse_ipc::PeerCompatibility {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(_, state)| state.compatibility.clone())
+            .unwrap_or_default()
     }
 
     /// Record capabilities learned from a `Pong`, before any `Hello` arrives.
@@ -890,13 +922,13 @@ mod tests {
         assert!(!manager.peer_supports(handle, CLIPBOARD));
 
         // A legacy peer decodes with version 0 and no capabilities.
-        manager.set_peer_hello(handle, Some(*b"legacy00"), 0, 0);
+        manager.set_peer_hello(handle, Some(*b"legacy00"), 0, 0, None);
         assert_eq!(manager.peer_capabilities(handle), Some(0));
         assert!(!manager.peer_supports(handle, ENTER_ACK));
         assert!(!manager.peer_supports(handle, CLIPBOARD));
 
         // A peer from this fork advertises both extensions.
-        manager.set_peer_hello(handle, Some(*b"fork0000"), 1, ENTER_ACK | CLIPBOARD);
+        manager.set_peer_hello(handle, Some(*b"fork0000"), 1, ENTER_ACK | CLIPBOARD, None);
         assert!(manager.peer_supports(handle, ENTER_ACK));
         assert!(manager.peer_supports(handle, CLIPBOARD));
         assert!(!manager.peer_supports(handle, lan_mouse_proto::capabilities::TIME_SYNC));
@@ -906,16 +938,47 @@ mod tests {
     fn peer_hello_and_reset_are_stored() {
         let manager = ClientManager::default();
         let handle = manager.add_client();
-        manager.set_peer_hello(handle, Some(*b"abcd1234"), 1, 0b101);
+        manager.set_peer_hello(handle, Some(*b"abcd1234"), 1, 0b101, None);
         let (_, state) = manager.get_state(handle).expect("client");
         assert_eq!(state.peer_commit, Some(*b"abcd1234"));
         assert_eq!(state.peer_proto_version, 1);
         assert_eq!(state.peer_capabilities, 0b101);
 
-        manager.set_peer_hello(handle, None, 0, 0);
+        manager.set_peer_hello(handle, None, 0, 0, None);
         let (_, state) = manager.get_state(handle).expect("client");
         assert_eq!(state.peer_commit, None);
         assert_eq!(state.peer_proto_version, 0);
+    }
+
+    #[test]
+    fn peer_hello_derives_version_compatibility() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        let local = lan_mouse_proto::AppVersion::parse(env!("CARGO_PKG_VERSION")).expect("version");
+
+        manager.set_peer_hello(
+            handle,
+            Some(*b"incompat"),
+            lan_mouse_proto::PROTO_VERSION,
+            0,
+            Some(lan_mouse_proto::AppVersion::new(local.major + 1, 0, 0)),
+        );
+        assert!(manager.peer_compatibility(handle).incompatible());
+
+        manager.set_peer_hello(
+            handle,
+            Some(*b"diffbuil"),
+            lan_mouse_proto::PROTO_VERSION,
+            0,
+            Some(local),
+        );
+        assert!(manager.peer_compatibility(handle).warning().is_some());
+
+        manager.set_peer_hello(handle, None, 0, 0, None);
+        assert_eq!(
+            manager.peer_compatibility(handle),
+            lan_mouse_ipc::PeerCompatibility::Unknown
+        );
     }
 
     #[test]

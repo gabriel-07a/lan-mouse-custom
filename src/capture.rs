@@ -1810,7 +1810,7 @@ mod capture_handle_tests {
 
         let modern = ClientManager::default();
         let modern_handle = modern.add_with_config(config(true));
-        modern.set_peer_hello(modern_handle, Some(*b"fork0000"), 1, CAPABILITIES);
+        modern.set_peer_hello(modern_handle, Some(*b"fork0000"), 1, CAPABILITIES, None);
         let mut task = capture_task_with_manager(vec![], modern);
         task.enter_along = Some(0.25);
         task.enter.begin(Instant::now(), Duration::from_secs(2));
@@ -1824,7 +1824,7 @@ mod capture_handle_tests {
 
         let legacy = ClientManager::default();
         let legacy_handle = legacy.add_with_config(config(true));
-        legacy.set_peer_hello(legacy_handle, Some(*b"legacy00"), 0, 0);
+        legacy.set_peer_hello(legacy_handle, Some(*b"legacy00"), 0, 0, None);
         let mut task = capture_task_with_manager(vec![], legacy);
         task.enter_along = Some(0.25);
         task.enter.begin(Instant::now(), Duration::from_secs(2));

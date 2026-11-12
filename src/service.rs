@@ -394,6 +394,7 @@ impl Service {
                 }
                 handle = self.conn_state_rx.recv() => {
                     if let Some(handle) = handle {
+                        self.enforce_peer_compatibility(handle);
                         self.broadcast_client(handle);
                         // A peer's AuthRevoke deactivates the client in the
                         // connection layer only. Drop the matching outgoing
@@ -1199,6 +1200,7 @@ impl Service {
                 commit,
                 proto_version,
                 capabilities,
+                app_version,
             } => {
                 self.incoming_peer_caps.insert(addr, capabilities);
                 // Map the peer's source addr back to its client handle
@@ -1209,10 +1211,26 @@ impl Service {
                         Some(commit),
                         proto_version,
                         capabilities,
+                        app_version,
                     );
+                    self.enforce_peer_compatibility(handle);
                     self.broadcast_client(handle);
                 }
             }
+        }
+    }
+
+    /// Hard-block a peer whose protocol/major version is incompatible.
+    /// Warning-level differences (different build, minor version) remain
+    /// visible to the user but do not tear down the link.
+    fn enforce_peer_compatibility(&mut self, handle: ClientHandle) {
+        let compatibility = self.client_manager.peer_compatibility(handle);
+        if let lan_mouse_ipc::PeerCompatibility::Incompatible { reason } = compatibility {
+            log::warn!("client {handle} is incompatible: {reason}");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "peer version is incompatible: {reason}"
+            )));
+            self.deactivate_client_and_peer(handle, false);
         }
     }
 

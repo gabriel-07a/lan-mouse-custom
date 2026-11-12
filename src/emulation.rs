@@ -157,6 +157,7 @@ pub(crate) enum EmulationEvent {
         commit: [u8; 8],
         proto_version: u8,
         capabilities: u32,
+        app_version: Option<lan_mouse_proto::AppVersion>,
     },
     /// A peer announced the permissions it grants to this machine
     /// (incoming_caps) and expects to use here (outgoing_caps).
@@ -615,17 +616,24 @@ impl ListenTask {
                             // listener down) the version display would
                             // otherwise silently say "unknown" while
                             // the peer is in fact happily talking to us.
-                            ProtoEvent::Hello { commit, proto_version, capabilities } => {
+                            ProtoEvent::Hello {
+                                commit,
+                                proto_version,
+                                capabilities,
+                                app_version,
+                            } => {
                                 self.listener.reply(addr, ProtoEvent::Hello {
                                     commit: local_commit(),
                                     proto_version: PROTO_VERSION,
                                     capabilities: CAPABILITIES,
+                                    app_version: Some(crate::local_app_version()),
                                 }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello {
                                     addr,
                                     commit,
                                     proto_version,
                                     capabilities,
+                                    app_version,
                                 }).ok().unwrap_or_default();
                             }
                             _ => {}

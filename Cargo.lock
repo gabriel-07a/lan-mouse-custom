@@ -2003,6 +2003,7 @@ name = "lan-mouse-ipc"
 version = "0.3.0"
 dependencies = [
  "futures",
+ "lan-mouse-proto",
  "libc",
  "log",
  "serde",
@@ -2020,6 +2021,7 @@ dependencies = [
  "num_enum",
  "paste",
  "proptest",
+ "serde",
  "thiserror 2.0.18",
 ]
 

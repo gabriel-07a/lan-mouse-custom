@@ -250,7 +250,7 @@ impl ConnCtx {
         log::warn!("client ({handle}) @ {} connection closed", active.addr);
         self.client_manager.set_active_addr(handle, None);
         self.client_manager.set_alive(handle, false);
-        self.client_manager.set_peer_hello(handle, None, 0, 0);
+        self.client_manager.set_peer_hello(handle, None, 0, 0, None);
         self.client_manager.set_rtt_ms(handle, None);
         // No transport means no round-trip proof: the frontend must not keep
         // showing "Connected" based on a Pong from the closed link.
@@ -1282,6 +1282,7 @@ async fn send_hello_once(ctx: &ConnCtx, addr: SocketAddr, conn: &ArcConn) {
         commit: local_commit(),
         proto_version: lan_mouse_proto::PROTO_VERSION,
         capabilities: lan_mouse_proto::CAPABILITIES,
+        app_version: Some(crate::local_app_version()),
     }
     .into();
     if let Err(e) = conn.send(&buf[..len]).await {
@@ -1353,12 +1354,14 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnecti
                         commit,
                         proto_version,
                         capabilities,
+                        app_version,
                     } => {
                         ctx.client_manager.set_peer_hello(
                             handle,
                             Some(commit),
                             proto_version,
                             capabilities,
+                            app_version,
                         );
                         ctx.notify_state_changed(handle);
                     }
