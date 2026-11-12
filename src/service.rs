@@ -3042,10 +3042,11 @@ impl Service {
             None => Capabilities::ALL,
         };
 
-        // Create the (possibly portal-backed) emulation backend now, while the
-        // user is configuring the link, so the first crossing does not pay the
-        // backend-creation cost.
-        self.emulation.warm_up();
+        // Do not warm up input emulation just because a client entry exists.
+        // That opened the GNOME RemoteDesktop portal (and its permission
+        // dialog) merely by having Lan Mouse configured/opened, even with no
+        // incoming session. Incoming hand-offs warm it on `Entered`, before the
+        // Ack, which is the path that needs the backend ready.
 
         /* resolve dns on activate */
         self.resolve(handle);
@@ -3115,6 +3116,13 @@ impl Service {
         self.capture.drop_transport(handle);
         if was_active {
             self.capture.destroy(handle);
+        }
+        if self.client_manager.active_clients().is_empty() && self.incoming_conns.is_empty() {
+            // No session of either direction remains: do not leave a portal
+            // grab/barrier or a hidden-cursor heartbeat behind after removing
+            // the last client.
+            self.capture.release();
+            self.cursor_hide.clear();
         }
         self.notify_frontend(FrontendEvent::Deleted(handle));
     }
