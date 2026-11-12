@@ -4167,11 +4167,42 @@ impl Dashboard {
     }
 }
 
+/// Keep the scaled window on screen. The UI scale is derived from the display
+/// height, so on a short/4K-scaled display `720 * scale` can exceed the usable
+/// height; the compositor then clips the bottom of the window (Settings looked
+/// "cut" and could not be reached by scrolling).
+fn clamp_window_to_screen(desired: (f32, f32), screen: Option<(f32, f32)>) -> (f32, f32) {
+    let Some((screen_width, screen_height)) = screen else {
+        return desired;
+    };
+    let margin = 48.0;
+    let width = desired
+        .0
+        .min((screen_width - margin).max(640.0))
+        .max(480.0);
+    let height = desired
+        .1
+        .min((screen_height - margin).max(480.0))
+        .max(360.0);
+    (width, height)
+}
+
 fn main_window_options(cx: &mut App) -> WindowOptions {
-    let bounds = Bounds::centered(None, size(px(980.0), px(720.0)), cx);
+    let display = cx
+        .primary_display()
+        .map(|display| {
+            (
+                f32::from(display.bounds().size.width),
+                f32::from(display.bounds().size.height),
+            )
+        });
+    let (width, height) = clamp_window_to_screen((f32::from(px(980.0)), f32::from(px(720.0))), display);
+    let bounds = Bounds::centered(None, size(gpui::px(width), gpui::px(height)), cx);
+    let min_width = f32::from(px(880.0)).min(width);
+    let min_height = f32::from(px(600.0)).min(height);
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        window_min_size: Some(size(px(880.0), px(600.0))),
+        window_min_size: Some(size(gpui::px(min_width), gpui::px(min_height))),
         titlebar: Some(TitlebarOptions {
             title: Some("Lan Mouse".into()),
             appears_transparent: false,
@@ -4865,5 +4896,31 @@ mod tests {
         assert!(aggregate.has_outgoing);
         assert!(aggregate.last_pong_at.is_some());
         assert_eq!(aggregate.position, lan_mouse_ipc::Position::Left);
+    }
+}
+
+
+#[cfg(test)]
+mod window_scale_tests {
+    use super::*;
+
+    #[test]
+    fn a_scaled_window_never_exceeds_the_display() {
+        let (width, height) = clamp_window_to_screen((1715.0, 1260.0), Some((1920.0, 1200.0)));
+        assert!(width <= 1920.0 - 48.0);
+        assert!(height <= 1200.0 - 48.0);
+    }
+
+    #[test]
+    fn a_window_that_already_fits_is_unchanged() {
+        assert_eq!(
+            clamp_window_to_screen((980.0, 720.0), Some((1920.0, 1200.0))),
+            (980.0, 720.0)
+        );
+    }
+
+    #[test]
+    fn no_display_keeps_the_default_size() {
+        assert_eq!(clamp_window_to_screen((980.0, 720.0), None), (980.0, 720.0));
     }
 }
