@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "lan-mouse"
-version = "0.2.13"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "clap",
