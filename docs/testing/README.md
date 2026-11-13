@@ -106,6 +106,9 @@ Checklist mínimo:
 ## Handoff no Windows
 
 Veja [windows-handoff.md](windows-handoff.md) para a matriz Windows 10/11 e a cobertura automatizada do retorno por coordenada.
+O handoff Ubuntu → Windows contra receptores antigos (0.2.18) está coberto por
+[handoff-old-receiver-harness.md](handoff-old-receiver-harness.md) e
+[handoff-old-receiver-verification.md](handoff-old-receiver-verification.md).
 
 ## Diagnóstico de handoff
 
