@@ -140,9 +140,12 @@ pub(crate) struct LibeiEmulation {
     absolute_env_scale: f64,
 }
 
-/// Pixels the pointer must be pushed past the entry edge before the hand-off
-/// fires. The absolute tracker knows the exact position, so this can be tiny.
-const RETURN_MARGIN_PX: f64 = 3.0;
+/// Extra pixels the pointer must be pushed past the entry edge before the
+/// hand-off fires. The edge pixel itself is included (the absolute anchor is
+/// the last pixel inside the region), so one outward pixel is enough. This
+/// matches the Windows raw-input hook; requiring more made the Ubuntu client
+/// feel heavier to leave than a physical monitor edge.
+const RETURN_MARGIN_PX: f64 = 0.0;
 
 /// Pointer settings of this Wayland session.
 ///
@@ -249,7 +252,7 @@ fn read_env_scale() -> f64 {
 /// Distance (logical px) the cursor starts inside the entry edge. Big enough
 /// that hand-off jitter cannot fire immediately, small enough that the cursor
 /// visibly appears on the side the peer came from.
-const EDGE_ANCHOR_INSET: f64 = 24.0;
+const EDGE_ANCHOR_INSET: f64 = 2.0;
 
 /// Largest per-event delta accepted from the wire. Bigger values are treated
 /// as corrupted packets: one bogus delta must not jump the cursor across the
@@ -431,12 +434,27 @@ impl AbsoluteTracker {
             PointerEdge::Top => y <= f64::from(y0) + 1.0,
             PointerEdge::Bottom => y >= f64::from(y1) - 2.0,
         };
-        let past_edge = match self.edge {
-            PointerEdge::Left => raw_x < f64::from(x0) - RETURN_MARGIN_PX,
-            PointerEdge::Right => raw_x > f64::from(x1) + RETURN_MARGIN_PX,
-            PointerEdge::Top => raw_y < f64::from(y0) - RETURN_MARGIN_PX,
-            PointerEdge::Bottom => raw_y > f64::from(y1) + RETURN_MARGIN_PX,
+        // The absolute anchor is the last pixel inside the region on the
+        // right/bottom edges, so reaching the edge coordinate itself is
+        // already one physical pixel of outward motion. Requiring `>` here
+        // made right/bottom hand-offs need two pixels while left/top needed
+        // one, which is the extra "force" felt on the Ubuntu client.
+        let outward = match self.edge {
+            PointerEdge::Left => dx < 0.0,
+            PointerEdge::Right => dx > 0.0,
+            PointerEdge::Top => dy < 0.0,
+            PointerEdge::Bottom => dy > 0.0,
         };
+        let past_edge = outward
+            && match self.edge {
+                // Left/top anchors are inside the region; the edge itself is
+                // not yet a crossing. Right/bottom anchors are the last pixel
+                // inside, so the edge coordinate is the first outward pixel.
+                PointerEdge::Left => raw_x < f64::from(x0) + RETURN_MARGIN_PX,
+                PointerEdge::Right => raw_x >= f64::from(x1) - RETURN_MARGIN_PX,
+                PointerEdge::Top => raw_y < f64::from(y0) + RETURN_MARGIN_PX,
+                PointerEdge::Bottom => raw_y >= f64::from(y1) - RETURN_MARGIN_PX,
+            };
         self.x = x;
         self.y = y;
         if near_edge && past_edge {
@@ -1254,15 +1272,15 @@ mod absolute_tracker_tests {
 
     #[test]
     fn anchor_starts_at_the_entry_edge() {
-        assert_eq!(tracker(PointerEdge::Left).absolute(), (24.0, 800.0));
+        assert_eq!(tracker(PointerEdge::Left).absolute(), (2.0, 800.0));
         assert_eq!(
             tracker(PointerEdge::Right).absolute(),
-            (W - 1.0 - 24.0, 800.0)
+            (W - 1.0 - 2.0, 800.0)
         );
-        assert_eq!(tracker(PointerEdge::Top).absolute(), (1280.0, 24.0));
+        assert_eq!(tracker(PointerEdge::Top).absolute(), (1280.0, 2.0));
         assert_eq!(
             tracker(PointerEdge::Bottom).absolute(),
-            (1280.0, H - 1.0 - 24.0)
+            (1280.0, H - 1.0 - 2.0)
         );
     }
 
@@ -1380,6 +1398,43 @@ mod absolute_tracker_tests {
     }
 
     #[test]
+    fn one_pixel_past_the_entry_edge_is_enough() {
+        // Anchored 2 px inside: -2 puts the raw position exactly on the edge
+        // (not a hand-off), the next outward pixel crosses it.
+        let mut tracker = tracker(PointerEdge::Left);
+        assert_eq!(tracker.apply(-2.0, 0.0), None);
+        assert_eq!(tracker.apply(-1.0, 0.0), Some(PointerEdge::Left));
+    }
+
+    #[test]
+    fn one_outward_pixel_fires_on_every_edge_from_the_anchor() {
+        // Right/bottom anchors are the last pixel *inside* the region; one
+        // outward pixel reaches the edge coordinate and must hand off.
+        let right = AbsoluteTracker::new_with_entry(
+            PointerEdge::Right,
+            1,
+            vec![(0.0, 0.0, W, H)],
+            1.0,
+            1.0,
+            Some(0.5),
+        )
+        .expect("right tracker");
+        let mut right = right;
+        assert_eq!(right.apply(1.0, 0.0), Some(PointerEdge::Right));
+
+        let mut bottom = AbsoluteTracker::new_with_entry(
+            PointerEdge::Bottom,
+            1,
+            vec![(0.0, 0.0, W, H)],
+            1.0,
+            1.0,
+            Some(0.5),
+        )
+        .expect("bottom tracker");
+        assert_eq!(bottom.apply(0.0, 1.0), Some(PointerEdge::Bottom));
+    }
+
+    #[test]
     fn pushing_past_the_entry_edge_fires_exactly_once() {
         let mut tracker = tracker(PointerEdge::Left);
         // anchored 24 px inside; a push back past the edge hands control back
@@ -1424,7 +1479,7 @@ mod absolute_tracker_tests {
         let mut tracker =
             AbsoluteTracker::new(PointerEdge::Left, 1, dual_regions(), 1.0, 1.0).unwrap();
         // anchored at the left edge of the first monitor
-        assert_eq!(tracker.absolute(), (24.0, 540.0));
+        assert_eq!(tracker.absolute(), (2.0, 540.0));
         assert_eq!(tracker.apply(2000.0, 0.0), None);
         let (x, _) = tracker.absolute();
         assert!(x > 1920.0, "cursor must reach the second monitor, got {x}");
@@ -1492,7 +1547,7 @@ mod absolute_tracker_tests {
         let mut tracker =
             AbsoluteTracker::new(PointerEdge::Bottom, 1, regions, 1.0, 1.0).expect("regions");
         // anchor is at the bottom edge of C
-        assert_eq!(tracker.absolute(), (4800.0, 2135.0));
+        assert_eq!(tracker.absolute(), (4800.0, 2157.0));
         // push left into the empty quadrant: the real cursor is snapped to a
         // monitor edge, so this must NOT hand off
         assert_eq!(tracker.apply(-3000.0, 0.0), None);

@@ -3,5 +3,5 @@
   "name": "Lan Mouse cursor hiding",
   "description": "Hides the local cursor while Lan Mouse controls another computer, so the pointer appears to move directly to the peer screen.",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "version": 3
+  "version": 6
 }

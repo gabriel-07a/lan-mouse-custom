@@ -34,6 +34,7 @@ use tokio::{
         mpsc::{self, Receiver, Sender},
     },
     task::JoinHandle,
+    time::timeout,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -348,6 +349,60 @@ async fn create_session(
     }
 }
 
+/// How long the shutdown path waits for one portal session call.
+///
+/// A hung portal must never delay the daemon past the launcher's shutdown
+/// grace: the SIGKILL fallback skips the whole teardown, which is exactly what
+/// can leave the compositor holding the pointer at the barrier after the app
+/// is gone. Both calls are local D-Bus round-trips and return in milliseconds
+/// on a healthy portal.
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Whether a portal teardown error only means that the session object is
+/// already gone.
+///
+/// The compositor/portal is allowed to destroy an input-capture session first
+/// (desktop logout, compositor restart, or a session whose EIS client already
+/// disconnected); `Disable`/`Close` then fail with "Object does not exist".
+/// That is a successful cleanup from our point of view, not a failure worth a
+/// warning.
+fn portal_session_already_gone(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    message.contains("object does not exist")
+        || message.contains("unknownsession")
+        || message.contains("unknown session")
+        || message.contains("no such session")
+}
+
+/// Best-effort, time-bounded teardown of the portal session.
+///
+/// Bounding both calls keeps a hung portal from delaying shutdown until the
+/// launcher's SIGKILL fallback, and a session that the portal already destroyed
+/// is handled gracefully instead of masking the cleanup with a warning.
+async fn close_capture_session(input_capture: &InputCapture, session: &Session<InputCapture>) {
+    match timeout(
+        SESSION_CLOSE_TIMEOUT,
+        input_capture.disable(session, Default::default()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if portal_session_already_gone(&error.to_string()) => {
+            log::debug!("input capture session was already disabled: {error}");
+        }
+        Ok(Err(error)) => log::warn!("input_capture.disable(&session) {error}"),
+        Err(_) => log::warn!("input_capture.disable(&session) timed out; closing anyway"),
+    }
+    match timeout(SESSION_CLOSE_TIMEOUT, session.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if portal_session_already_gone(&error.to_string()) => {
+            log::debug!("input capture session was already closed: {error}");
+        }
+        Ok(Err(error)) => log::warn!("session.close(): {error}"),
+        Err(_) => log::warn!("session.close() timed out; continuing shutdown"),
+    }
+}
+
 async fn connect_to_eis(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
@@ -474,12 +529,7 @@ async fn do_capture(
         // Tear down only when this session cannot be used anymore: every client
         // was removed, shutdown was requested, or a portal/EIS error surfaced.
         log::debug!("closing input capture session");
-        if let Err(e) = input_capture.disable(&session, Default::default()).await {
-            log::warn!("input_capture.disable(&session) {e}");
-        }
-        if let Err(e) = session.close().await {
-            log::warn!("session.close(): {e}");
-        }
+        close_capture_session(input_capture, &session).await;
         match result {
             Ok(()) => {
                 // do_capture_session only returns Ok when shutdown was
@@ -588,7 +638,24 @@ where
 
     loop {
         tokio::select! {
-            _ = cancellation_token.cancelled() => return Ok(()),
+            _ = cancellation_token.cancelled() => {
+                // A barrier may have activated the session (and the compositor
+                // may be holding the pointer) at the exact moment shutdown
+                // landed. The activation is then still queued on the EIS
+                // stream; returning without handing it back would leave the
+                // pointer latched at the edge after the portal session closes
+                // - the reported "cursor pinned at the top" after closing Lan
+                // Mouse. Release every queued activation before tearing down.
+                release_queued_activations(
+                    input_capture,
+                    session,
+                    &mut activated,
+                    &barriers,
+                    &pos_for_barrier_id,
+                )
+                .await;
+                return Ok(());
+            }
             _ = notify_release.notified() => {
                 // Not capturing right now; nothing to hand back, and a target
                 // left for this release must not affect the next activation.
@@ -636,44 +703,9 @@ where
                 // report barrier ids, some compositors do not report the
                 // position). An activation that cannot be mapped is dropped
                 // instead of panicking inside the capture task.
-                let barrier_id = match activated_event.barrier_id() {
-                    Some(ActivatedBarrier::Barrier(id)) => id,
-                    Some(ActivatedBarrier::UnknownBarrier) | None => {
-                        let Some(cursor_position) = activated_event.cursor_position() else {
-                            log::warn!(
-                                "ignoring activation without a barrier id or cursor position"
-                            );
-                            continue;
-                        };
-                        let Some(id) = find_corresponding_client(&barriers, cursor_position) else {
-                            log::warn!("activation does not match any registered barrier");
-                            continue;
-                        };
-                        id
-                    }
-                };
-                let pos = match pos_for_barrier_id.get(&barrier_id) {
-                    Some(pos) => *pos,
-                    None => {
-                        log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
-                        let Some(cursor_position) = activated_event.cursor_position() else {
-                            log::warn!(
-                                "ignoring activation with an unknown barrier id and no cursor position"
-                            );
-                            continue;
-                        };
-                        let Some(id) = find_corresponding_client(&barriers, cursor_position) else {
-                            log::warn!("activation does not match any registered barrier");
-                            continue;
-                        };
-                        match pos_for_barrier_id.get(&id) {
-                            Some(pos) => *pos,
-                            None => {
-                                log::warn!("barrier {id} has no registered client");
-                                continue;
-                            }
-                        }
-                    }
+                let Some(pos) = activation_position(&activated_event, &barriers, &pos_for_barrier_id)
+                else {
+                    continue;
                 };
                 // All four edges have a barrier; only the edges that belong
                 // to an enabled client may capture. Release immediately for a
@@ -776,6 +808,113 @@ where
     }
 }
 
+/// Resolve the local edge a barrier activation belongs to.
+///
+/// The barrier id is authoritative when the portal reported one we know; some
+/// compositors (KDE) do not report barrier ids and others report an
+/// `UnknownBarrier`, so fall back to the cursor position. `None` means the
+/// activation cannot be attributed to an edge and can only be dropped — a
+/// malformed/optional field must never take the capture task (and with it the
+/// whole service) down.
+fn activation_position(
+    activated_event: &Activated,
+    barriers: &[ICBarrier],
+    pos_for_barrier_id: &HashMap<BarrierID, Position>,
+) -> Option<Position> {
+    let barrier_id = match activated_event.barrier_id() {
+        Some(ActivatedBarrier::Barrier(id)) => Some(id),
+        Some(ActivatedBarrier::UnknownBarrier) | None => None,
+    };
+    if let Some(barrier_id) = barrier_id {
+        if let Some(pos) = pos_for_barrier_id.get(&barrier_id) {
+            return Some(*pos);
+        }
+        log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
+    }
+    let Some(cursor_position) = activated_event.cursor_position() else {
+        log::warn!("ignoring activation without a barrier id or cursor position");
+        return None;
+    };
+    let Some(id) = find_corresponding_client(barriers, cursor_position) else {
+        log::warn!("activation does not match any registered barrier");
+        return None;
+    };
+    match pos_for_barrier_id.get(&id) {
+        Some(pos) => Some(*pos),
+        None => {
+            log::warn!("barrier {id} has no registered client");
+            None
+        }
+    }
+}
+
+/// Upper bound on activations drained during shutdown: the compositor can only
+/// have a handful queued, and the cap keeps a misbehaving portal from delaying
+/// the exit indefinitely.
+const MAX_SHUTDOWN_ACTIVATION_RELEASES: usize = 4;
+
+/// Give back every activation the compositor already queued when shutdown was
+/// requested.
+///
+/// An unreleased activation keeps the pointer grabbed by the compositor; when
+/// the process closes the portal session right after, the pointer can stay
+/// latched at the barrier (the reported "cursor pinned at the top after
+/// closing the app"). Only already-queued events are drained (never blocks) and
+/// failures are logged at debug level because the session is going away
+/// anyway.
+async fn release_queued_activations<S>(
+    input_capture: &InputCapture,
+    session: &Session<InputCapture>,
+    activated: &mut S,
+    barriers: &[ICBarrier],
+    pos_for_barrier_id: &HashMap<BarrierID, Position>,
+) where
+    S: futures::Stream<Item = Activated> + Unpin,
+{
+    for _ in 0..MAX_SHUTDOWN_ACTIVATION_RELEASES {
+        let Some(event) = activated.next().now_or_never().flatten() else {
+            return;
+        };
+        let Some(pos) = activation_position(&event, barriers, pos_for_barrier_id) else {
+            continue;
+        };
+        log::debug!("releasing queued capture activation on {pos:?} during shutdown");
+        if let Err(error) = release_capture(
+            input_capture,
+            session,
+            event,
+            pos,
+            None,
+            barriers,
+            pos_for_barrier_id,
+        )
+        .await
+        {
+            log::debug!("could not release a queued activation during shutdown: {error}");
+        }
+    }
+}
+
+/// Cursor position that hands a released barrier back to the compositor.
+///
+/// Releasing exactly on the barrier would activate the capture again
+/// immediately (the old release/re-grab loop at the shared edge), so offset one
+/// pixel into the screen the activation belongs to. `None` when the compositor
+/// reported a non-finite position (optional, potentially corrupted field): the
+/// portal then releases at the current position instead.
+fn release_cursor_position(pos: Position, x: f32, y: f32) -> Option<(f64, f64)> {
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let (dx, dy) = match pos {
+        Position::Left => (1.0, 0.0),
+        Position::Right => (-1.0, 0.0),
+        Position::Top => (0.0, 1.0),
+        Position::Bottom => (0.0, -1.0),
+    };
+    Some((f64::from(x) + dx, f64::from(y) + dy))
+}
+
 async fn release_capture(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
@@ -805,16 +944,16 @@ async fn release_capture(
         match activated.cursor_position() {
             Some((x, y)) => {
                 log::debug!("client entered @ ({x}, {y})");
-                let (dx, dy) = match current_pos {
-                    // offset cursor position to not enter again immediately
-                    Position::Left => (1., 0.),
-                    Position::Right => (-1., 0.),
-                    Position::Top => (0., 1.),
-                    Position::Bottom => (0., -1.),
-                };
-                // release 1px to the right of the entered zone
-                release_options =
-                    release_options.set_cursor_position(Some((x as f64 + dx, y as f64 + dy)));
+                // Offset the cursor one pixel into the screen so the release
+                // does not immediately re-activate the barrier ("release 1px
+                // to the right of the entered zone").
+                let position = release_cursor_position(current_pos, x, y);
+                if position.is_none() {
+                    log::warn!(
+                        "compositor reported a non-finite cursor position; releasing at the current position"
+                    );
+                }
+                release_options = release_options.set_cursor_position(position);
             }
             None => {
                 log::warn!("compositor did not report a cursor position for the capture release")
@@ -1327,5 +1466,94 @@ mod barrier_edge_fraction_tests {
             barrier_edge_fraction(&[], &HashMap::new(), Position::Left, (0.0, 0.0)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_cleanup_tests {
+    use super::*;
+
+    /// The reported shutdown failure was a portal session that the compositor
+    /// had already destroyed ("Object does not exist at path ..."). Tearing it
+    /// down again must be treated as success (debug log), not as a warning
+    /// that masks the actual cleanup.
+    #[test]
+    fn a_session_the_portal_already_destroyed_is_treated_as_closed() {
+        let reported = "Portal request failed: org.freedesktop.zbus.Error: \
+                        Object does not exist at path \u{201c}/org/freedesktop/portal/\
+                        desktop/session/1_175/ashpd_FdZFDtozBz\u{201d}";
+        assert!(portal_session_already_gone(reported));
+        assert!(portal_session_already_gone(
+            "org.freedesktop.portal.Error.UnknownSession"
+        ));
+        assert!(portal_session_already_gone("no such session"));
+        // Genuine failures must still be surfaced.
+        assert!(!portal_session_already_gone(
+            "Portal request failed: timeout"
+        ));
+        assert!(!portal_session_already_gone("Access denied"));
+    }
+
+    /// Shutdown must stay inside the launcher's grace (`src/main.rs` SIGKILLs a
+    /// daemon that overstays it): a skipped teardown is exactly what can leave
+    /// the compositor pointer latched at the barrier.
+    #[test]
+    fn session_teardown_is_bounded_below_the_launcher_grace() {
+        assert!(SESSION_CLOSE_TIMEOUT > Duration::ZERO);
+        // disable + close together must fit comfortably in the 3 s grace.
+        assert!(SESSION_CLOSE_TIMEOUT * 2 < Duration::from_secs(3));
+    }
+
+    /// Releasing exactly on the barrier re-triggers the capture (release/
+    /// re-grab loop at the edge), so the cursor goes one pixel into the screen
+    /// the activation belongs to.
+    #[test]
+    fn the_release_position_moves_one_pixel_into_the_screen() {
+        assert_eq!(
+            release_cursor_position(Position::Left, 0.0, 500.0),
+            Some((1.0, 500.0))
+        );
+        assert_eq!(
+            release_cursor_position(Position::Right, 1919.0, 500.0),
+            Some((1918.0, 500.0))
+        );
+        assert_eq!(
+            release_cursor_position(Position::Top, 800.0, 0.0),
+            Some((800.0, 1.0))
+        );
+        assert_eq!(
+            release_cursor_position(Position::Bottom, 800.0, 1079.0),
+            Some((800.0, 1078.0))
+        );
+    }
+
+    /// The portal cursor position is an optional field: a corrupted value must
+    /// fall back to releasing at the current position, never move the pointer
+    /// to a non-finite coordinate.
+    #[test]
+    fn a_non_finite_cursor_position_is_not_used_for_the_release() {
+        assert_eq!(release_cursor_position(Position::Top, f32::NAN, 0.0), None);
+        assert_eq!(
+            release_cursor_position(Position::Top, 0.0, f32::INFINITY),
+            None
+        );
+        assert_eq!(
+            release_cursor_position(Position::Left, f32::NEG_INFINITY, 4.0),
+            None
+        );
+    }
+
+    /// The queued-activation drain runs on the shutdown path: it must cover a
+    /// normal barrier set (at most one activation per edge) but stay bounded so
+    /// a misbehaving portal cannot delay the exit.
+    #[test]
+    fn the_queued_activation_drain_is_bounded() {
+        // At most one activation per screen edge can be queued, so the drain
+        // must cover a normal barrier set while staying small enough that a
+        // misbehaving portal cannot delay shutdown.
+        const {
+            assert!(MAX_SHUTDOWN_ACTIVATION_RELEASES >= 4);
+            assert!(MAX_SHUTDOWN_ACTIVATION_RELEASES <= 16);
+        }
     }
 }

@@ -196,6 +196,7 @@ impl Capture {
             conn: Box::new(conn),
             enter: EnterState::default(),
             enter_along: None,
+            residual_reverse_px: None,
             handoff_begin_at: None,
             trace_window_until: None,
             trace_last_motion: None,
@@ -358,6 +359,18 @@ const ENTER_PAIR_THROTTLE: Duration = Duration::from_millis(5);
 const DISCRETE_SEND_BUDGET: Duration = Duration::from_millis(15);
 /// Give up on a peer that never acknowledges `Enter` and release the grab.
 const ENTER_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum accumulated distance (logical px) of the *leading* reverse pointer
+/// motion that is treated as the hand-off's activation residual after `Begin`.
+///
+/// Crossing a barrier is not instantaneous: the capture backend delivers the
+/// compositor's pointer warp (back into the source screen) and the touchpad's
+/// backswing before the motion that continues the crossing. On the receiver
+/// those deltas point out of its entry edge, so forwarding them makes it hand
+/// control straight back (enter/leave ping-pong). Suppress reverse motion until
+/// the first forward delta, but never swallow more than this: a deliberate
+/// return push exceeds it almost immediately, so an intentional hand-back is
+/// still forwarded without extra effort.
+const HANDOFF_RESIDUAL_MAX_PX: f64 = 32.0;
 /// How often the motion coalescing ratio is logged.
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -483,6 +496,17 @@ struct CaptureTask {
     /// Normalised crossing coordinate along the entry edge for the current
     /// hand-off (`BeginAt`); reused by retries and repair `EnterAt` events.
     enter_along: Option<f32>,
+    /// Leading reverse motion still to suppress after a hand-off, in logical
+    /// px. `None` means no hand-off residual filter is active.
+    ///
+    /// The edge activation usually includes the compositor's pointer warp and
+    /// the push's backswing, both pointing back into the source screen.
+    /// Forwarding them makes the receiver see an outward motion at its entry
+    /// edge and immediately hand control back (the capture enter/leave
+    /// ping-pong). The filter drops reverse deltas until the first forward
+    /// delta, bounded by [`HANDOFF_RESIDUAL_MAX_PX`] so a real return is never
+    /// lost.
+    residual_reverse_px: Option<f64>,
     /// When the current hand-off began; used to log the first motion latency
     /// (debug only).
     handoff_begin_at: Option<Instant>,
@@ -971,6 +995,7 @@ impl CaptureTask {
             }
             self.active_client.replace(handle);
             self.enter_along = event.begin_along();
+            self.residual_reverse_px = Some(HANDOFF_RESIDUAL_MAX_PX);
             self.handoff_begin_at = Some(Instant::now());
             if handoff_trace::enabled() {
                 self.trace_window_until = Some(Instant::now() + Duration::from_millis(500));
@@ -1028,6 +1053,52 @@ impl CaptureTask {
             }
             other => other,
         };
+
+        // Crossing an edge is not instantaneous: right after `Begin` the
+        // capture backend delivers the compositor's pointer warp and the
+        // push's backswing, both pointing back into the source screen. On the
+        // receiver they are an outward push at its entry edge and hand control
+        // straight back (the enter/leave ping-pong). Suppress that leading
+        // reverse motion until the first forward delta; the first forward
+        // delta is forwarded immediately, with no timed settle, so the crossing
+        // does not feel stuck.
+        if let Some(remaining_px) = self.residual_reverse_px {
+            if let CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. })) = event
+            {
+                let reverse_px = match self.get_pos(handle) {
+                    // `Position::Left` means the peer sits to the left, so the
+                    // crossing motion is negative and reverse is positive.
+                    Some(Position::Left) => dx.max(0.0),
+                    Some(Position::Right) => (-dx).max(0.0),
+                    Some(Position::Top) => dy.max(0.0),
+                    Some(Position::Bottom) => (-dy).max(0.0),
+                    None => 0.0,
+                };
+                if reverse_px <= 0.0 {
+                    // The crossing motion itself: stop filtering so a later
+                    // return push is forwarded normally.
+                    self.residual_reverse_px = None;
+                } else if reverse_px < remaining_px {
+                    self.residual_reverse_px = Some(remaining_px - reverse_px);
+                    handoff_trace::event(
+                        "controller",
+                        "capture.reverse_motion_dropped",
+                        Some(self.enter.serial()),
+                        Some(&format!("client {handle}")),
+                        &[
+                            ("dx", dx.to_string()),
+                            ("dy", dy.to_string()),
+                            ("remaining_px", (remaining_px - reverse_px).to_string()),
+                        ],
+                    );
+                    return Ok(());
+                } else {
+                    // More reverse motion than the activation residual can
+                    // contain: this is a deliberate hand-back, not a warp.
+                    self.residual_reverse_px = None;
+                }
+            }
+        }
 
         // Coalesce pointer motion while a client is active. Motion that
         // arrives while we are still waiting for `Ack` is buffered and flushed
@@ -1774,6 +1845,7 @@ mod capture_handle_tests {
             conn,
             enter: EnterState::default(),
             enter_along: None,
+            residual_reverse_px: None,
             handoff_begin_at: None,
             trace_window_until: None,
             trace_last_motion: None,
@@ -2022,7 +2094,7 @@ mod capture_handle_tests {
                 7,
                 CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
                     time: 0,
-                    dx: 2.0,
+                    dx: -2.0,
                     dy: 0.0,
                 })),
             ),
@@ -2034,10 +2106,238 @@ mod capture_handle_tests {
             assert!(
                 sent.iter()
                     .any(|event| matches!(event, ProtoEvent::Input(_))),
-                "motion must be forwarded after EnterAt: {sent:?}"
+                "forward motion must be forwarded after EnterAt: {sent:?}"
             );
         }
 
+        capture.terminate().await.expect("terminate");
+    }
+
+    /// The crossing motion must reach the peer at once. A timed settle window
+    /// here was felt as the cursor briefly sticking at the shared edge, and it
+    /// also made the user pull back (reverse motion) to retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_first_forward_motion_after_a_handoff_is_forwarded_immediately() {
+        let fake = FakeConnection::new();
+        let sent = fake.sent.clone();
+        let mut task = capture_task_with_connection(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("begin");
+        task.handle_capture_event(
+            &mut capture,
+            (
+                7,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: -2.0,
+                    dy: 0.0,
+                })),
+            ),
+        )
+        .await
+        .expect("crossing motion");
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|event| matches!(event, ProtoEvent::Input(_))),
+            "the first forward motion must be forwarded without any settle window"
+        );
+        assert!(
+            task.residual_reverse_px.is_none(),
+            "a forward delta ends the residual filter"
+        );
+        capture.terminate().await.expect("terminate");
+    }
+
+    /// Crossing an edge produces a burst of reverse deltas (compositor warp and
+    /// backswing) before the motion that continues the crossing. Forwarding
+    /// them makes the receiver hand control straight back, so the whole leading
+    /// burst is suppressed until the first forward delta.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_leading_reverse_burst_after_a_handoff_is_suppressed() {
+        let fake = FakeConnection::new();
+        let sent = fake.sent.clone();
+        let mut task = capture_task_with_connection(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("begin");
+
+        // Back into the source screen: on the receiver these point out of its
+        // entry edge and trigger an immediate LeaveAt.
+        for dx in [2.0, 5.0, 7.0] {
+            task.handle_capture_event(
+                &mut capture,
+                (
+                    7,
+                    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                        time: 0,
+                        dx,
+                        dy: 0.0,
+                    })),
+                ),
+            )
+            .await
+            .expect("reverse motion");
+        }
+        assert!(
+            !sent
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, ProtoEvent::Input(_))),
+            "the residual reverse burst must not be forwarded: {:?}",
+            sent.borrow()
+        );
+        assert_eq!(
+            task.residual_reverse_px,
+            Some(HANDOFF_RESIDUAL_MAX_PX - 14.0),
+            "the suppressed distance must be tracked"
+        );
+
+        // The actual crossing motion is forwarded.
+        task.handle_capture_event(
+            &mut capture,
+            (
+                7,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: -2.0,
+                    dy: 0.0,
+                })),
+            ),
+        )
+        .await
+        .expect("forward motion");
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|event| matches!(event, ProtoEvent::Input(_))),
+            "forward motion after the residual burst must be forwarded"
+        );
+        capture.terminate().await.expect("terminate");
+    }
+
+    /// A reverse push that exceeds the activation-residual budget is the user
+    /// deliberately handing control back; it must not be swallowed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reverse_push_larger_than_the_residual_budget_is_forwarded() {
+        let fake = FakeConnection::new();
+        let sent = fake.sent.clone();
+        let mut task = capture_task_with_connection(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("begin");
+        task.handle_capture_event(
+            &mut capture,
+            (
+                7,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: 20.0,
+                    dy: 0.0,
+                })),
+            ),
+        )
+        .await
+        .expect("residual");
+        assert!(
+            !sent
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, ProtoEvent::Input(_))),
+            "the activation residual is still suppressed"
+        );
+
+        task.handle_capture_event(
+            &mut capture,
+            (
+                7,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: 20.0,
+                    dy: 0.0,
+                })),
+            ),
+        )
+        .await
+        .expect("deliberate reverse push");
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|event| matches!(event, ProtoEvent::Input(_))),
+            "reverse motion past the residual budget is a real return request"
+        );
+        assert!(task.residual_reverse_px.is_none());
+        capture.terminate().await.expect("terminate");
+    }
+
+    /// Once the crossing motion has been seen, a later reverse delta is user
+    /// intent (a normal return gesture) and must be forwarded unchecked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn after_the_crossing_motion_a_reverse_return_is_forwarded() {
+        let fake = FakeConnection::new();
+        let sent = fake.sent.clone();
+        let mut task = capture_task_with_connection(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("begin");
+        task.handle_capture_event(
+            &mut capture,
+            (
+                7,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: -3.0,
+                    dy: 0.0,
+                })),
+            ),
+        )
+        .await
+        .expect("crossing motion");
+        let forwarded = sent.borrow().len();
+
+        task.handle_capture_event(
+            &mut capture,
+            (
+                7,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: 5.0,
+                    dy: 0.0,
+                })),
+            ),
+        )
+        .await
+        .expect("return gesture");
+        assert!(
+            sent.borrow().len() > forwarded,
+            "a reverse delta after the crossing motion must be forwarded: {:?}",
+            sent.borrow()
+        );
         capture.terminate().await.expect("terminate");
     }
 

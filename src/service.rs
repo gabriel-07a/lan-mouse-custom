@@ -476,6 +476,37 @@ impl Service {
 
         log::info!("terminating service ...");
         self.discovery_cancel.cancel();
+        // Cursor/portal shutdown ordering. Two failure modes made closing Lan
+        // Mouse leave the Ubuntu/GNOME pointer latched at the top edge:
+        //
+        // 1. the cursor-hide heartbeat AND the parked-cursor marker must not
+        //    outlive the process — the bundled extension hides the pointer for
+        //    either file and has nothing left to restore it after we exit;
+        // 2. an armed capture/remote-control session must be disarmed *before*
+        //    its portal session is torn down, otherwise the compositor keeps
+        //    the pointer at the last barrier/absolute position.
+        //
+        // The cursor markers are removed first so a slow or failing portal
+        // teardown below cannot leave the extension hiding the cursor.
+        let plan = shutdown_plan(
+            self.incoming_conns.len(),
+            self.cursor_hide.is_outgoing_active(),
+        );
+        if plan.clear_cursor_state {
+            self.cursor_hide.clear();
+        }
+        if plan.end_remote_control {
+            // A peer may still be driving this machine: drop the absolute
+            // pointer tracker and remote-control state before the emulation
+            // portal session is closed.
+            self.emulation.remote_leave();
+        }
+        if plan.release_outgoing_capture {
+            // Hand the compositor its pointer back at the barrier while the
+            // transport is still alive. `capture.terminate` repeats this
+            // defensively for a capture that is still marked active.
+            self.capture.release();
+        }
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating clipboard ...");
@@ -484,6 +515,10 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        // Backends are down; make the on-disk cursor state removal
+        // unconditional and final (idempotent, also runs from `CursorHide`'s
+        // destructor for error paths).
+        self.cursor_hide.shutdown();
 
         Ok(())
     }
@@ -910,6 +945,10 @@ impl Service {
                 // through also lets the capture side still detect the return
                 // hand-off at exactly that edge.
                 self.capture.set_remote_peer(Some(pos));
+                // The peer drives this screen now: make the local cursor
+                // visible for the remote pointer (it may have been parked at
+                // the border after the previous return hand-off).
+                self.cursor_hide.unpark();
                 // Resolve the client entry before the fingerprint is moved
                 // into the session registry below.
                 let handle = self.client_for_peer(addr, &fingerprint);
@@ -1001,6 +1040,12 @@ impl Service {
             }
             EmulationEvent::EdgeReturn { pos, along } => {
                 log::debug!("handoff: return requested through {pos:?} along {along:?}");
+                // The remote pointer just left this screen: hide the parked
+                // local cursor immediately, before the host confirms the
+                // return (PeerLeft arrives a round-trip later).
+                if !self.cursor_hide.is_outgoing_active() {
+                    self.cursor_hide.park();
+                }
                 self.request_return(pos, along);
             }
             EmulationEvent::PeerLeft { addr, fingerprint } => {
@@ -1267,6 +1312,7 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
+                self.cursor_hide.unpark();
                 self.cursor_hide.enter(handle);
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
@@ -1525,6 +1571,12 @@ impl Service {
         }
         if self.incoming_conns.is_empty() {
             self.capture.set_remote_peer(None);
+            if !self.cursor_hide.is_outgoing_active() {
+                // The remote pointer left this screen at the edge. Park the
+                // local cursor there until the user moves the mouse or the
+                // peer enters again.
+                self.cursor_hide.park();
+            }
         }
     }
 
@@ -2967,7 +3019,7 @@ impl Service {
     /// barrier after an explicit disconnect; only killing the daemon released
     /// it. Releasing here is idempotent and safe when no session is active.
     fn release_after_incoming_session(&mut self) {
-        let plan = incoming_teardown_plan(self.cursor_hide.is_active());
+        let plan = incoming_teardown_plan(self.cursor_hide.is_outgoing_active());
         self.capture.set_remote_peer(None);
         if plan.release_capture {
             // A portal/libei grab left activated used to keep the compositor
@@ -2978,6 +3030,9 @@ impl Service {
         self.emulation.remote_leave();
         if plan.clear_cursor_hide {
             self.cursor_hide.clear();
+        }
+        if !self.cursor_hide.is_outgoing_active() && self.incoming_conns.is_empty() {
+            self.cursor_hide.park();
         }
     }
 
@@ -3541,7 +3596,46 @@ fn incoming_teardown_plan(outgoing_capture_active: bool) -> IncomingTeardownPlan
         // Releasing a still-active outgoing capture would drop control of a
         // peer that has nothing to do with the incoming session that ended.
         release_capture: !outgoing_capture_active,
-        clear_cursor_hide: true,
+        // Likewise, do not clear the cursor heartbeat while an outgoing
+        // capture still owns it. The incoming session teardown (for example
+        // the Ack/return hand-off at the shared edge) used to clear the hide
+        // right after ClientEntered, leaving the source cursor visible at the
+        // border for the rest of the hand-off.
+        clear_cursor_hide: !outgoing_capture_active,
+    }
+}
+
+/// Ordered cursor/portal cleanup a clean service shutdown performs.
+///
+/// Kept pure so the shutdown regression (a closed Lan Mouse left the GNOME
+/// cursor hidden/parked, and a still-armed portal session could keep the
+/// pointer latched at the top edge) can be tested without constructing the
+/// whole service or a portal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShutdownPlan {
+    /// Remove the cursor-hide heartbeat and the parked-cursor marker.
+    clear_cursor_state: bool,
+    /// Disarm a live incoming remote-control (RemoteDesktop/libei) session
+    /// before its portal session is closed.
+    end_remote_control: bool,
+    /// Release a live outgoing capture grab before the capture portal session
+    /// is closed.
+    release_outgoing_capture: bool,
+}
+
+fn shutdown_plan(incoming_sessions: usize, outgoing_capture_active: bool) -> ShutdownPlan {
+    ShutdownPlan {
+        // Always: both markers hide the pointer via the bundled GNOME
+        // extension, and after the process exits nothing can restore it.
+        clear_cursor_state: true,
+        // A peer that is still driving this machine owns the emulation
+        // session; dropping the absolute-pointer tracker/remote-control state
+        // first means the compositor lets go of the pointer when the session
+        // closes instead of leaving it at the last injected position.
+        end_remote_control: incoming_sessions > 0,
+        // A live outgoing capture owns the compositor pointer through the
+        // InputCapture portal; release the barrier before the session ends.
+        release_outgoing_capture: outgoing_capture_active,
     }
 }
 
@@ -3549,13 +3643,93 @@ fn incoming_teardown_plan(outgoing_capture_active: bool) -> IncomingTeardownPlan
 mod tests {
     use super::{
         IncomingTeardownPlan, RETURN_MAX_ATTEMPTS, RETURN_RETRY_INTERVAL, ReturnHandoff,
-        incoming_teardown_plan, reverse_client_compatible, should_release_after_last_client,
+        ShutdownPlan, incoming_teardown_plan, reverse_client_compatible,
+        should_release_after_last_client, shutdown_plan,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)), 4242)
+    }
+
+    /// Regression: closing Lan Mouse with a capture/remote-control session
+    /// still live used to leave the compositor pointer latched at the barrier
+    /// (top edge) and the GNOME extension hiding it. A clean shutdown must
+    /// always remove the cursor markers and release whichever side owns the
+    /// pointer, on every shutdown path (window close, tray quit, SIGTERM,
+    /// `cli shutdown`).
+    #[test]
+    fn a_clean_shutdown_releases_the_cursor_for_every_session_shape() {
+        assert_eq!(
+            shutdown_plan(0, false),
+            ShutdownPlan {
+                clear_cursor_state: true,
+                end_remote_control: false,
+                release_outgoing_capture: false,
+            },
+            "an idle service must still remove stale cursor markers"
+        );
+        assert_eq!(
+            shutdown_plan(1, false),
+            ShutdownPlan {
+                clear_cursor_state: true,
+                end_remote_control: true,
+                release_outgoing_capture: false,
+            },
+            "a peer driving this machine must have its remote-control session disarmed"
+        );
+        assert_eq!(
+            shutdown_plan(0, true),
+            ShutdownPlan {
+                clear_cursor_state: true,
+                end_remote_control: false,
+                release_outgoing_capture: true,
+            },
+            "a live outgoing capture must release the local grab before teardown"
+        );
+        assert_eq!(
+            shutdown_plan(2, true),
+            ShutdownPlan {
+                clear_cursor_state: true,
+                end_remote_control: true,
+                release_outgoing_capture: true,
+            },
+            "both directions can be live and both must be released"
+        );
+    }
+
+    /// The cursor markers must be removed by the shutdown path itself, not
+    /// only by the field destructor: a hung portal teardown must not be able to
+    /// skip them (release builds abort on panic and the launcher SIGKILLs a
+    /// daemon that overstays its grace).
+    #[test]
+    fn the_shutdown_path_clears_the_cursor_state_before_any_backend() {
+        let source = include_str!("service.rs");
+        let start = source
+            .find("log::info!(\"terminating service ...\")")
+            .expect("shutdown block");
+        // Bound the slice to the `run` body so the assertions below cannot be
+        // satisfied by this test's own literals further down the file.
+        let teardown = &source[start..];
+        let end = teardown
+            .find("\n    fn handle_frontend_request")
+            .expect("next method after run");
+        let teardown = &teardown[..end];
+        let clear = teardown
+            .find("self.cursor_hide.clear()")
+            .expect("shutdown must clear the cursor state");
+        let capture_terminate = teardown
+            .find("self.capture.terminate().await")
+            .expect("capture terminate");
+        assert!(
+            clear < capture_terminate,
+            "cursor markers must be removed before the backend teardown"
+        );
+        assert!(
+            teardown.contains("self.cursor_hide.shutdown()"),
+            "shutdown must perform a final unconditional marker cleanup"
+        );
     }
 
     #[test]
@@ -3586,7 +3760,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_teardown_always_clears_the_cursor_and_releases_a_stale_grab() {
+    fn incoming_teardown_releases_a_stale_grab_but_keeps_an_active_cursor_hide() {
         assert_eq!(
             incoming_teardown_plan(false),
             IncomingTeardownPlan {
@@ -3599,9 +3773,9 @@ mod tests {
             incoming_teardown_plan(true),
             IncomingTeardownPlan {
                 release_capture: false,
-                clear_cursor_hide: true,
+                clear_cursor_hide: false,
             },
-            "an active outgoing capture must not be released"
+            "an active outgoing capture must neither be released nor un-hide its cursor"
         );
     }
 

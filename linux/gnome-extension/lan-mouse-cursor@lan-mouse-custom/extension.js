@@ -9,8 +9,14 @@ import Gio from 'gi://Gio';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const HEARTBEAT_MS = 3_000;
-const EXTENSION_VERSION = '3';
-const POLL_MS = 100;
+const EXTENSION_VERSION = '6';
+const POLL_MS = 50;
+// Ignore pointer movement right after a hand-off: the peer may still deliver
+// a few injected motion events while it releases its capture. Requiring two
+// consecutive polls beyond this distance also filters remote jitter.
+const PARK_SETTLE_MS = 250;
+const PARK_MOVE_PX = 12;
+const PARK_CONFIRM_POLLS = 2;
 
 export default class LanMouseCursorExtension extends Extension {
     enable() {
@@ -26,6 +32,13 @@ export default class LanMouseCursorExtension extends Extension {
         const runtime = `${GLib.get_user_runtime_dir()}/lan-mouse`;
         this._runtimeDir = runtime;
         this._stateFile = Gio.File.new_for_path(`${runtime}/cursor-hide`);
+        // Written by the service when a remote peer hands control back. The
+        // cursor is usually parked at the edge at that point; hide it there,
+        // but restore it as soon as the local pointer moves.
+        this._parkFile = Gio.File.new_for_path(`${runtime}/cursor-park`);
+        this._parkOrigin = null;
+        this._parkSeenAt = 0;
+        this._parkAwayPolls = 0;
         this._loadedFile = Gio.File.new_for_path(
             `${runtime}/cursor-extension-loaded`
         );
@@ -147,6 +160,49 @@ export default class LanMouseCursorExtension extends Extension {
         } catch (_error) {
             hide = false;
         }
+
+        // A cursor left parked at the edge after returning control is hidden
+        // until the local pointer actually moves. This keeps the desktop
+        // usable: any physical mouse movement restores the pointer.
+        try {
+            if (this._parkFile.query_exists(null)) {
+                const [x, y] = global.get_pointer();
+                if (!this._parkOrigin) {
+                    this._parkOrigin = [x, y];
+                    this._parkSeenAt = Date.now();
+                    this._parkAwayPolls = 0;
+                    // Hide on the first observation: waiting for the next
+                    // poll adds a visible delay to the return hand-off.
+                    hide = true;
+                } else if (Date.now() - this._parkSeenAt < PARK_SETTLE_MS) {
+                    hide = true;
+                } else {
+                    const dx = x - this._parkOrigin[0];
+                    const dy = y - this._parkOrigin[1];
+                    if (Math.hypot(dx, dy) > PARK_MOVE_PX) {
+                        this._parkAwayPolls += 1;
+                        if (this._parkAwayPolls >= PARK_CONFIRM_POLLS) {
+                            try {
+                                this._parkFile.delete(null);
+                            } catch (_error) {}
+                            this._parkOrigin = null;
+                            this._parkAwayPolls = 0;
+                        } else {
+                            hide = true;
+                        }
+                    } else {
+                        this._parkAwayPolls = 0;
+                        hide = true;
+                    }
+                }
+            } else {
+                this._parkOrigin = null;
+                this._parkAwayPolls = 0;
+            }
+        } catch (_error) {
+            this._parkOrigin = null;
+        }
+
         this._setInhibited(hide);
     }
 }
