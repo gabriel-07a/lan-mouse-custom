@@ -147,6 +147,26 @@ pub(crate) struct LibeiEmulation {
 /// feel heavier to leave than a physical monitor edge.
 const RETURN_MARGIN_PX: f64 = 0.0;
 
+/// Inward distance (logical px) the injected absolute pointer must reach from
+/// its entry anchor before an outward push is accepted as a real return.
+///
+/// The hand-off begins with the receiver's pointer parked on the entry edge and
+/// the old/unguarded sources forward the compositor warp / touchpad backswing
+/// *outward* through that edge - the observed `pushed past the Right edge`
+/// churn. Requiring the pointer to have actually been used inside the screen
+/// first (the user moved it this far in) removes those spurious return
+/// requests while a deliberate reverse beyond the deadband still hands control
+/// back.
+const ENTRY_WORK_DEADBAND_PX: f64 = 2.0;
+
+/// Settling time after the receiver arms the absolute pointer.
+///
+/// A return request in this window is entrance jitter/activation residual, not
+/// the user handing control back: the hand-off has only just begun and the
+/// source's own reverse guard (0.2.19) is still settling the crossing. Bounded
+/// and short, so a deliberate immediate hand-back still works right after.
+const ENTRY_RETURN_SETTLE: Duration = Duration::from_millis(250);
+
 /// Pointer settings of this Wayland session.
 ///
 /// The relative injection path is accelerated by libinput; absolute injection
@@ -290,6 +310,14 @@ struct AbsoluteTracker {
     x: f64,
     y: f64,
     fired: bool,
+    /// When the tracker was armed (remote `Enter`). Used for the settling
+    /// debounce before a return request is accepted.
+    armed_at: Instant,
+    /// Deepest inward displacement (logical px) reached since arming. The
+    /// receiver cursor is parked on the entry edge at arm time; an outward push
+    /// is only a real return once the pointer has actually been used inside the
+    /// screen (see [`ENTRY_WORK_DEADBAND_PX`]).
+    inward_travel_px: f64,
 }
 
 impl AbsoluteTracker {
@@ -363,12 +391,38 @@ impl AbsoluteTracker {
             x,
             y,
             fired: false,
+            armed_at: Instant::now(),
+            inward_travel_px: 0.0,
         })
     }
 
     /// The entry region bounds (return threshold).
     fn entry_bounds(&self) -> (f32, f32, f32, f32) {
         self.entry
+    }
+
+    /// Inward distance (logical px) of `(x, y)` from the entry edge, in the
+    /// EIS layout space. Positive means inside the screen.
+    fn inward_distance(&self, x: f64, y: f64) -> f64 {
+        match self.edge {
+            PointerEdge::Left => x - f64::from(self.entry.0),
+            PointerEdge::Right => f64::from(self.entry.2) - 1.0 - x,
+            PointerEdge::Top => y - f64::from(self.entry.1),
+            PointerEdge::Bottom => f64::from(self.entry.3) - 1.0 - y,
+        }
+    }
+
+    /// Whether an outward push may be accepted as a deliberate hand-back.
+    ///
+    /// Both gates are needed for the mixed-build setup (old unguarded source):
+    /// the settling debounce ignores entrance residual in the first
+    /// [`ENTRY_RETURN_SETTLE`], and the work deadband ignores outward jitter
+    /// while the pointer has never actually been used inside this screen
+    /// ([`ENTRY_WORK_DEADBAND_PX`]). A genuine reverse beyond both still hands
+    /// control back - immediately once the user moved the pointer in.
+    fn return_ready(&self) -> bool {
+        self.inward_travel_px >= ENTRY_WORK_DEADBAND_PX
+            && self.armed_at.elapsed() >= ENTRY_RETURN_SETTLE
     }
 
     /// Clamp a real cursor position into the layout (half-open region bounds).
@@ -407,6 +461,10 @@ impl AbsoluteTracker {
         // Keeping the tracked position equal to the sent one prevents a desync
         // when the cursor is pushed into a gap between monitors.
         let (x, y) = self.snap(clamped_x, clamped_y);
+        // Remember the deepest point inside the screen reached since arming:
+        // outward residual pushes the parked pointer at the edge and must not
+        // count as a return until the user has actually used the screen.
+        self.inward_travel_px = self.inward_travel_px.max(self.inward_distance(x, y));
 
         if self.fired {
             self.x = x;
@@ -457,7 +515,7 @@ impl AbsoluteTracker {
             };
         self.x = x;
         self.y = y;
-        if near_edge && past_edge {
+        if near_edge && past_edge && self.return_ready() {
             self.fired = true;
             // Snap to the edge so reversing the push moves the cursor again
             // immediately (the overrun distance must not be swallowed).
@@ -1270,6 +1328,19 @@ mod absolute_tracker_tests {
         vec![(0.0, 0.0, 1920.0, 1080.0), (1920.0, 0.0, 3840.0, 1080.0)]
     }
 
+    /// Mark the remote control as old enough for a return request (settle
+    /// elapsed) without moving the pointer.
+    fn settled(tracker: &mut AbsoluteTracker) {
+        tracker.armed_at = Instant::now() - ENTRY_RETURN_SETTLE - Duration::from_millis(1);
+    }
+
+    /// Mark the remote control as established for the geometry tests: settle
+    /// elapsed and the pointer was already used inside the screen.
+    fn established(tracker: &mut AbsoluteTracker) {
+        settled(tracker);
+        tracker.inward_travel_px = tracker.inward_travel_px.max(ENTRY_WORK_DEADBAND_PX);
+    }
+
     #[test]
     fn anchor_starts_at_the_entry_edge() {
         assert_eq!(tracker(PointerEdge::Left).absolute(), (2.0, 800.0));
@@ -1367,6 +1438,7 @@ mod absolute_tracker_tests {
             Some(0.5),
         )
         .expect("left tracker");
+        settled(&mut tracker);
         assert_eq!(tracker.absolute(), (0.0, 800.0));
         assert_eq!(tracker.apply(100.0, 0.0), None);
         assert_eq!(tracker.apply(50.0, 10.0), None);
@@ -1382,6 +1454,7 @@ mod absolute_tracker_tests {
             Some(0.5),
         )
         .expect("right tracker");
+        settled(&mut right);
         assert_eq!(right.absolute(), (W - 1.0, 800.0));
         assert_eq!(right.apply(-100.0, 0.0), None);
         assert_eq!(right.apply(110.0, 0.0), Some(PointerEdge::Right));
@@ -1402,6 +1475,7 @@ mod absolute_tracker_tests {
         // Anchored 2 px inside: -2 puts the raw position exactly on the edge
         // (not a hand-off), the next outward pixel crosses it.
         let mut tracker = tracker(PointerEdge::Left);
+        established(&mut tracker);
         assert_eq!(tracker.apply(-2.0, 0.0), None);
         assert_eq!(tracker.apply(-1.0, 0.0), Some(PointerEdge::Left));
     }
@@ -1420,6 +1494,7 @@ mod absolute_tracker_tests {
         )
         .expect("right tracker");
         let mut right = right;
+        established(&mut right);
         assert_eq!(right.apply(1.0, 0.0), Some(PointerEdge::Right));
 
         let mut bottom = AbsoluteTracker::new_with_entry(
@@ -1431,12 +1506,14 @@ mod absolute_tracker_tests {
             Some(0.5),
         )
         .expect("bottom tracker");
+        established(&mut bottom);
         assert_eq!(bottom.apply(0.0, 1.0), Some(PointerEdge::Bottom));
     }
 
     #[test]
     fn pushing_past_the_entry_edge_fires_exactly_once() {
         let mut tracker = tracker(PointerEdge::Left);
+        established(&mut tracker);
         // anchored 24 px inside; a push back past the edge hands control back
         assert_eq!(tracker.apply(-30.0, 0.0), Some(PointerEdge::Left));
         // latched: a single hand-off per activation
@@ -1453,6 +1530,7 @@ mod absolute_tracker_tests {
         ];
         for (edge, sx, sy) in cases {
             let mut tracker = tracker(edge);
+            established(&mut tracker);
             assert_eq!(tracker.apply(sx, sy), Some(edge), "{edge:?}");
         }
     }
@@ -1468,6 +1546,7 @@ mod absolute_tracker_tests {
     #[test]
     fn absolute_position_stays_valid_in_half_open_region_bounds() {
         let mut tracker = tracker(PointerEdge::Right);
+        established(&mut tracker);
         assert_eq!(tracker.apply(30.0, 0.0), Some(PointerEdge::Right));
         let (x, y) = tracker.absolute();
         assert!((0.0..=W - 1.0).contains(&x));
@@ -1498,6 +1577,7 @@ mod absolute_tracker_tests {
     #[test]
     fn overrun_does_not_swallow_the_reverse_movement() {
         let mut tracker = tracker(PointerEdge::Left);
+        established(&mut tracker);
         assert_eq!(tracker.apply(-30.0, 0.0), Some(PointerEdge::Left));
         // cursor snapped to the edge; moving back inside moves it immediately
         let _ = tracker.apply(500.0, 0.0);
@@ -1546,6 +1626,7 @@ mod absolute_tracker_tests {
         ];
         let mut tracker =
             AbsoluteTracker::new(PointerEdge::Bottom, 1, regions, 1.0, 1.0).expect("regions");
+        established(&mut tracker);
         // anchor is at the bottom edge of C
         assert_eq!(tracker.absolute(), (4800.0, 2157.0));
         // push left into the empty quadrant: the real cursor is snapped to a
@@ -1717,6 +1798,7 @@ mod absolute_tracker_tests {
     #[test]
     fn accelerated_fast_delta_is_not_rejected() {
         let mut tracker = tracker(PointerEdge::Left);
+        established(&mut tracker);
         // the raw delta limit is 4096; the tracker must accept the boosted
         // value (up to 3x) instead of treating it as corrupted
         assert_eq!(tracker.apply(-8800.0, 0.0), Some(PointerEdge::Left));
@@ -1725,9 +1807,100 @@ mod absolute_tracker_tests {
     #[test]
     fn fired_latch_rearms_after_returning_inside() {
         let mut tracker = tracker(PointerEdge::Left);
+        established(&mut tracker);
         assert_eq!(tracker.apply(-30.0, 0.0), Some(PointerEdge::Left));
         assert_eq!(tracker.apply(-8.0, 0.0), None);
         let _ = tracker.apply(200.0, 0.0);
         assert_eq!(tracker.apply(-1200.0, 0.0), Some(PointerEdge::Left));
+    }
+
+    // -----------------------------------------------------------------
+    // Receiver-side return gate (old unguarded source / mixed-build churn)
+    // -----------------------------------------------------------------
+
+    /// The parked-anchor residual: an old (0.2.18) source forwards the
+    /// activation warp/backswing outward through the edge while the receiver
+    /// pointer has never been used inside the screen. That must not request a
+    /// return - it is the observed `pushed past the Right edge` churn.
+    #[test]
+    fn parked_edge_residual_does_not_request_a_return() {
+        let mut tracker = tracker(PointerEdge::Right);
+        settled(&mut tracker);
+        assert_eq!(tracker.inward_travel_px, 0.0);
+        // 1 px of edge jitter, then a real 17.9 px backswing burst.
+        assert_eq!(tracker.apply(1.0, 0.0), None);
+        assert_eq!(tracker.apply(17.961, 0.0), None);
+        assert!(
+            !tracker.fired,
+            "no return before the pointer was used inside"
+        );
+        assert!(!tracker.return_ready());
+    }
+
+    /// The deadband/accumulation: once the injected pointer has actually been
+    /// worked 2+ px inside the screen, a deliberate reverse beyond the edge
+    /// hands control back immediately.
+    #[test]
+    fn return_after_working_inside_is_immediate() {
+        let mut tracker = tracker(PointerEdge::Right);
+        settled(&mut tracker);
+        // The user moves the remote cursor into the screen.
+        assert_eq!(tracker.apply(-10.0, 0.0), None);
+        assert!(tracker.inward_travel_px >= ENTRY_WORK_DEADBAND_PX);
+        // A deliberate push back through the edge hands control back at once.
+        assert_eq!(tracker.apply(14.0, 0.0), Some(PointerEdge::Right));
+    }
+
+    /// The settle debounce: entrance residual during the first
+    /// [`ENTRY_RETURN_SETTLE`] is ignored even if the pointer was nudged in;
+    /// once the remote control is established the same push hands back.
+    #[test]
+    fn entrance_residual_during_the_settle_window_is_ignored() {
+        let mut tracker = tracker(PointerEdge::Right);
+        // Fresh arm: settle not elapsed.
+        assert_eq!(tracker.apply(-10.0, 0.0), None);
+        assert_eq!(tracker.apply(14.0, 0.0), None, "settle window must gate it");
+        assert!(!tracker.fired);
+        // The hand-off settled: the same outward push now returns.
+        settled(&mut tracker);
+        assert_eq!(tracker.apply(14.0, 0.0), Some(PointerEdge::Right));
+    }
+
+    /// During the settle window the injected pointer still has to move (no
+    /// frozen cursor): only the *return request* is gated, not the injection.
+    #[test]
+    fn inward_motion_during_the_settle_still_moves_the_cursor() {
+        let mut tracker = tracker(PointerEdge::Right);
+        let (before, _) = tracker.absolute();
+        assert_eq!(tracker.apply(-10.0, 0.0), None);
+        let (after, _) = tracker.absolute();
+        assert!(
+            (before - after - 10.0).abs() < 1e-9,
+            "before={before} after={after}"
+        );
+    }
+
+    /// The work deadband accumulates from real inward motion: nudging in by one
+    /// pixel is not enough, two pixels are.
+    #[test]
+    fn the_work_deadband_requires_real_inward_travel() {
+        // `EnterAt` anchor: the pointer starts exactly on the entry edge.
+        let mut tracker = AbsoluteTracker::new_with_entry(
+            PointerEdge::Right,
+            1,
+            vec![(0.0, 0.0, W, H)],
+            1.0,
+            1.0,
+            Some(0.5),
+        )
+        .expect("right tracker");
+        settled(&mut tracker);
+        assert_eq!(tracker.inward_travel_px, 0.0);
+        assert_eq!(tracker.apply(-1.0, 0.0), None);
+        assert!(!tracker.return_ready(), "1 px inward is below the deadband");
+        assert_eq!(tracker.apply(3.0, 0.0), None, "but jitter must not fire");
+        assert_eq!(tracker.apply(-2.0, 0.0), None);
+        assert!(tracker.return_ready(), "2 px inward satisfies the deadband");
+        assert_eq!(tracker.apply(4.0, 0.0), Some(PointerEdge::Right));
     }
 }
