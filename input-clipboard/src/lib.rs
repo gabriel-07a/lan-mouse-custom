@@ -94,6 +94,23 @@ pub enum Error {
     Frame(#[from] lan_mouse_proto::clipboard::FrameError),
 }
 
+impl Error {
+    /// Whether this error means the OS clipboard session itself is gone and
+    /// the backend must be recreated (for example the XDG portal restarted or
+    /// invalidated the RemoteDesktop session). Retrying a write on the same
+    /// dead session can never succeed and used to leave clipboard sync broken
+    /// until the service was restarted.
+    pub fn needs_backend_restart(&self) -> bool {
+        let Self::Backend(message) = self else {
+            return false;
+        };
+        let message = message.to_ascii_lowercase();
+        message.contains("invalid session")
+            || message.contains("session is invalid")
+            || message.contains("session invalid")
+    }
+}
+
 /// Size limits for a single clipboard snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
@@ -586,5 +603,17 @@ mod tests {
             sample()
         );
         assert_eq!(clipboard.reads.get(), 1);
+    }
+    #[test]
+    fn an_invalid_portal_session_requests_a_backend_restart() {
+        assert!(
+            Error::Backend(
+                "set portal selection: Portal request failed: org.freedesktop.zbus.Error: Invalid session"
+                    .into()
+            )
+            .needs_backend_restart()
+        );
+        assert!(!Error::Backend("clipboard is busy".into()).needs_backend_restart());
+        assert!(!Error::TooLarge.needs_backend_restart());
     }
 }

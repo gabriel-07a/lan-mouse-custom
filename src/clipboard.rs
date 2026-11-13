@@ -593,6 +593,13 @@ async fn run(
                             log::warn!("clipboard: could not apply remote snapshot: {e}");
                             status.last_error = Some(e.to_string());
                             let _ = status_tx.send(status.clone());
+                            if e.needs_backend_restart() {
+                                log::warn!(
+                                    "clipboard: portal session is invalid; recreating the clipboard backend"
+                                );
+                                sync.on_apply_failed(&apply.snapshot);
+                                return RunExit::BackendStopped;
+                            }
                             if apply.on_failure(Instant::now()) {
                                 log::debug!(
                                     "clipboard: retrying the failed clipboard write (attempt {})",
@@ -638,6 +645,15 @@ async fn run(
                         return RunExit::BackendStopped;
                     }
                     Err(e) => {
+                        if e.needs_backend_restart() {
+                            log::warn!(
+                                "clipboard: portal session is invalid; recreating the clipboard backend"
+                            );
+                            if let Some(apply) = pending_apply.take() {
+                                sync.on_apply_failed(&apply.snapshot);
+                            }
+                            return RunExit::BackendStopped;
+                        }
                         log::warn!("clipboard: local change error: {e}");
                         // The OS notification was already consumed. A
                         // transient read failure (a clipboard manager holding
