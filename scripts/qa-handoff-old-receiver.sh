@@ -122,24 +122,32 @@ replay_checks() {
         return
     fi
     cp tests/qa_handoff_old_receiver_verify.rs "$prefix/tests/"
-    # Adapt the harness to the pre-fix API: the pre-fix CaptureTask has no
-    # reverse-guard field/deadline and its guard disarms on the first forward
-    # delta. Only the API differences are patched; the trace and both state
-    # machines (production source and old-receiver model) are unchanged.
+    # Adapt the harness to the pre-fix API: the pre-fix (8b6981d)
+    # CaptureTask has none of the later guard fields (residual budget, fixed
+    # window, position-aware band/deadline, remote-entry dwell) and its guard
+    # disarms on the first forward delta. Only the API differences are patched;
+    # the trace and both state machines (production source and old-receiver
+    # model) are unchanged.
     python3 - "$prefix/tests/qa_handoff_old_receiver_verify.rs" <<'PY'
 import sys
+
 path = sys.argv[1]
 s = open(path).read()
-s = s.replace("            reverse_guard_until: None,\n", "")
-s = s.replace("""    fn replay_expire_reverse_guard(task: &mut CaptureTask) {
-        assert!(
-            task.reverse_guard_until.is_some(),
-            "precondition: the reverse guard must be armed after Begin"
-        );
-        task.reverse_guard_until = Some(Instant::now() - Duration::from_millis(1));
-    }""", """    fn replay_expire_reverse_guard(_task: &mut CaptureTask) {
-        // pre-fix tree: the guard disarms on the first forward delta
-    }""")
+for field in [
+    "            reverse_guard_until: None,\n",
+    "            handoff_inward_px: None,\n",
+    "            handoff_leading_until: None,\n",
+    "            remote_peer_since: None,\n",
+    "            enter_only_take_back_sent: false,\n",
+]:
+    s = s.replace(field, "")
+start = s.index("    fn replay_expire_reverse_guard(")
+end = s.index("\n    }\n", start) + len("\n    }\n")
+s = s[:start] + (
+    "    fn replay_expire_reverse_guard(_task: &mut CaptureTask) {\n"
+    "        // pre-fix tree: the guard disarms on the first forward delta\n"
+    "    }\n"
+) + s[end:]
 open(path, "w").write(s)
 PY
     local prefix_log="$LOG/prefix-replay.log"

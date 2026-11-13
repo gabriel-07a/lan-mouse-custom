@@ -294,6 +294,8 @@ mod capture {
             enter_along: None,
             residual_reverse_px: None,
             reverse_guard_until: None,
+            handoff_inward_px: None,
+            handoff_leading_until: None,
             handoff_begin_at: None,
             trace_window_until: None,
             trace_last_motion: None,
@@ -301,6 +303,8 @@ mod capture {
             sensitivity: HashMap::new(),
             outgoing_caps: HashMap::new(),
             remote_peer: None,
+            remote_peer_since: None,
+            enter_only_take_back_sent: false,
             grace: Duration::from_millis(1000),
             disconnected_since: None,
             event_tx,
@@ -353,13 +357,19 @@ mod capture {
         .expect("motion event");
     }
 
-    /// Simulate the 200 ms reverse guard window elapsing without sleeping.
+    /// Simulate the whole hand-off guard elapsing without sleeping: the old
+    /// fixed 200 ms window plus the position-aware bound added by task-10.
+    /// The position-aware filter only disarms early once the pointer moved
+    /// clearly inward, so a "return after the window" needs both deadlines
+    /// expired (the 250 ms bounded escape).
     fn replay_expire_reverse_guard(task: &mut CaptureTask) {
         assert!(
-            task.reverse_guard_until.is_some(),
-            "precondition: the reverse guard must be armed after Begin"
+            task.handoff_inward_px.is_some(),
+            "precondition: the position-aware guard must be armed after Begin"
         );
-        task.reverse_guard_until = Some(Instant::now() - Duration::from_millis(1));
+        let past = Some(Instant::now() - Duration::from_millis(1));
+        task.reverse_guard_until = past;
+        task.handoff_leading_until = past;
     }
 
     /// The pointer motions the source actually forwarded, in send order.

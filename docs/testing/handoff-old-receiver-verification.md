@@ -278,3 +278,27 @@ Residual risks (accepted / documented, not blockers):
 | T4 | return within 200 ms of entry (deliberate quick hand-back) | the reverse push is delivered once the 200 ms window ends (≤ 200 ms delay, no extra force beyond the delay) | manual; expect a short pause for a deliberate immediate return, never a swallowed gesture |
 | T5 | close Lan Mouse on Ubuntu while a Windows session is active | cursor-hide and cursor-park removed, Ubuntu cursor visible at the edge/top | `scripts/qa-handoff-shutdown.sh` covers the daemon side; manual for the GUI close |
 | T6 | Windows 0.2.18 receives a forced return push > 3 px | one `LeaveAt`, no loop | manual; confirms the old receiver compatibility contract in production |
+
+## 8. Update after task-10 / 0.2.19 (bidirectional guard)
+
+The old-receiver conclusions above still hold on the final 0.2.19 tree
+(`ac728e5`), now with the task-10 **position-aware** extension of the same
+`src/capture.rs` guard (`docs/testing/handoff-bidirectional-verification.md`):
+
+- the filter still drops **all** reverse deltas while the receiver cursor is
+  next to the entry edge (displacement below `HANDOFF_ENTRY_BAND_PX = 16 px`),
+  independent of the 200 ms window, and forwards **all** forward deltas
+  immediately;
+- a guarded source therefore still feeds the old Windows 0.2.18 receiver only
+  inward motion, so it produces **0** `LeaveAt` triggers for the same trace
+  scenes (re-verified by `tests/qa_handoff_bidirectional.rs` and by the
+  adapted `tests/qa_handoff_old_receiver_verify.rs`);
+- the old receiver harness's "return after the window" helper now expires both
+  deadlines (the fixed 200 ms telemetry window and the 250 ms position-aware
+  bound): under the final guard a reverse gesture is only "genuine" after the
+  pointer moved clearly inward or the bounded filter expired, which matches
+  the task-10 contract and the analysis of the 204.0–205.4 ms settling cluster.
+
+No production behaviour regressed: the final gate in this document's sibling
+verification (`handoff-bidirectional-verification.md` §5) includes this
+harness (79/79) and the previous full gate script.
