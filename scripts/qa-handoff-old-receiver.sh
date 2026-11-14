@@ -240,7 +240,7 @@ gates() {
             env CC_x86_64_pc_windows_gnu="$OUT/zig/cc" \
                 AR_x86_64_pc_windows_gnu="$OUT/zig/ar" \
                 CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$OUT/zig/cc" \
-                cargo check --workspace --all-targets --exclude lan-mouse-gtk \
+                cargo check --workspace --all-targets \
                 --target x86_64-pc-windows-gnu
     fi
 }

@@ -50,7 +50,7 @@ modules:
       - cargo fetch --manifest-path Cargo.toml --verbose
       - cargo build
       - install -Dm0755 target/debug/lan-mouse /app/bin/lan-mouse
-      - install -Dm0644 lan-mouse-gtk/resources/de.feschber.LanMouse.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      - install -Dm0644 assets/de.feschber.LanMouse.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
       - install -Dm0644 de.feschber.LanMouse.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
     sources:
       - type: dir

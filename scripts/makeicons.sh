@@ -10,7 +10,7 @@
 # Usage: scripts/makeicons.sh [SVG]
 set -e
 
-svg="${1:-./lan-mouse-gtk/resources/de.feschber.LanMouse.svg}"
+svg="${1:-./assets/de.feschber.LanMouse.svg}"
 outdir="./assets"
 
 CANVAS=1024
@@ -62,10 +62,6 @@ done
 for size in 512 256 128 48 32; do
     cp "$workdir/${size}.png" "$outdir/icon-${size}.png"
 done
-
-# The tray loads the icon from the GTK resource bundle, so keep a copy there.
-mkdir -p lan-mouse-gtk/resources/icons
-cp "$outdir/icon-256.png" lan-mouse-gtk/resources/icons/icon-256.png
 
 # Multi-resolution .ico for the executable, the installer and the tray.
 "$magick" "$workdir/16.png" "$workdir/32.png" "$workdir/48.png" \

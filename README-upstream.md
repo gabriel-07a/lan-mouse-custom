@@ -149,7 +149,7 @@ sudo cp path/to/lan-mouse path/to/lan-mouse-gpui /usr/local/bin/
 
 # install app icon
 sudo mkdir -p /usr/local/share/icons/hicolor/scalable/apps
-sudo cp lan-mouse-gtk/resources/de.feschber.LanMouse.svg /usr/local/share/icons/hicolor/scalable/apps
+sudo cp assets/de.feschber.LanMouse.svg /usr/local/share/icons/hicolor/scalable/apps
 
 # update icon cache
 gtk-update-icon-cache /usr/local/share/icons/hicolor/
@@ -305,8 +305,8 @@ sudo apt install libx11-dev libxtst-dev libwayland-dev libxkbcommon-dev \
 ```
 
 For a GPU-accelerated GPUI frontend also install the Vulkan/GL driver for your
-system (Mesa is usually already present on Ubuntu). The legacy GTK frontend is
-opt-in with `--features gtk` and needs `libgtk-4-dev libadwaita-1-dev`.
+system (Mesa is usually already present on Ubuntu). The legacy GTK frontend has
+been removed from this fork.
 </details>
 
 <details>
@@ -356,9 +356,7 @@ cargo build --release --manifest-path lan-mouse-gpui/Cargo.toml
 - Put `lan-mouse.exe` and `lan-mouse-gpui.exe` in the same directory: the main
   binary starts the frontend as a separate process and connects over the local
   IPC socket.
-- The service/CLI and the GTK-less GPUI UI do not need GTK or gvsbuild anymore.
-  The legacy GTK frontend is opt-in with `--features gtk` and still requires
-  the old gvsbuild setup.
+- The service/CLI and the GPUI UI do not need GTK or gvsbuild.
 </details>
 
 ## Usage
@@ -366,7 +364,7 @@ cargo build --release --manifest-path lan-mouse-gpui/Cargo.toml
     <summary>GPUI Frontend (default)</summary>
 
 By default Lan Mouse starts the fast GPUI frontend. It connects to the
-background service over the same local IPC channel as the GTK build and shows:
+background service over the local IPC channel and shows:
 
 - **Devices**: configured peers with live state, connect/disconnect, position
   cycling, sensitivity, DNS resolution and edit/remove controls;
@@ -388,9 +386,8 @@ the LAN connection keep running, and starting Lan Mouse again reopens the
 window against the same service. Use **Settings → Quit Lan Mouse** (or the tray
 menu while the window is open) to stop the service and the connection.
 
-The legacy GTK frontend remains available by building with `--features gtk`;
-the `LAN_MOUSE_FRONTEND=gpui` environment variable selects the GPUI frontend
-from a GTK-enabled build.
+The legacy GTK frontend has been removed from this fork; GPUI is the only
+graphical frontend.
 <details>
     <summary>Command Line Interface</summary>
 

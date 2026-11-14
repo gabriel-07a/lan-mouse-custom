@@ -7,7 +7,6 @@ members = [
     "input-event",
     "lan-mouse-ipc",
     "lan-mouse-cli",
-    "lan-mouse-gtk",
     "lan-mouse-proto",
     "lan-mouse-test-support",
 ]
@@ -42,7 +41,6 @@ input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
-lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
 lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
 # The generated shadow.rs only needs the `shadow!` macro and `formatcp!`
@@ -107,7 +105,6 @@ default = [
     "rdp_emulation",
     "x11_emulation",
 ]
-gtk = ["dep:lan-mouse-gtk"]
 gpui = []
 layer_shell_capture = ["input-capture/layer_shell"]
 # NOTE: the X11 *capture* backend is a stub in this fork (always

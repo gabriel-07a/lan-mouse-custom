@@ -16,10 +16,8 @@ use lan_mouse::{
 };
 use lan_mouse_cli::CliError;
 
-#[cfg(feature = "gtk")]
-use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 use std::process::Child;
 use std::{future::Future, io, process};
 use thiserror::Error;
@@ -39,9 +37,6 @@ enum LanMouseError {
     Capture(#[from] InputCaptureError),
     #[error(transparent)]
     Emulation(#[from] InputEmulationError),
-    #[cfg(feature = "gtk")]
-    #[error(transparent)]
-    Gtk(#[from] GtkError),
     #[error(transparent)]
     Cli(#[from] CliError),
     #[error(transparent)]
@@ -49,11 +44,10 @@ enum LanMouseError {
 }
 
 fn main() {
-    // Must happen before the first window is created: the input backends rely
-    // on physical pixel coordinates and per-monitor DPI queries, and GDK (when
-    // the GUI starts) detects the awareness we set here instead of setting its
-    // own. Daemon and CLI modes never open a GDK display, so without this they
-    // would stay DPI-unaware and could not tell the displays' scale apart.
+    // The input backends rely on physical pixel coordinates and per-monitor
+    // DPI queries. The GUI runs in a separate process, so daemon and CLI modes
+    // never get DPI awareness from a toolkit; without this they would stay
+    // DPI-unaware and could not tell the displays' scale apart.
     enable_per_monitor_dpi_awareness();
 
     // A GUI executable has no console; when the binary is invoked from a
@@ -92,7 +86,7 @@ fn run() -> Result<(), LanMouseError> {
         None => {
             //  otherwise start the service as a child process and
             //  run a frontend
-            #[cfg(all(feature = "gpui", not(feature = "gtk")))]
+            #[cfg(feature = "gpui")]
             {
                 let mut service = if lan_mouse_ipc::is_service_running() {
                     log::info!("daemon already running, connecting to existing instance");
@@ -120,42 +114,10 @@ fn run() -> Result<(), LanMouseError> {
                 }
                 res.map(|_| ())?;
             }
-            #[cfg(feature = "gtk")]
+            #[cfg(not(feature = "gpui"))]
             {
-                // Only spawn a new daemon if one isn't already running
-                let mut service = if lan_mouse_ipc::is_service_running() {
-                    log::info!("daemon already running, connecting to existing instance");
-                    None
-                } else {
-                    Some(start_service()?)
-                };
-                let use_gpui =
-                    std::env::var_os("LAN_MOUSE_FRONTEND").is_some_and(|value| value == "gpui");
-                let res = if use_gpui {
-                    log::info!("LAN_MOUSE_FRONTEND=gpui selected");
-                    run_gpui_frontend()
-                } else {
-                    lan_mouse_gtk::run(config::local_commit())
-                        .map_err(LanMouseError::from)
-                        .map(|()| FrontendExit::Quit)
-                };
-                match &res {
-                    Ok(FrontendExit::KeepService) => {
-                        log::info!("frontend window closed; keeping the Lan Mouse service running");
-                    }
-                    _ => {
-                        // Give the service a chance to terminate gracefully
-                        // (SIGINT), but never block the window close on a stuck
-                        // daemon and always reap the child.
-                        shutdown_service(service.as_mut());
-                    }
-                }
-                res.map(|_| ())?;
-            }
-            #[cfg(all(not(feature = "gtk"), not(feature = "gpui")))]
-            {
-                // Headless build: run the daemon directly. With `gpui` or
-                // `gtk` enabled the frontend path above owns the lifecycle;
+                // Headless build: run the daemon directly. With `gpui`
+                // enabled the frontend path above owns the lifecycle;
                 // falling through to this arm after the GUI exits would leave
                 // the process running as a daemon forever.
                 match run_async(run_service(config)) {
@@ -172,7 +134,7 @@ fn run() -> Result<(), LanMouseError> {
 }
 
 /// Why the frontend process exited, as decided by its exit code.
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrontendExit {
     /// Explicit quit: the service was asked to shut down and the daemon this
@@ -191,7 +153,7 @@ enum FrontendExit {
 /// the opposite for unexpected codes: minimizing the Windows frontend ended
 /// the frontend process, the launcher then killed its daemon child, and the
 /// peer connection dropped.
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 fn classify_frontend_exit(code: Option<i32>) -> FrontendExit {
     match code {
         Some(lan_mouse_ipc::FRONTEND_EXIT_QUIT) => FrontendExit::Quit,
@@ -211,7 +173,7 @@ fn classify_frontend_exit(code: Option<i32>) -> FrontendExit {
     }
 }
 
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 fn run_gpui_frontend() -> Result<FrontendExit, LanMouseError> {
     let frontend = gpui_frontend_path()?;
     log::info!("launching GPUI frontend: {frontend:?}");
@@ -224,7 +186,7 @@ fn run_gpui_frontend() -> Result<FrontendExit, LanMouseError> {
     Ok(classify_frontend_exit(status.code()))
 }
 
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 fn gpui_frontend_path() -> Result<std::path::PathBuf, std::io::Error> {
     if let Some(path) = std::env::var_os("LAN_MOUSE_GPUI") {
         let path = std::path::PathBuf::from(path);
@@ -266,7 +228,7 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 fn start_service() -> Result<Child, io::Error> {
     let mut command = process::Command::new(std::env::current_exe()?);
     command.args(std::env::args().skip(1)).arg("daemon");
@@ -281,8 +243,8 @@ fn start_service() -> Result<Child, io::Error> {
 
 /// Sets the process DPI awareness to per-monitor v2 on Windows.
 ///
-/// GDK does the same when it opens a display, but `lan-mouse --daemon` and the
-/// CLI commands never do. `GetDpiForMonitor` reports the real scale only for a
+/// `lan-mouse --daemon` and the CLI commands never open a window, so no
+/// toolkit sets it for them. `GetDpiForMonitor` reports the real scale only for a
 /// per-monitor aware process, and the input backends need it to convert
 /// between physical pixels and the logical motion carried on the wire.
 fn enable_per_monitor_dpi_awareness() {
@@ -391,7 +353,7 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
 
 /// How long the frontend waits for the daemon to exit after SIGINT before
 /// killing it.
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 const SERVICE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Stop the daemon child this process started (if any) without ever blocking
@@ -400,13 +362,13 @@ const SERVICE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_se
 /// A window close must not hang on a daemon that ignores SIGINT, and the child
 /// must be reaped so it does not linger as an orphan (and so its pid cannot be
 /// recycled while this process still holds it).
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 fn shutdown_service(service: Option<&mut Child>) {
     let Some(service) = service else { return };
     shutdown_service_with_grace(service, SERVICE_SHUTDOWN_GRACE);
 }
 
-#[cfg(all(unix, any(feature = "gtk", feature = "gpui")))]
+#[cfg(all(unix, feature = "gpui"))]
 fn shutdown_service_with_grace(service: &mut Child, grace: std::time::Duration) {
     use std::time::Instant;
 
@@ -441,7 +403,7 @@ fn shutdown_service_with_grace(service: &mut Child, grace: std::time::Duration) 
     stop_child(service);
 }
 
-#[cfg(all(not(unix), any(feature = "gtk", feature = "gpui")))]
+#[cfg(all(not(unix), feature = "gpui"))]
 fn shutdown_service_with_grace(service: &mut Child, _grace: std::time::Duration) {
     // A Windows console-less child cannot receive our Ctrl-C; terminate it.
     match service.try_wait() {
@@ -451,7 +413,7 @@ fn shutdown_service_with_grace(service: &mut Child, _grace: std::time::Duration)
     stop_child(service);
 }
 
-#[cfg(any(feature = "gtk", feature = "gpui"))]
+#[cfg(feature = "gpui")]
 fn stop_child(service: &mut Child) {
     if let Err(e) = service.kill() {
         log::warn!("could not kill daemon: {e}");
@@ -461,7 +423,7 @@ fn stop_child(service: &mut Child) {
     }
 }
 
-#[cfg(all(test, any(feature = "gtk", feature = "gpui")))]
+#[cfg(all(test, feature = "gpui"))]
 mod frontend_exit_tests {
     use super::*;
 
@@ -495,7 +457,7 @@ mod frontend_exit_tests {
     }
 }
 
-#[cfg(all(test, unix, any(feature = "gtk", feature = "gpui")))]
+#[cfg(all(test, unix, feature = "gpui"))]
 mod shutdown_tests {
     use super::*;
     use std::process::Command;

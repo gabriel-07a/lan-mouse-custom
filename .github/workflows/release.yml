@@ -89,9 +89,7 @@ jobs:
         with:
           name: lan-mouse-gpui-windows
           path: lan-mouse-windows
-      # MSYS2 ships prebuilt GTK4/libadwaita for the mingw-w64 target, so the
-      # job takes minutes instead of compiling GTK with gvsbuild (which also
-      # depends on whichever Visual Studio version the runner happens to have).
+      # The service builds with the MSYS2 GNU toolchain (mingw-w64 target).
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64

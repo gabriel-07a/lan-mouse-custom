@@ -66,8 +66,8 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
 - Novo frontend **GPUI** (GPU, mais rápido) como padrão, com a interface
   repaginada: dispositivos, rede/descoberta, configurações, status do clipboard
   e emparelhamento.
-- O frontend antigo em GTK continua disponível como fallback opt-in
-  (`--features gtk`); `LAN_MOUSE_FRONTEND=gpui` força o GPUI.
+- O frontend antigo em GTK/libadwaita foi removido; o GPUI é o único
+  frontend gráfico (a CLI continua disponível).
 - O serviço/daemon e o frontend são processos separados; fechar a janela não
   precisa derrubar o daemon (ver seção de fechamento abaixo).
 

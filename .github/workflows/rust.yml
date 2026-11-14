@@ -48,7 +48,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev \
+          sudo apt-get install -y libx11-dev libxtst-dev \
             libwayland-dev libxkbcommon-dev
 
       - name: Setup MSYS2 (Windows)
@@ -82,10 +82,7 @@ jobs:
       - name: cargo check (Windows)
         if: runner.os == 'Windows' && matrix.job == 'check'
         shell: msys2 {0}
-        # lan-mouse-gtk is the legacy Linux-only GTK4 frontend; it remains a
-        # workspace member, so it must be excluded when checking the workspace
-        # on Windows (GTK4 is not available in this MSYS2 setup).
-        run: cargo check --workspace --all-targets --exclude lan-mouse-gtk
+        run: cargo check --workspace --all-targets
 
       - name: cargo test (Linux)
         if: runner.os == 'Linux' && matrix.job == 'test'
@@ -112,7 +109,7 @@ jobs:
           CARGO_TERM_COLOR: never
         run: |
           set +e
-          cargo test --workspace --exclude lan-mouse-gtk -- --test-threads=1 2>&1 | tee test.log
+          cargo test --workspace -- --test-threads=1 2>&1 | tee test.log
           status=${PIPESTATUS[0]}
           {
             echo "--- failing tests ---"
@@ -163,7 +160,7 @@ jobs:
           RUSTFLAGS: -D warnings
         run: |
           set +e
-          /ucrt64/bin/cargo.exe check --workspace --all-targets --exclude lan-mouse-gtk 2>&1 | tee clippy.log
+          /ucrt64/bin/cargo.exe check --workspace --all-targets 2>&1 | tee clippy.log
           status=${PIPESTATUS[0]}
           {
             echo "--- diagnostics ---"

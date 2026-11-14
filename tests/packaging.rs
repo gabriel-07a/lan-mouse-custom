@@ -267,10 +267,7 @@ fn desktop_entry_points_at_the_installed_binary() {
 fn icons_are_committed_and_valid() {
     assert!(exists("assets/icon.ico"), "windows icon");
     assert!(exists("assets/icon-256.png"), "package icon");
-    assert!(
-        exists("lan-mouse-gtk/resources/icons/icon-256.png"),
-        "tray icon"
-    );
+    assert!(exists("assets/de.feschber.LanMouse.svg"), "scalable icon");
 
     // ICO: reserved 0, type 1.
     let ico = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.ico"))
@@ -285,10 +282,10 @@ fn icons_are_committed_and_valid() {
 
 #[test]
 fn menu_offers_a_way_to_quit() {
-    let ui = read("lan-mouse-gtk/resources/window.ui");
+    let ui = read("lan-mouse-gpui/src/lib.rs");
     assert!(
-        ui.contains("app.quit-app"),
-        "the hamburger menu must offer Quit Lan Mouse"
+        ui.contains("\"quit-app\"") && ui.contains("request_quit()"),
+        "the frontend must offer Quit Lan Mouse"
     );
 }
 

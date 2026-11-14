@@ -29,7 +29,7 @@ trap 'rm -rf "$stage"' EXIT
 install -Dm755 "$binary" "$stage/usr/bin/lan-mouse"
 install -Dm755 "$frontend" "$stage/usr/bin/lan-mouse-gpui"
 install -Dm644 de.feschber.LanMouse.desktop "$stage/usr/share/applications/de.feschber.LanMouse.desktop"
-install -Dm644 lan-mouse-gtk/resources/de.feschber.LanMouse.svg \
+install -Dm644 assets/de.feschber.LanMouse.svg \
     "$stage/usr/share/icons/hicolor/scalable/apps/de.feschber.LanMouse.svg"
 
 # Raster sizes give the taskbar/tray crisp icons at every scale.

@@ -104,8 +104,7 @@ which ensures clients can only be controlled directly and not indirectly through
 
 ## Connection State Shown by the Frontend
 
-The device card (GPUI: `lan-mouse-gpui/src/lib.rs`; legacy GTK:
-`lan-mouse-gtk/src/client_row.rs`) derives its status badge,
+The device card (`lan-mouse-gpui/src/lib.rs`) derives its status badge,
 spinner, action button and subtitle from the two link properties published by
 the service:
 
