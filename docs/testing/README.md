@@ -112,6 +112,13 @@ O handoff Ubuntu → Windows contra receptores antigos (0.2.18) está coberto po
 A verificação bidirecional (origem/receptor, mesma build 0.2.19) está em
 [handoff-bidirectional-verification.md](handoff-bidirectional-verification.md).
 
+## Simulador de mesa (handoff sem mexer no mouse)
+
+[desk-simulator.md](desk-simulator.md): dois ou mais `Service` reais no mesmo
+processo, com telas virtuais no lugar dos backends de captura e emulação.
+Testa cruzar a borda e voltar de ponta a ponta com `cargo test --lib desk_sim`.
+Use para todo bug de handoff que hoje só se reproduz arrastando o mouse.
+
 ## Diagnóstico de handoff
 
 Consulte [handoff-trace.md](handoff-trace.md) para capturar a latência

@@ -301,6 +301,7 @@ mod capture {
         let task = CaptureTask {
             active_client: None,
             backend: Some(input_capture::Backend::Dummy),
+            custom_backend: None,
             cancellation_token: CancellationToken::new(),
             captures,
             coalescer: MotionCoalescer::new(0),

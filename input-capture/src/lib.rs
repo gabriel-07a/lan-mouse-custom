@@ -264,6 +264,24 @@ impl InputCapture {
         })
     }
 
+    /// Wrap a backend implemented outside this crate.
+    ///
+    /// The bookkeeping (position map, pressed keys, release) is the same as for
+    /// the OS backends, so a custom backend exercises the real wrapper.
+    /// [`InputCapture::backend`] reports it as [`Backend::Dummy`].
+    pub fn from_backend(
+        capture: Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+    ) -> Self {
+        Self {
+            capture,
+            backend: Backend::Dummy,
+            id_map: Default::default(),
+            pending: Default::default(),
+            position_map: Default::default(),
+            pressed_keys: HashSet::new(),
+        }
+    }
+
     /// the backend that was actually selected
     pub fn backend(&self) -> Backend {
         self.backend
@@ -365,8 +383,13 @@ impl Stream for InputCapture {
     }
 }
 
+/// Contract every capture backend implements.
+///
+/// Public so a backend that lives outside this crate (the desk simulator in
+/// the `lan-mouse` test suite) can be plugged in with
+/// [`InputCapture::from_backend`]; the OS backends stay private.
 #[async_trait]
-trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
+pub trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
     /// create a new client with the given id
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
 

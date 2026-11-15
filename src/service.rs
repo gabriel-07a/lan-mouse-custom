@@ -1,7 +1,7 @@
 use crate::cursor_hide::CursorHide;
 use crate::{
     audit::{AuditLog, AuditRecord},
-    capture::{Capture, CaptureType, ICaptureEvent},
+    capture::{Capture, CaptureFactory, CaptureType, ICaptureEvent},
     client::ClientManager,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
@@ -9,7 +9,7 @@ use crate::{
     devices::{Device, DeviceSource, DeviceStore, PolicyBundle},
     discovery,
     dns::{DnsEvent, DnsResolver},
-    emulation::{Emulation, EmulationEvent},
+    emulation::{Emulation, EmulationEvent, EmulationFactory},
     listen::{LanMouseListener, ListenerCreationError, PairingWindow},
     service_core::{
         BidirectionalAction, ConnectionAttemptNotifier, bidirectional_action,
@@ -30,6 +30,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -60,6 +61,23 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+}
+
+/// Overrides that let a service run inside a test process next to another
+/// one (desk simulator). `Default` is the production behaviour.
+#[derive(Default)]
+pub(crate) struct ServiceOptions {
+    /// frontend IPC socket instead of the per-user default (Unix only)
+    pub(crate) ipc_socket: Option<PathBuf>,
+    /// audit log instead of the per-user default
+    pub(crate) audit_path: Option<PathBuf>,
+    /// no UDP discovery beacon (it announces on the real LAN) and no GNOME
+    /// cursor-hide state file (it would hide the developer's real cursor)
+    pub(crate) isolated: bool,
+    /// capture backend replacing the configured one
+    pub(crate) capture_backend: Option<CaptureFactory>,
+    /// emulation backend replacing the configured one
+    pub(crate) emulation_backend: Option<EmulationFactory>,
 }
 
 pub struct Service {
@@ -171,6 +189,8 @@ pub struct Service {
     /// A frontend asked the service to shut down (CLI/installer upgrade path).
     /// The run loop breaks and the regular teardown runs once.
     shutdown_requested: bool,
+    /// see [`ServiceOptions::isolated`]
+    isolated: bool,
 }
 
 #[derive(Debug)]
@@ -182,6 +202,13 @@ struct Incoming {
 
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
+        Self::with_options(config, ServiceOptions::default()).await
+    }
+
+    pub(crate) async fn with_options(
+        config: Config,
+        options: ServiceOptions,
+    ) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
         for client in config.clients() {
             client_manager.add_with_config(client);
@@ -192,7 +219,11 @@ impl Service {
         let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
 
         // create frontend communication adapter, exit if already running
-        let frontend_listener = AsyncFrontendListener::new().await?;
+        let frontend_listener = match options.ipc_socket {
+            #[cfg(unix)]
+            Some(path) => AsyncFrontendListener::new_at(path).await?,
+            _ => AsyncFrontendListener::new().await?,
+        };
 
         let mut device_store = DeviceStore::default();
         device_store.seed(config.devices(), config.denied_devices());
@@ -224,8 +255,9 @@ impl Service {
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(
+        let capture = Capture::with_factory(
             capture_backend,
+            options.capture_backend,
             conn,
             config.release_bind(),
             config.motion_batch_ms(),
@@ -234,8 +266,9 @@ impl Service {
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let (clipboard_from_listener_tx, clipboard_from_listener_rx) =
             local_channel::mpsc::channel();
-        let emulation = Emulation::new(
+        let emulation = Emulation::with_factory(
             emulation_backend,
+            options.emulation_backend,
             listener,
             clipboard_from_listener_tx,
             Some(devices.clone()),
@@ -286,7 +319,7 @@ impl Service {
             emulation,
             frontend_listener,
             resolver,
-            audit: AuditLog::new(AuditLog::default_path()),
+            audit: AuditLog::new(options.audit_path.unwrap_or_else(AuditLog::default_path)),
             devices,
             authorized_keys,
             pairing_generation: Default::default(),
@@ -313,7 +346,11 @@ impl Service {
             discovery_port,
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
-            cursor_hide: CursorHide::new(),
+            cursor_hide: if options.isolated {
+                CursorHide::with_path(None)
+            } else {
+                CursorHide::new()
+            },
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
@@ -323,8 +360,15 @@ impl Service {
             return_serial: 0,
             peer_permissions_seen: Default::default(),
             shutdown_requested: false,
+            isolated: options.isolated,
         };
         Ok(service)
+    }
+
+    /// Shared handle to the client table (desk simulator observes link state).
+    #[cfg(test)]
+    pub(crate) fn client_manager(&self) -> ClientManager {
+        self.client_manager.clone()
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
@@ -343,14 +387,15 @@ impl Service {
         // Answer discovery beacons for the whole session. Active subnet
         // scanning is user-triggered (`ScanNetwork`) so a large/VPN-heavy
         // network does not get probed every time the service starts.
-        let discovery_port = self.discovery_port;
-        spawn_local(discovery::beacon_task(
-            self.port,
-            discovery_port,
-            self.discovery_cancel.clone(),
-            self.public_key_fingerprint.clone(),
-            self.announced_tx.clone(),
-        ));
+        if !self.isolated {
+            spawn_local(discovery::beacon_task(
+                self.port,
+                self.discovery_port,
+                self.discovery_cancel.clone(),
+                self.public_key_fingerprint.clone(),
+                self.announced_tx.clone(),
+            ));
+        }
 
         // Retry unanswered return hand-offs: DTLS application data is not
         // retransmitted, so a single lost `Leave` must not be able to latch the

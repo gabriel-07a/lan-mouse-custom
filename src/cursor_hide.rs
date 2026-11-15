@@ -70,7 +70,8 @@ impl CursorHide {
         }
     }
 
-    #[cfg(test)]
+    /// Use `path` as the heartbeat file; `None` disables the state files (an
+    /// isolated test service must not hide the developer's real cursor).
     pub(crate) fn with_path(path: Option<PathBuf>) -> Self {
         let park_path = path
             .as_ref()

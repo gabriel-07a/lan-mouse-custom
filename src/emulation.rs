@@ -224,15 +224,35 @@ fn edge_return_notifier_active(rx: &UnboundedReceiver<(PointerEdge, Option<f32>)
     !rx.is_closed()
 }
 
+/// Builds an emulation backend in place of the OS selection (desk simulator).
+///
+/// Called every time the lazily created backend is (re)started, exactly like
+/// [`InputEmulation::new_with_portal`] is for OS backends.
+pub(crate) type EmulationFactory = Rc<dyn Fn() -> InputEmulation>;
+
 impl Emulation {
+    /// OS backend only; the service uses [`Self::with_factory`].
+    #[cfg(test)]
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
         clipboard_tx: Sender<(std::net::SocketAddr, ClipboardFrame)>,
         devices: Option<Arc<RwLock<DeviceStore>>>,
     ) -> Self {
+        Self::with_factory(backend, None, listener, clipboard_tx, devices)
+    }
+
+    /// Like [`Emulation::new`]; a `custom_backend` replaces the OS backend.
+    pub(crate) fn with_factory(
+        backend: Option<input_emulation::Backend>,
+        custom_backend: Option<EmulationFactory>,
+        listener: LanMouseListener,
+        clipboard_tx: Sender<(std::net::SocketAddr, ClipboardFrame)>,
+        devices: Option<Arc<RwLock<DeviceStore>>>,
+    ) -> Self {
         let selected_backend: Rc<Cell<Option<input_emulation::Backend>>> = Default::default();
-        let emulation_proxy = EmulationProxy::new(backend, selected_backend.clone());
+        let emulation_proxy =
+            EmulationProxy::with_factory(backend, custom_backend, selected_backend.clone());
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let (reply_tx, reply_rx) = channel();
@@ -818,8 +838,17 @@ enum ProxyRequest {
 }
 
 impl EmulationProxy {
+    #[cfg(test)]
     fn new(
         backend: Option<input_emulation::Backend>,
+        selected_backend: Rc<Cell<Option<input_emulation::Backend>>>,
+    ) -> Self {
+        Self::with_factory(backend, None, selected_backend)
+    }
+
+    fn with_factory(
+        backend: Option<input_emulation::Backend>,
+        custom_backend: Option<EmulationFactory>,
         selected_backend: Rc<Cell<Option<input_emulation::Backend>>>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
@@ -830,6 +859,7 @@ impl EmulationProxy {
             || input_emulation::remote_desktop_consent_present();
         let emulation_task = EmulationTask {
             backend,
+            custom_backend,
             exit_requested: exit_requested.clone(),
             request_rx,
             peeked_request: None,
@@ -943,6 +973,8 @@ impl EmulationProxy {
 
 struct EmulationTask {
     backend: Option<input_emulation::Backend>,
+    /// replaces `backend` when set (desk simulator)
+    custom_backend: Option<EmulationFactory>,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     /// Next request already popped while draining consecutive motion events.
@@ -1208,6 +1240,9 @@ impl EmulationTask {
     /// Create the emulation backend while preserving semantic requests that
     /// arrive during the (possibly slow, portal-backed) creation.
     async fn create_emulation(&mut self) -> Result<Option<InputEmulation>, InputEmulationError> {
+        if let Some(factory) = &self.custom_backend {
+            return Ok(Some(factory()));
+        }
         let create = InputEmulation::new_with_portal(self.backend, self.allow_portal);
         tokio::pin!(create);
         loop {

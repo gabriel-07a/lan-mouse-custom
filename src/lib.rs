@@ -8,6 +8,8 @@ pub mod config;
 mod connect;
 mod crypto;
 mod cursor_hide;
+#[cfg(all(test, unix))]
+mod desk_sim;
 mod devices;
 mod discovery;
 mod dns;

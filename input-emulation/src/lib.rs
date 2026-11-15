@@ -186,6 +186,20 @@ impl InputEmulation {
         })
     }
 
+    /// Wrap a backend implemented outside this crate.
+    ///
+    /// Key/button tracking and release on destroy are the same as for the OS
+    /// backends. [`InputEmulation::backend`] reports it as [`Backend::Dummy`].
+    pub fn from_backend(emulation: Box<dyn Emulation>) -> Self {
+        Self {
+            emulation,
+            backend: Backend::Dummy,
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        }
+    }
+
     /// The backend that was actually selected.
     pub fn backend(&self) -> Backend {
         self.backend
@@ -504,8 +518,13 @@ enum ButtonUpdate {
     DuplicateRelease,
 }
 
+/// Contract every emulation backend implements.
+///
+/// Public so a backend that lives outside this crate (the desk simulator in
+/// the `lan-mouse` test suite) can be plugged in with
+/// [`InputEmulation::from_backend`]; the OS backends stay private.
 #[async_trait]
-trait Emulation: Send {
+pub trait Emulation: Send {
     async fn consume(
         &mut self,
         event: Event,

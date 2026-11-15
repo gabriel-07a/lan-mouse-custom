@@ -887,6 +887,37 @@ impl Config {
         Ok(config)
     }
 
+    /// Load `config_path` without parsing the command line (the test binary's
+    /// own arguments are not lan-mouse arguments). The certificate lives next
+    /// to the config file, so every instance gets its own identity.
+    #[cfg(test)]
+    pub(crate) fn load_for_test(config_path: &Path) -> Result<Self, ConfigError> {
+        let config_dir = config_path
+            .parent()
+            .expect("test config has a parent directory")
+            .to_path_buf();
+        let (config_toml, load_error) = load_config(config_path);
+        let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
+        let watcher = RecommendedWatcher::new(
+            move |res| {
+                let _ = tx.blocking_send(res);
+            },
+            notify::Config::default(),
+        )?;
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: config_dir.join(CERT_FILE_NAME),
+            config_path: config_path.to_path_buf(),
+            config_dir,
+            config_toml,
+            load_error,
+            watcher,
+            watch_rx,
+        };
+        config.watch()?;
+        Ok(config)
+    }
+
     fn watch(&mut self) -> Result<(), notify::Error> {
         self.watcher
             .watch(&self.config_dir, notify::RecursiveMode::NonRecursive)?;

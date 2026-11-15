@@ -105,6 +105,12 @@ impl CaptureConnection for LanMouseConnection {
     }
 }
 
+/// Builds a capture backend in place of the OS selection (desk simulator).
+///
+/// Called again whenever the capture session is recreated (reenable after a
+/// backend failure), exactly like [`InputCapture::new`] is for OS backends.
+pub(crate) type CaptureFactory = Rc<dyn Fn() -> InputCapture>;
+
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
     request_tx: Sender<CaptureRequest>,
@@ -175,8 +181,29 @@ enum CaptureRequest {
 }
 
 impl Capture {
+    /// OS backend only; the service uses [`Self::with_factory`].
+    #[cfg(test)]
     pub(crate) fn new(
         backend: Option<input_capture::Backend>,
+        conn: LanMouseConnection,
+        release_bind: Vec<scancode::Linux>,
+        motion_batch_ms: u64,
+        connect_grace_ms: u64,
+    ) -> Self {
+        Self::with_factory(
+            backend,
+            None,
+            conn,
+            release_bind,
+            motion_batch_ms,
+            connect_grace_ms,
+        )
+    }
+
+    /// Like [`Capture::new`]; a `custom_backend` replaces the OS backend.
+    pub(crate) fn with_factory(
+        backend: Option<input_capture::Backend>,
+        custom_backend: Option<CaptureFactory>,
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
         motion_batch_ms: u64,
@@ -189,6 +216,7 @@ impl Capture {
         let capture_task = CaptureTask {
             active_client: None,
             backend,
+            custom_backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
             coalescer: MotionCoalescer::new(motion_batch_ms),
@@ -570,6 +598,8 @@ impl EnterState {
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
+    /// replaces `backend` when set (desk simulator)
+    custom_backend: Option<CaptureFactory>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     coalescer: MotionCoalescer,
@@ -783,9 +813,12 @@ impl CaptureTask {
 
     async fn do_capture(&mut self) -> Result<(), InputCaptureError> {
         /* allow cancelling capture request */
-        let mut capture = tokio::select! {
-            r = InputCapture::new(self.backend) => r?,
-            _ = self.cancellation_token.cancelled() => return Ok(()),
+        let mut capture = match &self.custom_backend {
+            Some(factory) => factory(),
+            None => tokio::select! {
+                r = InputCapture::new(self.backend) => r?,
+                _ = self.cancellation_token.cancelled() => return Ok(()),
+            },
         };
         capture.set_remote_peer(self.remote_peer.map(to_capture_pos));
         self.selected_backend.set(Some(capture.backend()));
@@ -2100,6 +2133,7 @@ mod capture_handle_tests {
         let task = CaptureTask {
             active_client: None,
             backend: Some(input_capture::Backend::Dummy),
+            custom_backend: None,
             cancellation_token: CancellationToken::new(),
             captures,
             coalescer: MotionCoalescer::new(0),
