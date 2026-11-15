@@ -27,6 +27,10 @@
 mod screen;
 
 #[cfg(test)]
+mod clipboard_scenarios;
+#[cfg(test)]
+mod os_scenarios;
+#[cfg(test)]
 mod scenarios;
 
 use std::{
@@ -37,6 +41,7 @@ use std::{
 };
 
 use input_capture::{InputCapture, Position};
+use input_clipboard::{Clipboard, ClipboardSnapshot, Format, SharedClipboard};
 use input_emulation::InputEmulation;
 use lan_mouse_test_support::env::TestEnv;
 use tokio::task::{JoinHandle, spawn_local};
@@ -47,7 +52,9 @@ use crate::{
     service::{Service, ServiceOptions},
 };
 
-pub(crate) use screen::{ScreenEvent, ScreenState, SharedScreen, SimCapture, SimEmulation, lock};
+pub(crate) use screen::{
+    Personality, ScreenEvent, ScreenState, SharedScreen, SimCapture, SimEmulation, lock,
+};
 
 /// How the simulated hand moves the mouse.
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +89,8 @@ pub(crate) enum Focus {
 pub(crate) struct Pc {
     pub(crate) name: &'static str,
     pub(crate) screen: SharedScreen,
+    /// this PC's system clipboard (what Ctrl+C writes and Ctrl+V reads)
+    pub(crate) clipboard: SharedClipboard,
     pub(crate) clients: ClientManager,
     env: TestEnv,
     task: JoinHandle<()>,
@@ -135,6 +144,9 @@ pub(crate) struct DeskBuilder {
     pcs: Vec<(&'static str, u32, u32)>,
     /// `(of, side, target)`: `of` has `target` configured at `side`
     links: Vec<(&'static str, Position, &'static str)>,
+    /// extra `config.toml` text per PC
+    extra_config: Vec<(&'static str, String)>,
+    personalities: Vec<(&'static str, Personality)>,
     hand: Hand,
 }
 
@@ -154,6 +166,19 @@ impl DeskBuilder {
     /// at `side` (what the user configures in the GUI).
     pub(crate) fn place(mut self, target: &'static str, side: Position, of: &'static str) -> Self {
         self.links.push((of, side, target));
+        self
+    }
+
+    /// Append raw TOML to `name`'s `config.toml`. It goes after the
+    /// `[[clients]]` tables, so it must be whole tables (e.g. `[clipboard]`).
+    pub(crate) fn config(mut self, name: &'static str, toml: &str) -> Self {
+        self.extra_config.push((name, toml.to_string()));
+        self
+    }
+
+    /// Give `name` the quirks of an OS (default: [`Personality::baseline`]).
+    pub(crate) fn personality(mut self, name: &'static str, personality: Personality) -> Self {
+        self.personalities.push((name, personality));
         self
     }
 
@@ -202,12 +227,23 @@ impl DeskBuilder {
                 )
                 .expect("write to string");
             }
+            for (_, extra) in self.extra_config.iter().filter(|(n, _)| *n == name) {
+                toml.push('\n');
+                toml.push_str(extra);
+                toml.push('\n');
+            }
             let config_path = env.write("config/lan-mouse/config.toml", &toml);
             let config = Config::load_for_test(&config_path).expect("desk-sim config");
 
-            let screen = ScreenState::new(name, width, height).shared();
+            let mut state = ScreenState::new(name, width, height);
+            if let Some((_, personality)) = self.personalities.iter().find(|(n, _)| *n == name) {
+                state.personality = personality.clone();
+            }
+            let screen = state.shared();
             let capture_screen = screen.clone();
             let emulation_screen = screen.clone();
+            let clipboard = SharedClipboard::new();
+            let service_clipboard = clipboard.clone();
             let options = ServiceOptions {
                 ipc_socket: Some(env.runtime_dir().join("lan-mouse-socket.sock")),
                 audit_path: Some(env.state_dir().join("audit.jsonl")),
@@ -219,6 +255,11 @@ impl DeskBuilder {
                     InputEmulation::from_backend(Box::new(SimEmulation::new(
                         emulation_screen.clone(),
                     )))
+                })),
+                // in-memory clipboard: the OS one would open the GNOME
+                // RemoteDesktop portal dialog for every simulated PC
+                clipboard_backend: Some(Rc::new(move || {
+                    Box::new(service_clipboard.clone()) as Box<dyn Clipboard>
                 })),
             };
             let mut service = Service::with_options(config, options)
@@ -233,6 +274,7 @@ impl DeskBuilder {
             pcs.push(Pc {
                 name,
                 screen,
+                clipboard,
                 clients,
                 env,
                 task,
@@ -310,6 +352,39 @@ impl Desk {
         }
         // let the services process the last events before the caller looks
         tokio::task::yield_now().await;
+    }
+
+    /// Ctrl+C on `name`: the user copies `snapshot` there.
+    pub(crate) fn copy(&self, name: &str, snapshot: ClipboardSnapshot) {
+        self.pc(name).clipboard.set_local(snapshot);
+    }
+
+    /// Ctrl+C of a piece of text on `name`.
+    pub(crate) fn copy_text(&self, name: &str, text: &str) {
+        self.copy(
+            name,
+            ClipboardSnapshot::from_items([(Format::Text, text.as_bytes().to_vec())]),
+        );
+    }
+
+    /// Ctrl+C of an image (PNG bytes) on `name`.
+    pub(crate) fn copy_image(&self, name: &str, png: Vec<u8>) {
+        self.copy(name, ClipboardSnapshot::from_items([(Format::Png, png)]));
+    }
+
+    /// Ctrl+V on `name`: what pasting there would insert right now.
+    pub(crate) fn paste(&self, name: &str) -> ClipboardSnapshot {
+        self.pc(name).clipboard.current()
+    }
+
+    /// Wait until pasting on `name` gives exactly `expected`.
+    pub(crate) async fn wait_paste(&self, name: &str, expected: &ClipboardSnapshot) {
+        self.wait_until(
+            &format!("paste on {name} == {}", describe_snapshot(expected)),
+            Duration::from_secs(10),
+            |desk| desk.paste(name) == *expected,
+        )
+        .await;
     }
 
     /// Where the cursor moved by the hand PC's mouse is visible right now.
@@ -407,6 +482,13 @@ impl Desk {
         for pc in &self.pcs {
             let state = pc.state();
             writeln!(out, "  {state}").expect("write to string");
+            writeln!(
+                out,
+                "    clipboard: {} (applied from peers: {})",
+                describe_snapshot(&pc.clipboard.current()),
+                pc.clipboard.applied().len()
+            )
+            .expect("write to string");
             let skip = state.log.len().saturating_sub(15);
             for logged in &state.log[skip..] {
                 writeln!(
@@ -454,6 +536,23 @@ impl Desk {
         )
         .await;
     }
+}
+
+/// Short description of a clipboard snapshot for reports.
+pub(crate) fn describe_snapshot(snapshot: &ClipboardSnapshot) -> String {
+    if snapshot.is_empty() {
+        return "<empty>".to_string();
+    }
+    snapshot
+        .iter()
+        .map(|(format, data)| match format {
+            Format::Text if data.len() <= 40 => {
+                format!("{format} {:?}", String::from_utf8_lossy(data))
+            }
+            _ => format!("{format} {} bytes", data.len()),
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 fn position_name(side: Position) -> &'static str {

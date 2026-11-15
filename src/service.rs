@@ -78,6 +78,8 @@ pub(crate) struct ServiceOptions {
     pub(crate) capture_backend: Option<CaptureFactory>,
     /// emulation backend replacing the configured one
     pub(crate) emulation_backend: Option<EmulationFactory>,
+    /// clipboard backend replacing the OS one (portal/Wayland/X11/Windows)
+    pub(crate) clipboard_backend: Option<crate::clipboard::ClipboardFactory>,
 }
 
 pub struct Service {
@@ -294,6 +296,7 @@ impl Service {
             clipboard_enabled.clone(),
             clipboard_status_tx,
             devices.clone(),
+            options.clipboard_backend,
         );
 
         // create dns resolver

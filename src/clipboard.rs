@@ -229,13 +229,18 @@ async fn create_backend(
     status: &mut ClipboardStatus,
     status_tx: &Sender<ClipboardStatus>,
     retries: u32,
+    custom_backend: Option<&ClipboardFactory>,
 ) -> Box<dyn Clipboard> {
     let mut retries = retries;
     loop {
         if !enabled.get() {
             wait_for_enable(channels, enabled).await;
         }
-        match input_clipboard::default_backend().await {
+        let backend = match custom_backend {
+            Some(factory) => Ok(factory()),
+            None => input_clipboard::default_backend().await,
+        };
+        match backend {
             Ok(backend) => return backend,
             Err(e) => {
                 status.enabled = enabled.get();
@@ -253,6 +258,10 @@ async fn create_backend(
         }
     }
 }
+
+/// Builds a clipboard backend in place of the OS one (desk simulator). Called
+/// again when the backend stops, like [`input_clipboard::default_backend`].
+pub(crate) type ClipboardFactory = Rc<dyn Fn() -> Box<dyn Clipboard>>;
 
 impl ClipboardTask {
     /// Spawn the clipboard task.
@@ -274,6 +283,7 @@ impl ClipboardTask {
         enabled: Rc<Cell<bool>>,
         status_tx: Sender<ClipboardStatus>,
         devices: Arc<RwLock<DeviceStore>>,
+        custom_backend: Option<ClipboardFactory>,
     ) -> Self {
         let task = spawn_local(async move {
             let mut status = ClipboardStatus {
@@ -298,8 +308,15 @@ impl ClipboardTask {
                     wait_for_enable(&mut channels, &enabled).await;
                 }
                 let retries = if restarted { 3 } else { 0 };
-                let mut backend =
-                    create_backend(&mut channels, &enabled, &mut status, &status_tx, retries).await;
+                let mut backend = create_backend(
+                    &mut channels,
+                    &enabled,
+                    &mut status,
+                    &status_tx,
+                    retries,
+                    custom_backend.as_ref(),
+                )
+                .await;
                 log::info!("using clipboard backend: {}", backend.backend_name());
                 status.backend = Some(backend.backend_name().to_string());
                 status.available = true;

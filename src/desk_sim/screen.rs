@@ -37,6 +37,88 @@ const EDGE_RETURN_THROTTLE: Duration = Duration::from_millis(250);
 /// Same cap as the real trackers: requests per contiguous edge contact.
 const EDGE_RETURN_MAX_ATTEMPTS: u8 = 3;
 
+/// OS quirks of a virtual PC, on top of the baseline backend contract.
+///
+/// The numbers come from real traces (see `docs/analysis/handoff-bidirectional.md`
+/// and the models in `tests/qa_handoff_bidirectional.rs`). Each field is
+/// what the OS backend *delivers to lan-mouse*, so the service's own guards
+/// are what is being tested.
+#[derive(Clone, Debug)]
+pub(crate) struct Personality {
+    pub(crate) label: &'static str,
+    /// Source side: deltas the compositor emits right after a capture starts,
+    /// relative to the crossing direction (negative = back towards this
+    /// screen). GNOME/libei warps the pointer back from the barrier.
+    pub(crate) activation_backswing: Vec<f64>,
+    /// Source side: one more backswing delivered right after the first user
+    /// motion of a capture (GNOME: ~17 px).
+    pub(crate) post_forward_backswing: Option<f64>,
+    /// Receiver side: while a peer drives this screen, injected motion that
+    /// comes within this many px of an edge with a barrier makes the capture
+    /// backend report a (jittery) `Begin` there (GNOME capture portal).
+    pub(crate) begin_jitter_px: Option<f64>,
+    /// Receiver side: injected motion pushed past the edge the peer entered
+    /// through is also seen by the capture backend, which reports a `Begin`
+    /// there besides the emulation's edge return (Windows hooks see injected
+    /// input).
+    pub(crate) injected_crossing_begins_capture: bool,
+}
+
+impl Personality {
+    /// Baseline contract only, no quirks.
+    pub(crate) fn baseline() -> Self {
+        Self {
+            label: "baseline",
+            activation_backswing: Vec::new(),
+            post_forward_backswing: None,
+            begin_jitter_px: None,
+            injected_crossing_begins_capture: false,
+        }
+    }
+
+    /// Ubuntu/GNOME Wayland (libei capture portal + RemoteDesktop emulation).
+    pub(crate) fn gnome() -> Self {
+        Self {
+            label: "gnome",
+            // trace: -2, -5 before the crossing motion, -17 after it
+            activation_backswing: vec![-2.0, -5.0],
+            post_forward_backswing: Some(-17.0),
+            begin_jitter_px: Some(2.0),
+            injected_crossing_begins_capture: false,
+        }
+    }
+
+    /// Windows 10/11 (low-level hooks + SendInput emulation).
+    pub(crate) fn windows() -> Self {
+        Self {
+            label: "windows",
+            activation_backswing: Vec::new(),
+            post_forward_backswing: None,
+            begin_jitter_px: None,
+            injected_crossing_begins_capture: true,
+        }
+    }
+}
+
+impl Default for Personality {
+    fn default() -> Self {
+        Self::baseline()
+    }
+}
+
+/// Minimum time between two jittery `Begin`s of [`Personality::begin_jitter_px`].
+const BEGIN_JITTER_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Unit vector pointing out of the screen through `edge`.
+fn outward(edge: Position) -> (f64, f64) {
+    match edge {
+        Position::Left => (-1.0, 0.0),
+        Position::Right => (1.0, 0.0),
+        Position::Top => (0.0, -1.0),
+        Position::Bottom => (0.0, 1.0),
+    }
+}
+
 /// Something observable that happened on a virtual screen.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ScreenEvent {
@@ -57,6 +139,8 @@ pub(crate) enum ScreenEvent {
     RemoteEnd,
     /// the injected pointer was pushed past the entry edge (return request)
     EdgeReturn { edge: PointerEdge, along: f32 },
+    /// a [`Personality`] quirk fired
+    Quirk(&'static str),
 }
 
 /// A [`ScreenEvent`] with the time it happened.
@@ -86,6 +170,10 @@ pub(crate) struct ScreenState {
     /// injected non-motion events (buttons, keys, scroll)
     pub(crate) injected_other: Vec<Event>,
     pub(crate) log: Vec<Logged>,
+    pub(crate) personality: Personality,
+    /// backswing still owed after the first user motion of this capture
+    pending_backswing: Option<f64>,
+    last_jitter: Option<Instant>,
     capture_tx: Option<UnboundedSender<(Position, CaptureEvent)>>,
     edge_return: Option<EdgeReturnNotifier>,
     edge_contact: Option<EdgeContact>,
@@ -114,6 +202,9 @@ impl ScreenState {
             injected_motions: 0,
             injected_other: Vec::new(),
             log: Vec::new(),
+            personality: Personality::baseline(),
+            pending_backswing: None,
+            last_jitter: None,
             capture_tx: None,
             edge_return: None,
             edge_contact: None,
@@ -166,6 +257,10 @@ impl ScreenState {
         if let Some(edge) = self.captured {
             // captured: the OS cursor does not move, the delta goes to the peer
             self.send_capture(edge, CaptureEvent::Input(motion(dx, dy)));
+            if let Some(backswing) = self.pending_backswing.take() {
+                self.record(ScreenEvent::Quirk("post-forward backswing"));
+                self.send_backswing(edge, backswing);
+            }
             return;
         }
         let (x, y) = (self.cursor.0 + dx, self.cursor.1 + dy);
@@ -180,11 +275,31 @@ impl ScreenState {
         .map(|(edge, _)| edge);
         self.cursor = (x.clamp(0.0, self.max_x()), y.clamp(0.0, self.max_y()));
         if let Some(edge) = crossed {
-            let along = self.along(matches!(edge, Position::Left | Position::Right));
-            self.captured = Some(edge);
-            self.record(ScreenEvent::CaptureBegin { edge, along });
-            self.send_capture(edge, CaptureEvent::BeginAt(along));
+            self.begin_capture(edge);
+            let backswing = self.personality.activation_backswing.clone();
+            if !backswing.is_empty() {
+                self.record(ScreenEvent::Quirk("activation backswing"));
+            }
+            for delta in backswing {
+                self.send_backswing(edge, delta);
+            }
+            self.pending_backswing = self.personality.post_forward_backswing;
         }
+    }
+
+    /// The capture backend grabs the pointer at `edge` and reports `BeginAt`.
+    fn begin_capture(&mut self, edge: Position) {
+        let along = self.along(matches!(edge, Position::Left | Position::Right));
+        self.captured = Some(edge);
+        self.record(ScreenEvent::CaptureBegin { edge, along });
+        self.send_capture(edge, CaptureEvent::BeginAt(along));
+    }
+
+    /// Forward a delta of `amount` px along the crossing direction of `edge`
+    /// (negative = back towards this screen).
+    fn send_backswing(&mut self, edge: Position, amount: f64) {
+        let (ox, oy) = outward(edge);
+        self.send_capture(edge, CaptureEvent::Input(motion(ox * amount, oy * amount)));
     }
 
     fn send_capture(&mut self, edge: Position, event: CaptureEvent) {
@@ -202,6 +317,7 @@ impl ScreenState {
 
     fn release(&mut self, at: Option<(Position, f32)>) {
         self.captured = None;
+        self.pending_backswing = None;
         if let Some((edge, along)) = at {
             self.place_on_edge(edge, along);
         }
@@ -232,6 +348,7 @@ impl ScreenState {
         let Some(edge) = self.remote_edge else {
             return;
         };
+        self.jittery_begin();
         let pushed_past = match edge {
             PointerEdge::Left => x < 0.0,
             PointerEdge::Right => x > self.max_x(),
@@ -241,6 +358,14 @@ impl ScreenState {
         if !pushed_past {
             self.edge_contact = None;
             return;
+        }
+        let entry = to_position(edge);
+        if self.personality.injected_crossing_begins_capture
+            && self.captured.is_none()
+            && self.barriers.contains(&entry)
+        {
+            self.record(ScreenEvent::Quirk("injected crossing seen by capture"));
+            self.begin_capture(entry);
         }
         let now = Instant::now();
         let fire = match &mut self.edge_contact {
@@ -271,12 +396,45 @@ impl ScreenState {
     }
 }
 
+impl ScreenState {
+    /// [`Personality::begin_jitter_px`]: the capture backend reports a `Begin`
+    /// at a barrier the injected pointer merely came close to.
+    fn jittery_begin(&mut self) {
+        let Some(px) = self.personality.begin_jitter_px else {
+            return;
+        };
+        if self.captured.is_some()
+            || self
+                .last_jitter
+                .is_some_and(|at| at.elapsed() < BEGIN_JITTER_INTERVAL)
+        {
+            return;
+        }
+        let (x, y) = self.cursor;
+        let near = [
+            (Position::Left, x <= px),
+            (Position::Right, x >= self.max_x() - px),
+            (Position::Top, y <= px),
+            (Position::Bottom, y >= self.max_y() - px),
+        ]
+        .into_iter()
+        .find(|&(edge, close)| close && self.barriers.contains(&edge))
+        .map(|(edge, _)| edge);
+        if let Some(edge) = near {
+            self.last_jitter = Some(Instant::now());
+            self.record(ScreenEvent::Quirk("jittery begin"));
+            self.begin_capture(edge);
+        }
+    }
+}
+
 impl fmt::Display for ScreenState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} {}x{} cursor=({:.0}, {:.0}) captured={:?} remote_edge={:?} barriers={:?} injected_motions={}",
+            "{} [{}] {}x{} cursor=({:.0}, {:.0}) captured={:?} remote_edge={:?} barriers={:?} injected_motions={}",
             self.name,
+            self.personality.label,
             self.width,
             self.height,
             self.cursor.0,

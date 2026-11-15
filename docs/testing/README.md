@@ -115,9 +115,14 @@ A verificação bidirecional (origem/receptor, mesma build 0.2.19) está em
 ## Simulador de mesa (handoff sem mexer no mouse)
 
 [desk-simulator.md](desk-simulator.md): dois ou mais `Service` reais no mesmo
-processo, com telas virtuais no lugar dos backends de captura e emulação.
-Testa cruzar a borda e voltar de ponta a ponta com `cargo test --lib desk_sim`.
-Use para todo bug de handoff que hoje só se reproduz arrastando o mouse.
+processo, com telas virtuais no lugar dos backends de captura e emulação,
+clipboard em memória e manias de GNOME/Windows. Testa cruzar a borda e voltar
+e copiar/colar texto e imagem de ponta a ponta com `cargo test --lib desk_sim`.
+Use para todo bug de handoff ou clipboard que hoje só se reproduz na mão.
+
+Testes e scripts **não podem** abrir portais do desktop (o diálogo "Área de
+trabalho remota" aparece na tela de quem está desenvolvendo): injete backends
+falsos via `ServiceOptions` ou suba o daemon com `--no-clipboard`.
 
 ## Diagnóstico de handoff
 

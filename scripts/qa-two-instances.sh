@@ -129,7 +129,9 @@ start_daemon() {
     local name="$1" dir
     dir="$(inst_dir "$name")"
     : >"$dir/daemon.log"
-    inst_run "$name" "$BIN" daemon >>"$dir/daemon.log" 2>&1 &
+    # --no-clipboard: the real clipboard backend opens the GNOME RemoteDesktop
+    # portal dialog ("Área de trabalho remota") on the developer's desktop.
+    inst_run "$name" "$BIN" --no-clipboard daemon >>"$dir/daemon.log" 2>&1 &
     DAEMON_PID["$name"]=$!
     local i pid="${DAEMON_PID[$name]}"
     for i in $(seq 1 200); do

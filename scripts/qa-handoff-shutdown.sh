@@ -127,6 +127,8 @@ assert_no_cursor_markers() {
 # would then never reach the actual daemon process.
 start_daemon() {
     : >"$D/daemon.log"
+    # --no-clipboard: the real clipboard backend opens the GNOME RemoteDesktop
+    # portal dialog ("Área de trabalho remota") on the developer's desktop.
     env \
         HOME="$D/home" \
         XDG_CONFIG_HOME="$D/config" \
@@ -134,7 +136,7 @@ start_daemon() {
         XDG_CACHE_HOME="$D/cache" \
         XDG_RUNTIME_DIR="$D/runtime" \
         LAN_MOUSE_LOG_LEVEL="${LAN_MOUSE_LOG_LEVEL:-debug}" \
-        "$BIN" daemon >>"$D/daemon.log" 2>&1 &
+        "$BIN" --no-clipboard daemon >>"$D/daemon.log" 2>&1 &
     DAEMON_PID=$!
     local i
     for i in $(seq 1 200); do
