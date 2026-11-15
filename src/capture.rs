@@ -120,8 +120,11 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
-    /// a client was entered
-    CaptureBegin(CaptureHandle),
+    /// The local pointer entered the capture zone of an incoming connection
+    /// (local take-back). Carries the normalised crossing coordinate along
+    /// the edge when the backend reported one (`BeginAt`), so the return
+    /// hand-off puts the peer's cursor back where this one left.
+    CaptureBegin(CaptureHandle, Option<f32>),
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
@@ -1161,8 +1164,12 @@ impl CaptureTask {
         // incoming-capture begin; those must not turn into a `Leave` per
         // activation (the signature of the reported `along=None` storm).
         if event.is_begin() && self.should_report_enter_only_begin(capture_type) {
+            let along = match event {
+                CaptureEvent::BeginAt(along) => Some(along),
+                _ => None,
+            };
             self.event_tx
-                .send(ICaptureEvent::CaptureBegin(handle))
+                .send(ICaptureEvent::CaptureBegin(handle, along))
                 .ok()
                 .unwrap_or_default();
         }
@@ -3065,9 +3072,9 @@ mod capture_handle_tests {
         assert!(
             matches!(
                 next_capture_event(&mut events).await,
-                Some(ICaptureEvent::CaptureBegin(7))
+                Some(ICaptureEvent::CaptureBegin(7, Some(along))) if along == 0.5
             ),
-            "a deliberate take-back after the dwell must be reported"
+            "a deliberate take-back after the dwell must be reported with its crossing coordinate"
         );
         assert!(task.enter_only_take_back_sent);
 
@@ -3080,6 +3087,32 @@ mod capture_handle_tests {
             no_capture_event(&mut events).await,
             "one take-back request per remote-driving session is enough"
         );
+        capture.terminate().await.expect("terminate");
+    }
+
+    /// R-27: a backend that reports a plain `Begin` (no crossing coordinate)
+    /// still produces a take-back, without inventing a coordinate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_take_back_without_a_crossing_coordinate_carries_none() {
+        let (mut task, mut events) = capture_task_with_events(
+            vec![(7, Position::Right, CaptureType::EnterOnly)],
+            Box::new(FakeConnection::new()),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        capture.create(7, Position::Right).await.expect("create");
+
+        task.update_remote_peer(Some(lan_mouse_ipc::Position::Right));
+        task.remote_peer_since =
+            Some(Instant::now() - REMOTE_ENTRY_DWELL - Duration::from_millis(1));
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::Begin))
+            .await
+            .expect("begin");
+        assert!(matches!(
+            next_capture_event(&mut events).await,
+            Some(ICaptureEvent::CaptureBegin(7, None))
+        ));
         capture.terminate().await.expect("terminate");
     }
 
@@ -3104,7 +3137,7 @@ mod capture_handle_tests {
             .expect("begin");
         assert!(matches!(
             next_capture_event(&mut events).await,
-            Some(ICaptureEvent::CaptureBegin(7))
+            Some(ICaptureEvent::CaptureBegin(7, _))
         ));
 
         task.update_remote_peer(None);
@@ -3122,7 +3155,7 @@ mod capture_handle_tests {
         assert!(
             matches!(
                 next_capture_event(&mut events).await,
-                Some(ICaptureEvent::CaptureBegin(7))
+                Some(ICaptureEvent::CaptureBegin(7, _))
             ),
             "the new session's take-back must be reported"
         );

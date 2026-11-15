@@ -1338,15 +1338,19 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
-            ICaptureEvent::CaptureBegin(handle) => {
+            ICaptureEvent::CaptureBegin(handle, along) => {
                 // we entered the capture zone for an incoming connection
-                // => notify it that its capture should be released
+                // => notify it that its capture should be released. The
+                // crossing coordinate travels with the request (R-27): this
+                // path can win the race against the emulation's EdgeReturn,
+                // and without it the peer restored its cursor at the old
+                // entry anchor.
                 if let Some(addr) = self
                     .incoming_conn_info
                     .get(&handle)
                     .map(|incoming| incoming.addr)
                 {
-                    self.request_handoff(addr, None);
+                    self.request_handoff(addr, along);
                 }
             }
             ICaptureEvent::CaptureDisabled => {

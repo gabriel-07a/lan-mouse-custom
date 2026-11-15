@@ -135,19 +135,16 @@ async fn mixed_round_trips_stay_clean() {
         .await;
 }
 
-/// Open finding (R-27): on a GNOME receiver the capture portal can report the
-/// return crossing on the `EnterOnly` barrier before the emulation's edge
-/// return. That path (`ICaptureEvent::CaptureBegin` -> `request_handoff(addr,
-/// None)` in `src/service.rs`) carries no coordinate, so the source gets the
-/// cursor back at its old anchor instead of where it left the receiver.
+/// R-27: on a GNOME receiver the capture portal can report the return on the
+/// `EnterOnly` barrier before the emulation's edge return. That take-back path
+/// (`ICaptureEvent::CaptureBegin` -> `request_handoff` in `src/service.rs`)
+/// used to carry no coordinate, so the source got the cursor back at its old
+/// anchor instead of where it left the receiver.
 ///
 /// It only shows after `REMOTE_ENTRY_DWELL` (300 ms, `src/capture.rs`): a
-/// faster return is still routed through the emulation's edge return, which
-/// keeps the coordinate. Real users stay longer than that on the other PC.
-///
-/// Run with `cargo test --lib -- --ignored desk_sim` to reproduce.
+/// faster return is routed through the emulation's edge return, which always
+/// kept the coordinate. Real users stay longer than that on the other PC.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "R-27: the capture take-back path drops the return coordinate"]
 async fn a_gnome_receiver_returns_with_the_coordinate() {
     init_log();
     LocalSet::new()
@@ -166,9 +163,19 @@ async fn a_gnome_receiver_returns_with_the_coordinate() {
             let (x, _) = desk.cursor("B");
             desk.move_mouse(1.0 - x, 0.0).await;
             desk.wait_focus("A").await;
+            // A gets the cursor back on its right edge, at the height where it
+            // touched B's left edge (B is the same size, so the same fraction)
+            let (edge, along) = desk.pc("A").last_return().unwrap_or_else(|| {
+                panic!(
+                    "A got the cursor back without a return coordinate\n{}",
+                    desk.report()
+                )
+            });
+            assert_eq!(edge, Position::Right);
+            let (_, y_on_b) = desk.cursor("B");
             assert!(
-                desk.pc("A").last_return().is_some(),
-                "A got the cursor back without a return coordinate\n{}",
+                (f64::from(along) * 1079.0 - y_on_b).abs() <= 2.0,
+                "return height on A: along={along}, B's cursor at y={y_on_b}\n{}",
                 desk.report()
             );
         })

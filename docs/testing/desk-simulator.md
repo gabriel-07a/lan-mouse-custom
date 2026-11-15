@@ -103,7 +103,6 @@ no `report()` como `Quirk("...")`.
 cargo test --lib desk_sim                       # todos os cenários
 cargo test --lib desk_sim::os                   # só os cenários com manias de SO
 cargo test --lib desk_sim::clipboard            # só clipboard
-cargo test --lib -- --ignored desk_sim          # achados em aberto (falham hoje)
 
 # com os logs do serviço e da tela virtual
 LAN_MOUSE_LOG_LEVEL=debug cargo test --lib desk_sim -- --nocapture
@@ -228,7 +227,7 @@ dois serviços intercalados.
 |---|---|
 | `gnome_to_windows_rests_at_the_border_without_churn` (e as outras 3 combinações) | o usuário cruza 4 px e para: o cursor fica em B por 600 ms, volta para A uma vez só, B nunca passa a dirigir A e a captura de B não fica presa |
 | `mixed_round_trips_stay_clean` | 4 idas e voltas GNOME → Windows sem acumular estado |
-| `a_gnome_receiver_returns_with_the_coordinate` | **`#[ignore]`, achado em aberto R-27** (veja abaixo) |
+| `a_gnome_receiver_returns_with_the_coordinate` | receptor GNOME, depois de 500 ms em B: o usuário encosta na borda de entrada, o portal de captura dispara o take-back e A recebe o cursor na altura em que ele saiu de B (R-27, veja abaixo) |
 
 ### Clipboard (`clipboard_scenarios.rs`)
 
@@ -255,30 +254,38 @@ simulador e restaurei o código:
 | `src/emulation.rs`: reportar o `EdgeReturn` pela borda oposta | **não pegou, e é o esperado**: B só guarda a sessão que está dirigindo agora, e `service_core::return_targets` devolve para ela quando só existe uma |
 | `src/capture.rs`: `REMOTE_ENTRY_DWELL` = 0 (o receptor não ignora o jitter logo depois da entrada) | **não pegou, e é informação útil**: o guard da origem descarta o movimento para trás perto da borda, então o cursor de B nunca volta a menos de 2 px da borda dentro dos 300 ms. Com a build atual nos dois lados, a janela do receptor é proteção redundante; ela importa com uma origem antiga sem o guard (0.2.18), que o simulador não roda |
 
-## Achado em aberto: R-27
+## Achado e corrigido: R-27
 
-Com `Personality::gnome()` no receptor, o simulador mostrou que o cursor pode
+Com `Personality::gnome()` no receptor, o simulador mostrou que o cursor podia
 voltar para a origem **sem a coordenada de retorno**:
 
 1. B (GNOME) está sendo dirigido por A há mais de 300 ms (`REMOTE_ENTRY_DWELL`);
 2. o usuário leva o cursor até a borda de entrada de B;
 3. o portal de captura reporta `BeginAt(along)` na barreira `EnterOnly`;
-4. a `CaptureTask` repassa isso como take-back em `ICaptureEvent::CaptureBegin(handle)`,
-   que **não carrega a coordenada**, e `src/service.rs` chama
-   `request_handoff(addr, None)`;
-5. esse pedido chega antes do `EdgeReturn` da emulação (que tem a coordenada),
-   e A recoloca o cursor no ponto de entrada antigo.
+4. a `CaptureTask` repassava isso como take-back em
+   `ICaptureEvent::CaptureBegin(handle)`, que **não carregava a coordenada**, e
+   `src/service.rs` chamava `request_handoff(addr, None)`;
+5. esse pedido chegava antes do `EdgeReturn` da emulação (que tem a
+   coordenada), e A recolocava o cursor no ponto de entrada antigo.
 
-`a_gnome_receiver_returns_with_the_coordinate` reproduz isso de forma
-determinística: falhou em 5 de 5 execuções. Ele está marcado como `#[ignore]`
-até a correção, e está registrado em [regressions.md](regressions.md). A
-correção provável é levar o `along` do `BeginAt` no `ICaptureEvent::CaptureBegin`
-até o `request_handoff`.
+**Correção:** `ICaptureEvent::CaptureBegin(handle, along)` leva o `along` do
+`BeginAt` (ou `None` para um `Begin` sem coordenada), e o service o repassa ao
+`request_handoff`, que já descarta a coordenada para peers sem a capability
+`RETURN_COORDINATE`. Não muda nada na wire: o `LeaveAt` já existia.
 
-Ressalva: o achado depende do modelo de jitter do GNOME (`Begin` a até 2 px da
-barreira). O comentário em `input-emulation/src/lib.rs` diz que o portal "não
-reporta barreiras de forma confiável" para movimento injetado, então às vezes
-ele reporta. Vale confirmar num Ubuntu real com `LAN_MOUSE_HANDOFF_TRACE=1`.
+**Verificação:** `a_gnome_receiver_returns_with_the_coordinate` falhava em 5 de
+5 execuções antes da correção e passa em 5 de 5 depois. Com a correção
+desfeita só em `src/service.rs`, ele volta a falhar. O teste unitário
+`src/capture.rs::a_take_back_without_a_crossing_coordinate_carries_none` cobre
+o caso sem coordenada.
+
+**Ainda vale conferir na mão:** o achado depende do modelo de jitter do GNOME
+(`Begin` a até 2 px da barreira). O comentário em `input-emulation/src/lib.rs`
+diz que o portal "não reporta barreiras de forma confiável" para movimento
+injetado, então às vezes ele reporta. Num Ubuntu real recebendo o cursor, fique
+um pouco na tela do Ubuntu, volte devagar até a borda e confira que o cursor
+reaparece na origem na mesma altura (`LAN_MOUSE_HANDOFF_TRACE=1` registra o
+caminho).
 
 ## Popups do portal "Área de trabalho remota"
 
@@ -342,13 +349,12 @@ cargo test --workspace
 
 ## Próximos passos sugeridos
 
-1. **Corrigir o R-27** e tirar o `#[ignore]` do cenário.
-2. **Replay de trace:** transformar um JSONL de
+1. **Replay de trace:** transformar um JSONL de
    [handoff-trace.md](handoff-trace.md) gravado num bug real em roteiro de
    `move_mouse`, para que o bug achado na mão vire teste permanente.
-3. **Take-back e peer caindo:** a mão em B durante o controle remoto, e
+2. **Take-back e peer caindo:** a mão em B durante o controle remoto, e
    derrubar o serviço de um PC no meio do handoff ou de uma transferência de
    clipboard (R-15, R-23).
-4. **Teclado:** teclas e modificadores presos quando o handoff acontece com
+3. **Teclado:** teclas e modificadores presos quando o handoff acontece com
    uma tecla segurada.
-5. **Relógio virtual**, depois da migração para as máquinas de estado puras.
+4. **Relógio virtual**, depois da migração para as máquinas de estado puras.
