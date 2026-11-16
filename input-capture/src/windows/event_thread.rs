@@ -28,13 +28,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, HOOKPROC, HWND_MESSAGE, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
     LLKHF_INJECTED, LLMHF_INJECTED, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
-    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SetCursor, SetCursorPos, SetWindowPos, SetWindowsHookExW,
-    ShowWindow, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SPI_GETMOUSESPEED, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetCursor, SetCursorPos, SetWindowPos, SetWindowsHookExW, ShowWindow, SystemParametersInfoW,
+    TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{BOOL, w};
 
@@ -342,6 +343,9 @@ thread_local! {
     /// [`monitor_scale`]); the wire carries logical pixels so peers with a
     /// different display scale move the cursor at the same logical speed.
     static DPI_SCALE: Cell<f64> = const { Cell::new(1.0) };
+    /// multiplier of the Windows pointer speed setting, read when a capture
+    /// begins (see [`pointer_speed_multiplier`])
+    static POINTER_SPEED: Cell<f64> = const { Cell::new(1.0) };
     /// previous mouse position (out-of-bounds fallback detector only)
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// previous absolute raw position of an absolute pointing device (tablet,
@@ -738,6 +742,10 @@ fn activate(pos: Position, at: (i32, i32)) {
     // pointer speed, so dividing by the scale yields logical 96-DPI units
     // that peers with another scale can consume at the same logical speed.
     DPI_SCALE.replace(unsafe { monitor_scale(entry_point) });
+    // Raw input ignores the pointer speed chosen in Windows settings; apply
+    // it so the pointer keeps the speed it has on this screen when it
+    // continues on the peer.
+    POINTER_SPEED.replace(pointer_speed_multiplier(system_pointer_speed()));
     PREV_POS.replace(Some(entry_point));
     // Show the overlay under the pinned pointer *before* moving the cursor:
     // the resulting WM_SETCURSOR is delivered to the overlay and removes the
@@ -936,22 +944,63 @@ unsafe fn process_raw_input(lparam: LPARAM) {
         if dx == 0 && dy == 0 {
             return;
         }
-        unsafe { handle_mouse_delta(dx, dy) };
+        // Absolute devices already report screen positions: their deltas are
+        // real pixels and the pointer speed setting does not apply to them.
+        unsafe { handle_mouse_delta(dx, dy, 1.0) };
         return;
     }
     let (dx, dy) = (mouse.lLastX, mouse.lLastY);
     if dx == 0 && dy == 0 {
         return;
     }
-    unsafe { handle_mouse_delta(dx, dy) };
+    unsafe { handle_mouse_delta(dx, dy, POINTER_SPEED.get()) };
+}
+
+/// Multiplier Windows applies to mouse counts for a pointer speed setting
+/// (`SPI_GETMOUSESPEED`, 1..=20, default 10) with "Enhance pointer precision"
+/// off. The acceleration curve of that option is not reproduced.
+///
+/// The settings slider maps to speeds 1, 2, 4, 6, ... 20 with multipliers
+/// 1/32, 1/16, 1/4, 1/2, 3/4, 1, 1.5, 2, 2.5, 3, 3.5; the formula below
+/// matches every one of them and interpolates the values in between, which
+/// can only be set through the registry.
+fn pointer_speed_multiplier(speed: i32) -> f64 {
+    let speed = speed.clamp(1, 20);
+    match speed {
+        1..=2 => f64::from(speed) / 32.0,
+        3..=10 => f64::from(speed - 2) / 8.0,
+        _ => f64::from(speed - 6) / 4.0,
+    }
+}
+
+/// Pointer speed from Windows settings, or the default when it cannot be read.
+fn system_pointer_speed() -> i32 {
+    const DEFAULT_SPEED: i32 = 10;
+    let mut speed = DEFAULT_SPEED;
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSESPEED,
+            0,
+            Some((&raw mut speed).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if let Err(e) = read {
+        log::debug!("could not read the pointer speed setting: {e}");
+        return DEFAULT_SPEED;
+    }
+    speed
 }
 
 /// Forward a relative mouse delta to the peer (capture active) or use it for
 /// barrier detection (idle).
-unsafe fn handle_mouse_delta(dx: i32, dy: i32) {
+///
+/// `speed` scales the forwarded motion (the pointer speed setting for relative
+/// devices, `1.0` for absolute ones); barrier detection uses the raw delta.
+unsafe fn handle_mouse_delta(dx: i32, dy: i32, speed: f64) {
     match ACTIVE_CLIENT.get() {
         Some(pos) => {
-            let scale = DPI_SCALE.get().max(0.1);
+            let scale = DPI_SCALE.get().max(0.1) / speed;
             let _ = try_send_event(
                 pos,
                 CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
@@ -1432,6 +1481,30 @@ mod tests {
             Some(Position::Right),
             false
         ));
+    }
+
+    #[test]
+    fn pointer_speed_matches_the_windows_slider_positions() {
+        // (SPI_GETMOUSESPEED, multiplier) for the eleven slider notches.
+        let notches = [
+            (1, 0.03125),
+            (2, 0.0625),
+            (4, 0.25),
+            (6, 0.5),
+            (8, 0.75),
+            (10, 1.0),
+            (12, 1.5),
+            (14, 2.0),
+            (16, 2.5),
+            (18, 3.0),
+            (20, 3.5),
+        ];
+        for (speed, multiplier) in notches {
+            assert_eq!(pointer_speed_multiplier(speed), multiplier, "speed {speed}");
+        }
+        // Out-of-range values (corrupt registry) fall back to the nearest end.
+        assert_eq!(pointer_speed_multiplier(0), 0.03125);
+        assert_eq!(pointer_speed_multiplier(99), 3.5);
     }
 
     #[test]

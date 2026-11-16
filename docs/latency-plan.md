@@ -158,7 +158,25 @@ PowerShell de administrador no Windows:
 `netsh wlan set autoconfig enabled=no interface="Wi-Fi"` (desfazer com
 `enabled=yes`). Se os picos sumirem, a causa é a varredura.
 
-### Fase 3 — revisada, sem mudança de código (2026-11-16)
+**Resultado do teste com `netsh` (varredura desligada no Windows):**
+
+| Trecho | p50 | p90 | p99 | máx | picos ≥ 15 ms |
+|---|---|---|---|---|---|
+| Ubuntu → Windows | 3,3 ms | 8,2 ms | 23,1 ms | 31,8 ms | 27 de 586 |
+| Ubuntu → roteador | 1,6 ms | 2,9 ms | 11,3 ms | 29,2 ms | — |
+
+A hipótese **não se confirmou**: os picos continuam na mesma proporção (antes
+20 de 586). O ritmo de ~4,9 s sumiu e o máximo caiu de 47 para 32 ms, então a
+varredura contribuía para os piores casos, mas não é a causa principal. O
+trecho Ubuntu → roteador também tem cauda própria (p99 11–17 ms).
+
+Próximas hipóteses, todas do lado do rádio (nenhuma é do aplicativo):
+economia de energia do adaptador Wi-Fi do Windows, banda/sinal do Windows
+(o Ubuntu está em 6 GHz com −47 dBm; o do Windows é desconhecido) e
+coexistência com Bluetooth. Precisa da saída de `netsh wlan show interfaces`
+no Windows.
+
+### Fase 3 — revisada (2026-11-16)
 
 - **Esperas por tempo:** as guardas de `src/capture.rs` já são por posição desde
   `ac728e5`. Elas só descartam movimento *de volta* a menos de 16 px da borda de
@@ -166,11 +184,13 @@ PowerShell de administrador no Windows:
   duas esperas puramente por tempo (120 ms de cooldown na captura do Windows e
   300 ms de `REMOTE_ENTRY_DWELL`), ajustadas com trace real. Não mexidas: mudar
   às cegas arrisca o vai-e-volta na borda.
-- **Mesma velocidade nas duas telas:** proposta, depende de decisão. A captura
-  do Windows envia contagens brutas do mouse, sem a velocidade do ponteiro
-  configurada no Windows. Dá para ler essa configuração e aplicar o
-  multiplicador padrão, mas isso muda a sensação de quem já ajustou a
-  sensibilidade por cliente.
+- **Mesma velocidade nas duas telas:** feito na captura do Windows. Ao iniciar
+  uma captura ela lê a velocidade do ponteiro do Windows (`SPI_GETMOUSESPEED`)
+  e aplica o multiplicador correspondente às contagens brutas do mouse. Com a
+  velocidade padrão (10) o multiplicador é 1,0 e nada muda. A curva de
+  "Aprimorar precisão do ponteiro" não é reproduzida. Quem já compensava uma
+  velocidade diferente com a sensibilidade por cliente vai precisar voltá-la
+  para 100%. Compila para Windows; **não executado em Windows**.
 - **Cursor:** Windows resolvido (`6f7d7b3`). GNOME 50: `inhibit_cursor_visibility`
   não tem efeito; falta o teste com `MUTTER_DEBUG_DISABLE_HW_CURSORS=1`.
 - **Arrastar entre telas:** não avaliado.
@@ -183,7 +203,7 @@ PowerShell de administrador no Windows:
 |---|---|
 | P1-02 sessões mortas no listener | corrigido (timeout ocioso fecha o transporte em `src/emulation.rs`) |
 | P1-03 corrida na janela de pareamento | corrigido (`pairing_lost_race` em `src/listen.rs`) |
-| P1-01 estado e buffers retidos por endpoint UDP | **pendente**: exige alterar ou substituir o listener do `webrtc-util` |
+| P1-01 estado e buffers retidos por endpoint UDP | **pendente**: o `accept_filter` do `webrtc-util` recebe só os bytes do datagrama, sem o endereço de origem, então não dá para limitar por IP antes da alocação; exige alterar ou substituir o listener |
 
 Os itens P2/P3 não foram reconferidos.
 

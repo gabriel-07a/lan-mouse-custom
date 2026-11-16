@@ -197,6 +197,16 @@ level mouse hook:
   out-of-bounds detector and re-pins the cursor every event so its deltas are
   per-event rather than cumulative.
 
+## Pointer speed (Windows capture)
+
+Raw input reports mouse counts before the pointer speed chosen in Windows
+settings is applied. When a capture begins, the Windows backend reads
+`SPI_GETMOUSESPEED` and scales the forwarded relative motion by the matching
+multiplier (1.0 at the default speed of 10), so the pointer keeps on the peer
+the speed it has on the Windows screen. Absolute devices are not scaled, and
+the "Enhance pointer precision" acceleration curve is not reproduced. The
+per-client `sensitivity` still applies on top.
+
 ## Local cursor visibility
 
 While a machine is driving a peer, its own pointer is hidden so the cursor
