@@ -302,24 +302,41 @@ fn netmask_prefix(netmask: Ipv4Addr) -> u8 {
     u32::from(netmask).count_ones() as u8
 }
 
-/// IPv4 addresses this machine recently exchanged packets with.
-#[cfg(target_os = "linux")]
-fn arp_hosts() -> HashSet<Ipv4Addr> {
+/// IPv4 addresses with a resolved entry in a `/proc/net/arp` table.
+///
+/// The subnet sweep itself makes the kernel create an *incomplete* entry
+/// (flags `0x0`, MAC `00:00:00:00:00:00`) for every address it probes. Those
+/// are questions nobody answered, not hosts: listing them showed every
+/// address of the subnet as a device. Only entries with the `ATF_COM` flag
+/// (`0x2`, address resolved) count.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn resolved_arp_hosts(table: &str) -> HashSet<Ipv4Addr> {
+    const ATF_COM: u32 = 0x2;
     let mut hosts = HashSet::new();
-    let Ok(table) = std::fs::read_to_string("/proc/net/arp") else {
-        return hosts;
-    };
     for line in table.lines().skip(1) {
         let mut fields = line.split_whitespace();
-        let Some(ip) = fields.next() else { continue };
+        let (Some(ip), _hw_type, Some(flags)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
         let Ok(ip) = ip.parse::<Ipv4Addr>() else {
             continue;
         };
-        if !ip.is_loopback() {
+        let resolved = u32::from_str_radix(flags.trim_start_matches("0x"), 16)
+            .is_ok_and(|flags| flags & ATF_COM != 0);
+        if resolved && !ip.is_loopback() {
             hosts.insert(ip);
         }
     }
     hosts
+}
+
+/// IPv4 addresses this machine recently exchanged packets with.
+#[cfg(target_os = "linux")]
+fn arp_hosts() -> HashSet<Ipv4Addr> {
+    std::fs::read_to_string("/proc/net/arp")
+        .map(|table| resolved_arp_hosts(&table))
+        .unwrap_or_default()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -754,6 +771,30 @@ pub async fn probe_lan_mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unanswered_arp_entries_are_not_hosts() {
+        // Real shape of /proc/net/arp right after a subnet sweep.
+        let table = "\
+IP address       HW type     Flags       HW address            Mask     Device
+192.168.166.1    0x1         0x2         64:d1:54:82:41:14     *        wlp128s20f3
+192.168.166.88   0x1         0x0         00:00:00:00:00:00     *        wlp128s20f3
+192.168.166.166  0x1         0x2         90:cc:df:42:34:f7     *        wlp128s20f3
+192.168.166.204  0x1         0x0         00:00:00:00:00:00     *        wlp128s20f3
+192.168.166.9    0x1         0x6         00:11:22:33:44:55     *        wlp128s20f3
+garbage line
+";
+        let hosts = resolved_arp_hosts(table);
+        let expected: HashSet<Ipv4Addr> = [
+            Ipv4Addr::new(192, 168, 166, 1),
+            Ipv4Addr::new(192, 168, 166, 166),
+            // permanent entry (ATF_COM | ATF_PERM) is resolved too
+            Ipv4Addr::new(192, 168, 166, 9),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(hosts, expected);
+    }
 
     #[test]
     fn netmask_prefix_is_counted() {

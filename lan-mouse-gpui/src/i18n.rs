@@ -232,6 +232,13 @@ impl Language {
                 "No devices discovered yet. Press Scan network." => {
                     "Nenhum dispositivo descoberto ainda. Clique em Procurar na rede."
                 }
+                "No Lan Mouse answered. Check that it is running on the other PC \
+                 and that its firewall allows UDP 4245." => {
+                    "Nenhum Lan Mouse respondeu. Confira se ele está aberto no outro PC \
+                     e se o firewall dele libera a porta UDP 4245."
+                }
+                "Show" => "Mostrar",
+                "Hide" => "Ocultar",
                 "Configured" => "Configurado",
                 "configured" => "configurado",
                 "Lan Mouse available" => "Lan Mouse disponível",

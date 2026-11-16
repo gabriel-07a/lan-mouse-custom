@@ -812,6 +812,8 @@ struct Dashboard {
     add_notice: Option<(String, bool)>,
     /// When the user last requested a network scan (rate limit).
     scan_requested_at: Option<std::time::Instant>,
+    /// Whether the Network page also lists hosts where no Lan Mouse answered.
+    show_other_hosts: bool,
     first_frame_logged: bool,
 }
 
@@ -954,6 +956,7 @@ impl Dashboard {
             adding_device: None,
             add_notice: None,
             scan_requested_at: None,
+            show_other_hosts: false,
             first_frame_logged: false,
         }
     }
@@ -1049,8 +1052,14 @@ impl Dashboard {
                 if self.adding_device.is_some() {
                     self.adding_device = None;
                     let message = match self.language {
-                        Language::PortugueseBrazil => "Dispositivo adicionado — conectando…",
-                        Language::English => "Device added — connecting…",
+                        Language::PortugueseBrazil => {
+                            "Dispositivo adicionado. Agora aprove o pedido de conexão no outro PC \
+                             (aba Dispositivos) e escolha o lado da tela aqui."
+                        }
+                        Language::English => {
+                            "Device added. Now approve the connection request on the other PC \
+                             (Devices page) and choose the screen side here."
+                        }
                     };
                     self.status = message.to_string();
                     self.set_add_notice(message.to_string(), true);
@@ -3092,6 +3101,15 @@ impl Dashboard {
     }
 
     fn render_network(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        // Only devices that answered as Lan Mouse can be connected to. On a
+        // busy network they were buried among every other reachable host, so
+        // those are folded away behind a toggle.
+        let (lan_mouse, others): (Vec<_>, Vec<_>) = self
+            .discovered
+            .clone()
+            .into_iter()
+            .partition(|device| device.lan_mouse);
+        let scanned = !self.discovered.is_empty();
         div()
             .id("network-page")
             .size_full()
@@ -3122,15 +3140,78 @@ impl Dashboard {
                         ),
                 )
             })
+            .when(scanned && lan_mouse.is_empty(), |this| {
+                this.child(
+                    div()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(CARD))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_sm()
+                        .text_color(rgb(AMBER))
+                        .child(self.tr(
+                            "No Lan Mouse answered. Check that it is running on the other PC \
+                             and that its firewall allows UDP 4245.",
+                        )),
+                )
+            })
             .child(
                 div().flex().flex_col().gap_2().children(
-                    self.discovered
-                        .clone()
+                    lan_mouse
                         .into_iter()
                         .map(|device| self.render_network_row(device, cx).into_any_element())
                         .collect::<Vec<_>>(),
                 ),
             )
+            .when(!others.is_empty(), |this| {
+                let count = others.len();
+                let summary = match self.language {
+                    Language::PortugueseBrazil => {
+                        format!("{count} outro(s) host(s) na rede sem Lan Mouse detectado")
+                    }
+                    Language::English => {
+                        format!("{count} other host(s) on the network without Lan Mouse detected")
+                    }
+                };
+                let shown = self.show_other_hosts;
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .pt_2()
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(summary))
+                        .child(self.action_button(
+                            "toggle-other-hosts",
+                            if shown {
+                                self.tr("Hide")
+                            } else {
+                                self.tr("Show")
+                            },
+                            0x1d2430,
+                            TEXT,
+                            cx,
+                            |this, _, _, cx| {
+                                this.show_other_hosts = !this.show_other_hosts;
+                                cx.notify();
+                            },
+                        )),
+                )
+                .when(shown, |this| {
+                    this.child(
+                        div().flex().flex_col().gap_2().children(
+                            others
+                                .into_iter()
+                                .map(|device| {
+                                    self.render_network_row(device, cx).into_any_element()
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                })
+            })
     }
 
     fn render_pairing_review(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
