@@ -18,9 +18,9 @@ use crate::{
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AddressRuleView, AsyncFrontendListener, Capabilities, ClientHandle, ClipboardStatus,
-    DeviceView, Diagnostics, DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest,
-    HistoryEntry, IpcError, IpcListenerCreationError, PendingView, Position, Status,
+    AddressRuleView, AsyncFrontendListener, ClientHandle, ClipboardStatus, DeviceView, Diagnostics,
+    DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest, HistoryEntry, IpcError,
+    IpcListenerCreationError, PendingView, Position, Status,
 };
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION};
 use local_channel::mpsc::{Receiver, Sender};
@@ -3208,20 +3208,20 @@ impl Service {
 
         // Outgoing direction gate: controlling the peer is only possible when
         // the outgoing policy grants at least pointer or keyboard. Clients
-        // without a known fingerprint keep the legacy permissive behavior.
-        let outgoing_caps = match self.client_manager.fingerprint(handle) {
-            Some(fingerprint) => {
-                let policy = self.devices.read().expect("lock").outgoing(&fingerprint);
-                if !policy.grants_anything() {
-                    self.notify_frontend(FrontendEvent::Error(
-                        "outgoing control is not allowed for this device".to_string(),
-                    ));
-                    log::warn!("not activating client {handle}: outgoing direction disabled");
-                    return;
-                }
-                policy.capabilities
-            }
-            None => Capabilities::ALL,
+        // without a device record (unpinned, or pinned but not connected yet)
+        // are allowed; see `DeviceStore::outgoing_capabilities`.
+        let fingerprint = self.client_manager.fingerprint(handle);
+        let Some(outgoing_caps) = self
+            .devices
+            .read()
+            .expect("lock")
+            .outgoing_capabilities(fingerprint.as_deref())
+        else {
+            self.notify_frontend(FrontendEvent::Error(
+                "outgoing control is not allowed for this device".to_string(),
+            ));
+            log::warn!("not activating client {handle}: outgoing direction disabled");
+            return;
         };
 
         // Do not warm up input emulation just because a client entry exists.

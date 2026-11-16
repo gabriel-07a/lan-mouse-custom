@@ -405,6 +405,35 @@ impl DeviceStore {
             .unwrap_or_default()
     }
 
+    /// Capabilities this machine may use on the peer of a configured client,
+    /// or `None` when controlling it is not allowed.
+    ///
+    /// A client pinned to a certificate that has no device record yet (just
+    /// added from the Network page with the fingerprint its beacon announced)
+    /// is allowed like an unpinned client: the pin is checked by the handshake
+    /// and the device is registered once that handshake succeeds. Treating a
+    /// missing record as "outgoing disabled" refused to connect to it at all.
+    /// A revoked device, or a known one whose outgoing direction grants
+    /// nothing, stays blocked.
+    pub(crate) fn outgoing_capabilities(
+        &self,
+        fingerprint: Option<&str>,
+    ) -> Option<lan_mouse_ipc::Capabilities> {
+        let Some(fingerprint) = fingerprint else {
+            return Some(lan_mouse_ipc::Capabilities::ALL);
+        };
+        if self.is_denied(fingerprint) {
+            return None;
+        }
+        match self.devices.get(fingerprint) {
+            Some(device) => device
+                .outgoing
+                .grants_anything()
+                .then_some(device.outgoing.capabilities),
+            None => Some(lan_mouse_ipc::Capabilities::ALL),
+        }
+    }
+
     /// Display name of a device, if known.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn name_of(&self, fingerprint: &str) -> Option<&str> {
@@ -413,7 +442,6 @@ impl DeviceStore {
             .map(|device| device.name.as_str())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_denied(&self, fingerprint: &str) -> bool {
         self.denied
             .get(fingerprint)
@@ -630,6 +658,40 @@ impl DeviceStore {
 mod tests {
     use super::*;
     use lan_mouse_ipc::Capabilities;
+
+    #[test]
+    fn a_pinned_client_without_a_device_record_may_connect() {
+        let mut store = DeviceStore::default();
+        // unpinned client: legacy permissive behaviour
+        assert_eq!(store.outgoing_capabilities(None), Some(Capabilities::ALL));
+        // added from the Network page: pinned, not registered yet
+        assert_eq!(
+            store.outgoing_capabilities(Some("aa:bb")),
+            Some(Capabilities::ALL)
+        );
+
+        // a known device whose outgoing direction was switched off is blocked
+        let mut device = Device::new("aa:bb".to_string(), "desk".to_string());
+        device.outgoing = DirectionPolicy::default();
+        store.put(device);
+        assert_eq!(store.outgoing_capabilities(Some("aa:bb")), None);
+
+        // a known device keeps exactly the capabilities it was granted
+        let mut device = Device::new("cc:dd".to_string(), "laptop".to_string());
+        device.outgoing = DirectionPolicy {
+            allowed: true,
+            capabilities: Capabilities::CLIPBOARD,
+        };
+        store.put(device);
+        assert_eq!(
+            store.outgoing_capabilities(Some("cc:dd")),
+            Some(Capabilities::CLIPBOARD)
+        );
+
+        // a revoked device is blocked even though its record is gone
+        store.deny("ee:ff".to_string());
+        assert_eq!(store.outgoing_capabilities(Some("ee:ff")), None);
+    }
     use std::net::{IpAddr, Ipv4Addr};
 
     fn fp(n: u8) -> String {
