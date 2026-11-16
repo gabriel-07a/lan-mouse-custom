@@ -9,8 +9,7 @@
 
 use std::{
     cell::RefCell,
-    env, fs,
-    io::{self, Read, Write},
+    env, fs, io,
     os::fd::OwnedFd,
     path::{Path, PathBuf},
     rc::Rc,
@@ -24,6 +23,8 @@ use ashpd::desktop::{
 };
 use futures::StreamExt;
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::unix::pipe,
     sync::mpsc::{UnboundedReceiver, unbounded_channel},
     task::JoinHandle,
 };
@@ -453,36 +454,45 @@ fn data_for_mime(snapshot: &ClipboardSnapshot, mime: &str) -> Option<Vec<u8>> {
     format_for_mime(mime).and_then(|format| snapshot.get(format).map(|bytes| bytes.to_vec()))
 }
 
+/// Read a selection pipe to its end.
+///
+/// The portal hands out a non-blocking pipe and the owning application may
+/// take a moment to start writing (terminals do; browsers answer at once). A
+/// plain blocking read on it fails with `EAGAIN` in that window, which used to
+/// drop the copy silently. The pipe is read asynchronously instead, so the
+/// caller's timeout bounds the wait and cancels it cleanly.
 async fn read_fd(fd: OwnedFd, limit: usize) -> Result<Vec<u8>, Error> {
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::from(fd);
-        let mut out = Vec::new();
-        // Read one byte past the limit to distinguish "exactly the limit" from
-        // an oversized payload that must not be forwarded truncated.
-        file.take((limit as u64).saturating_add(1))
-            .read_to_end(&mut out)?;
-        if out.len() > limit {
-            return Err(std::io::Error::other(format!(
-                "clipboard payload exceeds {limit} bytes"
-            )));
-        }
-        Ok::<_, std::io::Error>(out)
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("clipboard pipe task failed: {e}")))?
-    .map_err(|e| Error::Backend(format!("clipboard pipe read failed: {e}")))
+    let pipe = pipe::Receiver::from_owned_fd_unchecked(fd)
+        .map_err(|e| Error::Backend(format!("clipboard pipe setup failed: {e}")))?;
+    let mut out = Vec::new();
+    // Read one byte past the limit to distinguish "exactly the limit" from
+    // an oversized payload that must not be forwarded truncated.
+    pipe.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .await
+        .map_err(|e| Error::Backend(format!("clipboard pipe read failed: {e}")))?;
+    if out.len() > limit {
+        return Err(Error::Backend(format!(
+            "clipboard pipe read failed: clipboard payload exceeds {limit} bytes"
+        )));
+    }
+    Ok(out)
 }
 
+/// Write a whole payload to a selection pipe.
+///
+/// Same non-blocking pipe as [`read_fd`]: a blocking `write_all` fails with
+/// `EAGAIN` as soon as the payload exceeds the pipe buffer (64 KiB) and the
+/// pasting application has not drained it yet, which truncated large pastes.
 async fn write_fd(fd: OwnedFd, bytes: Vec<u8>) -> Result<(), Error> {
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::from(fd);
-        file.write_all(&bytes)?;
-        file.flush()?;
-        Ok::<_, std::io::Error>(())
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("clipboard pipe task failed: {e}")))?
-    .map_err(|e| Error::Backend(format!("clipboard pipe write failed: {e}")))
+    let mut pipe = pipe::Sender::from_owned_fd_unchecked(fd)
+        .map_err(|e| Error::Backend(format!("clipboard pipe setup failed: {e}")))?;
+    pipe.write_all(&bytes)
+        .await
+        .map_err(|e| Error::Backend(format!("clipboard pipe write failed: {e}")))?;
+    pipe.flush()
+        .await
+        .map_err(|e| Error::Backend(format!("clipboard pipe write failed: {e}")))
 }
 
 /// Directory holding portal tokens: `$XDG_STATE_HOME/lan-mouse`, falling back
@@ -750,5 +760,53 @@ mod token_tests {
 
         fs::remove_dir_all(&state).unwrap();
         fs::remove_dir_all(&legacy).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// A terminal starts serving the selection a moment after the request;
+    /// the read must wait for it instead of failing on the empty pipe.
+    #[tokio::test]
+    async fn a_slow_selection_owner_is_read_completely() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let owner = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            writer.write_all(b"copied from ").expect("write");
+            std::thread::sleep(Duration::from_millis(60));
+            writer.write_all(b"a terminal").expect("write");
+        });
+        let bytes = read_fd(OwnedFd::from(reader), 1024).await.expect("read");
+        owner.join().expect("owner thread");
+        assert_eq!(bytes, b"copied from a terminal");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_selection_is_rejected_not_truncated() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(&[7u8; 64]).expect("write");
+        drop(writer);
+        assert!(read_fd(OwnedFd::from(reader), 16).await.is_err());
+    }
+
+    /// A paste larger than the pipe buffer must be delivered whole even when
+    /// the pasting application drains the pipe slowly.
+    #[tokio::test]
+    async fn a_large_paste_survives_a_slow_reader() {
+        let payload: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let pasting_app = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).expect("read");
+            received
+        });
+        write_fd(OwnedFd::from(writer), payload.clone())
+            .await
+            .expect("write");
+        assert_eq!(pasting_app.join().expect("reader thread"), payload);
     }
 }
