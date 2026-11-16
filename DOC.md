@@ -200,8 +200,21 @@ visually "moves" to the other screen instead of staying parked on the edge.
   compositor-owned cursor, so it remains visible there.
 - **X11**: the capture backend is not implemented in this fork.
 
-The local cursor is only hidden on the *sending* side; the receiving machine
-always keeps the visible pointer, since that is what the user is controlling.
+The local cursor is only hidden on the *sending* side while a capture is
+active; the receiving machine keeps the visible pointer, since that is what the
+user is controlling.
+
+After the peer hands control back, the receiving machine's pointer would stay
+visible wherever the peer left it (usually at the shared edge). It is *parked*:
+
+- **Windows**: when the remote session ends (`set_remote_peer(None)` after a
+  peer was driving), the same overlay is shown under the current cursor
+  position. The first physical mouse event (the low level hook sees no
+  `LLMHF_INJECTED` flag) hides it again, before the event is passed on so a
+  click without motion still reaches the window underneath. A peer entering
+  again or a local capture starting also restores it.
+- **GNOME**: the service writes the `cursor-park` marker for the bundled
+  extension (see the README).
 
 ## Symmetric roles
 Every instance runs both a listener and an outgoing connection, so *server* and

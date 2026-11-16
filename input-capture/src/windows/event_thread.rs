@@ -280,7 +280,46 @@ fn hide_hidden_pointer() {
     }
 }
 
+/// Whether the end of a remote session should park (hide) the local cursor.
+///
+/// Only the transition "a peer was driving this machine" -> "nobody is" parks:
+/// the pointer is then left wherever the peer stopped, usually at the shared
+/// edge. A local capture already hides the cursor on its own.
+fn should_park_cursor(previous: Option<Position>, next: Option<Position>, capturing: bool) -> bool {
+    previous.is_some() && next.is_none() && !capturing
+}
+
+/// Whether a low level mouse event should restore a parked cursor. Our own
+/// emulation (and any other injector) can still deliver a few events while the
+/// peer hands control back; only physical input means the local user is back.
+fn restores_parked_cursor(parked: bool, injected: bool) -> bool {
+    parked && !injected
+}
+
+/// Hide the cursor where the remote peer left it, until the local user moves
+/// the mouse or a peer/capture takes over again.
+fn park_cursor() {
+    let mut cursor = POINT::default();
+    if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+        return;
+    }
+    show_hidden_pointer((cursor.x, cursor.y));
+    if HIDDEN_POINTER_SHOWN.get() {
+        CURSOR_PARKED.set(true);
+        log::debug!("local pointer parked at ({}, {})", cursor.x, cursor.y);
+    }
+}
+
+/// Show a parked cursor again. No-op unless the cursor is parked, so it never
+/// touches the overlay of a live capture.
+fn unpark_cursor() {
+    if CURSOR_PARKED.replace(false) {
+        hide_hidden_pointer();
+    }
+}
+
 fn destroy_hidden_pointer() {
+    CURSOR_PARKED.set(false);
     hide_hidden_pointer();
     if let Some(hwnd) = hidden_pointer_hwnd() {
         unsafe {
@@ -326,6 +365,9 @@ thread_local! {
     static HIDDEN_POINTER_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// whether the hidden-pointer overlay is currently shown
     static HIDDEN_POINTER_SHOWN: Cell<bool> = const { Cell::new(false) };
+    /// whether the overlay is shown to hide a cursor parked after a remote
+    /// peer returned control (as opposed to hiding it for a local capture)
+    static CURSOR_PARKED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Log a failure to set up the local pointer overlay only once.
@@ -685,6 +727,9 @@ fn release_active_client_at(target: Option<(i32, i32)>) {
 /// clamped it to a display edge.
 fn activate(pos: Position, at: (i32, i32)) {
     ACTIVE_CLIENT.replace(Some(pos));
+    // The overlay is reused below for the capture itself; it is no longer a
+    // parked cursor, so the release must hide it, not the next local motion.
+    CURSOR_PARKED.set(false);
     let entry_point = DISPLAYS
         .with_borrow(|(displays, _, _)| display_util::clamp_to_display_bounds(displays, at, at));
     ENTRY_POINT.replace(entry_point);
@@ -941,6 +986,16 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
     let raw_input = RAW_INPUT_OK.get();
     if ACTIVE_CLIENT.get().is_none() {
+        // Restore a parked cursor on the first physical mouse event. Hiding
+        // the overlay before passing the event on lets a click that did not
+        // move the pointer reach the window under it instead of the overlay.
+        let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
+        if restores_parked_cursor(
+            CURSOR_PARKED.get(),
+            mouse_low_level.flags & LLMHF_INJECTED != 0,
+        ) {
+            unpark_cursor();
+        }
         // Primary detector: raw input (works with a clamped pointer).
         // Fallback only if raw input could not be registered.
         if !raw_input && wparam.0 == WM_MOUSEMOVE as usize {
@@ -1200,9 +1255,12 @@ fn update_clients(request: ClientUpdate) {
             release_active_client_at(target);
         }
         ClientUpdate::RemotePeer(peer) => {
-            REMOTE_PEER.set(peer);
+            let previous = REMOTE_PEER.replace(peer);
             match peer {
                 Some(pos) => {
+                    // The peer drives this screen again: its pointer must be
+                    // visible.
+                    unpark_cursor();
                     // A peer taking over must never leave a local capture (and
                     // a hidden cursor) behind, and the post-release cooldown
                     // must not swallow the return crossing through `pos`.
@@ -1212,7 +1270,14 @@ fn update_clients(request: ClientUpdate) {
                     LAST_RELEASE.replace(None);
                     log::debug!("remote peer control active from {pos:?}");
                 }
-                None => log::debug!("remote peer control inactive"),
+                None => {
+                    log::debug!("remote peer control inactive");
+                    // Control went back to the peer: do not leave this
+                    // machine's cursor visible at the edge it left through.
+                    if should_park_cursor(previous, peer, ACTIVE_CLIENT.get().is_some()) {
+                        park_cursor();
+                    }
+                }
             }
         }
     }
@@ -1351,6 +1416,32 @@ mod tests {
             Some(Position::Top),
             Position::Bottom
         ));
+    }
+
+    #[test]
+    fn only_the_end_of_a_remote_session_parks_the_cursor() {
+        assert!(should_park_cursor(Some(Position::Left), None, false));
+        // A local capture already hides the cursor itself.
+        assert!(!should_park_cursor(Some(Position::Left), None, true));
+        // Repeated "no peer" updates (teardown is idempotent) must not re-park.
+        assert!(!should_park_cursor(None, None, false));
+        // A peer (re)entering never parks.
+        assert!(!should_park_cursor(None, Some(Position::Left), false));
+        assert!(!should_park_cursor(
+            Some(Position::Left),
+            Some(Position::Right),
+            false
+        ));
+    }
+
+    #[test]
+    fn only_physical_input_restores_a_parked_cursor() {
+        assert!(restores_parked_cursor(true, false));
+        assert!(
+            !restores_parked_cursor(true, true),
+            "residual injected motion from the peer must keep it hidden"
+        );
+        assert!(!restores_parked_cursor(false, false));
     }
 }
 
