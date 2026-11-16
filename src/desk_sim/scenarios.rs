@@ -185,3 +185,59 @@ async fn the_return_goes_to_the_peer_that_drives() {
         })
         .await;
 }
+
+/// The latency percentiles a person reads in `cli list` must describe a real
+/// link: round-trips from the probes, the cadence of the motion this PC sends
+/// and the cadence of the motion the other PC receives.
+#[tokio::test(flavor = "current_thread")]
+async fn the_link_reports_latency_percentiles() {
+    init_log();
+    LocalSet::new()
+        .run_until(async {
+            let desk = a_with_b_on_the_right().await;
+            desk.move_mouse(1200.0, 0.0).await;
+            desk.wait_focus("B").await;
+            // keep the pointer moving on B so both cadence meters fill up
+            for _ in 0..4 {
+                desk.move_mouse(200.0, 100.0).await;
+                desk.move_mouse(-200.0, -100.0).await;
+            }
+
+            let latency = |name: &str| {
+                desk.pc(name)
+                    .clients
+                    .clients()
+                    .first()
+                    .map(|(_, state)| state.latency)
+                    .unwrap_or_default()
+            };
+            desk.wait_until(
+                "A measures round-trips and its send cadence",
+                Duration::from_secs(5),
+                |_| {
+                    let a = latency("A");
+                    a.rtt_p50_us.is_some()
+                        && a.rtt_p99_us.is_some()
+                        && a.probe_loss_permille == Some(0)
+                        && a.send_gap_p99_us.is_some()
+                },
+            )
+            .await;
+            desk.wait_until(
+                "B measures the cadence of the motion it receives",
+                Duration::from_secs(5),
+                |_| latency("B").recv_gap_p99_us.is_some(),
+            )
+            .await;
+
+            let a = latency("A");
+            assert!(
+                a.rtt_p50_us <= a.rtt_p99_us,
+                "percentiles must be ordered: {a:?}"
+            );
+            // loopback: anything near the probe timeout means replies were
+            // matched to the wrong probe
+            assert!(a.rtt_p99_us < Some(500_000), "{a:?}");
+        })
+        .await;
+}

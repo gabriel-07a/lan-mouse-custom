@@ -375,6 +375,8 @@ impl Service {
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
+        crate::net_tuning::init_process();
+        let loop_lag = tokio::task::spawn_local(crate::latency::watch_loop_lag());
         let active = self.client_manager.active_clients();
         for handle in active.iter() {
             // small hack: `activate_client()` checks, if the client
@@ -449,6 +451,12 @@ impl Service {
                     if let Some(handle) = handle {
                         self.enforce_peer_compatibility(handle);
                         self.broadcast_client(handle);
+                        // Radio tuning only while a peer link is up.
+                        crate::net_tuning::set_link_active(
+                            self.client_manager.clients().iter().any(|(_, state)| {
+                                state.active_addr.is_some() || state.incoming_addr.is_some()
+                            }),
+                        );
                         // A peer's AuthRevoke deactivates the client in the
                         // connection layer only. Drop the matching outgoing
                         // capture barrier here too, otherwise the local pointer
@@ -555,6 +563,8 @@ impl Service {
             // defensively for a capture that is still marked active.
             self.capture.release();
         }
+        crate::net_tuning::set_link_active(false);
+        loop_lag.abort();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating clipboard ...");
@@ -1292,6 +1302,21 @@ impl Service {
                         "peer at {addr} explicitly disconnected; deactivating client(s) for {fingerprint}"
                     );
                     self.deactivate_fingerprint(&fingerprint);
+                }
+            }
+            EmulationEvent::InputCadence {
+                addr,
+                p50_us,
+                p99_us,
+            } => {
+                if let Some(handle) = self.client_for_incoming(addr) {
+                    let changed = self.client_manager.update_latency(handle, |latency| {
+                        latency.recv_gap_p50_us = p50_us;
+                        latency.recv_gap_p99_us = p99_us;
+                    });
+                    if changed {
+                        self.broadcast_client(handle);
+                    }
                 }
             }
             EmulationEvent::PeerHello {

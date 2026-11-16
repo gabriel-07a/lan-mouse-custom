@@ -101,6 +101,7 @@ impl ClientManager {
                 s.rtt_ms = None;
                 s.jitter_ms = None;
                 s.loss_percent = None;
+                s.latency = Default::default();
                 s.last_error = None;
                 // No live link, therefore no round-trip proof either.
                 s.last_pong_at = None;
@@ -541,6 +542,22 @@ impl ClientManager {
         if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
             state.last_error = error;
         }
+    }
+
+    /// Update the latency percentiles of a link. `update` only touches the
+    /// fields its measurement owns (probes, send cadence or receive cadence).
+    pub(crate) fn update_latency(
+        &self,
+        handle: ClientHandle,
+        update: impl FnOnce(&mut lan_mouse_ipc::LinkLatency),
+    ) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((_, state)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        let previous = state.latency;
+        update(&mut state.latency);
+        previous != state.latency
     }
 
     pub(crate) fn set_loss_percent(&self, handle: ClientHandle, loss_percent: Option<u8>) {

@@ -118,6 +118,15 @@ struct ConnCtx {
     auth_announced: Rc<RefCell<HashMap<SocketAddr, AnnouncedPermissions>>>,
     /// how long a single `send` blocks waiting for a connection
     grace: Duration,
+    /// latency measurement of the live transport per client
+    latency: Rc<RefCell<HashMap<ClientHandle, LinkMeters>>>,
+}
+
+/// Latency measurement state of one outgoing transport.
+#[derive(Default)]
+struct LinkMeters {
+    probes: crate::latency::ProbeTracker,
+    send_cadence: crate::latency::CadenceMeter,
 }
 
 /// Permission bits last announced to one peer, and when.
@@ -257,6 +266,15 @@ impl ConnCtx {
         self.client_manager.set_last_pong_at(handle, None);
         self.ping_sent.borrow_mut().remove(&active.addr);
         self.ping_response.borrow_mut().remove(&active.addr);
+        // Percentiles describe one transport; a reconnect starts over.
+        self.latency.borrow_mut().remove(&handle);
+        self.client_manager.update_latency(handle, |latency| {
+            *latency = lan_mouse_ipc::LinkLatency {
+                recv_gap_p50_us: latency.recv_gap_p50_us,
+                recv_gap_p99_us: latency.recv_gap_p99_us,
+                ..Default::default()
+            };
+        });
         // A reconnect may legitimately reuse the same ip:port (stateful NAT,
         // fast socket rebinding), so per-address bookkeeping must not outlive
         // the transport it belongs to.
@@ -341,6 +359,7 @@ impl LanMouseConnection {
             auth_sessions: Default::default(),
             auth_announced: Default::default(),
             grace: Duration::from_millis(connect_grace_ms),
+            latency: Default::default(),
         };
         Self {
             sender: ConnectionSender { ctx },
@@ -586,6 +605,15 @@ impl ConnectionSender {
             match active.conn.send(buf).await {
                 Ok(_) => {
                     log::trace!("{} bytes >->->->->- {}", buf.len(), active.addr);
+                    if buf.first() == Some(&(lan_mouse_proto::EventType::PointerMotion as u8)) {
+                        self.ctx
+                            .latency
+                            .borrow_mut()
+                            .entry(handle)
+                            .or_default()
+                            .send_cadence
+                            .record(Instant::now());
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -692,6 +720,8 @@ async fn connect(
     );
     configure_low_latency_udp(&conn);
     conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
+    // Needs the connected destination, so it comes after `connect`.
+    crate::net_tuning::prioritize_socket(&conn);
     let mut config = Config {
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
@@ -1020,6 +1050,7 @@ async fn connect_to_handle(
         // unknown event id, which would silently make this connection
         // write-only.
         spawn_local(ping_pong(ctx.clone(), handle, active.clone()));
+        spawn_local(latency_probe(ctx.clone(), handle, active.clone()));
         spawn_local(receive_loop(ctx.clone(), handle, active));
         Ok(())
     }
@@ -1291,6 +1322,65 @@ async fn send_hello_once(ctx: &ConnCtx, addr: SocketAddr, conn: &ArcConn) {
     }
 }
 
+/// Measure the round-trip time of one transport and publish the latency
+/// percentiles of the link once per second.
+///
+/// Probes are only sent to peers advertising
+/// [`lan_mouse_proto::capabilities::LATENCY_PROBE`] (legacy peers close the
+/// connection on an unknown event id); the send cadence is local and is
+/// published for every peer. Tied to [`ActiveConnection::generation`] like the
+/// keepalive loop.
+async fn latency_probe(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnection) {
+    const PUBLISH_EVERY: u32 = 4;
+    let mut tick = tokio::time::interval(crate::latency::PROBE_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks = 0u32;
+    loop {
+        tick.tick().await;
+        if !ctx.is_current(handle, active.generation) {
+            return;
+        }
+        if ctx
+            .client_manager
+            .peer_supports(handle, lan_mouse_proto::capabilities::LATENCY_PROBE)
+        {
+            let seq = ctx
+                .latency
+                .borrow_mut()
+                .entry(handle)
+                .or_default()
+                .probes
+                .begin(Instant::now());
+            let (buf, len) = ProtoEvent::LatencyProbe(seq).into();
+            // A failed probe is simply a lost sample; the keepalive loop owns
+            // the decision to close the transport.
+            if let Err(e) = active.conn.send(&buf[..len]).await {
+                log::trace!("{}: latency probe not sent: {e}", active.addr);
+            }
+        }
+        ticks = ticks.wrapping_add(1);
+        if !ticks.is_multiple_of(PUBLISH_EVERY) || !ctx.is_current(handle, active.generation) {
+            continue;
+        }
+        let changed = {
+            let meters = ctx.latency.borrow();
+            let Some(meters) = meters.get(&handle) else {
+                continue;
+            };
+            ctx.client_manager.update_latency(handle, |latency| {
+                latency.rtt_p50_us = meters.probes.rtt().percentile(0.5);
+                latency.rtt_p99_us = meters.probes.rtt().percentile(0.99);
+                latency.probe_loss_permille = meters.probes.loss_permille();
+                latency.send_gap_p50_us = meters.send_cadence.window().percentile(0.5);
+                latency.send_gap_p99_us = meters.send_cadence.window().percentile(0.99);
+            })
+        };
+        if changed {
+            ctx.notify_state_changed(handle);
+        }
+    }
+}
+
 async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnection) {
     let addr = active.addr;
     let mut buf = [0u8; MAX_CLIPBOARD_FRAME];
@@ -1396,8 +1486,14 @@ async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnecti
                         }
                         return;
                     }
-                    // The listener is the responder for permission requests.
-                    ProtoEvent::AuthRequest { .. } => {}
+                    ProtoEvent::LatencyReply(seq) => {
+                        if let Some(meters) = ctx.latency.borrow_mut().get_mut(&handle) {
+                            meters.probes.complete(seq, Instant::now());
+                        }
+                    }
+                    // The listener is the responder for permission requests
+                    // and latency probes.
+                    ProtoEvent::AuthRequest { .. } | ProtoEvent::LatencyProbe(_) => {}
                     event => ctx.tx.send((handle, event)).ok().unwrap_or_default(),
                 }
             }

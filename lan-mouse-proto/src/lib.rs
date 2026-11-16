@@ -64,6 +64,13 @@ pub mod capabilities {
     /// so both ends can reject incompatible application versions before input
     /// is forwarded.
     pub const VERSION_INFO: u32 = 1 << 9;
+    /// The peer answers [`super::ProtoEvent::LatencyProbe`] with a
+    /// [`super::ProtoEvent::LatencyReply`] carrying the same sequence number,
+    /// so the sender can measure the round-trip time of individual datagrams
+    /// (percentiles and loss, not just one smoothed sample per ping round).
+    /// Legacy peers close the connection on an unknown event id, so probes
+    /// must only be sent when the peer advertised this bit.
+    pub const LATENCY_PROBE: u32 = 1 << 10;
 }
 
 /// Features this build can use when the peer also advertises them.
@@ -73,7 +80,8 @@ pub const CAPABILITIES: u32 = capabilities::ENTER_ACK
     | capabilities::SERIALIZED_LEAVE
     | capabilities::EDGE_COORDINATE
     | capabilities::RETURN_COORDINATE
-    | capabilities::VERSION_INFO;
+    | capabilities::VERSION_INFO
+    | capabilities::LATENCY_PROBE;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -250,6 +258,12 @@ pub enum ProtoEvent {
     /// released). `reason` is a small enum: 0 = revoked, 1 = released,
     /// 2 = policy changed to deny.
     AuthRevoke { session_id: u128, reason: u8 },
+    /// Round-trip probe. The receiver echoes the sequence number back in a
+    /// [`ProtoEvent::LatencyReply`] without any other side effect. Only sent
+    /// to peers advertising [`capabilities::LATENCY_PROBE`].
+    LatencyProbe(u32),
+    /// Echo of a [`ProtoEvent::LatencyProbe`] sequence number.
+    LatencyReply(u32),
 }
 
 impl Display for ProtoEvent {
@@ -314,6 +328,8 @@ impl Display for ProtoEvent {
             ProtoEvent::AuthRevoke { session_id, reason } => {
                 write!(f, "AuthRevoke(session={session_id:#x}, reason={reason})")
             }
+            ProtoEvent::LatencyProbe(seq) => write!(f, "LatencyProbe({seq})"),
+            ProtoEvent::LatencyReply(seq) => write!(f, "LatencyReply({seq})"),
         }
     }
 }
@@ -340,6 +356,8 @@ pub enum EventType {
     AuthRevoke = 18,
     EnterAt = 19,
     LeaveAt = 20,
+    LatencyProbe = 21,
+    LatencyReply = 22,
 }
 
 impl ProtoEvent {
@@ -368,6 +386,8 @@ impl ProtoEvent {
             ProtoEvent::AuthRequest { .. } => EventType::AuthRequest,
             ProtoEvent::AuthResponse { .. } => EventType::AuthResponse,
             ProtoEvent::AuthRevoke { .. } => EventType::AuthRevoke,
+            ProtoEvent::LatencyProbe(_) => EventType::LatencyProbe,
+            ProtoEvent::LatencyReply(_) => EventType::LatencyReply,
         }
     }
 }
@@ -514,6 +534,8 @@ impl TryFrom<&[u8]> for ProtoEvent {
                 session_id: decode_u128(&mut buf)?,
                 reason: decode_u8(&mut buf)?,
             }),
+            EventType::LatencyProbe => Ok(Self::LatencyProbe(decode_u32(&mut buf)?)),
+            EventType::LatencyReply => Ok(Self::LatencyReply(decode_u32(&mut buf)?)),
         }
     }
 }
@@ -639,6 +661,9 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_u128(buf, len, session_id);
                     encode_u8(buf, len, reason);
                 }
+                ProtoEvent::LatencyProbe(seq) | ProtoEvent::LatencyReply(seq) => {
+                    encode_u32(buf, len, seq);
+                }
             }
         }
         (buf, len)
@@ -757,6 +782,8 @@ mod tests {
                 along: 0.75,
             },
             ProtoEvent::Ack(0x0a0b_0c0d),
+            ProtoEvent::LatencyProbe(0x0102_0304),
+            ProtoEvent::LatencyReply(0xfffe_fdfc),
             ProtoEvent::Hello {
                 commit: *b"abcdefgh",
                 proto_version: PROTO_VERSION,
@@ -1090,6 +1117,8 @@ mod extra_tests {
         assert_eq!(EventType::Enter as u8, 8);
         assert_eq!(EventType::Leave as u8, 9);
         assert_eq!(EventType::LeaveAt as u8, 20);
+        assert_eq!(EventType::LatencyProbe as u8, 21);
+        assert_eq!(EventType::LatencyReply as u8, 22);
         assert_eq!(EventType::Ack as u8, 10);
         assert_eq!(EventType::Hello as u8, 11);
         // Clipboard frames reserve 12-15; new events must start at 16.
@@ -1141,6 +1170,7 @@ mod extra_tests {
             capabilities::EDGE_COORDINATE,
             capabilities::RETURN_COORDINATE,
             capabilities::VERSION_INFO,
+            capabilities::LATENCY_PROBE,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");
@@ -1164,6 +1194,7 @@ mod extra_tests {
                 | capabilities::EDGE_COORDINATE
                 | capabilities::RETURN_COORDINATE
                 | capabilities::VERSION_INFO
+                | capabilities::LATENCY_PROBE
         );
     }
 

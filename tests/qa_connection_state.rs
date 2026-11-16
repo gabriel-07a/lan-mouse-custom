@@ -50,6 +50,7 @@ fn state() -> ClientState {
         peer_outgoing_caps: Some(0b111),
         peer_app_version: None,
         compatibility: lan_mouse_ipc::PeerCompatibility::Unknown,
+        latency: Default::default(),
     }
 }
 

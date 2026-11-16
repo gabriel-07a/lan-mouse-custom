@@ -325,6 +325,8 @@ struct PeerAggregate {
     rtt_ms: Option<u32>,
     jitter_ms: Option<u32>,
     loss_percent: Option<u8>,
+    /// 99th percentile round-trip time of the latency probes, in microseconds
+    rtt_p99_us: Option<u32>,
     peer_commit: Option<[u8; 8]>,
     peer_app_version: Option<lan_mouse_ipc::AppVersion>,
     compatibility: lan_mouse_ipc::PeerCompatibility,
@@ -398,6 +400,7 @@ fn aggregate_peer(members: &[(ClientHandle, ClientConfig, ClientState)]) -> Opti
             .or_else(|| members.iter().find_map(|(_, _, state)| state.rtt_ms)),
         jitter_ms: link_state.jitter_ms,
         loss_percent: link_state.loss_percent,
+        rtt_p99_us: link_state.latency.rtt_p99_us,
         peer_commit: members.iter().find_map(|(_, _, state)| state.peer_commit),
         peer_app_version: members.iter().find_map(|(_, _, state)| state.peer_app_version),
         compatibility: members
@@ -1615,6 +1618,9 @@ impl Dashboard {
             .rtt_ms
             .map(|rtt| format!(" · RTT {rtt} ms"))
             .unwrap_or_default();
+        if let Some(p99) = peer.rtt_p99_us {
+            link_metrics.push_str(&format!(" · p99 {:.1} ms", f64::from(p99) / 1000.0));
+        }
         if let Some(jitter) = peer.jitter_ms {
             link_metrics.push_str(&format!(" · jitter {jitter} ms"));
         }

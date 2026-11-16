@@ -169,6 +169,14 @@ pub(crate) enum EmulationEvent {
     },
     /// A peer revoked the permission grants of its session.
     PeerAuthRevoked { addr: SocketAddr, reason: u8 },
+    /// Interval between consecutive motion events received from a peer while
+    /// its pointer is moving (percentiles in microseconds), published at most
+    /// once per second while the values change.
+    InputCadence {
+        addr: SocketAddr,
+        p50_us: Option<u32>,
+        p99_us: Option<u32>,
+    },
 }
 
 /// Addresses of every live incoming session of \`fingerprint\`.
@@ -541,6 +549,11 @@ impl ListenTask {
         // retransmissions without re-triggering `ReleaseNotify`.
         let mut last_enter = EnterDeduper::default();
         let mut rejected_connections = HashMap::new();
+        // Arrival cadence of motion per peer, measured as the datagram leaves
+        // the network (before the emulation queue), plus the last published
+        // percentiles so unchanged values are not re-broadcast.
+        let mut recv_cadence: HashMap<SocketAddr, crate::latency::CadenceMeter> = HashMap::new();
+        let mut recv_published: HashMap<SocketAddr, (Option<u32>, Option<u32>)> = HashMap::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -571,7 +584,12 @@ impl ListenTask {
                                     .ok()
                                     .unwrap_or_default();
                             }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::Input(event) => {
+                                if matches!(event, Event::Pointer(PointerEvent::Motion { .. })) {
+                                    recv_cadence.entry(addr).or_default().record(Instant::now());
+                                }
+                                self.emulation_proxy.consume(event, addr)
+                            }
                             ProtoEvent::AuthRequest {
                                 session_id,
                                 incoming_caps,
@@ -617,6 +635,11 @@ impl ListenTask {
                                     .send(EmulationEvent::PeerAuthRevoked { addr, reason })
                                     .ok()
                                     .unwrap_or_default();
+                            }
+                            // Echo only: a probe must never touch the
+                            // emulation or the hand-off state.
+                            ProtoEvent::LatencyProbe(seq) => {
+                                self.listener.reply(addr, ProtoEvent::LatencyReply(seq)).await
                             }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong {
                                 alive: self.emulation_proxy.emulation_active.get(),
@@ -776,6 +799,22 @@ impl ListenTask {
                     // disconnects accumulated in the listener until the
                     // connection cap rejected every new peer until restart.
                     let now = Instant::now();
+                    for (addr, meter) in &recv_cadence {
+                        let cadence = (
+                            meter.window().percentile(0.5),
+                            meter.window().percentile(0.99),
+                        );
+                        if recv_published.insert(*addr, cadence) != Some(cadence) {
+                            self.event_tx
+                                .send(EmulationEvent::InputCadence {
+                                    addr: *addr,
+                                    p50_us: cadence.0,
+                                    p99_us: cadence.1,
+                                })
+                                .ok()
+                                .unwrap_or_default();
+                        }
+                    }
                     let expired: Vec<SocketAddr> = last_response
                         .iter()
                         .filter(|(_, seen)| now.duration_since(**seen) > EMULATION_TIMEOUT)
@@ -786,6 +825,8 @@ impl ListenTask {
                         self.emulation_proxy.remove(addr);
                         last_response.remove(&addr);
                         last_enter.clear(addr);
+                        recv_cadence.remove(&addr);
+                        recv_published.remove(&addr);
                         self.listener.disconnect(addr).await;
                         self.event_tx.send(EmulationEvent::Disconnected { addr }).ok().unwrap_or_default();
                     }

@@ -65,6 +65,23 @@ earlier revisions of this document described. The actual flow is:
   revocation uses `AuthRevoke`.
 - **Liveness**: `Ping`/`Pong` provides RTT and detects a dead peer; a watchdog
   closes the transport and the reconnect loop backs off.
+- **Latency measurement**: peers advertising `LATENCY_PROBE` answer
+  `LatencyProbe(seq)` (event id 21) with `LatencyReply(seq)` (id 22). The
+  connecting side sends four probes per second and keeps a one-minute window,
+  so the link reports round-trip percentiles and loss instead of one smoothed
+  sample per ping round. Independently of the peer, each side measures the
+  interval between motion datagrams it sends and between motion events it
+  receives while the pointer moves. An irregular send interval points at the
+  sender; a regular send interval with an irregular receive interval on the
+  other machine points at the network. `lan-mouse cli list` prints the
+  percentiles (`ClientState::latency` over IPC).
+- **Low-latency tuning (Windows)**: `setsockopt(IP_TOS)` is ignored by
+  Windows, so the outgoing socket is also attached to a qWAVE voice flow. While
+  a peer link is up the Wi-Fi adapters are put in media streaming mode with the
+  background scan disabled (the scan stalls traffic for 100 ms or more); the
+  system reverts both when the WLAN handle closes, including on a crash. The
+  process requests 1 ms timers so short runtime timers do not wait for the
+  default ~15.6 ms tick. All of it is best effort and logged at debug level.
 - **Edge hand-off extension**: peers advertising `EDGE_COORDINATE` may send
   `EnterAt { pos, serial, along }` with the normalised crossing coordinate
   (0.0 = top/left, 1.0 = bottom/right) so the receiver continues the pointer

@@ -562,6 +562,9 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     println!(
                         "id {handle}: {host}:{port} ({pos}) active: {active}, status: {status}{rtt}, ips: {ips:?}"
                     );
+                    if let Some(latency) = describe_latency(&state.latency) {
+                        println!("      latency: {latency}");
+                    }
                 }
                 break;
             }
@@ -1027,6 +1030,42 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Format microseconds as milliseconds with one decimal.
+fn format_ms(micros: u32) -> String {
+    format!("{:.1}ms", f64::from(micros) / 1000.0)
+}
+
+/// One-line summary of the link latency percentiles, or `None` while nothing
+/// was measured yet.
+fn describe_latency(latency: &lan_mouse_ipc::LinkLatency) -> Option<String> {
+    let pair = |label: &str, p50: Option<u32>, p99: Option<u32>| {
+        Some(format!(
+            "{label} p50 {} p99 {}",
+            format_ms(p50?),
+            format_ms(p99?)
+        ))
+    };
+    let mut parts = Vec::new();
+    if let Some(rtt) = pair("rtt", latency.rtt_p50_us, latency.rtt_p99_us) {
+        let loss = latency
+            .probe_loss_permille
+            .map(|permille| format!(" loss {:.1}%", f64::from(permille) / 10.0))
+            .unwrap_or_default();
+        parts.push(format!("{rtt}{loss}"));
+    }
+    parts.extend(pair(
+        "send gap",
+        latency.send_gap_p50_us,
+        latency.send_gap_p99_us,
+    ));
+    parts.extend(pair(
+        "recv gap",
+        latency.recv_gap_p50_us,
+        latency.recv_gap_p99_us,
+    ));
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,5 +1207,25 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_rejected() {
         assert!(CliArgs::try_parse_from(["lan-mouse-cli", "teleport"]).is_err());
+    }
+
+    #[test]
+    fn latency_summary_lists_only_measured_values() {
+        assert_eq!(
+            describe_latency(&lan_mouse_ipc::LinkLatency::default()),
+            None
+        );
+        let latency = lan_mouse_ipc::LinkLatency {
+            rtt_p50_us: Some(2_500),
+            rtt_p99_us: Some(9_040),
+            probe_loss_permille: Some(4),
+            recv_gap_p50_us: Some(2_000),
+            recv_gap_p99_us: Some(16_300),
+            ..Default::default()
+        };
+        assert_eq!(
+            describe_latency(&latency).as_deref(),
+            Some("rtt p50 2.5ms p99 9.0ms loss 0.4%, recv gap p50 2.0ms p99 16.3ms")
+        );
     }
 }

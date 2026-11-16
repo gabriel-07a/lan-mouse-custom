@@ -295,6 +295,38 @@ pub struct ClientState {
     /// version/build compatibility with this peer
     #[serde(default)]
     pub compatibility: PeerCompatibility,
+    /// latency percentiles of the link (probe round-trips and motion cadence)
+    #[serde(default)]
+    pub latency: LinkLatency,
+}
+
+/// Latency percentiles of a peer link, in microseconds over a recent window.
+///
+/// Every field is `None` until enough samples exist; the round-trip fields
+/// stay `None` for peers that do not answer latency probes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkLatency {
+    /// median round-trip time of the latency probes
+    #[serde(default)]
+    pub rtt_p50_us: Option<u32>,
+    /// 99th percentile round-trip time of the latency probes
+    #[serde(default)]
+    pub rtt_p99_us: Option<u32>,
+    /// latency probes without a reply, per thousand
+    #[serde(default)]
+    pub probe_loss_permille: Option<u16>,
+    /// median interval between motion datagrams sent to the peer while moving
+    #[serde(default)]
+    pub send_gap_p50_us: Option<u32>,
+    /// 99th percentile of the send interval
+    #[serde(default)]
+    pub send_gap_p99_us: Option<u32>,
+    /// median interval between motion events received from the peer
+    #[serde(default)]
+    pub recv_gap_p50_us: Option<u32>,
+    /// 99th percentile of the receive interval
+    #[serde(default)]
+    pub recv_gap_p99_us: Option<u32>,
 }
 
 /// Compatibility of the peer's app/protocol with this build.
@@ -1163,8 +1195,17 @@ mod tests {
             peer_outgoing_caps: Some(0b011),
             peer_app_version: None,
             compatibility: PeerCompatibility::Unknown,
+            latency: LinkLatency {
+                rtt_p50_us: Some(2_500),
+                rtt_p99_us: Some(9_000),
+                probe_loss_permille: Some(4),
+                ..Default::default()
+            },
         };
         let decoded = json_roundtrip(state);
+        assert_eq!(decoded.latency.rtt_p99_us, Some(9_000));
+        assert_eq!(decoded.latency.probe_loss_permille, Some(4));
+        assert_eq!(decoded.latency.recv_gap_p99_us, None);
         assert_eq!(decoded.rtt_ms, Some(12));
         assert_eq!(decoded.jitter_ms, Some(2));
         assert_eq!(decoded.loss_percent, Some(0));
@@ -1188,6 +1229,7 @@ mod tests {
         });
         let state: ClientState = serde_json::from_value(legacy).expect("legacy state");
         assert_eq!(state.rtt_ms, None);
+        assert_eq!(state.latency, LinkLatency::default());
         // A service predating the round-trip timestamp must not make the
         // frontend claim liveness: the field defaults to "unknown".
         assert_eq!(state.last_pong_at, None);
