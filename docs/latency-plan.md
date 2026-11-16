@@ -128,9 +128,62 @@ Isso corrige a linha de base: "47% dos intervalos acima de 8 ms" era a taxa de
   o Wi-Fi já retransmite na camada de rádio. Decidir com `loss` das sondas:
   acima de ~0,5% vale implementar.
 
-### Fases 3 e 4 — não iniciadas
+### Picos de RTT de ~40 ms — diagnóstico (2026-11-16)
 
-Dependem de teste nos dois PCs reais a cada mudança (guardas de handoff,
-calibração de velocidade) ou de revisar item a item a auditoria de rede, que é
-de 2026-11-05 e tem pontos já corrigidos desde então.
+Medido com `scripts/net-probe.py` (handshake TCP até a porta 7680 do Windows,
+respondido pelo kernel dele, em paralelo com ping ao roteador):
+
+| Trecho | p50 | p90 | p99 | máx |
+|---|---|---|---|---|
+| Ubuntu → Windows | 3,3 ms | 7,2 ms | 24,7 ms | 46,9 ms |
+| Ubuntu → roteador | 1,6 ms | 2,6 ms | 17,0 ms | 33,4 ms |
+
+- Os picos de 15–47 ms existem **fora do Lan Mouse**: aparecem no handshake
+  TCP, que não passa pelo aplicativo.
+- Nos instantes dos picos o roteador responde em ~1,5 ms: o atraso está no
+  trecho roteador ↔ Windows (rádio do Windows).
+- Eles se repetem a cada ~4,9 s (intervalos de 4,9, 9,4 e 14,7 s nas amostras).
+- Nada no Lan Mouse roda nesse período (anúncio de descoberta a cada 10 s;
+  varredura de rede só manual).
+
+**Causa mais provável:** o adaptador Wi-Fi do Windows sai do canal
+periodicamente (varredura de redes em segundo plano). Não está provado.
+
+**Correção já no código (commit `71346c5`):** modo de streaming e varredura em
+segundo plano desligada enquanto há link (`net_tuning::set_link_active`).
+
+**Como confirmar:** instalar o build no Windows e repetir
+`scripts/net-probe.py 192.168.166.166`. Teste rápido sem instalar nada, em um
+PowerShell de administrador no Windows:
+`netsh wlan set autoconfig enabled=no interface="Wi-Fi"` (desfazer com
+`enabled=yes`). Se os picos sumirem, a causa é a varredura.
+
+### Fase 3 — revisada, sem mudança de código (2026-11-16)
+
+- **Esperas por tempo:** as guardas de `src/capture.rs` já são por posição desde
+  `ac728e5`. Elas só descartam movimento *de volta* a menos de 16 px da borda de
+  entrada, por no máximo 250 ms; o movimento para frente nunca espera. Restam
+  duas esperas puramente por tempo (120 ms de cooldown na captura do Windows e
+  300 ms de `REMOTE_ENTRY_DWELL`), ajustadas com trace real. Não mexidas: mudar
+  às cegas arrisca o vai-e-volta na borda.
+- **Mesma velocidade nas duas telas:** proposta, depende de decisão. A captura
+  do Windows envia contagens brutas do mouse, sem a velocidade do ponteiro
+  configurada no Windows. Dá para ler essa configuração e aplicar o
+  multiplicador padrão, mas isso muda a sensação de quem já ajustou a
+  sensibilidade por cliente.
+- **Cursor:** Windows resolvido (`6f7d7b3`). GNOME 50: `inhibit_cursor_visibility`
+  não tem efeito; falta o teste com `MUTTER_DEBUG_DISABLE_HW_CURSORS=1`.
+- **Arrastar entre telas:** não avaliado.
+
+### Fase 4 — auditoria revisada (2026-11-16)
+
+`docs/audit-network.md` é de 2026-11-05. Estado dos itens graves hoje:
+
+| Item | Estado |
+|---|---|
+| P1-02 sessões mortas no listener | corrigido (timeout ocioso fecha o transporte em `src/emulation.rs`) |
+| P1-03 corrida na janela de pareamento | corrigido (`pairing_lost_race` em `src/listen.rs`) |
+| P1-01 estado e buffers retidos por endpoint UDP | **pendente**: exige alterar ou substituir o listener do `webrtc-util` |
+
+Os itens P2/P3 não foram reconferidos.
 
