@@ -126,6 +126,21 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
 - `EdgeReturnLatch` no receptor limita os pedidos de retorno por contato com a
   borda.
 
+### Pressão nas bordas do desktop (dock/hot corners)
+
+- O dock do Ubuntu com auto-hide e o "hot corner" do GNOME só aparecem quando o
+  ponteiro é **empurrado além** da borda (pressão) — é o que um mouse físico faz
+  naturalmente. A injeção absoluta do libei não consegue reproduzir isso: o
+  compositor descarta eventos de ponteiro fora da região da tela, então o
+  cursor para no último pixel e a barreira de pressão nunca é atingida. Era por
+  isso que o dock só abria com o mouse do próprio PC.
+- O backend libei agora reenvia esse delta "preso" na borda pelo **dispositivo
+  relativo** do EIS, sem abandonar o rastreamento absoluto. O compositor aplica
+  o clamp exatamente como faz com input físico e a barreira recebe o empurrão,
+  então o dock volta a abrir com o mouse remoto. Vale para as quatro bordas
+  (dock embaixo, hot corners etc.); o handoff de retorno continua tendo
+  prioridade quando a borda é a de entrada.
+
 ### Rede e lag (ajustes para o meu setup)
 
 Estas melhorias foram feitas para o meu uso; **o upstream não tinha esses

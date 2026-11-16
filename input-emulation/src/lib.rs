@@ -82,8 +82,9 @@ pub fn clear_remote_desktop_consent() {
 /// The backend that injects the remote input is often the only component that
 /// can observe the pointer being pushed past a screen edge: Windows injects
 /// absolute positions (which the raw-input barrier detector ignores) and the
-/// GNOME/libei capture portal does not reliably report barriers for injected
-/// motion. Reporting the edge lets the service ask the peer to release its
+/// GNOME/libei absolute pointer cannot leave the last on-screen pixel (events
+/// outside the EIS region are dropped), so the compositor's barriers never see
+/// the push. Reporting the edge lets the service ask the peer to release its
 /// capture — that is what hands the cursor back.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointerEdge {

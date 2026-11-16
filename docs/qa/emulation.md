@@ -265,3 +265,26 @@ Goal: crossing into the other machine should feel like moving the pointer onto a
    `handoff: armed <edge> along <...> before Ack` on the receiver, `handoff: first input applied N us after
    arming`, and on the sender `handoff: Begin -> first motion sent in N us`. The return path logs
    `handoff: return requested through <edge>` and `handoff: peer <addr> released, local control returned`.
+
+
+## Post-release round (2026-11-16 user report) - R-20: desktop edge pressure is dead with remote input
+
+| ID | Sev | Location | Symptom | Root cause | Fix |
+|---|---|---|---|---|---|
+| R-20 | P1 (UX) | input-emulation/src/libei.rs (absolute injection path) | Ubuntu 26.04/GNOME 50 receiver: the Ubuntu Dock at the bottom (`autohide=true`, `require-pressure-to-show=true`, `pressure-threshold=100`) only reveals with the PC's own mouse; with the controller's (remote) mouse the cursor reaches the bottom but the dock never appears. Other pressure barriers (GNOME hot corner) are affected the same way. | mutter emits a `Meta.Barrier` hit only when a pointer motion *segment crosses the barrier line*, and the shell's `PressureBarrier` sums the distance across the barrier. The dock's bottom barrier sits at `monitor.y + monitor.height`, one row past the last on-screen pixel, so relative (physical) input can cross it. The libei absolute pointer cannot: `meta-eis-client.c:handle_motion_absolute()` drops events outside an EIS region, and the absolute tracker clamps at `layout_max - 1`, so no segment ever crosses the barrier line - the dock never sees the push that a physical mouse produces. | The tracker now reports when a delta was clamped by the workspace boundary (`AppliedMotion::pressed`). Instead of the absolute event, the backend replays that delta on the EIS **relative** pointer device (`inject_pressure`): the compositor clamps it exactly like real input (barrier hit, then viewport clamp), so the cursor stays on the same pixel while the dock's pressure accumulates. A hand-off on the entry edge keeps priority over the replay, and the code falls back to the absolute event when no usable relative device exists. |
+
+Verification:
+
+```
+cargo test --workspace                                  # all crates green (input-emulation: 89 tests)
+cargo clippy --workspace --all-targets --all-features   # no warnings
+cargo fmt --check                                       # clean
+```
+
+Unit coverage (`input-emulation/src/libei.rs`, `absolute_tracker_tests`): moving inside the workspace
+reports nothing, all four outer edges report pressure at the last pixel, interior monitor boundaries do
+not, a hand-off coinciding with a boundary push keeps both flags, corrupted deltas report nothing, and
+the pressure stops as soon as the user reverses inside. Runtime validation of the dock reveal is the
+reporter's manual two-PC test (Windows controller, Ubuntu/GNOME receiver, flick to the bottom edge) on
+the installed build (`0.2.19`, commit `19bb6ea9`), with the previous binary kept as
+`~/.local/bin/lan-mouse-custom.bak-20261116-174212`.

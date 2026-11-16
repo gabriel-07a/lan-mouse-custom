@@ -138,6 +138,9 @@ pub(crate) struct LibeiEmulation {
     last_motion_arrival: Option<Instant>,
     /// temporary LAN_MOUSE_ABSOLUTE_SCALE override, applied on every gain update
     absolute_env_scale: f64,
+    /// one-shot debug log when a boundary push is replayed on the relative
+    /// pointer (edge pressure)
+    pressure_logged: bool,
 }
 
 /// Extra pixels the pointer must be pushed past the entry edge before the
@@ -278,6 +281,23 @@ const EDGE_ANCHOR_INSET: f64 = 2.0;
 /// as corrupted packets: one bogus delta must not jump the cursor across the
 /// screen and trigger a false hand-off.
 const MAX_DELTA_PX: f64 = 4096.0;
+
+/// Result of one injected absolute delta.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AppliedMotion {
+    /// Entry-edge hand-off requested by this motion (once per activation).
+    handoff: Option<PointerEdge>,
+    /// The workspace boundary stopped the motion: the pointer would leave the
+    /// last on-screen pixel while the user keeps pushing outward.
+    ///
+    /// Absolute events cannot leave the advertised EIS region, so the
+    /// compositor never sees what a physical mouse does there: keep pushing
+    /// past the edge. Edge pressure barriers (the Ubuntu Dock reveal, GNOME
+    /// hot corners) are only hit by that overrun, so the caller replays these
+    /// deltas on the relative pointer device instead of sending them
+    /// absolutely.
+    pressed: bool,
+}
 
 /// Exact edge-return detector for absolute pointer injection.
 ///
@@ -435,10 +455,11 @@ impl AbsoluteTracker {
         )
     }
 
-    /// Apply one injected delta and report the hand-off edge once.
-    fn apply(&mut self, dx: f64, dy: f64) -> Option<PointerEdge> {
+    /// Apply one injected delta and report the hand-off edge once and whether
+    /// the workspace boundary stopped the motion.
+    fn apply_motion(&mut self, dx: f64, dy: f64) -> AppliedMotion {
         if !dx.is_finite() || !dy.is_finite() {
-            return None;
+            return AppliedMotion::default();
         }
         // Corrupted single deltas would jump the tracked cursor anywhere; drop
         // them instead of clamping (a clamp could still fire the hand-off).
@@ -446,7 +467,7 @@ impl AbsoluteTracker {
         // curve adds up to 2.2x, so valid values can reach 4.4x the wire limit.
         if dx.abs() > MAX_DELTA_PX * 5.0 || dy.abs() > MAX_DELTA_PX * 5.0 {
             log::debug!("dropping implausible absolute delta ({dx}, {dy})");
-            return None;
+            return AppliedMotion::default();
         }
         // HiDPI: the EIS region is in logical pixels while the peer's deltas
         // are physical-ish; dividing by the monitor scale keeps the physical
@@ -461,6 +482,10 @@ impl AbsoluteTracker {
         // Keeping the tracked position equal to the sent one prevents a desync
         // when the cursor is pushed into a gap between monitors.
         let (x, y) = self.snap(clamped_x, clamped_y);
+        // A clamp means the motion ran off the last on-screen pixel. The
+        // compositor cannot be told that with an absolute event (out-of-region
+        // events are dropped), but a relative device can.
+        let pressed = clamped_x != raw_x || clamped_y != raw_y;
         // Remember the deepest point inside the screen reached since arming:
         // outward residual pushes the parked pointer at the edge and must not
         // count as a return until the user has actually used the screen.
@@ -478,7 +503,12 @@ impl AbsoluteTracker {
             {
                 self.fired = false;
             }
-            return None;
+            // The return request is already on its way: no desktop gestures
+            // while control changes hands.
+            return AppliedMotion {
+                handoff: None,
+                pressed: false,
+            };
         }
 
         // The hand-off requires BOTH: the real cursor reached the entry edge
@@ -525,9 +555,21 @@ impl AbsoluteTracker {
                 PointerEdge::Top => self.y = f64::from(y0),
                 PointerEdge::Bottom => self.y = f64::from(y1) - 1.0,
             }
-            return Some(self.edge);
+            return AppliedMotion {
+                handoff: Some(self.edge),
+                pressed,
+            };
         }
-        None
+        AppliedMotion {
+            handoff: None,
+            pressed,
+        }
+    }
+
+    /// Hand-off-only view used by the tracker tests.
+    #[cfg(test)]
+    fn apply(&mut self, dx: f64, dy: f64) -> Option<PointerEdge> {
+        self.apply_motion(dx, dy).handoff
     }
 
     /// The position to send to the compositor.
@@ -675,6 +717,48 @@ fn entry_point_at(
     best.map(|(entry, _)| entry)
 }
 
+/// Replay boundary-clamped motion on the relative pointer device.
+///
+/// Absolute EIS events are constrained to the advertised regions, so an
+/// absolute pointer stops at the last on-screen pixel. A physical mouse keeps
+/// moving past it, and that overrun is the only thing edge pressure barriers
+/// (the Ubuntu Dock reveal, GNOME hot corners) react to. The relative device is
+/// not region-constrained, so the compositor clamps it exactly like real input
+/// and emits the barrier hits.
+///
+/// Returns `false` when no usable relative pointer exists; the caller then
+/// keeps the absolute event so the pointer still moves.
+fn inject_pressure(
+    devices: &Devices,
+    conn: &event::Connection,
+    time: u64,
+    delta: (f32, f32),
+) -> bool {
+    let (dx, dy) = delta;
+    if !dx.is_finite() || !dy.is_finite() {
+        return false;
+    }
+    let pointer = devices
+        .pointer
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some((device, pointer)) = pointer else {
+        return false;
+    };
+    let paused = devices
+        .paused
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&device);
+    if paused {
+        return false;
+    }
+    pointer.motion_relative(dx, dy);
+    device.frame(conn.serial(), time);
+    true
+}
+
 async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
     let remote_desktop = RemoteDesktop::new().await?;
 
@@ -722,9 +806,11 @@ impl LibeiEmulation {
     /// injected deltas from that known anchor.
     ///
     /// With absolute injection the tracked position is the real cursor
-    /// position, so crossing the entry edge can be detected exactly - this is
-    /// what makes the automatic return hand-off work on Wayland, where the
-    /// compositor does not report capture barriers for injected motion.
+    /// position, so crossing the entry edge can be detected exactly. The
+    /// compositor only reports pointer barriers when a motion event actually
+    /// crosses the barrier line, and an absolute pointer cannot leave the last
+    /// on-screen pixel (positions outside the EIS region are dropped), so it
+    /// never sees the push past the edge on its own - hence the tracker.
     fn start_absolute_tracking(&mut self) -> bool {
         let Some(edge) = self.remote_edge else {
             return false;
@@ -863,6 +949,7 @@ impl LibeiEmulation {
             last_motion_time: None,
             last_motion_arrival: None,
             absolute_env_scale: read_env_scale(),
+            pressure_logged: false,
         })
     }
 }
@@ -894,6 +981,7 @@ impl Emulation for LibeiEmulation {
         self.absolute_warned = false;
         self.last_motion_time = None;
         self.last_motion_arrival = None;
+        self.pressure_logged = false;
         self.start_absolute_tracking();
     }
 
@@ -977,17 +1065,38 @@ impl Emulation for LibeiEmulation {
                             let velocity = (dx * dx + dy * dy).sqrt() / dt;
                             let velocity = velocity.clamp(0.0, 1000.0);
                             let accel = self.pointer_settings.acceleration(velocity);
-                            let fired = tracker.apply(dx * accel, dy * accel);
+                            let applied = tracker.apply_motion(dx * accel, dy * accel);
                             let (x, y) = tracker.absolute();
-                            pointer.pointer.motion_absolute(x, y);
-                            pointer.device.frame(self.conn.serial(), now);
+                            // A return request is the peer's job to handle; an
+                            // extra pressure replay here would only chase the
+                            // pointer while control changes hands.
+                            let pressure = applied.pressed && applied.handoff.is_none();
+                            let scaled = (
+                                (dx * accel * tracker.delta_scale) as f32,
+                                (dy * accel * tracker.delta_scale) as f32,
+                            );
+                            let replayed =
+                                pressure && inject_pressure(&self.devices, &self.conn, now, scaled);
+                            if replayed && !self.pressure_logged {
+                                self.pressure_logged = true;
+                                log::debug!(
+                                    "replaying clamped motion on the relative pointer (edge pressure)"
+                                );
+                            }
+                            if !replayed {
+                                pointer.pointer.motion_absolute(x, y);
+                                pointer.device.frame(self.conn.serial(), now);
+                            }
                             self.context
                                 .flush()
                                 .map_err(|e| io::Error::new(e.kind(), e))?;
-                            let return_along =
-                                fired.is_some().then(|| tracker.return_along()).flatten();
+                            let return_along = applied
+                                .handoff
+                                .is_some()
+                                .then(|| tracker.return_along())
+                                .flatten();
                             self.absolute = Some(tracker);
-                            if let Some(edge) = fired {
+                            if let Some(edge) = applied.handoff {
                                 log::info!("pushed past the {edge:?} edge; handing control back");
                                 if let Some(notifier) = &self.edge_return {
                                     let _ = notifier.send((edge, return_along));
@@ -1902,5 +2011,114 @@ mod absolute_tracker_tests {
         assert_eq!(tracker.apply(-2.0, 0.0), None);
         assert!(tracker.return_ready(), "2 px inward satisfies the deadband");
         assert_eq!(tracker.apply(4.0, 0.0), Some(PointerEdge::Right));
+    }
+
+    /// Moving inside the workspace is plain injection: no hand-off and no
+    /// pressure replay.
+    #[test]
+    fn moving_inside_the_screen_reports_no_pressure() {
+        let mut tracker = tracker(PointerEdge::Left);
+        established(&mut tracker);
+        assert_eq!(
+            tracker.apply_motion(100.0, -300.0),
+            AppliedMotion::default()
+        );
+        assert_eq!(tracker.apply_motion(50.0, 40.0), AppliedMotion::default());
+        let motion = tracker.apply_motion(200.0, 500.0);
+        assert!(!motion.pressed);
+        assert_eq!(motion.handoff, None);
+    }
+
+    /// Every outer workspace edge reports pressure when the pointer is pushed
+    /// past the last on-screen pixel, independently of the entry edge.
+    #[test]
+    fn pushing_past_each_workspace_edge_reports_pressure() {
+        let cases = [
+            (PointerEdge::Top, (0.0, -3000.0)),
+            (PointerEdge::Bottom, (0.0, 3000.0)),
+            (PointerEdge::Left, (-4000.0, 0.0)),
+            (PointerEdge::Right, (4000.0, 0.0)),
+        ];
+        for (pressed_edge, (dx, dy)) in cases {
+            // Enter through the opposite edge so the push itself is not a
+            // legitimate return hand-off.
+            let entry = match pressed_edge {
+                PointerEdge::Top => PointerEdge::Bottom,
+                PointerEdge::Bottom => PointerEdge::Top,
+                PointerEdge::Left => PointerEdge::Right,
+                PointerEdge::Right => PointerEdge::Left,
+            };
+            let mut tracker = tracker(entry);
+            established(&mut tracker);
+            let motion = tracker.apply_motion(dx, dy);
+            assert!(motion.pressed, "{pressed_edge:?}");
+            assert_eq!(motion.handoff, None, "{pressed_edge:?}");
+            let (x, y) = tracker.absolute();
+            match pressed_edge {
+                PointerEdge::Top => assert_eq!(y, 0.0),
+                PointerEdge::Bottom => assert_eq!(y, H - 1.0),
+                PointerEdge::Left => assert_eq!(x, 0.0),
+                PointerEdge::Right => assert_eq!(x, W - 1.0),
+            }
+        }
+    }
+
+    /// An interior monitor boundary is not a workspace edge: the cursor just
+    /// moves into the next monitor and no pressure is replayed.
+    #[test]
+    fn crossing_an_interior_monitor_boundary_reports_no_pressure() {
+        let regions = vec![(0.0, 0.0, 1920.0, 1080.0), (0.0, 1080.0, 1920.0, 2160.0)];
+        let mut tracker =
+            AbsoluteTracker::new_with_entry(PointerEdge::Top, 1, regions, 1.0, 1.0, Some(0.5))
+                .expect("stacked monitors");
+        // anchor: top edge of the upper monitor at 50% -> (960, 0)
+        assert!(!tracker.apply_motion(0.0, 1070.0).pressed);
+        assert!(!tracker.apply_motion(0.0, 20.0).pressed);
+        let (_, y) = tracker.absolute();
+        assert!(y > 1080.0, "cursor must reach the lower monitor, got {y}");
+    }
+
+    /// Pushing past the entry edge reports the hand-off *and* the boundary
+    /// clamp; the caller prefers the hand-off and skips the pressure replay.
+    #[test]
+    fn handoff_can_coincide_with_a_boundary_push() {
+        let mut tracker = AbsoluteTracker::new_with_entry(
+            PointerEdge::Bottom,
+            1,
+            vec![(0.0, 0.0, W, H)],
+            1.0,
+            1.0,
+            Some(0.5),
+        )
+        .expect("bottom tracker");
+        settled(&mut tracker);
+        assert_eq!(tracker.apply_motion(0.0, -10.0), AppliedMotion::default());
+        let motion = tracker.apply_motion(0.0, 20.0);
+        assert_eq!(motion.handoff, Some(PointerEdge::Bottom));
+        assert!(motion.pressed);
+    }
+
+    /// Corrupted deltas must neither move the pointer nor fake pressure.
+    #[test]
+    fn implausible_delta_reports_no_motion() {
+        let mut tracker = tracker(PointerEdge::Left);
+        let before = tracker.absolute();
+        assert_eq!(tracker.apply_motion(-1.0e12, 0.0), AppliedMotion::default());
+        assert_eq!(tracker.absolute(), before);
+    }
+
+    /// Pressure starts exactly at the last pixel and stops as soon as the user
+    /// moves back inside (the compositor then releases the barrier and the
+    /// dock pressure decays).
+    #[test]
+    fn pressure_starts_at_the_last_pixel_and_stops_on_reverse() {
+        let mut tracker = tracker(PointerEdge::Right);
+        assert!(!tracker.apply_motion(0.0, 799.0).pressed);
+        assert!(tracker.apply_motion(0.0, 1.0).pressed);
+        assert_eq!(tracker.absolute().1, H - 1.0);
+        let back = tracker.apply_motion(0.0, -10.0);
+        assert!(!back.pressed);
+        assert_eq!(back.handoff, None);
+        assert_eq!(tracker.absolute().1, H - 11.0);
     }
 }
