@@ -666,6 +666,13 @@ impl Service {
                     },
                     None => None,
                 };
+                // Adding by address (Network page, `cli add-client --ips`)
+                // carries no name; use the one the device's discovery beacon
+                // announced, as saved clients already do, instead of showing
+                // the new entry as "unknown".
+                let hostname = hostname
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| discovered_hostname(&self.discovered, &fix_ips));
                 let handle = self.client_manager.add_client();
                 let config = lan_mouse_ipc::ClientConfig {
                     hostname,
@@ -3725,13 +3732,29 @@ fn merge_clipboard_status(current: &mut ClipboardStatus, report: ClipboardStatus
     *current = ClipboardStatus { enabled, ..report };
 }
 
+/// Hostname announced by the discovery beacon of the first of `ips` that has
+/// one, if any.
+fn discovered_hostname(
+    discovered: &HashMap<IpAddr, DiscoveredDevice>,
+    ips: &[IpAddr],
+) -> Option<String> {
+    ips.iter()
+        .filter_map(|ip| discovered.get(ip))
+        .filter_map(|device| device.hostname.as_deref())
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         IncomingTeardownPlan, RETURN_MAX_ATTEMPTS, RETURN_RETRY_INTERVAL, ReturnHandoff,
-        ShutdownPlan, incoming_teardown_plan, merge_clipboard_status, reverse_client_compatible,
-        should_release_after_last_client, shutdown_plan,
+        ShutdownPlan, discovered_hostname, incoming_teardown_plan, merge_clipboard_status,
+        reverse_client_compatible, should_release_after_last_client, shutdown_plan,
     };
+    use lan_mouse_ipc::{DiscoveredDevice, LinkKind};
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
 
@@ -3756,6 +3779,41 @@ mod tests {
         assert_eq!(current.last_error.as_deref(), Some("transient"));
         // the toggle stays the service's
         assert!(current.enabled);
+    }
+
+    #[test]
+    fn an_address_only_add_takes_the_announced_hostname() {
+        let ip = |last| IpAddr::V4(Ipv4Addr::new(192, 168, 1, last));
+        let device = |last, hostname: Option<&str>| DiscoveredDevice {
+            ip: ip(last),
+            hostname: hostname.map(str::to_string),
+            port: Some(4242),
+            version: None,
+            link: LinkKind::Unknown,
+            lan_mouse: true,
+            configured: false,
+            fingerprint: None,
+            fingerprint_verified: false,
+            last_seen: None,
+        };
+        let discovered: HashMap<IpAddr, DiscoveredDevice> = [
+            (ip(2), device(2, Some("  "))),
+            (ip(3), device(3, Some(" DESKTOP-GABRIEL "))),
+            (ip(4), device(4, None)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            discovered_hostname(&discovered, &[ip(3)]).as_deref(),
+            Some("DESKTOP-GABRIEL")
+        );
+        // blank and missing names are skipped, the next address is tried
+        assert_eq!(
+            discovered_hostname(&discovered, &[ip(2), ip(4), ip(3)]).as_deref(),
+            Some("DESKTOP-GABRIEL")
+        );
+        assert_eq!(discovered_hostname(&discovered, &[ip(4), ip(9)]), None);
+        assert_eq!(discovered_hostname(&discovered, &[]), None);
     }
 
     fn addr(last: u8) -> SocketAddr {
