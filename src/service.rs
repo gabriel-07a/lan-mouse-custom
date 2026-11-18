@@ -1457,13 +1457,11 @@ impl Service {
     }
 
     fn handle_clipboard_status(&mut self, status: ClipboardStatus) {
-        // The service owns the toggle: a status produced before the task saw
-        // a recent toggle must not flip it back.
-        self.clipboard_status.backend = status.backend;
-        self.clipboard_status.available = status.available;
-        self.clipboard_status.applied = status.applied;
-        self.clipboard_status.last_error = status.last_error;
-        self.clipboard_status.enabled = self.clipboard_enabled.get();
+        merge_clipboard_status(
+            &mut self.clipboard_status,
+            status,
+            self.clipboard_enabled.get(),
+        );
         self.notify_frontend(FrontendEvent::ClipboardStatus(
             self.clipboard_status.clone(),
         ));
@@ -3716,15 +3714,49 @@ fn shutdown_plan(incoming_sessions: usize, outgoing_capture_active: bool) -> Shu
     }
 }
 
+/// Take a status report from the clipboard task into the service's copy.
+///
+/// Every counter the task owns is taken over. Leaving `detected` out made
+/// `cli clipboard status` report "0 local change(s)" forever, which is exactly
+/// the reading its documentation says means "the backend does not observe the
+/// clipboard". The service owns the toggle: a status produced before the task
+/// saw a recent toggle must not flip it back.
+fn merge_clipboard_status(current: &mut ClipboardStatus, report: ClipboardStatus, enabled: bool) {
+    *current = ClipboardStatus { enabled, ..report };
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         IncomingTeardownPlan, RETURN_MAX_ATTEMPTS, RETURN_RETRY_INTERVAL, ReturnHandoff,
-        ShutdownPlan, incoming_teardown_plan, reverse_client_compatible,
+        ShutdownPlan, incoming_teardown_plan, merge_clipboard_status, reverse_client_compatible,
         should_release_after_last_client, shutdown_plan,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
+
+    #[test]
+    fn the_clipboard_task_counters_reach_the_service() {
+        let mut current = lan_mouse_ipc::ClipboardStatus {
+            enabled: true,
+            ..Default::default()
+        };
+        let report = lan_mouse_ipc::ClipboardStatus {
+            enabled: false,
+            backend: Some("portal".to_string()),
+            available: true,
+            applied: 4,
+            detected: 45,
+            last_error: Some("transient".to_string()),
+        };
+        merge_clipboard_status(&mut current, report, true);
+        assert_eq!(current.detected, 45);
+        assert_eq!(current.applied, 4);
+        assert_eq!(current.backend.as_deref(), Some("portal"));
+        assert_eq!(current.last_error.as_deref(), Some("transient"));
+        // the toggle stays the service's
+        assert!(current.enabled);
+    }
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)), 4242)
