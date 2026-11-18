@@ -457,6 +457,14 @@ impl Service {
                                 state.active_addr.is_some() || state.incoming_addr.is_some()
                             }),
                         );
+                        if crate::net_tuning::take_changed() {
+                            let diagnostics = self.diagnostics();
+                            log::info!(
+                                "network tuning: {}",
+                                diagnostics.network_tuning.as_deref().unwrap_or("-")
+                            );
+                            self.notify_frontend(FrontendEvent::Diagnostics(diagnostics));
+                        }
                         // A peer's AuthRevoke deactivates the client in the
                         // connection layer only. Drop the matching outgoing
                         // capture barrier here too, otherwise the local pointer
@@ -1504,6 +1512,7 @@ impl Service {
                 .get_client_states()
                 .iter()
                 .find_map(|(_, _, state)| state.last_error.clone()),
+            network_tuning: Some(crate::net_tuning::summary()),
         }
     }
 

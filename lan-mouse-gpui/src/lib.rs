@@ -3682,6 +3682,21 @@ impl Dashboard {
                         ),
                     }),
             )
+            .when_some(self.diagnostics.network_tuning.clone(), |this, tuning| {
+                // Shown verbatim (technical detail, like the backend names):
+                // it is what tells "the Wi-Fi tuning did not help" apart from
+                // "the Wi-Fi tuning was never applied".
+                let label = match self.language {
+                    Language::PortugueseBrazil => "ajuste de rede",
+                    Language::English => "network tuning",
+                };
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(format!("{label}: {tuning}")),
+                )
+            })
             .child(
                 div()
                     .flex()

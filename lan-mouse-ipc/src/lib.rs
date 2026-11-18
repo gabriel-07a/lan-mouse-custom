@@ -879,6 +879,10 @@ pub struct Diagnostics {
     /// Last connection/handshake error reported by a client.
     #[serde(default)]
     pub last_connection_error: Option<String>,
+    /// Latency tuning in effect (timer resolution, QoS, Wi-Fi low-latency
+    /// mode), as a one-line description. `None` from services that predate it.
+    #[serde(default)]
+    pub network_tuning: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -1270,6 +1274,7 @@ mod tests {
             clipboard_backend: Some("portal".into()),
             clipboard_enabled: true,
             last_connection_error: None,
+            network_tuning: Some("1 ms timers".into()),
         }));
         json_roundtrip(FrontendEvent::State(
             1,

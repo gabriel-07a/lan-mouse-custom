@@ -690,6 +690,10 @@ pub async fn run(config: Config, args: DoctorArgs) -> Result<(), DoctorError> {
                 .as_deref()
                 .unwrap_or("none")
         );
+        println!(
+            "  net tuning:      {}",
+            diagnostics.network_tuning.as_deref().unwrap_or("unknown")
+        );
     } else if report.service_running {
         println!("  live:            service did not return diagnostics");
     }
