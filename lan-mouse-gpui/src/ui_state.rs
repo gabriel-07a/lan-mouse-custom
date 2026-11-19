@@ -149,8 +149,16 @@ pub(crate) fn row_action(state: LinkState, active: bool) -> RowAction {
 
 /// Whether the per-device outgoing sensitivity control is meaningful.
 ///
-/// It scales motion sent to the peer, so a device that only receives input
-/// (the other PC controls this one) must not offer it.
-pub(crate) fn outgoing_sensitivity_visible(active: bool, receiving: bool) -> bool {
-    active && !receiving
+/// It scales motion sent to the peer, so it can only have an effect when this
+/// machine drives the peer. It is hidden when the client is off, when the card
+/// is a receiving-only session (the other PC controls this one), and when the
+/// outgoing link exists only because the service activated it back to complete
+/// an incoming session: in that last case the peer controls this machine and
+/// the link is just the reverse half of its session.
+pub(crate) fn outgoing_sensitivity_visible(
+    active: bool,
+    receiving: bool,
+    auto_activated: bool,
+) -> bool {
+    active && !receiving && !auto_activated
 }

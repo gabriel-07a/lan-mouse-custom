@@ -218,6 +218,16 @@ pub type ClientHandle = u64;
 pub struct ClientState {
     /// events should be sent to and received from the client
     pub active: bool,
+    /// The service activated this client on its own to complete an incoming
+    /// session (the peer controls this machine), instead of the user turning
+    /// it on.
+    ///
+    /// The outgoing link then only exists as the reverse half of the peer's
+    /// session: controls that scale motion sent to the peer (the per-client
+    /// sensitivity) cannot have any effect and the frontend hides them. An
+    /// explicit user activation or a disconnect clears the marker.
+    #[serde(default)]
+    pub auto_activated: bool,
     /// `active` address of the client, used to send data to.
     /// This should generally be the socket address where data
     /// was last received from.
@@ -1173,6 +1183,7 @@ mod tests {
     fn client_state_roundtrips() {
         let state = ClientState {
             active: true,
+            auto_activated: true,
             active_addr: Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
                 4242,
@@ -1207,6 +1218,7 @@ mod tests {
             },
         };
         let decoded = json_roundtrip(state);
+        assert!(decoded.auto_activated);
         assert_eq!(decoded.latency.rtt_p99_us, Some(9_000));
         assert_eq!(decoded.latency.probe_loss_permille, Some(4));
         assert_eq!(decoded.latency.recv_gap_p99_us, None);
@@ -1232,6 +1244,7 @@ mod tests {
             "peer_commit": null
         });
         let state: ClientState = serde_json::from_value(legacy).expect("legacy state");
+        assert!(!state.auto_activated);
         assert_eq!(state.rtt_ms, None);
         assert_eq!(state.latency, LinkLatency::default());
         // A service predating the round-trip timestamp must not make the

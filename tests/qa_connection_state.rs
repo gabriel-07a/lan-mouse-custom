@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 fn state() -> ClientState {
     ClientState {
         active: true,
+        auto_activated: false,
         active_addr: Some("192.0.2.10:4242".parse::<SocketAddr>().expect("addr")),
         alive: true,
         rtt_ms: Some(7),
@@ -63,6 +64,7 @@ fn client_state_round_trips_through_json() {
     let decoded: ClientState = serde_json::from_str(&encoded).expect("deserialize");
 
     assert_eq!(decoded.active, original.active);
+    assert_eq!(decoded.auto_activated, original.auto_activated);
     assert_eq!(decoded.active_addr, original.active_addr);
     assert_eq!(decoded.incoming_addr, original.incoming_addr);
     assert_eq!(decoded.alive, original.alive);

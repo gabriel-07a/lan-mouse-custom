@@ -318,6 +318,10 @@ struct PeerAggregate {
     position: Position,
     sensitivity: u16,
     active: bool,
+    /// Every active member of this peer was activated by the service to
+    /// complete an incoming session, not by the user: the outgoing link is
+    /// only the reverse half of the peer's session.
+    auto_activated: bool,
     alive: bool,
     has_outgoing: bool,
     has_incoming: bool,
@@ -380,6 +384,16 @@ fn aggregate_peer(members: &[(ClientHandle, ClientConfig, ClientState)]) -> Opti
     let has_incoming = members
         .iter()
         .any(|(_, _, state)| state.incoming_addr.is_some());
+    // The card is service-driven only when every active member was activated
+    // automatically: one user-activated member means this machine is meant to
+    // control the peer.
+    let active_members = members.iter().filter(|(_, _, state)| state.active);
+    let active_count = active_members.clone().count();
+    let auto_activated = active_count > 0
+        && active_members
+            .filter(|(_, _, state)| state.auto_activated)
+            .count()
+            == active_count;
     Some(PeerAggregate {
         primary: *primary,
         members: members.iter().map(|(handle, _, _)| *handle).collect(),
@@ -387,7 +401,8 @@ fn aggregate_peer(members: &[(ClientHandle, ClientConfig, ClientState)]) -> Opti
         endpoint,
         position: link_config.pos,
         sensitivity: first_config.sensitivity,
-        active: members.iter().any(|(_, _, state)| state.active),
+        active: active_count > 0,
+        auto_activated,
         alive: link_state.alive,
         has_outgoing,
         has_incoming,
@@ -1731,8 +1746,11 @@ impl Dashboard {
         // Outgoing sensitivity only matters when this machine may control the
         // peer. A purely receiving client (the other PC drives this one) would
         // show a control that cannot have any effect.
-        let show_sensitivity =
-            outgoing_sensitivity_visible(peer.active, state == LinkState::Receiving);
+        let show_sensitivity = outgoing_sensitivity_visible(
+            peer.active,
+            state == LinkState::Receiving,
+            peer.auto_activated,
+        );
         let primary = peer.primary;
         let action_members = peer.members.clone();
         let edit_members = peer.members.clone();
@@ -4920,12 +4938,60 @@ mod tests {
 
     #[test]
     fn outgoing_sensitivity_is_only_offered_by_the_controlling_side() {
-        assert!(outgoing_sensitivity_visible(true, false));
+        assert!(outgoing_sensitivity_visible(true, false, false));
         assert!(
-            !outgoing_sensitivity_visible(true, true),
+            !outgoing_sensitivity_visible(true, true, false),
             "a receiving-only client must not show the outgoing sensitivity control"
         );
-        assert!(!outgoing_sensitivity_visible(false, false));
+        assert!(!outgoing_sensitivity_visible(false, false, false));
+        assert!(
+            !outgoing_sensitivity_visible(true, false, true),
+            "a client the service activated back for an incoming session must not show it either"
+        );
+    }
+
+    /// The receiving machine shows the peer card as "connected (bidirectional)"
+    /// because the service activates the reverse half of the incoming session.
+    /// The per-client sensitivity scales motion sent to the peer, which that
+    /// machine is not sending, so the card must not offer it.
+    #[test]
+    fn an_auto_activated_peer_hides_the_outgoing_sensitivity() {
+        let mut auto = state(
+            true,
+            true,
+            Some("192.168.166.166:4242"),
+            Some("192.168.166.166:56651"),
+            Some(NOW - 1_000),
+        );
+        auto.auto_activated = true;
+        let members = [member(
+            1,
+            config(Some("DESKTOP-GABRIEL"), None),
+            auto.clone(),
+        )];
+        let peer = aggregate_peer(&members).expect("aggregate");
+        assert!(peer.active);
+        assert!(peer.auto_activated);
+        assert!(!outgoing_sensitivity_visible(
+            peer.active,
+            false,
+            peer.auto_activated
+        ));
+
+        // One user-activated entry in the group means this machine does control
+        // the peer (dual-stack config): keep offering the control.
+        let user = state(true, true, Some("[fd00::2]:4242"), None, Some(NOW - 1_000));
+        let members = [
+            member(1, config(Some("DESKTOP-GABRIEL"), Some("aa:bb")), auto),
+            member(2, config(Some("DESKTOP-GABRIEL"), Some("aa:bb")), user),
+        ];
+        let peer = aggregate_peer(&members).expect("aggregate");
+        assert!(!peer.auto_activated);
+        assert!(outgoing_sensitivity_visible(
+            peer.active,
+            false,
+            peer.auto_activated
+        ));
     }
 
     #[test]

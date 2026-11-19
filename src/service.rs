@@ -18,9 +18,10 @@ use crate::{
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AddressRuleView, AsyncFrontendListener, ClientHandle, ClipboardStatus, DeviceView, Diagnostics,
-    DirectionPolicy, DiscoveredDevice, FrontendEvent, FrontendRequest, HistoryEntry, IpcError,
-    IpcListenerCreationError, PendingView, Position, Status,
+    AddressRuleView, AsyncFrontendListener, ClientConfig, ClientHandle, ClientState,
+    ClipboardStatus, DeviceView, Diagnostics, DirectionPolicy, DiscoveredDevice, FrontendEvent,
+    FrontendRequest, HistoryEntry, IpcError, IpcListenerCreationError, PendingView, Position,
+    Status,
 };
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION};
 use local_channel::mpsc::{Receiver, Sender};
@@ -123,6 +124,13 @@ pub struct Service {
     /// merged into the user-configured client once its certificate fingerprint
     /// is learned, so one logical peer never shows up as two devices.
     auto_reverse_clients: HashSet<ClientHandle>,
+    /// clients the service activated on its own because an incoming session
+    /// arrived (the peer controls this machine). The frontend hides the
+    /// controls that only affect motion sent to the peer (per-client
+    /// sensitivity) on such cards: the outgoing link is just the reverse half
+    /// of the peer's session, not a link the user asked to drive. An explicit
+    /// activation, deactivation or removal drops the entry.
+    auto_activated_clients: HashSet<ClientHandle>,
     /// devices authorized with [`FrontendRequest::AuthorizeDevice`] whose
     /// reverse client entry must be created once their address is known
     pending_reverse: HashMap<String, (String, Position)>,
@@ -328,6 +336,7 @@ impl Service {
             pairing_generation: Default::default(),
             learned_fingerprints: Default::default(),
             auto_reverse_clients: Default::default(),
+            auto_activated_clients: Default::default(),
             pending_reverse: Default::default(),
             connection_attempt_notifier: Default::default(),
             discovery_rx,
@@ -629,6 +638,11 @@ impl Service {
                 outgoing,
             } => self.respond_pending(fingerprint, accept, name, position, incoming, outgoing),
             FrontendRequest::Activate(handle, active) => {
+                // An explicit user action replaces the service's automatic
+                // reverse-link activation: if this machine is now meant to
+                // control the peer, the outgoing controls become meaningful
+                // again.
+                self.auto_activated_clients.remove(&handle);
                 self.set_client_active(handle, active);
                 self.save_config();
             }
@@ -2358,7 +2372,15 @@ impl Service {
     }
 
     fn enumerate(&mut self) {
-        let clients = self.client_manager.get_client_states();
+        let clients = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .map(|(handle, config, mut state)| {
+                state.auto_activated = self.auto_activated_clients.contains(&handle);
+                (handle, config, state)
+            })
+            .collect();
         self.notify_frontend(FrontendEvent::Enumerate(clients));
     }
 
@@ -2912,6 +2934,9 @@ impl Service {
         match self.discovered.get(&ip).and_then(|device| device.port) {
             Some(port) => {
                 self.client_manager.set_port(handle, port);
+                // Service-created reverse entry: the user never asked to
+                // control this peer, the incoming session did.
+                self.auto_activated_clients.insert(handle);
                 self.activate_client(handle);
             }
             None => log::info!(
@@ -3035,6 +3060,10 @@ impl Service {
                 log::info!(
                     "incoming session established: activating client {handle} back (bidirectional)"
                 );
+                // Mark before activating: activation publishes the client
+                // state to the frontend, which must already know the link was
+                // not requested by the user.
+                self.auto_activated_clients.insert(handle);
                 self.set_client_active(handle, true);
             }
         }
@@ -3129,6 +3158,7 @@ impl Service {
 
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
+        self.auto_activated_clients.remove(&handle);
         self.cursor_hide.leave(handle);
         if self.client_manager.deactivate_client(handle) {
             self.capture.destroy(handle);
@@ -3145,6 +3175,7 @@ impl Service {
     /// sessions for the same identity are closed too.
     fn deactivate_client_and_peer(&mut self, handle: ClientHandle, user_initiated: bool) {
         log::debug!("explicitly disconnecting client {handle}");
+        self.auto_activated_clients.remove(&handle);
         let fingerprint = self.client_manager.fingerprint(handle);
         // A peer that controls this machine uses a reverse (inactive) client
         // entry; the full teardown below is what stops it.
@@ -3299,6 +3330,7 @@ impl Service {
     fn remove_client(&mut self, handle: ClientHandle) {
         self.learned_fingerprints.remove(&handle);
         self.auto_reverse_clients.remove(&handle);
+        self.auto_activated_clients.remove(&handle);
         // Remove the entry first so the connection layer's reconnect loop sees
         // an inactive client, then close the live transport. Without this a
         // deleted/reloaded client kept its DTLS socket and ping/receive tasks
@@ -3442,10 +3474,24 @@ impl Service {
         self.broadcast_client(handle);
     }
 
+    /// Client state as published to the frontend.
+    ///
+    /// Stamps the service-owned `auto_activated` marker: it says whether the
+    /// outgoing link exists because the user asked to control the peer or just
+    /// as the reverse half of an incoming session. The frontend uses it to
+    /// hide controls that only scale motion sent to the peer.
+    fn frontend_client_state(&self, handle: ClientHandle) -> Option<(ClientConfig, ClientState)> {
+        self.client_manager
+            .get_state(handle)
+            .map(|(config, mut state)| {
+                state.auto_activated = self.auto_activated_clients.contains(&handle);
+                (config, state)
+            })
+    }
+
     fn broadcast_client(&mut self, handle: ClientHandle) {
         let event = self
-            .client_manager
-            .get_state(handle)
+            .frontend_client_state(handle)
             .map(|(c, s)| FrontendEvent::State(handle, c, s))
             .unwrap_or(FrontendEvent::NoSuchClient(handle));
         self.notify_frontend(event);
