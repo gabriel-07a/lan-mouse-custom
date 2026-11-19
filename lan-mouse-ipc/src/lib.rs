@@ -679,7 +679,7 @@ pub enum LinkKind {
 }
 
 impl LinkKind {
-    /// Icon name used by the GTK frontend.
+    /// Freedesktop icon name for this link kind.
     pub fn icon_name(&self) -> &'static str {
         match self {
             LinkKind::Wired => "network-wired-symbolic",

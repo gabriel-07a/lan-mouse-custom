@@ -1,8 +1,8 @@
 # GPUI migration status
 
-Lan Mouse now ships the **GPUI frontend as the default UI** on Linux and
-Windows. The legacy GTK/libadwaita frontend remains available as an opt-in
-fallback (`--features gtk`) while parity work and release validation finish.
+Lan Mouse ships the **GPUI frontend** on Linux and Windows. The legacy
+GTK/libadwaita frontend has been removed; GPUI is the only graphical frontend
+(the CLI remains available).
 
 ## Architecture
 
@@ -60,22 +60,16 @@ keeps the tray working and isolates UI crashes from the input service.
 - Manual Windows release validation (manual `Release` workflow) and a real
   Windows run: installer, startup, tray, firewall, IPC.
 - Nix flake evaluation/build on Linux.
-- GTK fallback still in the workspace; remove it once the Windows/Linux
-  matrix is signed off.
-- Advanced client fields still GTK-only (enter/leave hooks, fix-IP list); the
-  GPUI dialog covers hostname/port/fingerprint.
+- Advanced client fields (enter/leave hooks, fix-IP list) are config-file/CLI
+  only; the GPUI dialog covers hostname/port/fingerprint.
 - Screenshot refresh for README/docs.
 
-## Running the frontends
+## Running the frontend
 
 ```sh
-# GPUI (default)
 cargo build --release
 cargo build --release --manifest-path lan-mouse-gpui/Cargo.toml
 ./target/release/lan-mouse
-
-# GTK fallback
-cargo run --no-default-features --features "gtk,layer_shell_capture,x11_capture,libei_capture,wlroots_emulation,libei_emulation,rdp_emulation,x11_emulation"
 ```
 
 The main binary looks for `lan-mouse-gpui` next to itself; set

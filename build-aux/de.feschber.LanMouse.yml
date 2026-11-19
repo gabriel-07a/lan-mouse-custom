@@ -35,7 +35,6 @@ finish-args:
   - "--filesystem=xdg-config"
   - "--env=RUST_BACKTRACE=1"
   - "--env=RUST_LOG=lan-mouse=debug"
-  - "--env=GTK_PATH=/app/lib/gtk-4.0"
 
 modules:
   - name: lan-mouse

@@ -202,9 +202,6 @@ impl Language {
                 "Devices adopted while the pairing window was open. Keep them or revoke access." => {
                     "Dispositivos adotados enquanto a janela de pareamento estava aberta. Mantenha-os ou revogue o acesso."
                 }
-                "The GTK frontend is still available as an opt-in fallback; the IPC/service protocol is unchanged." => {
-                    "A interface GTK continua disponível como fallback opcional; o protocolo IPC/serviço não mudou."
-                }
                 "Lan Mouse — unofficial fork · GPUI frontend · GPL-3.0-or-later" => {
                     "Lan Mouse — fork não oficial · interface GPUI · GPL-3.0-or-later"
                 }

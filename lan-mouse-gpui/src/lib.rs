@@ -3789,9 +3789,6 @@ impl Dashboard {
                         ),
                     }),
             )
-            .child(div().text_xs().text_color(rgb(MUTED)).child(
-                self.tr("The GTK frontend is still available as an opt-in fallback; the IPC/service protocol is unchanged."),
-            ))
     }
 
     fn render_device_permissions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
