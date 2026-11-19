@@ -141,6 +141,11 @@ pub(crate) struct LibeiEmulation {
     /// one-shot debug log when a boundary push is replayed on the relative
     /// pointer (edge pressure)
     pressure_logged: bool,
+    /// boundary pushes seen since the remote control was armed (diagnostics)
+    pressure_events: u32,
+    /// hidden `LAN_MOUSE_FORCE_RELATIVE=1` override: skip absolute injection
+    /// entirely (A/B diagnostics for compositor behaviour with relative input)
+    force_relative: bool,
 }
 
 /// Extra pixels the pointer must be pushed past the entry edge before the
@@ -299,6 +304,25 @@ struct AppliedMotion {
     pressed: bool,
 }
 
+/// Outcome of one boundary-pressure replay attempt.
+///
+/// Diagnostics for the Ubuntu Dock / GNOME hot-corner pressure hand-off: the
+/// compositor only emits barrier hits for motion past the last on-screen
+/// pixel, which absolute events cannot express. The replay goes through the
+/// relative pointer device; if that device is missing or paused the pointer at
+/// least keeps following the absolute tracker, but edge pressure stays dead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PressureStatus {
+    /// The clamped delta was sent on the relative pointer device.
+    Sent,
+    /// The compositor exposed no relative pointer device.
+    NoRelativePointer,
+    /// The relative pointer device is paused by the compositor.
+    PointerPaused,
+    /// The delta narrowed to a non-finite f32.
+    InvalidDelta,
+}
+
 /// Exact edge-return detector for absolute pointer injection.
 ///
 /// The pointer is warped to a known anchor on entry and every injected motion
@@ -329,6 +353,9 @@ struct AbsoluteTracker {
     layout_max_y: f32,
     x: f64,
     y: f64,
+    /// Bounding box of the positions the injected pointer actually reached
+    /// since arming (`min_x`, `max_x`, `min_y`, `max_y`); debug diagnostics.
+    reached: (f64, f64, f64, f64),
     fired: bool,
     /// When the tracker was armed (remote `Enter`). Used for the settling
     /// debounce before a return request is accepted.
@@ -410,6 +437,7 @@ impl AbsoluteTracker {
             layout_max_y,
             x,
             y,
+            reached: (x, x, y, y),
             fired: false,
             armed_at: Instant::now(),
             inward_travel_px: 0.0,
@@ -482,6 +510,8 @@ impl AbsoluteTracker {
         // Keeping the tracked position equal to the sent one prevents a desync
         // when the cursor is pushed into a gap between monitors.
         let (x, y) = self.snap(clamped_x, clamped_y);
+        let (min_x, max_x, min_y, max_y) = self.reached;
+        self.reached = (min_x.min(x), max_x.max(x), min_y.min(y), max_y.max(y));
         // A clamp means the motion ran off the last on-screen pixel. The
         // compositor cannot be told that with an absolute event (out-of-region
         // events are dropped), but a relative device can.
@@ -578,6 +608,12 @@ impl AbsoluteTracker {
     /// position in a gap between monitors is clamped into the nearest region.
     fn absolute(&self) -> (f32, f32) {
         (self.x as f32, self.y as f32)
+    }
+
+    /// Bounding box of the positions the injected pointer reached since
+    /// arming (`min_x`, `max_x`, `min_y`, `max_y`); debug diagnostics only.
+    fn reached(&self) -> (f64, f64, f64, f64) {
+        self.reached
     }
 
     /// Normalised position along the entry edge where the pointer currently
@@ -726,17 +762,18 @@ fn entry_point_at(
 /// not region-constrained, so the compositor clamps it exactly like real input
 /// and emits the barrier hits.
 ///
-/// Returns `false` when no usable relative pointer exists; the caller then
-/// keeps the absolute event so the pointer still moves.
+/// Returns [`PressureStatus::NoRelativePointer`] (or
+/// [`PressureStatus::PointerPaused`]) when no usable relative pointer exists;
+/// the caller then keeps the absolute event so the pointer still moves.
 fn inject_pressure(
     devices: &Devices,
     conn: &event::Connection,
     time: u64,
     delta: (f32, f32),
-) -> bool {
+) -> PressureStatus {
     let (dx, dy) = delta;
     if !dx.is_finite() || !dy.is_finite() {
-        return false;
+        return PressureStatus::InvalidDelta;
     }
     let pointer = devices
         .pointer
@@ -744,7 +781,7 @@ fn inject_pressure(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let Some((device, pointer)) = pointer else {
-        return false;
+        return PressureStatus::NoRelativePointer;
     };
     let paused = devices
         .paused
@@ -752,11 +789,11 @@ fn inject_pressure(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .contains(&device);
     if paused {
-        return false;
+        return PressureStatus::PointerPaused;
     }
     pointer.motion_relative(dx, dy);
     device.frame(conn.serial(), time);
-    true
+    PressureStatus::Sent
 }
 
 async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
@@ -802,6 +839,30 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
 }
 
 impl LibeiEmulation {
+    /// Debug: log whether the compositor exposes the relative pointer device
+    /// used for the edge-pressure replay, and whether it is paused.
+    fn log_relative_pointer(&self) {
+        let pointer = self
+            .devices
+            .pointer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let (available, paused) = match pointer {
+            Some((device, _)) => {
+                let paused = self
+                    .devices
+                    .paused
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(&device);
+                (true, paused)
+            }
+            None => (false, false),
+        };
+        log::debug!("relative pointer device: available={available} paused={paused}");
+    }
+
     /// Warp the pointer to the centre of the EIS region and start tracking the
     /// injected deltas from that known anchor.
     ///
@@ -950,6 +1011,8 @@ impl LibeiEmulation {
             last_motion_arrival: None,
             absolute_env_scale: read_env_scale(),
             pressure_logged: false,
+            pressure_events: 0,
+            force_relative: std::env::var_os("LAN_MOUSE_FORCE_RELATIVE").is_some(),
         })
     }
 }
@@ -982,10 +1045,30 @@ impl Emulation for LibeiEmulation {
         self.last_motion_time = None;
         self.last_motion_arrival = None;
         self.pressure_logged = false;
-        self.start_absolute_tracking();
+        self.pressure_events = 0;
+        self.log_relative_pointer();
+        if self.force_relative {
+            log::warn!(
+                "LAN_MOUSE_FORCE_RELATIVE=1: absolute pointer injection disabled (diagnostic)"
+            );
+        } else {
+            self.start_absolute_tracking();
+        }
     }
 
     async fn end_remote_control(&mut self) {
+        // Diagnostic: what the injected pointer actually reached, and whether
+        // boundary pressure was seen during this activation.
+        if let Some(tracker) = &self.absolute {
+            let (min_x, max_x, min_y, max_y) = tracker.reached();
+            log::debug!(
+                "absolute tracker disarmed: reached x {min_x:.1}..{max_x:.1} of 0..{:.0}, \
+                 y {min_y:.1}..{max_y:.1} of 0..{:.0}; pressure events {}",
+                tracker.layout_max_x - 1.0,
+                tracker.layout_max_y - 1.0,
+                self.pressure_events
+            );
+        }
         self.remote_edge = None;
         self.entry_along = None;
         self.absolute = None;
@@ -1028,7 +1111,7 @@ impl Emulation for LibeiEmulation {
                     // offers an absolute pointer, move it absolutely from a
                     // tracked position: that is exact (no acceleration/drift)
                     // and makes the edge-return detection trustworthy.
-                    if self.remote_edge.is_some() {
+                    if self.remote_edge.is_some() && !self.force_relative {
                         if self.absolute.is_none() {
                             self.start_absolute_tracking();
                         }
@@ -1075,13 +1158,23 @@ impl Emulation for LibeiEmulation {
                                 (dx * accel * tracker.delta_scale) as f32,
                                 (dy * accel * tracker.delta_scale) as f32,
                             );
-                            let replayed =
-                                pressure && inject_pressure(&self.devices, &self.conn, now, scaled);
-                            if replayed && !self.pressure_logged {
-                                self.pressure_logged = true;
-                                log::debug!(
-                                    "replaying clamped motion on the relative pointer (edge pressure)"
-                                );
+                            let status = pressure
+                                .then(|| inject_pressure(&self.devices, &self.conn, now, scaled));
+                            let replayed = matches!(status, Some(PressureStatus::Sent));
+                            if pressure {
+                                self.pressure_events = self.pressure_events.saturating_add(1);
+                                if !self.pressure_logged {
+                                    self.pressure_logged = true;
+                                    log::debug!(
+                                        "edge pressure: cursor ({x:.1},{y:.1}) of ({:.0},{:.0}) \
+                                         delta ({:.2},{:.2}) handoff {:?} replay {status:?}",
+                                        tracker.layout_max_x - 1.0,
+                                        tracker.layout_max_y - 1.0,
+                                        scaled.0,
+                                        scaled.1,
+                                        applied.handoff
+                                    );
+                                }
                             }
                             if !replayed {
                                 pointer.pointer.motion_absolute(x, y);
@@ -2105,6 +2198,31 @@ mod absolute_tracker_tests {
         let before = tracker.absolute();
         assert_eq!(tracker.apply_motion(-1.0e12, 0.0), AppliedMotion::default());
         assert_eq!(tracker.absolute(), before);
+    }
+
+    /// The tracker keeps the bounding box of reached positions so a debug
+    /// session can tell whether the injected pointer ever reached the edge.
+    #[test]
+    fn reached_bounds_cover_the_injected_positions() {
+        let mut tracker = tracker(PointerEdge::Right);
+        let (x0, y0) = tracker.absolute();
+        assert_eq!(
+            tracker.reached(),
+            (f64::from(x0), f64::from(x0), f64::from(y0), f64::from(y0))
+        );
+        assert!(!tracker.apply_motion(-200.0, 300.0).pressed);
+        assert!(!tracker.apply_motion(-10.0, 40.0).pressed);
+        let (min_x, max_x, min_y, max_y) = tracker.reached();
+        assert!(
+            (min_x - f64::from(x0) + 210.0).abs() < 1e-9,
+            "min_x={min_x}"
+        );
+        assert_eq!(max_x, f64::from(x0));
+        assert_eq!(min_y, f64::from(y0));
+        assert!(
+            (max_y - f64::from(y0) - 340.0).abs() < 1e-9,
+            "max_y={max_y}"
+        );
     }
 
     /// Pressure starts exactly at the last pixel and stops as soon as the user
