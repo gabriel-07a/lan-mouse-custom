@@ -50,6 +50,17 @@ LAN_MOUSE_LOG_LEVEL=debug cargo run                        # debug logging
 
 Run from repo root—no `cd` in scripts.
 
+## Disk hygiene
+
+Rust builds must never be left consuming disk space. The two workspaces
+(`target/` here and `lan-mouse-gpui/target/`) accumulate tens of GB, so:
+
+- after finishing a build or test session, delete the generated target
+  directories (`cargo clean` or `rm -rf target lan-mouse-gpui/target`);
+- keep only installed binaries or explicitly requested release artifacts;
+- before starting a new build, check `df -h` and remove stale target dirs
+  first when space is short.
+
 ## Testing
 
 - Unit tests for utilities; integration tests for protocol behavior.
