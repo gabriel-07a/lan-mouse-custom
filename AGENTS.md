@@ -58,6 +58,10 @@ Rust builds must never be left consuming disk space. The two workspaces
 - after finishing a build or test session, delete the generated target
   directories (`cargo clean` or `rm -rf target lan-mouse-gpui/target`);
 - keep only installed binaries or explicitly requested release artifacts;
+- prune installed build copies in `~/.local/bin` (`.bak-*`) after installing a
+  new build: keep at most the two most recent per binary;
+- `dist/` holds explicitly requested release packages; leave it alone unless
+  asked to clean it;
 - before starting a new build, check `df -h` and remove stale target dirs
   first when space is short.
 
