@@ -9,7 +9,7 @@ import Gio from 'gi://Gio';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const HEARTBEAT_MS = 3_000;
-const EXTENSION_VERSION = '6';
+const EXTENSION_VERSION = '7';
 const POLL_MS = 50;
 // Ignore pointer movement right after a hand-off: the peer may still deliver
 // a few injected motion events while it releases its capture. Requiring two
@@ -27,6 +27,14 @@ export default class LanMouseCursorExtension extends Extension {
         this._cursorTracker = null;
         this._trackerError = '';
         this._inhibited = false;
+        // GNOME 50: the plain visibility inhibitor is undone by the next
+        // pointer event (the cursor renderer is re-attached and shown again).
+        // The Shell's own screen shield/magnifier also keep the seat's
+        // "unfocus inhibited" refcount up while hiding; without it the
+        // cursor sprite is detached on hide and re-shown on the first motion.
+        this._seat = null;
+        this._seatUnfocusInhibited = false;
+        this._seatError = '';
         this._lastStatus = '';
 
         const runtime = `${GLib.get_user_runtime_dir()}/lan-mouse`;
@@ -68,7 +76,9 @@ export default class LanMouseCursorExtension extends Extension {
         }
         this._stateFile = null;
         this._setInhibited(false);
+        this._uninhibitSeat();
         this._cursorTracker = null;
+        this._seat = null;
         this._runtimeDir = null;
         if (this._loadedFile) {
             try {
@@ -103,7 +113,9 @@ export default class LanMouseCursorExtension extends Extension {
         }
         const status = `tracker=${this._cursorTracker ? 1 : 0} inhibited=${
             this._inhibited ? 1 : 0
-        } state=${state} error=${this._trackerError}`;
+        } seat=${this._seatUnfocusInhibited ? 1 : 0} state=${state} error=${
+            this._trackerError || this._seatError
+        }`;
         if (status === this._lastStatus) {
             return;
         }
@@ -119,6 +131,31 @@ export default class LanMouseCursorExtension extends Extension {
         }
     }
 
+    _getSeat() {
+        if (this._seat)
+            return this._seat;
+        try {
+            this._seat = global.stage.context.get_backend().get_default_seat();
+        } catch (error) {
+            this._seatError = String(error);
+        }
+        return this._seat;
+    }
+
+    _uninhibitSeat() {
+        if (!this._seatUnfocusInhibited)
+            return;
+        const seat = this._getSeat();
+        if (seat) {
+            try {
+                seat.uninhibit_unfocus();
+            } catch (error) {
+                this._seatError = String(error);
+            }
+        }
+        this._seatUnfocusInhibited = false;
+    }
+
     _setInhibited(inhibit) {
         if (inhibit && !this._resolveTracker()) {
             this._writeStatus('no-tracker');
@@ -129,18 +166,30 @@ export default class LanMouseCursorExtension extends Extension {
         }
         try {
             if (inhibit && !this._inhibited) {
+                // Keep the pointer focus-surface attached while the cursor is
+                // hidden. On GNOME 50 hiding detaches the cursor renderer; the
+                // next pointer event re-attaches it and shows the cursor again
+                // (the Shell's screen shield/magnifier hold the same seat
+                // refcount for exactly this reason).
+                const seat = this._getSeat();
+                if (seat) {
+                    seat.inhibit_unfocus();
+                    this._seatUnfocusInhibited = true;
+                }
                 this._cursorTracker.inhibit_cursor_visibility();
                 this._inhibited = true;
                 this._writeStatus('inhibited');
             } else if (!inhibit && this._inhibited) {
                 this._cursorTracker.uninhibit_cursor_visibility();
                 this._inhibited = false;
+                this._uninhibitSeat();
                 this._writeStatus('visible');
             }
         } catch (error) {
             this._trackerError = String(error);
             this._cursorTracker = null;
             this._inhibited = false;
+            this._uninhibitSeat();
             console.error(`Lan Mouse cursor extension: ${error}`);
             this._writeStatus('error');
         }
