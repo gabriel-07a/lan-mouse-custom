@@ -9,7 +9,7 @@ import Gio from 'gi://Gio';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const HEARTBEAT_MS = 3_000;
-const EXTENSION_VERSION = '7';
+const EXTENSION_VERSION = '8';
 const POLL_MS = 50;
 // Ignore pointer movement right after a hand-off: the peer may still deliver
 // a few injected motion events while it releases its capture. Requiring two
@@ -17,6 +17,11 @@ const POLL_MS = 50;
 const PARK_SETTLE_MS = 250;
 const PARK_MOVE_PX = 12;
 const PARK_CONFIRM_POLLS = 2;
+// Content of the park marker when this machine's own capture just ended
+// (its user moved back from the peer). No peer injects motion here, so the
+// cursor is shown on the first poll that sees real movement: with the
+// settle/confirm delays above a fast hand appeared only mid-screen.
+const PARK_KIND_RETURN = 'return';
 
 export default class LanMouseCursorExtension extends Extension {
     enable() {
@@ -47,6 +52,8 @@ export default class LanMouseCursorExtension extends Extension {
         this._parkOrigin = null;
         this._parkSeenAt = 0;
         this._parkAwayPolls = 0;
+        this._parkSettleMs = PARK_SETTLE_MS;
+        this._parkConfirmPolls = PARK_CONFIRM_POLLS;
         this._loadedFile = Gio.File.new_for_path(
             `${runtime}/cursor-extension-loaded`
         );
@@ -195,6 +202,15 @@ export default class LanMouseCursorExtension extends Extension {
         }
     }
 
+    _readParkKind() {
+        try {
+            const [ok, bytes] = GLib.file_get_contents(this._parkFile.get_path());
+            if (ok)
+                return new TextDecoder().decode(bytes).trim();
+        } catch (_error) {}
+        return '';
+    }
+
     _sync() {
         let hide = false;
         try {
@@ -220,17 +236,20 @@ export default class LanMouseCursorExtension extends Extension {
                     this._parkOrigin = [x, y];
                     this._parkSeenAt = Date.now();
                     this._parkAwayPolls = 0;
+                    const ownReturn = this._readParkKind() === PARK_KIND_RETURN;
+                    this._parkSettleMs = ownReturn ? 0 : PARK_SETTLE_MS;
+                    this._parkConfirmPolls = ownReturn ? 1 : PARK_CONFIRM_POLLS;
                     // Hide on the first observation: waiting for the next
                     // poll adds a visible delay to the return hand-off.
                     hide = true;
-                } else if (Date.now() - this._parkSeenAt < PARK_SETTLE_MS) {
+                } else if (Date.now() - this._parkSeenAt < this._parkSettleMs) {
                     hide = true;
                 } else {
                     const dx = x - this._parkOrigin[0];
                     const dy = y - this._parkOrigin[1];
                     if (Math.hypot(dx, dy) > PARK_MOVE_PX) {
                         this._parkAwayPolls += 1;
-                        if (this._parkAwayPolls >= PARK_CONFIRM_POLLS) {
+                        if (this._parkAwayPolls >= this._parkConfirmPolls) {
                             try {
                                 this._parkFile.delete(null);
                             } catch (_error) {}

@@ -14,6 +14,14 @@ use std::{
 
 /// How often the service refreshes the heartbeat while capture is active.
 pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// Park marker content after a remote peer stopped driving this machine; the
+/// extension waits for the peer's last injected motion before trusting
+/// pointer movement.
+const PARK_REMOTE: &[u8] = b"1";
+/// Park marker content after this machine's own capture ended; the extension
+/// shows the cursor on the first real movement (see the extension's
+/// `PARK_KIND_RETURN`).
+const PARK_RETURN: &[u8] = b"return";
 
 pub(crate) struct CursorHide {
     path: Option<PathBuf>,
@@ -101,7 +109,7 @@ impl CursorHide {
     pub(crate) fn leave(&mut self, handle: ClientHandle) {
         if self.owner == Some(handle) {
             self.owner = None;
-            self.park();
+            self.park_after_return();
             self.set_active(false);
             log::debug!("cursor-hide: left client {handle}, cursor parked until the mouse moves");
         }
@@ -149,6 +157,18 @@ impl CursorHide {
     /// remote peer returned control to the other machine. The extension shows
     /// it as soon as the local pointer moves or a new incoming session starts.
     pub(crate) fn park(&mut self) {
+        self.write_park(PARK_REMOTE);
+    }
+
+    /// Park the cursor after this machine's own capture ended. The extension
+    /// shows it on the first real movement: no peer injects motion here, so
+    /// the settle delay used for [`Self::park`] would only make the cursor
+    /// appear late (mid-screen for a fast hand).
+    fn park_after_return(&mut self) {
+        self.write_park(PARK_RETURN);
+    }
+
+    fn write_park(&mut self, kind: &[u8]) {
         if self.owner.is_some() {
             return;
         }
@@ -158,7 +178,7 @@ impl CursorHide {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Err(error) = fs::write(path, b"1") {
+        if let Err(error) = fs::write(path, kind) {
             log::debug!("could not write cursor-park marker: {error}");
         }
     }
@@ -316,6 +336,11 @@ mod tests {
                 !path.exists(),
                 "the heartbeat must not outlive the capture (it ignores local movement)"
             );
+            assert_eq!(
+                std::fs::read(&park).expect("park marker"),
+                b"return",
+                "an own return must tell the extension to show the cursor on the first movement"
+            );
             assert!(
                 park.exists(),
                 "the returned cursor is parked: hidden at the border until the mouse moves"
@@ -354,6 +379,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The marker content is a contract with the bundled GNOME extension:
+    /// the fast reveal after an own return only works if both sides agree.
+    #[test]
+    fn the_extension_understands_both_park_kinds() {
+        let extension =
+            include_str!("../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/extension.js");
+        let own_return = std::str::from_utf8(PARK_RETURN).expect("ascii");
+        assert!(
+            extension.contains(&format!("const PARK_KIND_RETURN = '{own_return}';")),
+            "the extension must recognise the own-return park marker"
+        );
+        assert!(
+            extension.contains("this._parkSettleMs = ownReturn ? 0 : PARK_SETTLE_MS;"),
+            "an own return must skip the settle delay"
+        );
+        assert_ne!(PARK_RETURN, PARK_REMOTE);
+    }
+
     #[test]
     fn a_foreign_leave_neither_parks_nor_shows_the_cursor() {
         let (dir, path) = temp_path("foreign");
@@ -377,6 +420,11 @@ mod tests {
             let mut hide = CursorHide::with_path(Some(path));
             hide.park();
             assert!(park.exists(), "a returned cursor must be parked");
+            assert_eq!(
+                std::fs::read(&park).expect("park marker"),
+                b"1",
+                "a peer's return keeps the settle delay for its injected motion"
+            );
             hide.unpark();
             assert!(!park.exists(), "entering again must restore the cursor");
         }
