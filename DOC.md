@@ -65,6 +65,9 @@ earlier revisions of this document described. The actual flow is:
   revocation uses `AuthRevoke`.
 - **Liveness**: `Ping`/`Pong` provides RTT and detects a dead peer; a watchdog
   closes the transport and the reconnect loop backs off.
+- **Keyboard lock sync**: peers advertising `LOCK_SYNC` exchange
+  `LockState { known, on }` (event id 23, bits `CAPS`/`NUM`); see "Keyboard
+  locks" below.
 - **Latency measurement**: peers advertising `LATENCY_PROBE` answer
   `LatencyProbe(seq)` (event id 21) with `LatencyReply(seq)` (id 22). The
   connecting side sends four probes per second and keeps a one-minute window,
@@ -250,6 +253,38 @@ hidden through the Enter/Leave flapping of a shared edge, and appears on the
 first real local movement (more than 12 px, after a 250 ms settle). A fixed
 post-leave grace used to keep the heartbeat for 4 s, which left the cursor
 invisible while the user was already moving it on this screen.
+
+## Keyboard locks (Caps Lock / Num Lock)
+
+Caps Lock and Num Lock are one shared state across connected machines, so the
+LED of every keyboard matches and typing on the peer follows the LED of the
+keyboard in use.
+
+- **Detect**: every 100 ms each machine reads its own lock state. Linux reads
+  the keyboard LEDs in `/sys/class/leds/*::{capslock,numlock}/brightness`
+  (driven by the compositor or X server, so GNOME, KDE, wlroots and X11 all
+  work, without privileges); Windows reads the toggle bit of `GetKeyState`.
+  `known` carries the locks a machine can observe: a lock missing on either
+  side is never toggled blindly.
+- **Tell**: a change made on a machine is sent as `LockState` to every peer
+  that advertised `LOCK_SYNC`, over the outgoing connection when there is one,
+  otherwise as a reply on the incoming session. When the pointer moves to a
+  peer, the controlling machine sends its state too: the keyboard the user is
+  typing on wins the hand-off.
+- **Apply**: a different remote state is applied by injecting the lock key
+  through the input-emulation backend (libei, wlroots, X11, the portal,
+  Windows), so the OS toggles the lock and drives the LED itself. On Windows
+  Num Lock is the extended scan code `0xE045`.
+- **No loops**: a machine never re-sends a change it caused; after injecting it
+  expects that state and treats observing it (within 2 s) as the echo. The
+  capture also drops captured lock keys for 500 ms after an injection, because
+  some backends see injected keys while capturing and forwarding them would
+  toggle the peer back.
+- **Configuration**: `sync_num_lock = false` in `config.toml` limits the sync
+  to Caps Lock (useful on laptops without a numeric keypad).
+
+On GNOME the first injection may need the RemoteDesktop portal consent, like
+the first input received from a peer.
 
 ## Symmetric roles
 Every instance runs both a listener and an outgoing connection, so *server* and

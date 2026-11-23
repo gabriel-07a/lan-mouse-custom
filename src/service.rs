@@ -178,6 +178,8 @@ pub struct Service {
     capture_status: Status,
     /// GNOME Wayland cursor-hide heartbeat state file
     cursor_hide: CursorHide,
+    /// Caps Lock / Num Lock sync with connected machines
+    lock_sync: crate::lock_sync::LockSync,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
     /// keep track of registered connections to avoid duplicate barriers
@@ -314,6 +316,7 @@ impl Service {
         let (announced_tx, announced_rx) = local_channel::mpsc::channel();
         let port = config.port();
         let discovery_port = config.discovery_port();
+        let lock_sync_mask = config.lock_sync_mask();
         let service = Self {
             config,
             capture,
@@ -358,6 +361,7 @@ impl Service {
             discovery_port,
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
+            lock_sync: crate::lock_sync::LockSync::new(lock_sync_mask),
             cursor_hide: if options.isolated {
                 CursorHide::with_path(None)
             } else {
@@ -417,6 +421,8 @@ impl Service {
         let mut return_retry = tokio::time::interval(RETURN_RETRY_INTERVAL);
         return_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         return_retry.tick().await;
+        let mut lock_tick = tokio::time::interval(crate::lock_sync::POLL_INTERVAL);
+        lock_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut cursor_hide_tick = tokio::time::interval(crate::cursor_hide::HEARTBEAT_INTERVAL);
         cursor_hide_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // systemd `stop`, desktop logout and the Windows service wrapper use
@@ -446,6 +452,7 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 _ = cursor_hide_tick.tick() => self.cursor_hide.tick(),
+                _ = lock_tick.tick() => self.poll_locks(),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.discovery_rx.recv() => self.handle_discovery_event(event),
                 event = self.announced_rx.recv() => {
@@ -1333,6 +1340,9 @@ impl Service {
                     self.deactivate_fingerprint(&fingerprint);
                 }
             }
+            EmulationEvent::RemoteLocks { addr, locks } => {
+                self.apply_remote_locks(locks, &addr.to_string());
+            }
             EmulationEvent::InputCadence {
                 addr,
                 p50_us,
@@ -1420,7 +1430,14 @@ impl Service {
                 log::info!("entering client {handle} ...");
                 // `enter` also unparks, after the heartbeat exists.
                 self.cursor_hide.enter(handle);
+                // The keyboard the user types on wins the hand-off.
+                if let Some(locks) = self.lock_sync.for_handoff() {
+                    self.send_locks_to(handle, locks);
+                }
                 self.spawn_hook_command(handle, HookKind::Enter);
+            }
+            ICaptureEvent::RemoteLocks(handle, locks) => {
+                self.apply_remote_locks(locks, &format!("client {handle}"));
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
@@ -1510,6 +1527,63 @@ impl Service {
     }
 
     /// Runtime information used by the frontend and `lan-mouse doctor`.
+    /// Read the local lock state and tell the peers when the user changed it.
+    fn poll_locks(&mut self) {
+        let Some(observed) = crate::lock_sync::read_local() else {
+            return;
+        };
+        if let Some(locks) = self.lock_sync.observe_local(observed, Instant::now()) {
+            log::info!(
+                "keyboard locks changed locally (caps={}, num={}); syncing peers",
+                locks.on & lan_mouse_proto::lock_bits::CAPS != 0,
+                locks.on & lan_mouse_proto::lock_bits::NUM != 0
+            );
+            for handle in self.client_manager.registered_clients() {
+                self.send_locks_to(handle, locks);
+            }
+        }
+    }
+
+    /// Send the lock state to one peer, over the outgoing connection when
+    /// there is one, otherwise as a reply on its incoming session. Peers that
+    /// did not advertise lock sync are skipped (legacy peers close the
+    /// connection on an unknown event).
+    fn send_locks_to(&self, handle: ClientHandle, locks: crate::lock_sync::Locks) {
+        let Some((_, state)) = self.client_manager.get_state(handle) else {
+            return;
+        };
+        if state.active_addr.is_some() {
+            self.capture.send_locks(handle, locks);
+            return;
+        }
+        let Some(addr) = state.incoming_addr else {
+            return;
+        };
+        let supported = self
+            .incoming_peer_caps
+            .read()
+            .expect("lock")
+            .get(&addr)
+            .is_some_and(|caps| caps & lan_mouse_proto::capabilities::LOCK_SYNC != 0);
+        if supported {
+            self.emulation.send_locks(addr, locks);
+        }
+    }
+
+    /// A peer reported its lock state: toggle the local locks that differ.
+    fn apply_remote_locks(&mut self, locks: crate::lock_sync::Locks, from: &str) {
+        let now = Instant::now();
+        let keys = self.lock_sync.on_remote(locks, now);
+        if keys.is_empty() {
+            return;
+        }
+        log::info!("syncing keyboard locks from {from}: injecting keys {keys:?}");
+        // The capture must not forward the injected key back to the peer.
+        self.capture
+            .suppress_lock_keys(now + crate::lock_sync::INJECTED_KEY_SUPPRESS);
+        self.emulation.tap_keys(keys);
+    }
+
     pub(crate) fn diagnostics(&self) -> Diagnostics {
         Diagnostics {
             capture_backend: self.capture.backend().map(|b| b.to_string()),

@@ -4,7 +4,7 @@ use crate::handoff_trace;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCommand, ListenerCreationError};
 use futures::{FutureExt, StreamExt};
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, PointerEdge};
-use input_event::{Event, PointerEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 use lan_mouse_proto::clipboard::ClipboardFrame;
 use lan_mouse_proto::{CAPABILITIES, PROTO_VERSION, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -177,6 +177,11 @@ pub(crate) enum EmulationEvent {
         p50_us: Option<u32>,
         p99_us: Option<u32>,
     },
+    /// A peer reported its keyboard lock state on an incoming connection.
+    RemoteLocks {
+        addr: SocketAddr,
+        locks: crate::lock_sync::Locks,
+    },
 }
 
 /// Addresses of every live incoming session of \`fingerprint\`.
@@ -197,6 +202,11 @@ fn session_addrs_for_fingerprint(
     addrs.sort();
     addrs
 }
+
+/// Pseudo peer address of locally injected lock keys (lock sync). No real
+/// connection uses the unspecified address with port 0.
+const LOCK_SYNC_ADDR: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 enum EmulationRequest {
     Reenable,
@@ -220,6 +230,10 @@ enum EmulationRequest {
     RemoteLeave,
     /// Update the absolute-pointer sensitivity (percent).
     SetAbsoluteSensitivity(u16),
+    /// Send this machine's keyboard lock state to an incoming peer.
+    SendLocks(SocketAddr, crate::lock_sync::Locks),
+    /// Inject a press and release of each of these keys locally (lock sync).
+    TapKeys(Vec<u32>),
     ChangePort(u16),
     Terminate,
 }
@@ -366,6 +380,23 @@ impl Emulation {
     }
 
     /// The peer no longer drives this machine.
+    /// Send this machine's keyboard lock state to the incoming peer at
+    /// `addr`. The caller checks that the peer advertised lock sync.
+    pub(crate) fn send_locks(&self, addr: SocketAddr, locks: crate::lock_sync::Locks) {
+        self.request_tx
+            .send(EmulationRequest::SendLocks(addr, locks))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Toggle local locks by injecting their keys (lock sync).
+    pub(crate) fn tap_keys(&self, keys: Vec<u32>) {
+        self.request_tx
+            .send(EmulationRequest::TapKeys(keys))
+            .ok()
+            .unwrap_or_default();
+    }
+
     pub(crate) fn remote_leave(&self) {
         self.request_tx
             .send(EmulationRequest::RemoteLeave)
@@ -636,6 +667,15 @@ impl ListenTask {
                                     .ok()
                                     .unwrap_or_default();
                             }
+                            ProtoEvent::LockState { known, on } => {
+                                self.event_tx
+                                    .send(EmulationEvent::RemoteLocks {
+                                        addr,
+                                        locks: crate::lock_sync::Locks { known, on },
+                                    })
+                                    .ok()
+                                    .unwrap_or_default();
+                            }
                             // Echo only: a probe must never touch the
                             // emulation or the hand-off state.
                             ProtoEvent::LatencyProbe(seq) => {
@@ -782,6 +822,12 @@ impl ListenTask {
                     }
                     EmulationRequest::WarmUp => self.emulation_proxy.warm_up(),
                     EmulationRequest::RemoteLeave => self.emulation_proxy.end_remote_control(),
+                    EmulationRequest::SendLocks(addr, locks) => {
+                        self.listener
+                            .reply(addr, ProtoEvent::LockState { known: locks.known, on: locks.on })
+                            .await
+                    }
+                    EmulationRequest::TapKeys(keys) => self.emulation_proxy.tap_keys(&keys),
                     EmulationRequest::SetAbsoluteSensitivity(percent) => self
                         .emulation_proxy
                         .set_absolute_sensitivity(percent as f64 / 100.0),
@@ -944,6 +990,27 @@ impl EmulationProxy {
                 .send(ProxyRequest::Input(event, addr))
                 .ok()
                 .unwrap_or_default();
+        }
+    }
+
+    /// Inject a press and release of each key on this machine.
+    ///
+    /// Not gated on `emulation_active`: like the first input of a peer, this
+    /// may be what starts the (lazily created) emulation backend, with the
+    /// same portal consent rules.
+    fn tap_keys(&self, keys: &[u32]) {
+        for &key in keys {
+            for state in [1, 0] {
+                let event = Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key,
+                    state,
+                });
+                self.request_tx
+                    .send(ProxyRequest::Input(event, LOCK_SYNC_ADDR))
+                    .ok()
+                    .unwrap_or_default();
+            }
         }
     }
 
@@ -1195,6 +1262,24 @@ impl EmulationTask {
         }
     }
 
+    /// Emulation handle of `addr`, created on first use.
+    async fn handle_for(
+        &mut self,
+        emulation: &mut InputEmulation,
+        addr: SocketAddr,
+    ) -> EmulationHandle {
+        match self.handles.get(&addr) {
+            Some(&handle) => handle,
+            None => {
+                let handle = self.next_id;
+                self.next_id += 1;
+                emulation.create(handle).await;
+                self.handles.insert(addr, handle);
+                handle
+            }
+        }
+    }
+
     /// Inject one input event, creating the emulation target for the peer on
     /// first use.
     async fn consume_input(
@@ -1205,6 +1290,14 @@ impl EmulationTask {
     ) -> Result<(), InputEmulationError> {
         if self.closed.contains(&addr) {
             return Ok(());
+        }
+        if addr == LOCK_SYNC_ADDR {
+            // Local lock toggle, not peer input: no hand-off bookkeeping.
+            let handle = self.handle_for(emulation, addr).await;
+            return emulation
+                .consume(event, handle)
+                .await
+                .map_err(InputEmulationError::from);
         }
         let now = Instant::now();
         if let Some(armed) = self.handoff_armed_at.take() {
@@ -1245,16 +1338,7 @@ impl EmulationTask {
             }
             self.trace_last_input = Some(now);
         }
-        let handle = match self.handles.get(&addr) {
-            Some(&handle) => handle,
-            None => {
-                let handle = self.next_id;
-                self.next_id += 1;
-                emulation.create(handle).await;
-                self.handles.insert(addr, handle);
-                handle
-            }
-        };
+        let handle = self.handle_for(emulation, addr).await;
         let inject_started = Instant::now();
         let result = emulation
             .consume(event, handle)

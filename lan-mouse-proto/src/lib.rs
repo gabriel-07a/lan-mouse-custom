@@ -71,6 +71,17 @@ pub mod capabilities {
     /// Legacy peers close the connection on an unknown event id, so probes
     /// must only be sent when the peer advertised this bit.
     pub const LATENCY_PROBE: u32 = 1 << 10;
+    /// The peer understands [`super::ProtoEvent::LockState`] and keeps its
+    /// Caps Lock / Num Lock in sync with the other machine. Legacy peers close
+    /// the connection on an unknown event id, so the event must only be sent
+    /// when the peer advertised this bit.
+    pub const LOCK_SYNC: u32 = 1 << 11;
+}
+
+/// Bits of [`ProtoEvent::LockState`].
+pub mod lock_bits {
+    pub const CAPS: u8 = 1 << 0;
+    pub const NUM: u8 = 1 << 1;
 }
 
 /// Features this build can use when the peer also advertises them.
@@ -81,7 +92,8 @@ pub const CAPABILITIES: u32 = capabilities::ENTER_ACK
     | capabilities::EDGE_COORDINATE
     | capabilities::RETURN_COORDINATE
     | capabilities::VERSION_INFO
-    | capabilities::LATENCY_PROBE;
+    | capabilities::LATENCY_PROBE
+    | capabilities::LOCK_SYNC;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -264,6 +276,10 @@ pub enum ProtoEvent {
     LatencyProbe(u32),
     /// Echo of a [`ProtoEvent::LatencyProbe`] sequence number.
     LatencyReply(u32),
+    /// Keyboard lock state of the sender ([`lock_bits`]). `known` holds the
+    /// locks the sender can observe; only those bits of `on` are meaningful.
+    /// Only sent to peers advertising [`capabilities::LOCK_SYNC`].
+    LockState { known: u8, on: u8 },
 }
 
 impl Display for ProtoEvent {
@@ -330,6 +346,9 @@ impl Display for ProtoEvent {
             }
             ProtoEvent::LatencyProbe(seq) => write!(f, "LatencyProbe({seq})"),
             ProtoEvent::LatencyReply(seq) => write!(f, "LatencyReply({seq})"),
+            ProtoEvent::LockState { known, on } => {
+                write!(f, "LockState(known={known:#04b}, on={on:#04b})")
+            }
         }
     }
 }
@@ -358,6 +377,7 @@ pub enum EventType {
     LeaveAt = 20,
     LatencyProbe = 21,
     LatencyReply = 22,
+    LockState = 23,
 }
 
 impl ProtoEvent {
@@ -388,6 +408,7 @@ impl ProtoEvent {
             ProtoEvent::AuthRevoke { .. } => EventType::AuthRevoke,
             ProtoEvent::LatencyProbe(_) => EventType::LatencyProbe,
             ProtoEvent::LatencyReply(_) => EventType::LatencyReply,
+            ProtoEvent::LockState { .. } => EventType::LockState,
         }
     }
 }
@@ -536,6 +557,10 @@ impl TryFrom<&[u8]> for ProtoEvent {
             }),
             EventType::LatencyProbe => Ok(Self::LatencyProbe(decode_u32(&mut buf)?)),
             EventType::LatencyReply => Ok(Self::LatencyReply(decode_u32(&mut buf)?)),
+            EventType::LockState => Ok(Self::LockState {
+                known: decode_u8(&mut buf)?,
+                on: decode_u8(&mut buf)?,
+            }),
         }
     }
 }
@@ -664,6 +689,10 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::LatencyProbe(seq) | ProtoEvent::LatencyReply(seq) => {
                     encode_u32(buf, len, seq);
                 }
+                ProtoEvent::LockState { known, on } => {
+                    encode_u8(buf, len, known);
+                    encode_u8(buf, len, on);
+                }
             }
         }
         (buf, len)
@@ -784,6 +813,10 @@ mod tests {
             ProtoEvent::Ack(0x0a0b_0c0d),
             ProtoEvent::LatencyProbe(0x0102_0304),
             ProtoEvent::LatencyReply(0xfffe_fdfc),
+            ProtoEvent::LockState {
+                known: lock_bits::CAPS | lock_bits::NUM,
+                on: lock_bits::NUM,
+            },
             ProtoEvent::Hello {
                 commit: *b"abcdefgh",
                 proto_version: PROTO_VERSION,
@@ -1119,6 +1152,7 @@ mod extra_tests {
         assert_eq!(EventType::LeaveAt as u8, 20);
         assert_eq!(EventType::LatencyProbe as u8, 21);
         assert_eq!(EventType::LatencyReply as u8, 22);
+        assert_eq!(EventType::LockState as u8, 23);
         assert_eq!(EventType::Ack as u8, 10);
         assert_eq!(EventType::Hello as u8, 11);
         // Clipboard frames reserve 12-15; new events must start at 16.
@@ -1171,6 +1205,7 @@ mod extra_tests {
             capabilities::RETURN_COORDINATE,
             capabilities::VERSION_INFO,
             capabilities::LATENCY_PROBE,
+            capabilities::LOCK_SYNC,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");
@@ -1195,6 +1230,7 @@ mod extra_tests {
                 | capabilities::RETURN_COORDINATE
                 | capabilities::VERSION_INFO
                 | capabilities::LATENCY_PROBE
+                | capabilities::LOCK_SYNC
         );
     }
 

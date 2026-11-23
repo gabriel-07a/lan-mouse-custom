@@ -459,6 +459,12 @@ impl LanMouseConnection {
         self.sender.peer_supports_edge_coordinate(handle)
     }
 
+    /// Whether the peer advertised the optional protocol feature `cap` on the
+    /// outgoing connection.
+    pub(crate) fn peer_supports(&self, handle: ClientHandle, cap: u32) -> bool {
+        self.sender.ctx.client_manager.peer_supports(handle, cap)
+    }
+
     pub(crate) fn peer_rtt_ms(&self, handle: ClientHandle) -> Option<u32> {
         self.sender.peer_rtt_ms(handle)
     }

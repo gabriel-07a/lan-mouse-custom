@@ -30,6 +30,11 @@ pub(crate) trait CaptureConnection {
     fn peer_supports_enter_ack(&self, handle: CaptureHandle) -> bool;
     fn peer_supports_serialized_leave(&self, handle: CaptureHandle) -> bool;
     fn peer_supports_edge_coordinate(&self, handle: CaptureHandle) -> bool;
+    /// Whether the peer advertised the optional protocol feature `cap`.
+    /// Test fakes speak no optional feature by default.
+    fn peer_supports(&self, _handle: CaptureHandle, _cap: u32) -> bool {
+        false
+    }
     fn peer_rtt_ms(&self, handle: CaptureHandle) -> Option<u32>;
     fn is_connected(&self, handle: CaptureHandle) -> bool;
     fn ensure_connected(&self, handle: CaptureHandle);
@@ -61,6 +66,10 @@ impl CaptureConnection for LanMouseConnection {
 
     fn peer_supports_edge_coordinate(&self, handle: CaptureHandle) -> bool {
         LanMouseConnection::peer_supports_edge_coordinate(self, handle)
+    }
+
+    fn peer_supports(&self, handle: CaptureHandle, cap: u32) -> bool {
+        LanMouseConnection::peer_supports(self, handle, cap)
     }
 
     fn peer_rtt_ms(&self, handle: CaptureHandle) -> Option<u32> {
@@ -143,6 +152,8 @@ pub(crate) enum ICaptureEvent {
     /// remote `Leave`, explicit `Release` request, send
     /// failure, or destroy of the active capture).
     ClientLeft(u64),
+    /// A peer reported its keyboard lock state on the outgoing connection.
+    RemoteLocks(CaptureHandle, crate::lock_sync::Locks),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +192,11 @@ enum CaptureRequest {
     /// edge a remote peer entered through while it drives this machine;
     /// `None` means no peer is driving us
     SetRemotePeer(Option<lan_mouse_ipc::Position>),
+    /// send this machine's keyboard lock state to the client
+    SendLocks(CaptureHandle, crate::lock_sync::Locks),
+    /// do not forward lock keys until the given instant (a lock key was just
+    /// injected locally)
+    SuppressLockKeys(Instant),
 }
 
 impl Capture {
@@ -224,6 +240,7 @@ impl Capture {
             captures: Default::default(),
             coalescer: MotionCoalescer::new(motion_batch_ms),
             outgoing_caps: Default::default(),
+            lock_keys_suppressed_until: None,
             conn: Box::new(conn),
             enter: EnterState::default(),
             enter_along: None,
@@ -304,6 +321,24 @@ impl Capture {
     ///
     /// Events that need a capability the user did not grant are dropped by
     /// the capture task instead of being sent to the peer.
+    /// Send this machine's keyboard lock state to `handle` (only when the
+    /// peer advertised lock sync).
+    pub(crate) fn send_locks(&self, handle: CaptureHandle, locks: crate::lock_sync::Locks) {
+        self.request_tx
+            .send(CaptureRequest::SendLocks(handle, locks))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Stop forwarding lock keys for a moment: a lock key was just injected
+    /// here and must not be captured and sent back to the peer.
+    pub(crate) fn suppress_lock_keys(&self, until: Instant) {
+        self.request_tx
+            .send(CaptureRequest::SuppressLockKeys(until))
+            .ok()
+            .unwrap_or_default();
+    }
+
     pub(crate) fn set_outgoing_caps(
         &self,
         handle: CaptureHandle,
@@ -662,6 +697,9 @@ struct CaptureTask {
     sensitivity: HashMap<CaptureHandle, f64>,
     /// capabilities allowed in the outgoing direction, per client
     outgoing_caps: HashMap<CaptureHandle, lan_mouse_ipc::Capabilities>,
+    /// lock keys are not forwarded before this instant (see
+    /// [`CaptureRequest::SuppressLockKeys`])
+    lock_keys_suppressed_until: Option<Instant>,
     /// edge a remote peer entered through while it drives this machine
     /// (`None` = no peer is driving us)
     remote_peer: Option<lan_mouse_ipc::Position>,
@@ -780,6 +818,23 @@ impl CaptureTask {
         true
     }
 
+    /// Send the keyboard lock state to a peer that understands lock sync.
+    async fn send_locks(&self, handle: CaptureHandle, locks: crate::lock_sync::Locks) {
+        if !self
+            .conn
+            .peer_supports(handle, lan_mouse_proto::capabilities::LOCK_SYNC)
+        {
+            return;
+        }
+        let event = ProtoEvent::LockState {
+            known: locks.known,
+            on: locks.on,
+        };
+        if let Err(e) = self.conn.send_now(event, handle).await {
+            log::debug!("could not send the lock state to client {handle}: {e}");
+        }
+    }
+
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_capture().await {
@@ -806,6 +861,12 @@ impl CaptureTask {
                         }
                         CaptureRequest::SetRemotePeer(peer) => {
                             self.update_remote_peer(peer);
+                        }
+                        // Lock sync works while the capture backend is down
+                        // (e.g. a machine that only receives input).
+                        CaptureRequest::SendLocks(h, locks) => self.send_locks(h, locks).await,
+                        CaptureRequest::SuppressLockKeys(until) => {
+                            self.lock_keys_suppressed_until = Some(until);
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -925,6 +986,17 @@ impl CaptureTask {
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
+                    // Lock state is independent of who is being controlled.
+                    if let ProtoEvent::LockState { known, on } = event {
+                        self.event_tx
+                            .send(ICaptureEvent::RemoteLocks(
+                                handle,
+                                crate::lock_sync::Locks { known, on },
+                            ))
+                            .ok()
+                            .unwrap_or_default();
+                        continue;
+                    }
                     if let Some(active) = self.active_client {
                         if handle != active {
                             // we only care about events coming from the client we are currently connected to
@@ -1024,6 +1096,10 @@ impl CaptureTask {
                     }
                     CaptureRequest::SetOutgoingCaps(h, caps) => {
                         self.outgoing_caps.insert(h, caps);
+                    }
+                    CaptureRequest::SendLocks(h, locks) => self.send_locks(h, locks).await,
+                    CaptureRequest::SuppressLockKeys(until) => {
+                        self.lock_keys_suppressed_until = Some(until);
                     }
                     CaptureRequest::SetRemotePeer(peer) => {
                         self.update_remote_peer(peer);
@@ -1155,6 +1231,11 @@ impl CaptureTask {
             log::debug!(
                 "dropping {event:?} for client {handle}: capability not granted for the outgoing direction"
             );
+            return Ok(());
+        }
+
+        if is_suppressed_lock_key(&event, self.lock_keys_suppressed_until, Instant::now()) {
+            log::debug!("not forwarding {event:?}: it is the lock key injected for lock sync");
             return Ok(());
         }
 
@@ -1803,6 +1884,17 @@ enum State {
     Sending,
 }
 
+/// Whether `event` is a lock key captured while a locally injected lock key
+/// must not be forwarded (lock sync). Forwarding it would toggle the peer back
+/// and the two machines would keep flipping the lock.
+fn is_suppressed_lock_key(event: &CaptureEvent, until: Option<Instant>, now: Instant) -> bool {
+    let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, .. })) = event else {
+        return false;
+    };
+    (*key == crate::lock_sync::KEY_CAPSLOCK || *key == crate::lock_sync::KEY_NUMLOCK)
+        && until.is_some_and(|until| now < until)
+}
+
 /// Whether a capture event must be ignored because a remote peer is driving
 /// this machine.
 ///
@@ -2157,6 +2249,7 @@ mod capture_handle_tests {
             last_enter_pair: None,
             sensitivity: HashMap::new(),
             outgoing_caps: HashMap::new(),
+            lock_keys_suppressed_until: None,
             remote_peer: None,
             remote_peer_since: None,
             enter_only_take_back_sent: false,
@@ -3284,5 +3377,47 @@ mod capture_handle_tests {
         assert_eq!(task.enter.awaiting_ack(), None);
 
         capture.terminate().await.expect("terminate");
+    }
+}
+
+#[cfg(test)]
+mod lock_key_tests {
+    use super::*;
+
+    fn key(key: u32, state: u8) -> CaptureEvent {
+        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state,
+        }))
+    }
+
+    /// The lock key injected for lock sync may be seen by the capture (Windows
+    /// forwards injected keys while capturing); forwarding it would toggle the
+    /// peer back. Only lock keys, and only inside the window, are dropped.
+    #[test]
+    fn only_lock_keys_inside_the_window_are_suppressed() {
+        let now = Instant::now();
+        let until = Some(now + Duration::from_millis(500));
+        for lock in [
+            crate::lock_sync::KEY_CAPSLOCK,
+            crate::lock_sync::KEY_NUMLOCK,
+        ] {
+            assert!(is_suppressed_lock_key(&key(lock, 1), until, now));
+            assert!(is_suppressed_lock_key(&key(lock, 0), until, now));
+            assert!(
+                !is_suppressed_lock_key(&key(lock, 1), until, now + Duration::from_secs(1)),
+                "a user's lock key after the window is forwarded"
+            );
+            assert!(!is_suppressed_lock_key(&key(lock, 1), None, now));
+        }
+        // KEY_A and pointer input are never affected.
+        assert!(!is_suppressed_lock_key(&key(30, 1), until, now));
+        let motion = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        }));
+        assert!(!is_suppressed_lock_key(&motion, until, now));
     }
 }

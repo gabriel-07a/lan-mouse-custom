@@ -91,7 +91,11 @@ pub enum Windows {
     KeyLeft = 0xE04B,
     KeyDown = 0xE050,
     KeyUp = 0xE048,
-    KeypadNumLock = 0x0045,
+    // Num Lock is an extended key in Windows' keyboard tables: the
+    // low-level hook reports it with LLKHF_EXTENDED, and injecting scan code
+    // 0x45 without KEYEVENTF_EXTENDEDKEY produces Pause instead (Microsoft's
+    // own "toggle Num Lock" example passes 0x45 with KEYEVENTF_EXTENDEDKEY).
+    KeypadNumLock = 0xE045,
     KeypadSlash = 0xE035,
     KeypadStar = 0x0037,
     KeypadDash = 0x004A,
@@ -880,6 +884,22 @@ mod tests {
             let back = Linux::try_from(windows).expect("linux mapping");
             assert_eq!(back, key, "roundtrip failed for {key:?}");
         }
+    }
+
+    /// Lock sync injects these keys; a wrong mapping toggles nothing (or,
+    /// for Num Lock without the extended flag, sends Pause).
+    #[test]
+    fn lock_keys_map_to_the_windows_scan_codes_that_toggle_them() {
+        let caps = Windows::try_from(Linux::KeyCapsLock).expect("caps lock mapping");
+        assert_eq!(caps as u32, 0x3A, "Caps Lock is not extended");
+        let num = Windows::try_from(Linux::KeyNumlock).expect("num lock mapping");
+        assert_eq!(num as u32, 0xE045, "Num Lock is the extended 0x45");
+        assert_eq!(Linux::try_from(num).ok(), Some(Linux::KeyNumlock));
+        // What the Windows capture builds for Num Lock (0x45 | LLKHF_EXTENDED).
+        assert_eq!(
+            Windows::try_from(0xE045u32).ok().map(|key| key as u32),
+            Some(0xE045)
+        );
     }
 
     #[test]

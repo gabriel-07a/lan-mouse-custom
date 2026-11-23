@@ -97,6 +97,9 @@ struct ConfigToml {
     connect_grace_ms: Option<u64>,
     /// clipboard synchronization settings
     clipboard: Option<ClipboardConfig>,
+    /// keep Num Lock in sync with connected machines (Caps Lock always is);
+    /// defaults to true
+    sync_num_lock: Option<bool>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     /// known devices with identity and permission policies (config v2)
@@ -1260,6 +1263,22 @@ impl Config {
             .connect_grace_ms
             .or(self.config_toml.as_ref().and_then(|c| c.connect_grace_ms))
             .unwrap_or(DEFAULT_CONNECT_GRACE_MS)
+    }
+
+    /// Keyboard locks kept in sync with connected machines
+    /// ([`lan_mouse_proto::lock_bits`]).
+    pub fn lock_sync_mask(&self) -> u8 {
+        let num = self
+            .config_toml
+            .as_ref()
+            .and_then(|c| c.sync_num_lock)
+            .unwrap_or(true);
+        lan_mouse_proto::lock_bits::CAPS
+            | if num {
+                lan_mouse_proto::lock_bits::NUM
+            } else {
+                0
+            }
     }
 
     /// whether clipboard synchronization is enabled at startup

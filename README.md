@@ -85,6 +85,18 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
 - Histórico de clipboard/nuvem do Windows e áreas de transferência não
   autorizadas não são sincronizados.
 
+### Caps Lock e Num Lock sincronizados
+
+- Caps Lock e Num Lock viram um estado só entre os PCs conectados: ligar em
+  um acende a luz no teclado do outro, nos dois sentidos, em qualquer
+  combinação Linux (GNOME, KDE, wlroots, X11) e Windows.
+- Quando o mouse passa para o outro PC, vale o estado do teclado que você está
+  usando.
+- Para sincronizar só o Caps Lock (notebook sem teclado numérico):
+  `sync_num_lock = false` no `config.toml`.
+- Os dois PCs precisam desta versão; com versões antigas nada muda. Detalhes em
+  [DOC.md](DOC.md#keyboard-locks-caps-lock--num-lock).
+
 ### Handoff de borda (melhoria posterior)
 
 - **Coordenada de cruzamento no protocolo.** Peers novos anunciam a capability

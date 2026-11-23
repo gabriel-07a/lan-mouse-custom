@@ -19,6 +19,7 @@ pub mod emulation_test;
 mod handoff_trace;
 mod latency;
 mod listen;
+mod lock_sync;
 mod net_tuning;
 mod reset;
 pub mod service;

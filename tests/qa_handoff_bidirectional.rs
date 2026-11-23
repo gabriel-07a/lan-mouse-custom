@@ -194,6 +194,10 @@ mod connect {
         pub(crate) async fn disconnect(&self, _handle: CaptureHandle) {}
 
         pub(crate) async fn drop_transport(&self, _handle: CaptureHandle) {}
+
+        pub(crate) fn peer_supports(&self, _handle: CaptureHandle, _cap: u32) -> bool {
+            false
+        }
     }
 }
 
@@ -203,6 +207,9 @@ mod coalesce;
 mod crypto;
 #[path = "../src/cursor_hide.rs"]
 mod cursor_hide;
+#[path = "../src/lock_sync.rs"]
+#[allow(dead_code)]
+mod lock_sync;
 
 #[path = "../src/handoff_trace.rs"]
 mod handoff_trace;
@@ -318,6 +325,7 @@ mod capture {
             last_enter_pair: None,
             sensitivity: HashMap::new(),
             outgoing_caps: HashMap::new(),
+            lock_keys_suppressed_until: None,
             remote_peer: None,
             remote_peer_since: None,
             enter_only_take_back_sent: false,
