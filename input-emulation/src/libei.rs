@@ -765,6 +765,21 @@ fn entry_point_at(
 /// Returns [`PressureStatus::NoRelativePointer`] (or
 /// [`PressureStatus::PointerPaused`]) when no usable relative pointer exists;
 /// the caller then keeps the absolute event so the pointer still moves.
+/// The system CLOCK_MONOTONIC in microseconds.
+fn monotonic_micros() -> Option<u64> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(now.tv_sec).ok()?;
+    let nanos = u64::try_from(now.tv_nsec).ok()?;
+    Some(seconds * 1_000_000 + nanos / 1_000)
+}
+
 fn inject_pressure(
     devices: &Devices,
     conn: &event::Connection,
@@ -938,9 +953,14 @@ impl LibeiEmulation {
         true
     }
 
-    /// Monotonic microseconds for EI frame timestamps.
+    /// CLOCK_MONOTONIC microseconds for EI frame timestamps.
+    ///
+    /// libei requires the system monotonic clock: an EIS server that uses the
+    /// frame time (instead of its own clock, as Mutter does) would otherwise
+    /// see injected input dated right after boot, hours behind the physical
+    /// mouse, and time-based edge gestures could never accumulate.
     fn now_micros(&self) -> u64 {
-        self.clock.elapsed().as_micros() as u64
+        monotonic_micros().unwrap_or_else(|| self.clock.elapsed().as_micros() as u64)
     }
 
     /// Milliseconds since the previous motion event (clamped); 8 ms fallback.
@@ -1517,6 +1537,29 @@ async fn ei_event_handler(
 
 #[cfg(test)]
 mod absolute_tracker_tests {
+    /// EI frame timestamps are CLOCK_MONOTONIC (time since boot), not time
+    /// since the backend started: a fresh process must already report the
+    /// system's uptime, and the clock must not go backwards.
+    #[test]
+    fn frame_timestamps_use_the_system_monotonic_clock() {
+        // The old timestamps started at zero when the backend was created.
+        // The system clock already counts the whole time since boot, which
+        // on any real machine is far more than this test process has run.
+        let started = std::time::Instant::now();
+        let first = super::monotonic_micros().expect("CLOCK_MONOTONIC");
+        assert!(
+            first > 1_000_000,
+            "frame time {first} us must be the system uptime, not a fresh counter"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = super::monotonic_micros().expect("CLOCK_MONOTONIC");
+        assert!(
+            second >= first + 4_000,
+            "the clock advances in microseconds"
+        );
+        assert!(second - first < started.elapsed().as_micros() as u64 + 1_000_000);
+    }
+
     use super::*;
 
     const W: f32 = 2560.0;

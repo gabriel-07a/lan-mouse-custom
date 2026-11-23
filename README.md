@@ -152,6 +152,13 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
   então o dock volta a abrir com o mouse remoto. Vale para as quatro bordas
   (dock embaixo, hot corners etc.); o handoff de retorno continua tendo
   prioridade quando a borda é a de entrada.
+- Para conferir sem o outro PC: `cargo run --example edge_pressure_probe` faz o
+  papel do peer (entra pela borda direita e empurra o ponteiro contra a borda
+  inferior por ~2 s, movendo o cursor de verdade). O dock tem que aparecer.
+- Os frames injetados pelo libei usam o relógio `CLOCK_MONOTONIC` do sistema,
+  como a especificação pede; antes contavam a partir da criação do backend, o
+  que quebraria gestos de borda baseados em tempo em compositores que usam o
+  horário do frame.
 
 ### Rede e lag (ajustes para o meu setup)
 
