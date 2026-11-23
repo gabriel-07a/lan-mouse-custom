@@ -894,6 +894,7 @@ impl Config {
     /// own arguments are not lan-mouse arguments). The certificate lives next
     /// to the config file, so every instance gets its own identity.
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn load_for_test(config_path: &Path) -> Result<Self, ConfigError> {
         let config_dir = config_path
             .parent()

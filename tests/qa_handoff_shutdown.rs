@@ -117,12 +117,13 @@ fn a_clean_teardown_leaves_no_cursor_hiding_state() {
             "an outgoing capture must publish the heartbeat"
         );
 
-        // A border Leave/Enter flap keeps the heartbeat for the grace period,
-        // so the cursor does not flash at the shared edge during a hand-off.
+        // Control came back: the cursor is parked (hidden until the local
+        // mouse moves), so a border Leave/Enter flap does not flash it.
         hide.leave(7);
-        assert!(
-            hide_path.exists(),
-            "the post-leave grace must keep the cursor hidden through a hand-off flap"
+        assert_eq!(
+            extension_state(&hide_path, &park_path),
+            (false, true),
+            "the returned cursor must be parked, not kept hidden by the heartbeat"
         );
 
         // Teardown: the session ended, so the hide must be released.
@@ -212,9 +213,10 @@ fn only_the_owning_handle_can_release_the_hidden_cursor() {
 
     hide.leave(7);
     assert!(!hide.is_outgoing_active());
-    assert!(
-        hide_path.exists(),
-        "the heartbeat stays during the grace window after the owner leaves"
+    assert_eq!(
+        extension_state(&hide_path, &park_path),
+        (false, true),
+        "the owner leaving parks the cursor (hidden until the mouse moves)"
     );
 
     hide.clear();
@@ -268,8 +270,9 @@ fn repeated_enter_leave_churn_releases_the_cursor_on_teardown() {
         !hide.is_outgoing_active(),
         "after the flapping ends no outgoing capture may stay active"
     );
-    // The last Leave keeps the hide alive during the grace window on purpose.
-    assert!(hide_path.exists());
+    // The last Leave parks the cursor: hidden through the flap, shown on the
+    // first real local movement.
+    assert_eq!(extension_state(&hide_path, &park_path), (false, true));
     hide.clear();
     assert_eq!(extension_state(&hide_path, &park_path), (false, false));
 }

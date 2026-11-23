@@ -541,11 +541,9 @@ fn handoff_outward_px(pos: Position, dx: f64, dy: f64) -> f64 {
 /// `$prev` is used to keep track of this timestamp
 macro_rules! debounce {
     ($prev:ident, $dur:expr, $st:stmt) => {
-        let exec = match $prev.get() {
-            None => true,
-            Some(instant) if instant.elapsed() > $dur => true,
-            _ => false,
-        };
+        let exec = $prev
+            .get()
+            .is_none_or(|instant: Instant| instant.elapsed() > $dur);
         if exec {
             $prev.replace(Some(Instant::now()));
             $st

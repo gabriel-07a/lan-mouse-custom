@@ -395,7 +395,9 @@ impl Service {
     }
 
     /// Shared handle to the client table (desk simulator observes link state).
+    /// The simulator is Unix-only; Windows test builds do not call it.
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn client_manager(&self) -> ClientManager {
         self.client_manager.clone()
     }

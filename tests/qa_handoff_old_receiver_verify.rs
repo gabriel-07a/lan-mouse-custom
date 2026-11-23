@@ -1014,8 +1014,13 @@ fn a_stable_capture_keeps_the_hide_and_shutdown_removes_both_markers() {
 
     hide.leave(7);
     assert!(
-        hide_path.exists(),
-        "the heartbeat must survive the post-leave grace to avoid a border flash"
+        park_path.exists(),
+        "the returned cursor must be parked to avoid a border flash"
+    );
+    assert!(
+        !hide_path.exists(),
+        "the heartbeat must end with the capture: it keeps the cursor hidden \
+         even while the user moves it on this screen"
     );
     assert!(!hide.is_outgoing_active());
 
