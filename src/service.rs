@@ -1418,7 +1418,7 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
-                self.cursor_hide.unpark();
+                // `enter` also unparks, after the heartbeat exists.
                 self.cursor_hide.enter(handle);
                 self.spawn_hook_command(handle, HookKind::Enter);
             }

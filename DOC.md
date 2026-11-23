@@ -243,6 +243,14 @@ visible wherever the peer left it (usually at the shared edge). It is *parked*:
 - **GNOME**: the service writes the `cursor-park` marker for the bundled
   extension (see the README).
 
+On GNOME the sending side uses the same marker when control comes back to it:
+the capture's heartbeat (`cursor-hide`) is replaced by `cursor-park`, written
+first so the extension never sees neither file. The cursor therefore stays
+hidden through the Enter/Leave flapping of a shared edge, and appears on the
+first real local movement (more than 12 px, after a 250 ms settle). A fixed
+post-leave grace used to keep the heartbeat for 4 s, which left the cursor
+invisible while the user was already moving it on this screen.
+
 ## Symmetric roles
 Every instance runs both a listener and an outgoing connection, so *server* and
 *client* above only describe who initiates a given DTLS session — not a fixed

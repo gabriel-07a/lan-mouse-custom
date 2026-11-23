@@ -1552,8 +1552,9 @@ fn the_bidirectional_guard_and_deadband_stay_bounded() {
 }
 
 /// While a source capture is live the heartbeat file must stay fresh; after
-/// the capture ends the heartbeat survives the short border-flap grace, and
-/// shutdown removes both the heartbeat and the park marker.
+/// the capture ends the cursor is parked (hidden until the local mouse moves,
+/// so a border flap does not flash it), and shutdown removes both the
+/// heartbeat and the park marker.
 #[test]
 fn a_stable_capture_keeps_the_hide_and_shutdown_removes_both_markers() {
     let dir = TempDir::new("cursor-hide");
@@ -1585,8 +1586,13 @@ fn a_stable_capture_keeps_the_hide_and_shutdown_removes_both_markers() {
 
     hide.leave(7);
     assert!(
-        hide_path.exists(),
-        "the heartbeat must survive the post-leave grace to avoid a border flash"
+        park_path.exists(),
+        "the returned cursor must be parked to avoid a border flash"
+    );
+    assert!(
+        !hide_path.exists(),
+        "the heartbeat must end with the capture: it keeps the cursor hidden \
+         even while the user moves it on this screen"
     );
     assert!(!hide.is_outgoing_active());
 

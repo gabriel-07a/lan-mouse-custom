@@ -14,11 +14,6 @@ use std::{
 
 /// How often the service refreshes the heartbeat while capture is active.
 pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-/// Keep hiding briefly after a capture leaves. At a shared edge the capture
-/// emits Enter/Leave/Enter within milliseconds; removing the heartbeat on the
-/// first Leave made the source cursor flash back at the border on every
-/// hand-off.
-pub(crate) const LEAVE_GRACE: Duration = Duration::from_secs(4);
 
 pub(crate) struct CursorHide {
     path: Option<PathBuf>,
@@ -31,9 +26,6 @@ pub(crate) struct CursorHide {
     /// lets a disconnect clear the heartbeat even when no `ClientLeft` event is
     /// delivered (transport drop, explicit disconnect, capture teardown).
     owner: Option<ClientHandle>,
-    /// After `ClientLeft`, keep the heartbeat for [`LEAVE_GRACE`] so an
-    /// immediate re-enter at the shared border does not flash the cursor.
-    grace_until: Option<Instant>,
 }
 
 impl CursorHide {
@@ -66,7 +58,6 @@ impl CursorHide {
             active: false,
             last_touch: None,
             owner: None,
-            grace_until: None,
         }
     }
 
@@ -83,31 +74,40 @@ impl CursorHide {
             active: false,
             last_touch: None,
             owner: None,
-            grace_until: None,
         }
     }
 
     /// An outgoing capture began for `handle`; hide the cursor until it ends.
+    ///
+    /// The heartbeat is written before a parked cursor is unparked: the
+    /// extension polls both files, and a moment with neither (unpark first)
+    /// flashed the cursor at the border on every re-entry.
     pub(crate) fn enter(&mut self, handle: ClientHandle) {
         self.owner = Some(handle);
-        self.grace_until = None;
         self.set_active(true);
+        self.unpark();
         log::debug!("cursor-hide: active for client {handle}");
     }
 
-    /// The capture for `handle` ended. A different handle must not clear it.
-    /// Keep the heartbeat for a short grace period to absorb border flapping.
+    /// The capture for `handle` ended and control is back on this machine. A
+    /// different handle must not clear it.
+    ///
+    /// The cursor is parked, not shown: the extension keeps it hidden at the
+    /// border until the local pointer really moves. That absorbs the
+    /// Enter/Leave/Enter flapping of a shared edge without the old fixed
+    /// 4 s grace, which kept the cursor invisible while the user was already
+    /// moving it on this screen. The park marker is written before the
+    /// heartbeat is removed so the extension never sees neither file.
     pub(crate) fn leave(&mut self, handle: ClientHandle) {
         if self.owner == Some(handle) {
             self.owner = None;
-            self.grace_until = Some(Instant::now() + LEAVE_GRACE);
-            log::debug!("cursor-hide: leaving client {handle} (grace period)");
+            self.park();
+            self.set_active(false);
+            log::debug!("cursor-hide: left client {handle}, cursor parked until the mouse moves");
         }
     }
 
-    /// Whether a real outgoing capture (not just its post-leave grace) owns
-    /// the cursor. Teardown decisions must not release a live capture because
-    /// of a pending grace timer.
+    /// Whether a real outgoing capture owns the cursor.
     pub(crate) fn is_outgoing_active(&self) -> bool {
         self.owner.is_some()
     }
@@ -136,7 +136,6 @@ impl CursorHide {
     /// after a clean close — the reported shutdown cursor latch.
     pub(crate) fn clear(&mut self) {
         self.owner = None;
-        self.grace_until = None;
         self.remove_markers();
     }
 
@@ -188,15 +187,6 @@ impl CursorHide {
     /// Refresh the heartbeat if a capture is active. Called from the service
     /// loop on the same cadence as `HEARTBEAT_INTERVAL`.
     pub(crate) fn tick(&mut self) {
-        if self
-            .grace_until
-            .is_some_and(|until| Instant::now() >= until)
-            && self.owner.is_none()
-        {
-            self.grace_until = None;
-            self.set_active(false);
-            return;
-        }
         if self.active
             && self
                 .last_touch
@@ -300,24 +290,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Whether the extension would hide the cursor right now: it hides while
+    /// the heartbeat exists (fresh) or the park marker exists.
+    fn hidden(heartbeat: &std::path::Path, park: &std::path::Path) -> bool {
+        heartbeat.exists() || park.exists()
+    }
+
+    /// Regression: after controlling the peer, coming back kept the cursor
+    /// invisible for a fixed 4 s grace (plus up to a heartbeat tick) no matter
+    /// how much the user moved it on this screen. Returning must park the
+    /// cursor instead - the extension shows a parked cursor on the first real
+    /// local movement - and no tick may revive the heartbeat afterwards.
     #[test]
-    fn a_leave_keeps_the_cursor_hidden_during_the_grace_period() {
-        let (dir, path) = temp_path("grace");
+    fn returning_control_parks_the_cursor_instead_of_keeping_it_hidden() {
+        let (dir, path) = temp_path("return");
+        let park = dir.join("cursor-park");
         {
             let mut hide = CursorHide::with_path(Some(path.clone()));
             hide.enter(7);
+            assert!(path.exists(), "controlling the peer hides the cursor");
+            assert!(!park.exists());
+
             hide.leave(7);
             assert!(
-                path.exists(),
-                "a border Leave/Enter flap must not flash the cursor"
+                !path.exists(),
+                "the heartbeat must not outlive the capture (it ignores local movement)"
             );
-            hide.tick();
             assert!(
-                path.exists(),
-                "the heartbeat is still inside the grace window"
+                park.exists(),
+                "the returned cursor is parked: hidden at the border until the mouse moves"
             );
+            assert!(!hide.is_outgoing_active());
+
+            for _ in 0..10 {
+                hide.tick();
+            }
+            assert!(!path.exists(), "no heartbeat after the return");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shared edge emits Enter/Leave/Enter within milliseconds. The cursor
+    /// must stay hidden through every step (no flash at the border), and a
+    /// re-entry must not leave the park marker behind.
+    #[test]
+    fn a_border_flap_never_shows_the_cursor() {
+        let (dir, path) = temp_path("flap");
+        let park = dir.join("cursor-park");
+        {
+            let mut hide = CursorHide::with_path(Some(path.clone()));
+            for _ in 0..3 {
+                hide.enter(7);
+                assert!(hidden(&path, &park), "hidden while controlling the peer");
+                assert!(!park.exists(), "a capture is not a parked cursor");
+                hide.leave(7);
+                assert!(hidden(&path, &park), "hidden right after the leave");
+            }
+            hide.enter(7);
+            assert!(path.exists() && !park.exists());
             hide.clear();
-            assert!(!path.exists());
+            assert!(!hidden(&path, &park), "teardown always shows the cursor");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_foreign_leave_neither_parks_nor_shows_the_cursor() {
+        let (dir, path) = temp_path("foreign");
+        let park = dir.join("cursor-park");
+        {
+            let mut hide = CursorHide::with_path(Some(path.clone()));
+            hide.enter(7);
+            hide.leave(8);
+            assert!(path.exists(), "the live capture still owns the cursor");
+            assert!(!park.exists());
+            assert!(hide.is_outgoing_active());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
