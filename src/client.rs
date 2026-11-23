@@ -63,10 +63,16 @@ impl ClientManager {
     }
 
     /// set the config of the given client
+    ///
+    /// The dialable address set (`state.ips`) is derived from the configured
+    /// addresses, so it is recomputed here: a client added in one step from
+    /// the Network page (`AddClient` with `fix_ips`) otherwise had no address
+    /// to dial until the service restarted, and Connect never connected.
     pub fn set_config(&self, handle: ClientHandle, config: ClientConfig) {
         if let Some((c, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
             *c = config;
         }
+        self.update_ips(handle);
     }
 
     /// set the state of the given client
@@ -906,6 +912,28 @@ mod tests {
         assert!(!manager.set_pos(active, Position::Bottom), "unchanged");
         assert!(!manager.set_pos(inactive, Position::Right));
         assert_eq!(manager.get_pos(active), Some(Position::Bottom));
+    }
+
+    #[test]
+    fn a_config_with_addresses_is_dialable_immediately() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        manager.set_config(
+            handle,
+            ClientConfig {
+                fix_ips: vec![ip(10)],
+                port: 4242,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            manager.get_ips(handle),
+            Some(HashSet::from([ip(10)])),
+            "the Network page adds a client in one step; it must be dialable"
+        );
+        // replacing the config replaces the address set
+        manager.set_config(handle, ClientConfig::default());
+        assert_eq!(manager.get_ips(handle), Some(HashSet::new()));
     }
 
     #[test]

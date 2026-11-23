@@ -1434,7 +1434,13 @@ impl Dashboard {
         cx.notify();
     }
 
-    fn add_discovered(&mut self, ip: std::net::IpAddr, port: u16, fingerprint: Option<String>) {
+    fn add_discovered(
+        &mut self,
+        ip: std::net::IpAddr,
+        port: u16,
+        hostname: Option<String>,
+        fingerprint: Option<String>,
+    ) {
         if self.adding_device.is_some() {
             self.status = self
                 .tr("Waiting for the previous add request to finish")
@@ -1448,8 +1454,10 @@ impl Dashboard {
         };
         self.status = adding.clone();
         self.set_add_notice(adding, true);
+        // The name the row shows (from the device's beacon); the address
+        // stays the dialable one.
         self.send(FrontendRequest::AddClient {
-            hostname: None,
+            hostname: hostname.filter(|name| !name.trim().is_empty()),
             fix_ips: vec![ip],
             port,
             position: Position::Left,
@@ -2144,7 +2152,12 @@ impl Dashboard {
                     cx,
                     move |this, _, _, _| {
                         if !adding {
-                            this.add_discovered(device.ip, port, device.fingerprint.clone())
+                            this.add_discovered(
+                                device.ip,
+                                port,
+                                device.hostname.clone(),
+                                device.fingerprint.clone(),
+                            )
                         }
                     },
                 ))
