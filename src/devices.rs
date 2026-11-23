@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// How long an unauthorized connection request stays visible before it is
@@ -200,6 +200,12 @@ pub(crate) struct PolicyDenied {
     pub reason: Option<String>,
 }
 
+/// How long a disconnected peer that honors the revoke is still refused:
+/// long enough for handshakes already in flight during the teardown (the
+/// reconnect backoff starts at 250 ms), short enough that its user clicking
+/// Connect right after works.
+pub(crate) const REVOKE_IN_FLIGHT_GRACE: Duration = Duration::from_secs(5);
+
 /// In-memory store for devices, revoked fingerprints and pending requests.
 #[derive(Default)]
 pub(crate) struct DeviceStore {
@@ -211,7 +217,9 @@ pub(crate) struct DeviceStore {
     /// machine. Their next handshake is rejected until the user allows the
     /// device again (explicit activation or a device policy change). Kept in
     /// memory only: restarting the app clears it.
-    reconnect_suppressed: HashMap<String, IpAddr>,
+    /// identities refused at the listener after a local disconnect, with the
+    /// peer's last address and an optional end of the block
+    reconnect_suppressed: HashMap<String, (IpAddr, Option<Instant>)>,
     /// one-shot handshake limiter budget granted when the user explicitly
     /// allows a device again: the rejected retries of the blocked peer must not
     /// delay the deliberate reconnect by the 60 s per-IP window.
@@ -238,9 +246,23 @@ impl DeviceStore {
             .retain(|fingerprint, _| !self.denied.contains_key(fingerprint));
     }
 
-    /// Refuse reconnections of a device the local user just disconnected.
+    /// Refuse reconnections of a device the local user just disconnected,
+    /// until the user allows it again.
     pub(crate) fn suppress_reconnect(&mut self, fingerprint: String, addr: IpAddr) {
-        self.reconnect_suppressed.insert(fingerprint, addr);
+        self.reconnect_suppressed.insert(fingerprint, (addr, None));
+    }
+
+    /// Refuse reconnections of a device for `grace` only. Used for peers that
+    /// honor the revoke: they never reconnect on their own, so only handshakes
+    /// already in flight during the teardown must be refused.
+    pub(crate) fn suppress_reconnect_for(
+        &mut self,
+        fingerprint: String,
+        addr: IpAddr,
+        grace: Duration,
+    ) {
+        self.reconnect_suppressed
+            .insert(fingerprint, (addr, Some(Instant::now() + grace)));
     }
 
     /// Grant a few handshake attempts to an IP after the user explicitly
@@ -262,13 +284,17 @@ impl DeviceStore {
     }
 
     pub(crate) fn is_reconnect_suppressed(&self, fingerprint: &str) -> bool {
-        self.reconnect_suppressed.contains_key(fingerprint)
+        self.reconnect_suppressed
+            .get(fingerprint)
+            .is_some_and(|(_, until)| until.is_none_or(|until| Instant::now() < until))
     }
 
     /// Lift the post-disconnect block (explicit user action). Returns the
     /// peer's last known address so the caller can grant a handshake budget.
     pub(crate) fn allow_reconnect(&mut self, fingerprint: &str) -> Option<IpAddr> {
-        self.reconnect_suppressed.remove(fingerprint)
+        self.reconnect_suppressed
+            .remove(fingerprint)
+            .map(|(addr, _)| addr)
     }
 
     pub(crate) fn device(&self, fingerprint: &str) -> Option<&Device> {
@@ -781,6 +807,21 @@ mod tests {
         // Suppression is per identity.
         store.suppress_reconnect(fp(1), ip);
         assert!(!store.is_reconnect_suppressed(&fp(2)));
+    }
+
+    #[test]
+    fn a_short_suppression_ends_on_its_own() {
+        let mut store = DeviceStore::default();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        store.suppress_reconnect_for(fp(1), ip, Duration::from_millis(30));
+        assert!(store.is_reconnect_suppressed(&fp(1)));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            !store.is_reconnect_suppressed(&fp(1)),
+            "a peer that honors the revoke may reconnect when its user clicks Connect"
+        );
+        // an explicit allow still returns the address for the handshake budget
+        assert_eq!(store.allow_reconnect(&fp(1)), Some(ip));
     }
 
     #[test]

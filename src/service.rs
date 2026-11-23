@@ -3181,6 +3181,19 @@ impl Service {
         // entry; the full teardown below is what stops it.
         let incoming_addr = self.client_manager.incoming_addr(handle);
         let had_incoming = incoming_addr.is_some();
+        // Read before the teardown below forgets the peer's capabilities. A
+        // peer that understands AuthRevoke deactivates its own entry and only
+        // reconnects when its user clicks Connect.
+        let peer_honors_revoke = incoming_addr
+            .and_then(|addr| {
+                self.incoming_peer_caps
+                    .read()
+                    .expect("lock")
+                    .get(&addr)
+                    .copied()
+            })
+            .or_else(|| self.client_manager.peer_capabilities(handle))
+            .is_some_and(|caps| caps & lan_mouse_proto::capabilities::PERMISSIONS != 0);
         // Mark inactive first so the reconnect loop cannot revive the link.
         self.cursor_hide.leave(handle);
         let was_active = self.client_manager.deactivate_client(handle);
@@ -3214,24 +3227,40 @@ impl Service {
         if user_initiated && had_incoming {
             if let Some(fingerprint) = fingerprint.as_deref() {
                 if !fingerprint.is_empty() {
-                    // Reject the peer's next handshake at the listener: a peer
-                    // that ignores the revoke (or lost it) must not be able to
-                    // re-establish a session and inject input behind the UI's
-                    // back. The user lifts this by allowing the device again.
                     let peer_ip = incoming_addr
                         .map(|addr| addr.ip())
                         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                    self.devices
-                        .write()
-                        .expect("lock")
-                        .suppress_reconnect(fingerprint.to_string(), peer_ip);
-                    self.notify_frontend(FrontendEvent::Error(format!(
-                        "device {} disconnected locally; allow it again in Devices to reconnect",
-                        &fingerprint[..fingerprint.len().min(16)]
-                    )));
-                    log::info!(
-                        "blocking reconnects from {fingerprint} until the device is allowed again"
-                    );
+                    let mut devices = self.devices.write().expect("lock");
+                    if peer_honors_revoke {
+                        // The peer deactivated its entry on the revoke, so its
+                        // next handshake is its user clicking Connect - which
+                        // must work without re-adding the device by address.
+                        // Only refuse the attempts already in flight during
+                        // this teardown.
+                        devices.suppress_reconnect_for(
+                            fingerprint.to_string(),
+                            peer_ip,
+                            crate::devices::REVOKE_IN_FLIGHT_GRACE,
+                        );
+                        log::info!(
+                            "refusing reconnects from {fingerprint} for {:?} (peer honors the revoke)",
+                            crate::devices::REVOKE_IN_FLIGHT_GRACE
+                        );
+                    } else {
+                        // A peer that ignores the revoke (legacy build) would
+                        // re-establish the session and inject input behind
+                        // the UI's back. The user lifts this by allowing the
+                        // device again.
+                        devices.suppress_reconnect(fingerprint.to_string(), peer_ip);
+                        drop(devices);
+                        self.notify_frontend(FrontendEvent::Error(format!(
+                            "device {} disconnected locally; allow it again in Devices to reconnect",
+                            &fingerprint[..fingerprint.len().min(16)]
+                        )));
+                        log::info!(
+                            "blocking reconnects from {fingerprint} until the device is allowed again"
+                        );
+                    }
                 }
             }
         }
