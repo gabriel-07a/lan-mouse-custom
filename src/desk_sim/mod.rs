@@ -29,6 +29,10 @@ mod screen;
 #[cfg(test)]
 mod clipboard_scenarios;
 #[cfg(test)]
+mod lock_scenarios;
+#[cfg(test)]
+mod network_scenarios;
+#[cfg(test)]
 mod os_scenarios;
 #[cfg(test)]
 mod scenarios;
@@ -92,11 +96,25 @@ pub(crate) struct Pc {
     /// this PC's system clipboard (what Ctrl+C writes and Ctrl+V reads)
     pub(crate) clipboard: SharedClipboard,
     pub(crate) clients: ClientManager,
+    /// DTLS listen port
+    pub(crate) port: u16,
+    /// discovery beacon port, when the desk is [`DeskBuilder::discoverable`]
+    pub(crate) discovery_port: Option<u16>,
     env: TestEnv,
     task: JoinHandle<()>,
 }
 
 impl Pc {
+    /// Frontend IPC socket of this PC's service (what the GUI connects to).
+    pub(crate) fn ipc_socket(&self) -> std::path::PathBuf {
+        self.env.runtime_dir().join("lan-mouse-socket.sock")
+    }
+
+    /// Caps Lock / Num Lock state of this PC ([`lan_mouse_proto::lock_bits`]).
+    pub(crate) fn locks(&self) -> u8 {
+        self.state().locks
+    }
+
     /// Snapshot of this PC's screen.
     pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, ScreenState> {
         lock(&self.screen)
@@ -148,6 +166,14 @@ pub(crate) struct DeskBuilder {
     extra_config: Vec<(&'static str, String)>,
     personalities: Vec<(&'static str, Personality)>,
     hand: Hand,
+    /// top-level `config.toml` keys per PC (before the `[[clients]]` tables)
+    top_config: Vec<(&'static str, String)>,
+    /// loopback peers need pairing approval like real machines
+    untrusted: bool,
+    /// every PC answers discovery probes on its own port
+    discoverable: bool,
+    /// Caps Lock / Num Lock state per PC before its service starts
+    initial_locks: Vec<(&'static str, u8)>,
 }
 
 impl DeskBuilder {
@@ -173,6 +199,34 @@ impl DeskBuilder {
     /// `[[clients]]` tables, so it must be whole tables (e.g. `[clipboard]`).
     pub(crate) fn config(mut self, name: &'static str, toml: &str) -> Self {
         self.extra_config.push((name, toml.to_string()));
+        self
+    }
+
+    /// Top-level `config.toml` keys for `name` (e.g. `sync_num_lock = false`).
+    pub(crate) fn top_config(mut self, name: &'static str, toml: &str) -> Self {
+        self.top_config.push((name, toml.to_string()));
+        self
+    }
+
+    /// Caps Lock / Num Lock of `name` before its service starts
+    /// ([`lan_mouse_proto::lock_bits`]); the service's first reading is a
+    /// baseline, not a change.
+    pub(crate) fn locks(mut self, name: &'static str, bits: u8) -> Self {
+        self.initial_locks.push((name, bits));
+        self
+    }
+
+    /// Do not pre-trust loopback: a new peer must be approved, as between two
+    /// real machines.
+    pub(crate) fn untrusted(mut self) -> Self {
+        self.untrusted = true;
+        self
+    }
+
+    /// Every PC answers discovery probes on its own port (never announces on
+    /// the real network).
+    pub(crate) fn discoverable(mut self) -> Self {
+        self.discoverable = true;
         self
     }
 
@@ -210,10 +264,20 @@ impl DeskBuilder {
                 "port = {port}\n\
                  # replaced by the simulator backends; keeps the config valid\n\
                  capture_backend = \"dummy\"\n\
-                 emulation_backend = \"dummy\"\n\
-                 # loopback peers are pre-trusted: no pairing prompt\n\
-                 trusted_ips = [\"127.0.0.1\"]\n"
+                 emulation_backend = \"dummy\"\n"
             );
+            if !self.untrusted {
+                toml.push_str("# loopback peers are pre-trusted: no pairing prompt\n");
+                toml.push_str("trusted_ips = [\"127.0.0.1\"]\n");
+            }
+            let discovery_port = self.discoverable.then(free_udp_port);
+            if let Some(discovery_port) = discovery_port {
+                writeln!(toml, "discovery_port = {discovery_port}").expect("write to string");
+            }
+            for (_, top) in self.top_config.iter().filter(|(n, _)| *n == name) {
+                toml.push_str(top);
+                toml.push('\n');
+            }
             for &(_, side, target) in self.links.iter().filter(|(of, ..)| *of == name) {
                 write!(
                     toml,
@@ -236,6 +300,9 @@ impl DeskBuilder {
             let config = Config::load_for_test(&config_path).expect("desk-sim config");
 
             let mut state = ScreenState::new(name, width, height);
+            if let Some((_, bits)) = self.initial_locks.iter().find(|(n, _)| *n == name) {
+                state.locks = *bits;
+            }
             if let Some((_, personality)) = self.personalities.iter().find(|(n, _)| *n == name) {
                 state.personality = personality.clone();
             }
@@ -244,7 +311,16 @@ impl DeskBuilder {
             let emulation_screen = screen.clone();
             let clipboard = SharedClipboard::new();
             let service_clipboard = clipboard.clone();
+            let lock_screen = screen.clone();
             let options = ServiceOptions {
+                discovery_beacon: self.discoverable,
+                // the PC's own lock state, as the OS would report it
+                lock_reader: Some(Rc::new(move || {
+                    Some(crate::lock_sync::Locks {
+                        known: lan_mouse_proto::lock_bits::CAPS | lan_mouse_proto::lock_bits::NUM,
+                        on: lock(&lock_screen).locks,
+                    })
+                })),
                 ipc_socket: Some(env.runtime_dir().join("lan-mouse-socket.sock")),
                 audit_path: Some(env.state_dir().join("audit.jsonl")),
                 isolated: true,
@@ -276,6 +352,8 @@ impl DeskBuilder {
                 screen,
                 clipboard,
                 clients,
+                port,
+                discovery_port,
                 env,
                 task,
             });
@@ -354,6 +432,13 @@ impl Desk {
         tokio::task::yield_now().await;
     }
 
+    /// The user taps `key` on the keyboard attached to `name` (Linux key
+    /// code). While `name` captures for a peer the key goes to that peer.
+    pub(crate) async fn key_tap_on(&self, name: &str, key: u32) {
+        lock(&self.pc(name).screen).key_tap(key);
+        tokio::task::yield_now().await;
+    }
+
     /// Ctrl+C on `name`: the user copies `snapshot` there.
     pub(crate) fn copy(&self, name: &str, snapshot: ClipboardSnapshot) {
         self.pc(name).clipboard.set_local(snapshot);
@@ -406,12 +491,23 @@ impl Desk {
         }
     }
 
-    /// The PC configured at `side` of `of`.
+    /// The PC configured at `side` of `of`: from the declared layout, or from
+    /// the client the service holds at that side (a link created at run time,
+    /// e.g. from the Network page), matched by its listen port.
     fn neighbour(&self, of: &str, side: Position) -> Option<&Pc> {
-        self.layout
-            .iter()
-            .find(|&&(o, s, _)| o == of && s == side)
-            .map(|&(_, _, target)| self.pc(target))
+        if let Some(&(_, _, target)) = self.layout.iter().find(|&&(o, s, _)| o == of && s == side) {
+            return Some(self.pc(target));
+        }
+        let clients = &self.pc(of).clients;
+        let side = match side {
+            Position::Left => lan_mouse_ipc::Position::Left,
+            Position::Right => lan_mouse_ipc::Position::Right,
+            Position::Top => lan_mouse_ipc::Position::Top,
+            Position::Bottom => lan_mouse_ipc::Position::Bottom,
+        };
+        let handle = clients.client_at(side)?;
+        let port = clients.get_state(handle)?.0.port;
+        self.pcs.iter().find(|pc| pc.name != of && pc.port == port)
     }
 
     /// Cursor position on `name`'s screen.

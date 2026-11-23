@@ -169,6 +169,11 @@ pub(crate) struct ScreenState {
     pub(crate) injected_motions: usize,
     /// injected non-motion events (buttons, keys, scroll)
     pub(crate) injected_other: Vec<Event>,
+    /// Caps Lock / Num Lock of this PC ([`lan_mouse_proto::lock_bits`]), as
+    /// the OS keeps it: toggled by a local lock key and by an injected one
+    pub(crate) locks: u8,
+    /// lock keys injected by the emulation backend (lock sync)
+    pub(crate) injected_lock_taps: usize,
     pub(crate) log: Vec<Logged>,
     pub(crate) personality: Personality,
     /// backswing still owed after the first user motion of this capture
@@ -201,6 +206,8 @@ impl ScreenState {
             remote_peer_hint: None,
             injected_motions: 0,
             injected_other: Vec::new(),
+            locks: 0,
+            injected_lock_taps: 0,
             log: Vec::new(),
             personality: Personality::baseline(),
             pending_backswing: None,
@@ -293,6 +300,35 @@ impl ScreenState {
         self.captured = Some(edge);
         self.record(ScreenEvent::CaptureBegin { edge, along });
         self.send_capture(edge, CaptureEvent::BeginAt(along));
+    }
+
+    /// The user presses and releases `key` on this PC's keyboard. While a
+    /// local capture is active the key goes to the peer and the local OS
+    /// never sees it (the real grab); otherwise a lock key toggles the local
+    /// lock.
+    pub(crate) fn key_tap(&mut self, key: u32) {
+        if let Some(edge) = self.captured {
+            for state in [1, 0] {
+                self.send_capture(
+                    edge,
+                    CaptureEvent::Input(Event::Keyboard(input_event::KeyboardEvent::Key {
+                        time: 0,
+                        key,
+                        state,
+                    })),
+                );
+            }
+            return;
+        }
+        self.toggle_lock(key);
+    }
+
+    fn toggle_lock(&mut self, key: u32) {
+        match key {
+            crate::lock_sync::KEY_CAPSLOCK => self.locks ^= lan_mouse_proto::lock_bits::CAPS,
+            crate::lock_sync::KEY_NUMLOCK => self.locks ^= lan_mouse_proto::lock_bits::NUM,
+            _ => {}
+        }
     }
 
     /// Forward a delta of `amount` px along the crossing direction of `edge`
@@ -559,7 +595,19 @@ impl input_emulation::Emulation for SimEmulation {
         let mut state = lock(&self.screen);
         match event {
             Event::Pointer(PointerEvent::Motion { dx, dy, .. }) => state.injected_motion(dx, dy),
-            other => state.injected_other.push(other),
+            other => {
+                // An injected lock key press toggles the lock like the OS does.
+                if let Event::Keyboard(input_event::KeyboardEvent::Key { key, state: 1, .. }) =
+                    other
+                {
+                    if key == crate::lock_sync::KEY_CAPSLOCK || key == crate::lock_sync::KEY_NUMLOCK
+                    {
+                        state.injected_lock_taps += 1;
+                        state.toggle_lock(key);
+                    }
+                }
+                state.injected_other.push(other);
+            }
         }
         Ok(())
     }

@@ -149,11 +149,18 @@ async fn meu_cenario() {
 | `.personality(pc, Personality::gnome())` | manias de SO do PC (padrão: `baseline`) |
 | `.config(pc, toml)` | TOML extra no `config.toml` do PC, em tabelas inteiras (ex.: `[clipboard]\nmax_image_bytes = 65536`) |
 | `.hand(Hand { step_px, interval })` | ritmo do mouse (padrão: 4 px a cada 1 ms) |
+| `.untrusted()` | loopback não é pré-confiável: um PC novo precisa ser aprovado, como entre máquinas reais |
+| `.discoverable()` | cada PC responde às sondas de descoberta numa porta própria (`pc(nome).discovery_port`), sem anunciar na rede real |
+| `.locks(pc, bits)` | Caps/Num Lock do PC antes de o serviço subir (a primeira leitura é linha de base, não mudança) |
+| `.top_config(pc, toml)` | chaves de topo do `config.toml` (ex.: `sync_num_lock = false`) |
 | `.start().await` | sobe os serviços e espera todo link configurado ficar `alive` (até 10 s) |
 | `move_mouse(dx, dy)` / `move_mouse_on(pc, dx, dy)` | move o mouse físico do PC da mão / de outro PC |
 | `focus()` / `focus_from(pc)` | `Focus::On(pc)` = onde o cursor está visível; `Focus::Lost` = o PC da mão está capturado mas ninguém está sendo dirigido (o bug do "cursor sumiu") |
 | `wait_focus(pc)` / `wait_focus_from(mão, pc)` | espera o foco chegar (até 5 s) |
 | `copy(pc, snapshot)` / `copy_text(pc, texto)` / `copy_image(pc, png)` | Ctrl+C no PC |
+| `key_tap_on(pc, tecla)` | o usuário toca uma tecla no teclado do PC; se o PC está capturando, a tecla vai para o peer |
+| `pc(nome).locks()` / `.state().injected_lock_taps` | Caps/Num Lock do PC / quantas teclas de trava a emulação injetou |
+| `pc(nome).ipc_socket()` | socket do IPC do PC, para falar com o serviço como a GUI (`connect_async_at`) |
 | `paste(pc)` | o que um Ctrl+V no PC colaria agora |
 | `wait_paste(pc, &esperado)` | espera o Ctrl+V do PC colar exatamente `esperado` (até 10 s) |
 | `wait_until(descrição, timeout, cond)` | espera uma condição qualquer |
@@ -240,6 +247,31 @@ dois serviços intercalados.
 | `the_receiver_refuses_an_image_over_its_limit` | o receptor recusa uma imagem acima do próprio limite, mantém o que tinha, e a cópia seguinte passa normalmente |
 | `the_sender_does_not_offer_an_image_over_its_limit` | o emissor nem oferece uma imagem acima do próprio limite, e a cópia seguinte passa normalmente |
 
+### Caps Lock / Num Lock (`lock_scenarios.rs`)
+
+Cada PC guarda o estado das travas como o SO: a tecla local alterna, e a tecla
+injetada pela emulação também. O serviço lê esse estado pelo mesmo gancho
+(`ServiceOptions::lock_reader`) em que os leitores do Linux e do Windows
+entram.
+
+| Cenário | O que garante |
+|---|---|
+| `caps_lock_on_one_pc_lights_the_other_and_back` | Caps em A acende em B (uma injeção só) e o eco não volta; depois de B para A |
+| `num_lock_syncs_both_ways_without_touching_caps_lock` | Num Lock nos dois sentidos, sem mexer no Caps |
+| `a_lock_key_typed_while_controlling_the_peer_lights_both_keyboards` | Caps digitado em A enquanto controla B: vai para B e A acompanha |
+| `the_controlling_keyboard_wins_the_handoff` | estados divergentes: na passagem do mouse vale o de quem controla; passagens com estados iguais não injetam nada |
+| `num_lock_stays_local_when_its_sync_is_disabled` | `sync_num_lock = false`: o PC não aplica nem envia Num Lock, e o Caps continua sincronizando |
+
+### Aba Network (`network_scenarios.rs`)
+
+Fala com o serviço pelo IPC, com as mesmas requisições da GUI.
+
+| Cenário | O que garante |
+|---|---|
+| `a_device_added_from_the_network_page_without_a_name_connects` | sondar B, `AddClient` com o endereço da varredura e sem nome, aprovar em B (`RespondPending`), conectar e passar o mouse |
+| `a_device_added_from_the_network_page_with_an_unresolvable_name_connects` | o mesmo com um nome que nunca resolve (RFC 6761), como o nome de um Windows numa rede sem resolução local; o cliente leva esse nome |
+| `the_scan_reports_the_port_and_identity_add_needs` | a sonda devolve porta, impressão digital e nome; uma porta sem beacon não é oferecida |
+
 ## Ele pega bug? (verificação por mutação)
 
 Para cada grupo de cenários, quebrei o código de produção de propósito, rodei o
@@ -252,6 +284,8 @@ simulador e restaurei o código:
 | `input-clipboard`: `Limits::accepts` sempre `true` (o emissor não checa tamanho) | **pegou**: `the_sender_does_not_offer_an_image_over_its_limit` |
 | `input-clipboard/src/transfer.rs`: desligar a checagem de tamanho do receptor | **pegou**: `the_receiver_refuses_an_image_over_its_limit` |
 | `src/emulation.rs`: reportar o `EdgeReturn` pela borda oposta | **não pegou, e é o esperado**: B só guarda a sessão que está dirigindo agora, e `service_core::return_targets` devolve para ela quando só existe uma |
+| `src/client.rs`: `set_config` sem recalcular `state.ips` (o bug do Connect da aba Network) | **pegou**: `a_device_added_from_the_network_page_without_a_name_connects`. Com um nome que não resolve **não** pega: a falha da resolução grava a lista DNS vazia e, de tabela, recalcula os endereços. Por isso existem os dois cenários |
+| `src/lock_sync.rs`: desligar a proteção contra eco | **não pegou no simulador, e é o esperado**: o eco chega a um PC que já está no mesmo estado e não faz nada. A proteção só importa quando os dois mudam ao mesmo tempo; o teste unitário `the_echo_of_an_applied_change_is_not_broadcast` pega |
 | `src/capture.rs`: `REMOTE_ENTRY_DWELL` = 0 (o receptor não ignora o jitter logo depois da entrada) | **não pegou, e é informação útil**: o guard da origem descarta o movimento para trás perto da borda, então o cursor de B nunca volta a menos de 2 px da borda dentro dos 300 ms. Com a build atual nos dois lados, a janela do receptor é proteção redundante; ela importa com uma origem antiga sem o guard (0.2.18), que o simulador não roda |
 
 ## Achado e corrigido: R-27

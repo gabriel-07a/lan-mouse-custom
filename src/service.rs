@@ -81,7 +81,14 @@ pub(crate) struct ServiceOptions {
     pub(crate) emulation_backend: Option<EmulationFactory>,
     /// clipboard backend replacing the OS one (portal/Wayland/X11/Windows)
     pub(crate) clipboard_backend: Option<crate::clipboard::ClipboardFactory>,
+    /// answer discovery probes even when `isolated` (never announces)
+    pub(crate) discovery_beacon: bool,
+    /// keyboard lock state source replacing the OS one
+    pub(crate) lock_reader: Option<LockReader>,
 }
+
+/// Reads this machine's keyboard lock state (see [`crate::lock_sync`]).
+pub(crate) type LockReader = Rc<dyn Fn() -> Option<crate::lock_sync::Locks>>;
 
 pub struct Service {
     /// configuration
@@ -203,6 +210,10 @@ pub struct Service {
     shutdown_requested: bool,
     /// see [`ServiceOptions::isolated`]
     isolated: bool,
+    /// see [`ServiceOptions::discovery_beacon`]
+    discovery_beacon: bool,
+    /// see [`ServiceOptions::lock_reader`]
+    lock_reader: Option<LockReader>,
 }
 
 #[derive(Debug)]
@@ -377,6 +388,8 @@ impl Service {
             peer_permissions_seen: Default::default(),
             shutdown_requested: false,
             isolated: options.isolated,
+            discovery_beacon: options.discovery_beacon,
+            lock_reader: options.lock_reader,
         };
         Ok(service)
     }
@@ -405,13 +418,14 @@ impl Service {
         // Answer discovery beacons for the whole session. Active subnet
         // scanning is user-triggered (`ScanNetwork`) so a large/VPN-heavy
         // network does not get probed every time the service starts.
-        if !self.isolated {
+        if !self.isolated || self.discovery_beacon {
             spawn_local(discovery::beacon_task(
                 self.port,
                 self.discovery_port,
                 self.discovery_cancel.clone(),
                 self.public_key_fingerprint.clone(),
                 self.announced_tx.clone(),
+                !self.isolated,
             ));
         }
 
@@ -1529,7 +1543,11 @@ impl Service {
     /// Runtime information used by the frontend and `lan-mouse doctor`.
     /// Read the local lock state and tell the peers when the user changed it.
     fn poll_locks(&mut self) {
-        let Some(observed) = crate::lock_sync::read_local() else {
+        let observed = match &self.lock_reader {
+            Some(reader) => reader(),
+            None => crate::lock_sync::read_local(),
+        };
+        let Some(observed) = observed else {
             return;
         };
         if let Some(locks) = self.lock_sync.observe_local(observed, Instant::now()) {

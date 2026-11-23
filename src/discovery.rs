@@ -466,6 +466,16 @@ fn device_from_probe(ip: Ipv4Addr, outcome: HostProbe) -> DiscoveredDevice {
     }
 }
 
+/// Probe one host the way the network scan does and describe it as the
+/// Network page lists it (`None` when nothing answered).
+// only the (Unix-only) desk simulator calls it outside `scan`
+#[cfg_attr(not(all(test, unix)), allow(dead_code))]
+pub(crate) async fn probe(ip: Ipv4Addr, discovery_port: u16) -> Option<DiscoveredDevice> {
+    probe_host(ip, discovery_port)
+        .await
+        .map(|outcome| device_from_probe(ip, outcome))
+}
+
 async fn probe_host(ip: Ipv4Addr, discovery_port: u16) -> Option<HostProbe> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
     sock.connect((ip, discovery_port)).await.ok()?;
@@ -554,12 +564,16 @@ fn is_unreachable(error: &io::Error) -> bool {
 ///
 /// Runs for the whole lifetime of the service. A bind failure (another
 /// instance, a sandbox) is not fatal: the machine is simply not discoverable.
+///
+/// `announce_on_network = false` only answers probes and never broadcasts on the network
+/// (an isolated test service must not announce itself on the real LAN).
 pub async fn beacon_task(
     port: u16,
     discovery_port: u16,
     cancel: CancellationToken,
     fingerprint: String,
     announce_tx: local_channel::mpsc::Sender<Announced>,
+    announce_on_network: bool,
 ) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discovery_port)).await {
         Ok(sock) => sock,
@@ -613,7 +627,7 @@ pub async fn beacon_task(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = announce_interval.tick() => {
+            _ = announce_interval.tick(), if announce_on_network => {
                 // DHCP/roaming can change our addresses at runtime; refresh
                 // the self-detection set so our own announcements are never
                 // listed as a remote device.
