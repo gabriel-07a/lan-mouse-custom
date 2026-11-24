@@ -118,14 +118,10 @@ impl MotionCoalescer {
         if self.burst_until.is_some_and(|until| now < until) {
             return true;
         }
-        let due = match self.batch {
+        match self.batch {
             Some(batch) => now.saturating_duration_since(self.last_flush) >= batch,
             None => false,
-        };
-        if due {
-            return true;
         }
-        false
     }
 
     /// Take the pending motion of a single handle (used before sending a
