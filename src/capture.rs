@@ -154,6 +154,15 @@ pub(crate) enum ICaptureEvent {
     ClientLeft(u64),
     /// A peer reported its keyboard lock state on the outgoing connection.
     RemoteLocks(CaptureHandle, crate::lock_sync::Locks),
+    /// A switch hotkey was typed while driving `from` (see
+    /// [`crate::switch_hotkey`]); the service picks the target PC.
+    Switch {
+        target: crate::switch_hotkey::SwitchTarget,
+        from: Option<CaptureHandle>,
+    },
+    /// The backend cannot start a capture by itself: walk the local pointer
+    /// into this edge so its barrier starts it (see [`Capture::enter`]).
+    PushPointer(CaptureHandle, Position),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,6 +206,8 @@ enum CaptureRequest {
     /// do not forward lock keys until the given instant (a lock key was just
     /// injected locally)
     SuppressLockKeys(Instant),
+    /// move the keyboard and mouse to this client now (hotkey / "go to")
+    Enter(CaptureHandle),
 }
 
 impl Capture {
@@ -371,6 +382,16 @@ impl Capture {
     pub(crate) fn release(&self) {
         self.request_tx
             .send(CaptureRequest::Release)
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Move the keyboard and mouse to `handle` now, as if the pointer had
+    /// crossed its edge. Backends that cannot start a capture by themselves
+    /// answer with [`ICaptureEvent::PushPointer`].
+    pub(crate) fn enter(&self, handle: CaptureHandle) {
+        self.request_tx
+            .send(CaptureRequest::Enter(handle))
             .ok()
             .unwrap_or_default();
     }
@@ -698,6 +719,12 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     /// fixed way home: Right Shift held alone for 3 s
     emergency: crate::emergency_release::EmergencyRelease,
+    /// AltGr + Right Shift (+ digit) while driving a peer
+    switch_hotkey: crate::switch_hotkey::SwitchHotkey,
+    /// an `Enter` request answered with a pointer push, and when
+    pushed_entry: Option<(CaptureHandle, Instant)>,
+    /// motion after a pushed entry began is our own push, not the user's
+    drop_motion_until: Option<Instant>,
     request_rx: Receiver<CaptureRequest>,
     selected_backend: Rc<Cell<Option<input_capture::Backend>>>,
     state: State,
@@ -751,6 +778,9 @@ impl CaptureTask {
             request_rx: parts.request_rx,
             release_bind: Rc::new(RefCell::new(parts.release_bind)),
             emergency: Default::default(),
+            switch_hotkey: Default::default(),
+            pushed_entry: None,
+            drop_motion_until: None,
             selected_backend: parts.selected_backend,
             state: Default::default(),
         }
@@ -923,6 +953,9 @@ impl CaptureTask {
                         CaptureRequest::SendLocks(h, locks) => self.send_locks(h, locks).await,
                         CaptureRequest::SuppressLockKeys(until) => {
                             self.lock_keys_suppressed_until = Some(until);
+                        }
+                        CaptureRequest::Enter(h) => {
+                            log::info!("cannot move to client {h}: input capture is not running");
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -1157,6 +1190,7 @@ impl CaptureTask {
                     CaptureRequest::SuppressLockKeys(until) => {
                         self.lock_keys_suppressed_until = Some(until);
                     }
+                    CaptureRequest::Enter(h) => self.enter_client(capture, h).await?,
                     CaptureRequest::SetRemotePeer(peer) => {
                         self.update_remote_peer(peer);
                         capture.set_remote_peer(peer.map(to_capture_pos));
@@ -1243,6 +1277,49 @@ impl CaptureTask {
         }
     }
 
+    /// [`CaptureRequest::Enter`]: start a capture for `handle` without the
+    /// pointer crossing its edge.
+    async fn enter_client(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+    ) -> Result<(), CaptureError> {
+        if self.active_client == Some(handle) {
+            return Ok(());
+        }
+        if self.remote_peer.is_some() {
+            log::info!("not moving to client {handle}: another PC drives this one");
+            return Ok(());
+        }
+        if self.get_type(handle) != Some(CaptureType::Default) {
+            log::info!("not moving to client {handle}: no outgoing capture for it");
+            return Ok(());
+        }
+        if !self.conn.is_connected(handle) {
+            // Same rule as a barrier crossing: no grab without a transport.
+            self.conn.ensure_connected(handle);
+            log::info!("not moving to client {handle} yet: not connected");
+            return Ok(());
+        }
+        if self.active_client.is_some() {
+            self.release_capture(capture, None).await?;
+        }
+        if capture.begin(handle) {
+            log::info!("moving to client {handle} (capture started by the backend)");
+            return Ok(());
+        }
+        let Some(pos) = capture.position(handle) else {
+            return Ok(());
+        };
+        log::info!("moving to client {handle}: walking the pointer into the {pos} edge");
+        self.pushed_entry = Some((handle, Instant::now()));
+        self.event_tx
+            .send(ICaptureEvent::PushPointer(handle, pos))
+            .ok()
+            .unwrap_or_default();
+        Ok(())
+    }
+
     async fn handle_capture_event(
         &mut self,
         capture: &mut InputCapture,
@@ -1287,6 +1364,31 @@ impl CaptureTask {
             if self.emergency.on_event(input, Instant::now()) {
                 log::info!("releasing capture: Right Shift held for 3 s (emergency release)");
                 return self.release_capture(capture, None).await;
+            }
+            match self.switch_hotkey.on_event(input) {
+                crate::switch_hotkey::Verdict::Forward => {}
+                crate::switch_hotkey::Verdict::Swallow => return Ok(()),
+                crate::switch_hotkey::Verdict::Switch(target) => {
+                    log::info!(
+                        "switch hotkey: {target:?} (driving {:?})",
+                        self.active_client
+                    );
+                    self.event_tx
+                        .send(ICaptureEvent::Switch {
+                            target,
+                            from: self.active_client,
+                        })
+                        .ok()
+                        .unwrap_or_default();
+                    return Ok(());
+                }
+            }
+            if matches!(input, Event::Pointer(PointerEvent::Motion { .. }))
+                && self
+                    .drop_motion_until
+                    .is_some_and(|until| Instant::now() < until)
+            {
+                return Ok(());
             }
         }
 
@@ -1356,6 +1458,15 @@ impl CaptureTask {
             self.active_client.replace(handle);
             self.enter_along = event.begin_along();
             let handoff_began = Instant::now();
+            // A capture started by our own pointer push: the push keeps
+            // going for a moment, and that motion is not the user's.
+            if self
+                .pushed_entry
+                .take()
+                .is_some_and(|(pushed, at)| pushed == handle && at.elapsed() < PUSHED_ENTRY_WINDOW)
+            {
+                self.drop_motion_until = Some(handoff_began + PUSHED_MOTION_DROP);
+            }
             self.residual_reverse_px = Some(HANDOFF_RESIDUAL_MAX_PX);
             self.reverse_guard_until = Some(handoff_began + HANDOFF_REVERSE_GUARD);
             self.handoff_inward_px = Some(0.0);
@@ -1853,6 +1964,10 @@ impl CaptureTask {
         capture: &mut InputCapture,
         return_along: Option<f32>,
     ) -> Result<(), CaptureError> {
+        // a half-typed hotkey or push must not carry over to the next capture
+        self.switch_hotkey.reset();
+        self.emergency.reset();
+        self.drop_motion_until = None;
         // Deliver pending motion before the synthesized key-up events and
         // `Leave` so the peer never observes an out-of-order button/key.
         // Teardown uses the non-blocking send path: releasing a connection
@@ -2781,6 +2896,107 @@ mod capture_handle_tests {
         capture.terminate().await.expect("terminate");
     }
 
+    /// A capture started by our own pointer walk ("go to" on a desktop that
+    /// only captures at its barrier): the walk is still pushing for a few
+    /// events, and that motion must not reach the peer as the user's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_pointer_walk_after_a_pushed_entry_is_not_forwarded() {
+        for pushed in [false, true] {
+            let fake = FakeConnection::new();
+            let sent = fake.sent.clone();
+            let mut task = capture_task_with_connection(
+                vec![(7, Position::Left, CaptureType::Default)],
+                Box::new(fake),
+            );
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+                .await
+                .expect("dummy capture");
+            if pushed {
+                task.pushed_entry = Some((7, Instant::now()));
+            }
+            task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+                .await
+                .expect("begin");
+            // the walk's next step, outward (towards the peer on the left)
+            send_pointer(&mut task, &mut capture, -30.0, 0.0).await;
+            if pushed {
+                assert!(
+                    sent_motions(&sent).is_empty(),
+                    "the walk leaked into the peer"
+                );
+                assert!(
+                    task.pushed_entry.is_none(),
+                    "the entry consumed the push marker"
+                );
+            } else {
+                assert_eq!(
+                    sent_motions(&sent),
+                    vec![(-30.0, 0.0)],
+                    "a user's crossing is forwarded"
+                );
+            }
+            capture.terminate().await.expect("terminate");
+        }
+    }
+
+    /// AltGr + Right Shift + 2 while driving a peer: the peer gets the
+    /// modifiers but never the "2" (neither down nor up), and the service is
+    /// told to switch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_digit_of_a_switch_hotkey_never_reaches_the_peer() {
+        let fake = FakeConnection::new();
+        let sent = fake.sent.clone();
+        let (mut task, mut events) = capture_task_with_events(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("begin");
+        const KEY_2: u32 = 3;
+        for (key, state) in [(100, 1), (54, 1), (KEY_2, 1), (KEY_2, 0), (54, 0), (100, 0)] {
+            let event = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key,
+                state,
+            }));
+            task.handle_capture_event(&mut capture, (7, event))
+                .await
+                .expect("key");
+        }
+        let keys: Vec<u32> = sent
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, .. })) => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !keys.contains(&KEY_2),
+            "the digit reached the peer: {keys:?}"
+        );
+        assert!(
+            keys.contains(&100) && keys.contains(&54),
+            "modifiers are forwarded: {keys:?}"
+        );
+        let mut switched = false;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(20), events.recv()).await
+        {
+            if let ICaptureEvent::Switch { target, from } = event {
+                assert_eq!(target, crate::switch_hotkey::SwitchTarget::Pc(2));
+                assert_eq!(from, Some(7));
+                switched = true;
+            }
+        }
+        assert!(switched, "the service was not told to switch");
+        capture.terminate().await.expect("terminate");
+    }
+
     /// A reverse burst larger than the old 32 px accumulation bound used to be
     /// forwarded whole as a "deliberate hand-back". The fixed window is now the
     /// only decision: no reverse delta leaks inside it, regardless of size.
@@ -3452,6 +3668,13 @@ mod lock_key_tests {
         assert!(!is_suppressed_lock_key(&motion, until, now));
     }
 }
+
+/// How long after an `Enter` answered with a pointer push the capture that
+/// begins counts as started by that push.
+const PUSHED_ENTRY_WINDOW: Duration = Duration::from_secs(2);
+/// How long motion is dropped after a pushed entry began: the push is still
+/// in flight for a few events (it stops when the service hears the entry).
+const PUSHED_MOTION_DROP: Duration = Duration::from_millis(150);
 
 /// Mixed-build hand-off verification harnesses. They drive the private
 /// `CaptureTask` directly, so they live under this module instead of

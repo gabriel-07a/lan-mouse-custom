@@ -189,6 +189,30 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
   que quebraria gestos de borda baseados em tempo em compositores que usam o
   horário do frame.
 
+### Trocar de PC sem passar pela borda
+
+| Como | Faz |
+|---|---|
+| **AltGr + Shift Direito** (apertar os dois e soltar, sem nada no meio) | enquanto controla um PC: vai para o próximo; depois do último, volta para este |
+| **AltGr + Shift Direito + 1 … 9** | vai direto para aquele PC (na ordem de `lan-mouse cli list`) |
+| **AltGr + Shift Direito + 0** | volta para este PC |
+| `lan-mouse cli go <id ou nome>` / `lan-mouse cli home` | o mesmo, de um terminal ou de um atalho do sistema |
+| botão **Ir para este PC** no cartão do dispositivo | o mesmo, pela janela |
+
+- Os atalhos com AltGr funcionam enquanto o teclado deste PC controla outro
+  (é quando o lan-mouse recebe todas as teclas). AltGr é o Alt da direita em
+  teclados sem AltGr. O outro PC recebe AltGr e Shift (só modificadores), mas
+  nunca o dígito do atalho; AltGr+letra e Shift+1 continuam digitando normal.
+- Para ir de **este** PC para outro pelo teclado, crie um atalho do sistema que
+  rode `lan-mouse-custom cli go <nome>`. No GNOME: Configurações → Teclado →
+  Atalhos personalizados. No Windows: um atalho (`.lnk`) para
+  `lan-mouse.exe cli go <nome>` com uma tecla de atalho nas propriedades.
+- Como funciona: no Windows a captura começa direto. No GNOME (e no sway/X11)
+  a captura só pode começar numa barreira de borda, então o lan-mouse leva o
+  próprio cursor até a borda daquele PC (movimento injetado, ~7500 px/s), a
+  barreira dispara e daí em diante é um handoff normal; o resto do empurrão
+  não chega ao outro PC.
+
 ### Saída de emergência
 
 - Enquanto o teclado e o mouse deste PC controlam outro, **segurar o Shift

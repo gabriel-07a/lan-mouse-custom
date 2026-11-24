@@ -915,6 +915,9 @@ pub enum FrontendRequest {
         incoming: DirectionPolicy,
         outgoing: DirectionPolicy,
     },
+    /// Move the keyboard and mouse to this client now, as if the pointer had
+    /// crossed its edge; `None` brings them back to this PC.
+    GoTo(Option<ClientHandle>),
     /// rename a device (display only; the fingerprint stays the identity)
     RenameDevice { fingerprint: String, name: String },
     /// revoke a device: close live sessions, deny the fingerprint and drop it

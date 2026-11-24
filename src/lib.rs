@@ -27,6 +27,7 @@ mod qa;
 mod reset;
 pub mod service;
 mod service_core;
+mod switch_hotkey;
 
 /// This app's semantic version, exchanged in the peer Hello handshake.
 pub(crate) fn local_app_version() -> lan_mouse_proto::AppVersion {

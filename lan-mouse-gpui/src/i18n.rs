@@ -71,6 +71,7 @@ impl Language {
                 "Connect" => "Conectar",
                 "Cancel" => "Cancelar",
                 "Disconnect" => "Desconectar",
+                "Go to this PC" => "Ir para este PC",
                 "Edit" => "Editar",
                 "Remove" => "Remover",
                 "Side" => "Lado",

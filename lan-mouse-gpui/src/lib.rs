@@ -1783,6 +1783,12 @@ impl Dashboard {
         );
         let primary = peer.primary;
         let action_members = peer.members.clone();
+        let go_to_offered = peer.active
+            && matches!(
+                state,
+                LinkState::Connected | LinkState::ConnectedBidirectional | LinkState::ConnectedDegraded
+            );
+        let go_to_handle = peer.primary;
         let edit_members = peer.members.clone();
         let position_members = peer.members.clone();
         let sensitivity_down_members = peer.members.clone();
@@ -1865,7 +1871,28 @@ impl Dashboard {
                                 .on_click(cx.listener(move |this, _, _, _| {
                                     this.apply_row_action(&action_members, action)
                                 })),
-                        ),
+                        )
+                        // Move the keyboard and mouse there now, as if the
+                        // pointer had crossed the edge (also: AltGr + Right
+                        // Shift while driving, `lan-mouse cli go`).
+                        .when(go_to_offered, |row| {
+                            row.child(
+                                div()
+                                    .id(SharedString::from(format!("go-{primary}")))
+                                    .flex_shrink_0()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x1b2a3a))
+                                    .text_color(rgb(ACCENT))
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .child(self.tr("Go to this PC"))
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        this.send(FrontendRequest::GoTo(Some(go_to_handle)));
+                                    })),
+                            )
+                        }),
                     )
                     // Long status lines get their own full-width row and are
                     // truncated instead of pushing the card past the window

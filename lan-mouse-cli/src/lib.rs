@@ -45,6 +45,8 @@ pub enum CliError {
     ServiceError(String),
     #[error("no client with id {0} (use `lan-mouse-cli list` to see the configured clients)")]
     NoSuchClient(ClientHandle),
+    #[error("no PC with id or name {0:?} (use `lan-mouse-cli list` to see the configured clients)")]
+    NoSuchPc(String),
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -83,6 +85,12 @@ enum CliSubcommand {
     AddClient(Client),
     /// remove an existing client
     RemoveClient { id: ClientHandle },
+    /// move the keyboard and mouse to a PC now, as if the pointer had
+    /// crossed its edge (by id from `list`, or by name); bind it to a desktop
+    /// shortcut to switch with the keyboard
+    Go { pc: String },
+    /// bring the keyboard and mouse back to this PC
+    Home,
     /// activate a client
     Activate { id: ClientHandle },
     /// deactivate a client
@@ -342,6 +350,32 @@ async fn next_event(rx: &mut AsyncFrontendEventReader) -> Result<FrontendEvent, 
 /// silently ignored by the service (no reply at all), which used to make the
 /// CLI exit 0 without doing anything. Enumerating first gives a truthful
 /// error; the small race with a concurrent delete is acceptable for a CLI.
+/// The client `pc` names: its id, or its name (case-insensitive).
+fn resolve_pc(
+    clients: &[(
+        ClientHandle,
+        lan_mouse_ipc::ClientConfig,
+        lan_mouse_ipc::ClientState,
+    )],
+    pc: &str,
+) -> Option<ClientHandle> {
+    if let Ok(id) = pc.parse::<ClientHandle>() {
+        return clients
+            .iter()
+            .find(|(h, _, _)| *h == id)
+            .map(|(h, _, _)| *h);
+    }
+    clients
+        .iter()
+        .find(|(_, config, _)| {
+            config
+                .hostname
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(pc))
+        })
+        .map(|(h, _, _)| *h)
+}
+
 async fn ensure_client_exists(
     rx: &mut AsyncFrontendEventReader,
     tx: &mut AsyncFrontendRequestWriter,
@@ -513,6 +547,23 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::Delete(id)).await?;
             settle(&mut rx, Some(id)).await?;
+        }
+        CliSubcommand::Go { pc } => {
+            tx.request(FrontendRequest::Enumerate()).await?;
+            let clients = loop {
+                if let FrontendEvent::Enumerate(clients) = next_event(&mut rx).await? {
+                    break clients;
+                }
+            };
+            let Some(id) = resolve_pc(&clients, &pc) else {
+                return Err(CliError::NoSuchPc(pc));
+            };
+            tx.request(FrontendRequest::GoTo(Some(id))).await?;
+            settle(&mut rx, None).await?;
+        }
+        CliSubcommand::Home => {
+            tx.request(FrontendRequest::GoTo(None)).await?;
+            settle(&mut rx, None).await?;
         }
         CliSubcommand::Activate { id } => {
             ensure_client_exists(&mut rx, &mut tx, id).await?;
@@ -1145,6 +1196,30 @@ mod tests {
             CliArgs::try_parse_from(["lan-mouse-cli", "add-client", "--position", "diagonal"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn go_and_home_parse() {
+        let args = parse(&["lan-mouse-cli", "go", "DESKTOP-GABRIEL"]);
+        assert!(matches!(args.command, CliSubcommand::Go { ref pc } if pc == "DESKTOP-GABRIEL"));
+        let args = parse(&["lan-mouse-cli", "home"]);
+        assert!(matches!(args.command, CliSubcommand::Home));
+    }
+
+    #[test]
+    fn a_pc_is_found_by_id_or_by_name() {
+        let client = |name: Option<&str>| lan_mouse_ipc::ClientConfig {
+            hostname: name.map(str::to_string),
+            ..Default::default()
+        };
+        let clients = vec![
+            (2, client(Some("Desktop-Gabriel")), Default::default()),
+            (5, client(None), Default::default()),
+        ];
+        assert_eq!(resolve_pc(&clients, "5"), Some(5));
+        assert_eq!(resolve_pc(&clients, "desktop-gabriel"), Some(2));
+        assert_eq!(resolve_pc(&clients, "7"), None);
+        assert_eq!(resolve_pc(&clients, "laptop"), None);
     }
 
     #[test]

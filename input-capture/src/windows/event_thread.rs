@@ -89,6 +89,13 @@ impl EventThread {
         self.client_update(ClientUpdate::ReleaseAt(pos, along));
     }
 
+    /// Start a capture towards `pos` now (hotkey / "go to"), from the middle
+    /// of that edge. Ignored while capturing, while a peer drives this
+    /// machine, or when no client sits at `pos`.
+    pub(crate) fn begin_capture(&self, pos: Position) {
+        self.client_update(ClientUpdate::Begin(pos));
+    }
+
     /// Tell the hook thread which edge a remote peer entered through and is
     /// currently controlling this machine from.
     ///
@@ -188,6 +195,7 @@ enum ClientUpdate {
     Destroy(Position),
     RemotePeer(Option<Position>),
     ReleaseAt(Position, f32),
+    Begin(Position),
 }
 
 fn try_send_event(
@@ -1302,6 +1310,22 @@ fn update_clients(request: ClientUpdate) {
                 super::display_util::point_for_edge_fraction(displays, pos, along)
             });
             release_active_client_at(target);
+        }
+        ClientUpdate::Begin(pos) => {
+            if ACTIVE_CLIENT.get().is_some() || REMOTE_PEER.get().is_some() {
+                log::debug!("not starting a capture towards {pos}: already capturing or driven");
+            } else if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
+                log::debug!("not starting a capture towards {pos}: no client there");
+            } else {
+                let at = DISPLAYS.with_borrow_mut(|(displays, generation, primary)| {
+                    update_display_regions(displays, generation, primary);
+                    super::display_util::point_for_edge_fraction(displays, pos, 0.5)
+                });
+                match at {
+                    Some(at) => activate(pos, at),
+                    None => log::warn!("not starting a capture towards {pos}: no displays"),
+                }
+            }
         }
         ClientUpdate::RemotePeer(peer) => {
             let previous = REMOTE_PEER.replace(peer);

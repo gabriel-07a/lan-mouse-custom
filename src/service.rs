@@ -799,6 +799,7 @@ impl Service {
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
+            FrontendRequest::GoTo(target) => self.go_to(target),
             FrontendRequest::ScanNetwork => self.start_scan(),
             FrontendRequest::ProbeDevice { ip, port } => self.start_probe(ip, port),
             FrontendRequest::TrustAddress(entry) => {
@@ -1442,7 +1443,20 @@ impl Service {
                 self.capture_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
+            ICaptureEvent::Switch { target, from } => {
+                let order = self.client_manager.active_clients();
+                match switch_destination(&order, from, target) {
+                    Some(destination) => self.go_to(destination),
+                    None => log::info!("switch hotkey {target:?}: no such PC"),
+                }
+            }
+            ICaptureEvent::PushPointer(handle, pos) => {
+                log::debug!("walking the pointer into the {pos} edge for client {handle}");
+                self.emulation.push_pointer(pos);
+            }
             ICaptureEvent::ClientEntered(handle) => {
+                // A pointer push that started this entry is done.
+                self.emulation.stop_pointer_push();
                 log::info!("entering client {handle} ...");
                 // `enter` also unparks, after the heartbeat exists.
                 self.cursor_hide.enter(handle);
@@ -1460,6 +1474,19 @@ impl Service {
                 self.cursor_hide.leave(handle);
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
+        }
+    }
+
+    /// Move the keyboard and mouse to `target` (`None`: back to this PC).
+    fn go_to(&mut self, target: Option<ClientHandle>) {
+        match target {
+            None => {
+                log::info!("bringing the keyboard and mouse back to this PC");
+                self.emulation.stop_pointer_push();
+                self.capture.release();
+            }
+            Some(handle) if self.client_manager.is_active(handle) => self.capture.enter(handle),
+            Some(handle) => log::info!("not moving to client {handle}: it is not enabled"),
         }
     }
 
@@ -4282,5 +4309,63 @@ mod tests {
         assert!(!reverse_client_compatible(Some("bb"), Some("aa")));
         // Never replace a pin with a peer that somehow lost its fingerprint.
         assert!(!reverse_client_compatible(None, Some("aa")));
+    }
+}
+
+/// Where a switch hotkey goes: `Some(None)` is this PC, `Some(Some(h))` a
+/// client, `None` nothing (no such PC, or already there). `order` is the
+/// enabled clients in device-list order; "next" goes through them and then
+/// back to this PC.
+fn switch_destination(
+    order: &[ClientHandle],
+    from: Option<ClientHandle>,
+    target: crate::switch_hotkey::SwitchTarget,
+) -> Option<Option<ClientHandle>> {
+    use crate::switch_hotkey::SwitchTarget;
+    let destination = match target {
+        SwitchTarget::Home => None,
+        SwitchTarget::Pc(n) => Some(*order.get(usize::from(n).checked_sub(1)?)?),
+        SwitchTarget::Next => match from.and_then(|h| order.iter().position(|&o| o == h)) {
+            None => Some(*order.first()?),
+            Some(i) => order.get(i + 1).copied(),
+        },
+    };
+    (destination != from || from.is_none() && destination.is_some()).then_some(destination)
+}
+
+#[cfg(test)]
+mod switch_destination_tests {
+    use super::switch_destination;
+    use crate::switch_hotkey::SwitchTarget::{Home, Next, Pc};
+
+    #[test]
+    fn next_goes_through_the_pcs_and_back_home() {
+        let order = [3, 7];
+        assert_eq!(switch_destination(&order, None, Next), Some(Some(3)));
+        assert_eq!(switch_destination(&order, Some(3), Next), Some(Some(7)));
+        assert_eq!(
+            switch_destination(&order, Some(7), Next),
+            Some(None),
+            "after the last: home"
+        );
+        assert_eq!(switch_destination(&[], None, Next), None, "no PC to go to");
+    }
+
+    #[test]
+    fn a_number_picks_that_pc_and_zero_is_home() {
+        let order = [3, 7];
+        assert_eq!(switch_destination(&order, Some(3), Pc(2)), Some(Some(7)));
+        assert_eq!(
+            switch_destination(&order, Some(3), Pc(3)),
+            None,
+            "no third PC"
+        );
+        assert_eq!(
+            switch_destination(&order, Some(3), Pc(1)),
+            None,
+            "already there"
+        );
+        assert_eq!(switch_destination(&order, Some(7), Home), Some(None));
+        assert_eq!(switch_destination(&order, None, Home), None, "already home");
     }
 }

@@ -397,6 +397,14 @@ impl ScreenState {
     /// A peer injected relative motion.
     fn injected_motion(&mut self, dx: f64, dy: f64) {
         self.injected_motions += 1;
+        if self.remote_edge.is_none() {
+            // Nobody drives this screen: injected motion moves the local
+            // pointer exactly like the physical mouse, barriers and capture
+            // included (Wayland compositors route virtual pointers through
+            // their barriers). The pointer walk of a "go to" relies on it.
+            self.local_motion(dx, dy);
+            return;
+        }
         let (x, y) = (self.cursor.0 + dx, self.cursor.1 + dy);
         self.cursor = (x.clamp(0.0, self.max_x()), y.clamp(0.0, self.max_y()));
         let Some(edge) = self.remote_edge else {

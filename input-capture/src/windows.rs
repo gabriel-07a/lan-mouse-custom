@@ -46,6 +46,11 @@ impl Capture for WindowsInputCapture {
     fn set_remote_peer(&mut self, peer: Option<Position>) {
         self.event_thread.set_remote_peer(peer);
     }
+
+    fn begin(&mut self, pos: Position) -> bool {
+        self.event_thread.begin_capture(pos);
+        true
+    }
 }
 
 impl WindowsInputCapture {

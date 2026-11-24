@@ -227,6 +227,22 @@ impl InputCapture {
         self.capture.release_at(pos, along).await
     }
 
+    /// Start capturing for `id` now, without the pointer crossing its edge.
+    /// `false`: unknown handle, or the backend cannot do it (see
+    /// [`Capture::begin`]); [`Self::position`] tells where to walk the
+    /// pointer instead.
+    pub fn begin(&mut self, id: CaptureHandle) -> bool {
+        let Some(&pos) = self.id_map.get(&id) else {
+            return false;
+        };
+        self.capture.begin(pos)
+    }
+
+    /// The edge a capture handle sits on.
+    pub fn position(&self, id: CaptureHandle) -> Option<Position> {
+        self.id_map.get(&id).copied()
+    }
+
     /// Tell the backend which edge a remote peer entered through and is
     /// currently driving this machine from (`None` = no peer is driving us).
     pub fn set_remote_peer(&mut self, peer: Option<Position>) {
@@ -417,6 +433,15 @@ pub trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>>
     /// shared border. The exception is the edge the peer entered through: a
     /// crossing there is the return hand-off and must still be reported.
     fn set_remote_peer(&mut self, _peer: Option<Position>) {}
+
+    /// Start capturing towards `pos` now (a hotkey or a "go to" command),
+    /// without the pointer crossing that edge. `false` means the backend
+    /// cannot (the desktop only starts a capture at a barrier); the caller
+    /// then walks the local pointer into the edge instead. The capture's
+    /// `Begin` arrives on the stream as usual.
+    fn begin(&mut self, _pos: Position) -> bool {
+        false
+    }
 }
 
 async fn create_backend(

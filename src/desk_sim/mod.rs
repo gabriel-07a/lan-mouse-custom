@@ -36,6 +36,8 @@ mod network_scenarios;
 mod os_scenarios;
 #[cfg(test)]
 mod scenarios;
+#[cfg(test)]
+mod switch_scenarios;
 
 use std::{
     fmt::Write as _,
@@ -439,6 +441,19 @@ impl Desk {
     pub(crate) async fn key_tap_on(&self, name: &str, key: u32) {
         lock(&self.pc(name).screen).key_tap(key);
         tokio::task::yield_now().await;
+    }
+
+    /// Keys pressed in order on `name`'s keyboard, then let go in reverse
+    /// (a chord such as AltGr + Right Shift + 1).
+    pub(crate) async fn key_chord_on(&self, name: &str, keys: &[u32]) {
+        for &key in keys {
+            lock(&self.pc(name).screen).key_event(key, 1);
+            tokio::task::yield_now().await;
+        }
+        for &key in keys.iter().rev() {
+            lock(&self.pc(name).screen).key_event(key, 0);
+            tokio::task::yield_now().await;
+        }
     }
 
     /// A key held down on `name`'s keyboard for `hold` (real time).

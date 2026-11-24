@@ -234,6 +234,11 @@ enum EmulationRequest {
     SendLocks(SocketAddr, crate::lock_sync::Locks),
     /// Inject a press and release of each of these keys locally (lock sync).
     TapKeys(Vec<u32>),
+    /// Walk the local pointer into this edge (hotkey / "go to" on a desktop
+    /// that only starts a capture at its edge barrier).
+    PushPointer(input_capture::Position),
+    /// The capture began (or the user went home): stop walking the pointer.
+    StopPointerPush,
     ChangePort(u16),
     Terminate,
 }
@@ -397,6 +402,20 @@ impl Emulation {
             .unwrap_or_default();
     }
 
+    pub(crate) fn push_pointer(&self, pos: input_capture::Position) {
+        self.request_tx
+            .send(EmulationRequest::PushPointer(pos))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    pub(crate) fn stop_pointer_push(&self) {
+        self.request_tx
+            .send(EmulationRequest::StopPointerPush)
+            .ok()
+            .unwrap_or_default();
+    }
+
     pub(crate) fn remote_leave(&self) {
         self.request_tx
             .send(EmulationRequest::RemoteLeave)
@@ -425,6 +444,67 @@ impl Emulation {
         if let Err(e) = (&mut self.task).await {
             log::warn!("{e}");
         }
+    }
+}
+
+/// Time between two steps of a pointer walk.
+const POINTER_PUSH_STEP_INTERVAL: Duration = Duration::from_millis(4);
+/// Pixels per step: ~7500 px/s, a fast but plausible flick.
+const POINTER_PUSH_STEP_PX: f64 = 30.0;
+/// Steps before giving up (9000 px: across any desktop and into the edge).
+const POINTER_PUSH_STEPS: u32 = 300;
+
+/// Walks the local pointer into one edge with relative motion, so the
+/// desktop's capture barrier there starts a capture exactly as when the user
+/// moves the mouse (the compositor routes injected motion through its
+/// barriers). Stopped by the service once the capture began.
+#[derive(Debug)]
+struct PointerPush {
+    pos: input_capture::Position,
+    steps_left: u32,
+}
+
+impl PointerPush {
+    fn new(pos: input_capture::Position) -> Self {
+        Self {
+            pos,
+            steps_left: POINTER_PUSH_STEPS,
+        }
+    }
+
+    fn step(&mut self) -> Event {
+        self.steps_left = self.steps_left.saturating_sub(1);
+        let px = POINTER_PUSH_STEP_PX;
+        let (dx, dy) = match self.pos {
+            input_capture::Position::Left => (-px, 0.0),
+            input_capture::Position::Right => (px, 0.0),
+            input_capture::Position::Top => (0.0, -px),
+            input_capture::Position::Bottom => (0.0, px),
+        };
+        Event::Pointer(PointerEvent::Motion { time: 0, dx, dy })
+    }
+
+    fn done(&self) -> bool {
+        self.steps_left == 0
+    }
+}
+
+#[cfg(test)]
+mod pointer_push_tests {
+    use super::*;
+
+    #[test]
+    fn a_walk_moves_outward_and_ends() {
+        let mut walk = PointerPush::new(input_capture::Position::Left);
+        let mut total = 0.0;
+        while !walk.done() {
+            let Event::Pointer(PointerEvent::Motion { dx, dy, .. }) = walk.step() else {
+                panic!("motion only");
+            };
+            assert!(dx < 0.0 && dy == 0.0);
+            total += dx;
+        }
+        assert!(total <= -8000.0, "far enough for any desktop: {total}");
     }
 }
 
@@ -585,8 +665,18 @@ impl ListenTask {
         // percentiles so unchanged values are not re-broadcast.
         let mut recv_cadence: HashMap<SocketAddr, crate::latency::CadenceMeter> = HashMap::new();
         let mut recv_published: HashMap<SocketAddr, (Option<u32>, Option<u32>)> = HashMap::new();
+        // an active walk of the local pointer into an edge
+        let mut push: Option<PointerPush> = None;
         loop {
             select! {
+                _ = tokio::time::sleep(POINTER_PUSH_STEP_INTERVAL), if push.is_some() => {
+                    let walk = push.as_mut().expect("guarded");
+                    self.emulation_proxy.inject_local(walk.step());
+                    if walk.done() {
+                        log::info!("pointer walk into the {:?} edge ended without a capture", walk.pos);
+                        push = None;
+                    }
+                }
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr }) => {
                         log::trace!("{event} <-<-<-<-<- {addr}");
@@ -828,6 +918,8 @@ impl ListenTask {
                             .await
                     }
                     EmulationRequest::TapKeys(keys) => self.emulation_proxy.tap_keys(&keys),
+                    EmulationRequest::PushPointer(pos) => push = Some(PointerPush::new(pos)),
+                    EmulationRequest::StopPointerPush => push = None,
                     EmulationRequest::SetAbsoluteSensitivity(percent) => self
                         .emulation_proxy
                         .set_absolute_sensitivity(percent as f64 / 100.0),
@@ -991,6 +1083,14 @@ impl EmulationProxy {
                 .ok()
                 .unwrap_or_default();
         }
+    }
+
+    /// Inject one event on this machine (not peer input).
+    fn inject_local(&self, event: Event) {
+        self.request_tx
+            .send(ProxyRequest::Input(event, LOCK_SYNC_ADDR))
+            .ok()
+            .unwrap_or_default();
     }
 
     /// Inject a press and release of each key on this machine.
