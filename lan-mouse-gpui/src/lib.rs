@@ -880,6 +880,22 @@ impl Dashboard {
         if demo::page() == Some("add") {
             dashboard.add_device();
         }
+        if demo::page() == Some("network") {
+            // the banner and status line a Network "Add" leaves behind
+            let notice = match dashboard.language {
+                Language::PortugueseBrazil => {
+                    "Dispositivo adicionado. Agora aprove o pedido de conexão no outro PC \
+                     (aba Dispositivos) e escolha o lado da tela aqui."
+                }
+                Language::English => {
+                    "Device added. Now approve the connection request on the other PC \
+                     (Devices page) and choose the screen side here."
+                }
+            }
+            .to_string();
+            dashboard.status = notice.clone();
+            dashboard.add_notice = Some((notice, true));
+        }
         dashboard
     }
 
@@ -2289,7 +2305,11 @@ impl Dashboard {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_millis() as u64)
                     .unwrap_or(0);
-                format!(" · seen {}s ago", now.saturating_sub(seen) / 1000)
+                let secs = now.saturating_sub(seen) / 1000;
+                match self.language {
+                    Language::PortugueseBrazil => format!(" · visto há {secs}s"),
+                    Language::English => format!(" · seen {secs}s ago"),
+                }
             })
             .unwrap_or_default();
         div()
@@ -2303,7 +2323,11 @@ impl Dashboard {
             .border_1()
             .border_color(rgb(BORDER))
             .child(
+                // the text takes what is left and wraps; the Add button
+                // keeps its size at the right
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -2371,18 +2395,28 @@ impl Dashboard {
             .bg(rgb(background))
             .border_b_1()
             .border_color(rgb(border))
-            .child(div().text_sm().text_color(rgb(TEXT)).child(message.clone()))
-            .child(self.action_button(
-                "dismiss-add-notice",
-                self.tr("OK"),
-                0x1d2430,
-                TEXT,
-                cx,
-                |this, _, _, cx| {
-                    this.add_notice = None;
-                    cx.notify();
-                },
-            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .child(message.clone()),
+            )
+            .child(
+                self.action_button(
+                    "dismiss-add-notice",
+                    self.tr("OK"),
+                    0x1d2430,
+                    TEXT,
+                    cx,
+                    |this, _, _, cx| {
+                        this.add_notice = None;
+                        cx.notify();
+                    },
+                )
+                .flex_shrink_0(),
+            )
             .into_any_element()
     }
 
@@ -2400,6 +2434,8 @@ impl Dashboard {
             .border_color(rgb(0x5a4a20))
             .child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -2485,107 +2521,117 @@ impl Render for Dashboard {
         // height: the titlebar/banner heights vary, and a fixed content height
         // clipped the bottom of the Settings cards (the extension row made the
         // card taller than the old estimate).
-        let shell = div().flex().flex_1().min_h(px(0.0)).child(sidebar).child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h(px(0.0))
-                .child(
-                    div()
-                        .h(px(64.0))
-                        .flex_none()
-                        .flex()
-                        .justify_center()
-                        .border_b_1()
-                        .border_color(rgb(BORDER))
-                        .child(
-                            div()
-                                .w_full()
-                                .max_w(px(CONTENT_MAX_WIDTH))
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px_6()
-                                .child(
-                                    div()
-                                        .text_lg()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(rgb(TEXT))
-                                        .child(match self.page {
-                                            Page::Devices => self.tr("Devices"),
-                                            Page::Network => self.tr("Network"),
-                                            Page::Settings => self.tr("Settings"),
-                                        }),
-                                )
-                                .when(self.page == Page::Devices, |this| {
-                                    this.child(
-                                        div()
-                                            .id("add-device")
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .bg(rgb(ACCENT))
-                                            .text_color(rgb(0x081018))
-                                            .text_sm()
-                                            .cursor_pointer()
-                                            .child(self.tr("+ Add device"))
-                                            .on_click(cx.listener(|this, _, window, _| {
-                                                this.add_device();
-                                                window.focus(&this.add_focus);
-                                            })),
-                                    )
-                                })
-                                .when(self.page == Page::Network, |this| {
-                                    this.child(
-                                        div()
-                                            .id("scan-network-header")
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .bg(rgb(ACCENT))
-                                            .text_color(rgb(0x081018))
-                                            .text_sm()
-                                            .cursor_pointer()
-                                            .child(self.tr("Scan network"))
-                                            .on_click(
-                                                cx.listener(|this, _, _, _| this.start_scan()),
-                                            ),
-                                    )
-                                }),
-                        ),
-                )
-                .when(self.add_notice.is_some(), |this| {
-                    this.child(self.render_add_notice(cx))
-                })
-                .when(self.settings_dialog.is_some(), |this| {
-                    this.child(self.render_settings_dialog(cx))
-                })
-                .when(self.cursor_extension.hint.is_some(), |this| {
-                    this.child(self.render_cursor_extension_banner(cx))
-                })
-                .child(
-                    div()
-                        .id("content-scroll")
-                        .w_full()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .overflow_y_scroll()
-                        .scrollbar_width(px(8.0))
-                        .child(
-                            // Cards stretched to 1900 px put a label and its
-                            // button a screen apart; keep a readable column.
-                            div().w_full().flex().justify_center().child(
+        // The content column gets `min_w(0)`: without it the column grew to
+        // fit its widest line (a one-line notice) and pushed the header
+        // buttons and the cards out of the window.
+        let shell = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .child(sidebar)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .child(
+                        div()
+                            .h(px(64.0))
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .border_b_1()
+                            .border_color(rgb(BORDER))
+                            .child(
                                 div()
                                     .w_full()
                                     .max_w(px(CONTENT_MAX_WIDTH))
-                                    .min_w(px(0.0))
-                                    .child(content),
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px_6()
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgb(TEXT))
+                                            .child(match self.page {
+                                                Page::Devices => self.tr("Devices"),
+                                                Page::Network => self.tr("Network"),
+                                                Page::Settings => self.tr("Settings"),
+                                            }),
+                                    )
+                                    .when(self.page == Page::Devices, |this| {
+                                        this.child(
+                                            div()
+                                                .id("add-device")
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .bg(rgb(ACCENT))
+                                                .text_color(rgb(0x081018))
+                                                .text_sm()
+                                                .cursor_pointer()
+                                                .child(self.tr("+ Add device"))
+                                                .on_click(cx.listener(|this, _, window, _| {
+                                                    this.add_device();
+                                                    window.focus(&this.add_focus);
+                                                })),
+                                        )
+                                    })
+                                    .when(self.page == Page::Network, |this| {
+                                        this.child(
+                                            div()
+                                                .id("scan-network-header")
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .bg(rgb(ACCENT))
+                                                .text_color(rgb(0x081018))
+                                                .text_sm()
+                                                .cursor_pointer()
+                                                .child(self.tr("Scan network"))
+                                                .on_click(
+                                                    cx.listener(|this, _, _, _| this.start_scan()),
+                                                ),
+                                        )
+                                    }),
                             ),
-                        ),
-                ),
-        );
+                    )
+                    .when(self.add_notice.is_some(), |this| {
+                        this.child(self.render_add_notice(cx))
+                    })
+                    .when(self.settings_dialog.is_some(), |this| {
+                        this.child(self.render_settings_dialog(cx))
+                    })
+                    .when(self.cursor_extension.hint.is_some(), |this| {
+                        this.child(self.render_cursor_extension_banner(cx))
+                    })
+                    .child(
+                        div()
+                            .id("content-scroll")
+                            .w_full()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_y_scroll()
+                            .scrollbar_width(px(8.0))
+                            .child(
+                                // Cards stretched to 1900 px put a label and its
+                                // button a screen apart; keep a readable column.
+                                div().w_full().flex().justify_center().child(
+                                    div()
+                                        .w_full()
+                                        .max_w(px(CONTENT_MAX_WIDTH))
+                                        .min_w(px(0.0))
+                                        .child(content),
+                                ),
+                            ),
+                    ),
+            );
 
         div()
             .flex()
