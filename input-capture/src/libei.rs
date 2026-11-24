@@ -553,14 +553,7 @@ async fn do_capture(
         close_capture_session(input_capture, &session).await;
         match result {
             Ok(SessionEnd::Shutdown) => return Ok(()),
-            Ok(SessionEnd::NewEdge(pos)) => {
-                log::info!(
-                    "a client is now configured on the {pos:?} edge, which this capture \
-                     session has no barrier for; starting a new session (the desktop may \
-                     ask for input-capture permission again)"
-                );
-                session_attempts = 0;
-            }
+            Ok(SessionEnd::Rebuild) => session_attempts = 0,
             Err(e) => {
                 if cancellation_token.is_cancelled() {
                     return Ok(());
@@ -628,8 +621,9 @@ struct CaptureSessionCtx<'a, S> {
 enum SessionEnd {
     /// shutdown was requested
     Shutdown,
-    /// a client was configured on an edge this session has no barrier for
-    NewEdge(Position),
+    /// the portal refused to change the barriers of this session; a new
+    /// session gets the current ones
+    Rebuild,
 }
 
 /// The edges to install barriers for: the configured ones, in a fixed order.
@@ -645,12 +639,41 @@ fn barrier_positions(active_clients: &[Position]) -> Vec<Position> {
     .collect()
 }
 
-/// A configured edge without a barrier in this session, if any.
-fn new_edge(active_clients: &[Position], barrier_set: &[Position]) -> Option<Position> {
-    active_clients
-        .iter()
-        .copied()
-        .find(|pos| !barrier_set.contains(pos))
+/// The barriers installed on a session.
+struct Barriers {
+    /// the edges they cover
+    positions: Vec<Position>,
+    barriers: Vec<ICBarrier>,
+    ids: HashMap<BarrierID, Position>,
+}
+
+impl Barriers {
+    /// Install barriers for the configured edges on the current monitors.
+    ///
+    /// GNOME refuses barrier changes on an enabled session ("Session already
+    /// enabled") but accepts them after `Disable`, and a disabled session can
+    /// be enabled again (checked against Mutter 50.1's InputCapture API), so
+    /// the layout changes without a new session and its consent dialog.
+    async fn replace(
+        &mut self,
+        input_capture: &InputCapture,
+        session: &Session<InputCapture>,
+        active_clients: &[Position],
+        next_barrier_id: &mut NonZeroU32,
+    ) -> Result<(), ashpd::Error> {
+        let positions = barrier_positions(active_clients);
+        log::info!("capture edges: {:?} -> {positions:?}", self.positions);
+        input_capture.disable(session, Default::default()).await?;
+        let (barriers, ids) =
+            update_barriers(input_capture, session, &positions, next_barrier_id).await?;
+        input_capture.enable(session, Default::default()).await?;
+        *self = Self {
+            positions,
+            barriers,
+            ids,
+        };
+        Ok(())
+    }
 }
 
 async fn do_capture_session<S>(ctx: CaptureSessionCtx<'_, S>) -> Result<SessionEnd, CaptureError>
@@ -677,23 +700,25 @@ where
     // pressure (the auto-hidden Ubuntu Dock at the bottom, hot corners) - with
     // the local mouse and with a peer driving this screen alike.
     //
-    // GNOME's InputCapture v1 forbids changing barriers after the session is
-    // enabled ("Session already enabled") and a disabled session cannot be
-    // re-enabled. A client configured on a new edge therefore ends this
-    // session (`SessionEnd::NewEdge`) and the caller creates a new one, which
-    // asks for consent again on portals that cannot persist it; that only
-    // happens when the layout is reconfigured. Edges whose client went away
-    // keep their barrier until then and are released immediately below.
-    let barrier_set = barrier_positions(active_clients);
-    let (barriers, pos_for_barrier_id) =
-        update_barriers(input_capture, session, &barrier_set, next_barrier_id).await?;
+    // When the configured edges or the monitors change, the barriers are
+    // swapped in place (`Barriers::replace`); a new session, which asks for
+    // consent again on portals that cannot persist it (GNOME), is only the
+    // fallback when the portal refuses that.
+    let positions = barrier_positions(active_clients);
+    let (barriers, ids) =
+        update_barriers(input_capture, session, &positions, next_barrier_id).await?;
+    let mut installed = Barriers {
+        positions,
+        barriers,
+        ids,
+    };
     log::debug!("enabling session");
     input_capture.enable(session, Default::default()).await?;
     let mut activated = input_capture.receive_activated().await?;
     let current_pos = Rc::new(Cell::new(None));
-    // a new edge configured while the pointer was captured: rebuild the
-    // session once it is released
-    let mut pending_new_edge: Option<Position> = None;
+    // the edges or monitors changed while the pointer was captured: swap the
+    // barriers once it is released
+    let mut barriers_stale = false;
 
     loop {
         tokio::select! {
@@ -709,8 +734,8 @@ where
                     input_capture,
                     session,
                     &mut activated,
-                    &barriers,
-                    &pos_for_barrier_id,
+                    &installed.barriers,
+                    &installed.ids,
                 )
                 .await;
                 return Ok(SessionEnd::Shutdown);
@@ -722,23 +747,30 @@ where
                 log::debug!("release requested while no capture is active");
             }
             _ = zones_changed.next() => {
-                // Barriers are fixed for the lifetime of the enabled session
-                // (GNOME cannot update them); only the active-client filter
-                // changes, handled when an activation arrives.
-                log::debug!("zones changed; keeping the fixed barrier set");
+                // Monitors added, removed or rearranged: the barriers must
+                // follow the new edges.
+                log::debug!("zones changed; replacing the barriers");
+                if let Err(e) = installed
+                    .replace(input_capture, session, active_clients, next_barrier_id)
+                    .await
+                {
+                    log::warn!("could not move the capture barriers to the new monitors ({e}); starting a new capture session");
+                    return Ok(SessionEnd::Rebuild);
+                }
             }
             event = capture_event.recv() => match event {
                 Some(event) => {
                     apply_client_event(active_clients, event);
-                    // Keep the session alive while no client is enabled, or
-                    // when a client comes back on an edge that still has its
-                    // barrier: closing and recreating it would ask for consent
-                    // again on portals that cannot persist it (GNOME).
-                    if let Some(pos) = new_edge(active_clients, &barrier_set) {
-                        if current_pos.get().is_none() {
-                            return Ok(SessionEnd::NewEdge(pos));
+                    // Not capturing here (the capture loop below has its own
+                    // arm): swap the barriers now if the edges changed.
+                    if installed.positions != barrier_positions(active_clients) {
+                        if let Err(e) = installed
+                            .replace(input_capture, session, active_clients, next_barrier_id)
+                            .await
+                        {
+                            log::warn!("could not change the capture barriers ({e}); starting a new capture session (the desktop may ask for permission again)");
+                            return Ok(SessionEnd::Rebuild);
                         }
-                        pending_new_edge = Some(pos);
                     }
                 }
                 None => return Ok(SessionEnd::Shutdown),
@@ -758,8 +790,8 @@ where
                         activated_event,
                         Position::Left,
                         None,
-                        &barriers,
-                        &pos_for_barrier_id,
+                        &installed.barriers,
+                        &installed.ids,
                     )
                     .await?;
                     continue;
@@ -769,7 +801,7 @@ where
                 // report barrier ids, some compositors do not report the
                 // position). An activation that cannot be mapped is dropped
                 // instead of panicking inside the capture task.
-                let Some(pos) = activation_position(&activated_event, &barriers, &pos_for_barrier_id)
+                let Some(pos) = activation_position(&activated_event, &installed.barriers, &installed.ids)
                 else {
                     continue;
                 };
@@ -786,8 +818,8 @@ where
                         activated_event,
                         pos,
                         None,
-                        &barriers,
-                        &pos_for_barrier_id,
+                        &installed.barriers,
+                        &installed.ids,
                     )
                     .await?;
                     continue;
@@ -799,7 +831,7 @@ where
                 let begin = activated_event
                     .cursor_position()
                     .and_then(|point| {
-                        barrier_edge_fraction(&barriers, &pos_for_barrier_id, pos, point)
+                        barrier_edge_fraction(&installed.barriers, &installed.ids, pos, point)
                     })
                     .map(CaptureEvent::BeginAt)
                     .unwrap_or(CaptureEvent::Begin);
@@ -819,7 +851,8 @@ where
                             release_now = true;
                         }
                         _ = zones_changed.next() => {
-                            // fixed barrier set (see above)
+                            // replaced once this capture is released
+                            barriers_stale = true;
                         }
                         event = capture_event.recv() => match event {
                             Some(event) => {
@@ -828,6 +861,9 @@ where
                                     || !active_clients.contains(&pos)
                                 {
                                     release_now = true;
+                                }
+                                if installed.positions != barrier_positions(active_clients) {
+                                    barriers_stale = true;
                                 }
                             }
                             None => release_now = true,
@@ -859,8 +895,8 @@ where
                     activated_event,
                     pos,
                     target,
-                    &barriers,
-                    &pos_for_barrier_id,
+                    &installed.barriers,
+                    &installed.ids,
                 )
                 .await?;
                 // No client is being driven anymore: input events that arrive
@@ -870,8 +906,14 @@ where
                 if cancellation_token.is_cancelled() {
                     return Ok(SessionEnd::Shutdown);
                 }
-                if let Some(pos) = pending_new_edge.take() {
-                    return Ok(SessionEnd::NewEdge(pos));
+                if std::mem::take(&mut barriers_stale) {
+                    if let Err(e) = installed
+                        .replace(input_capture, session, active_clients, next_barrier_id)
+                        .await
+                    {
+                        log::warn!("could not change the capture barriers ({e}); starting a new capture session (the desktop may ask for permission again)");
+                        return Ok(SessionEnd::Rebuild);
+                    }
                 }
             }
         }
@@ -1646,17 +1688,26 @@ mod barrier_set_tests {
         assert!(!barrier_positions(&[Position::Left, Position::Right]).contains(&Position::Bottom));
     }
 
+    /// The installed set is compared with this to decide whether to swap the
+    /// barriers: a client moved or removed changes it, a reconnect on the
+    /// same edge does not.
     #[test]
-    fn only_an_edge_without_a_barrier_needs_a_new_session() {
-        let barriers = [Position::Left, Position::Right];
-        // reconnecting a client on an edge that has its barrier: no rebuild
-        assert_eq!(new_edge(&[Position::Right], &barriers), None);
-        // a client removed: the barrier stays, released on activation
-        assert_eq!(new_edge(&[], &barriers), None);
-        // a client moved to the top: that edge needs a barrier
+    fn the_barrier_set_follows_the_configured_edges() {
+        let installed = barrier_positions(&[Position::Left, Position::Right]);
         assert_eq!(
-            new_edge(&[Position::Right, Position::Top], &barriers),
-            Some(Position::Top)
+            barrier_positions(&[Position::Right, Position::Left]),
+            installed
         );
+        assert_ne!(
+            barrier_positions(&[Position::Right]),
+            installed,
+            "a client removed"
+        );
+        assert_ne!(
+            barrier_positions(&[Position::Right, Position::Top]),
+            installed,
+            "a client moved to the top"
+        );
+        assert!(barrier_positions(&[]).is_empty());
     }
 }
