@@ -550,6 +550,20 @@ impl ClientManager {
         }
     }
 
+    /// See [`lan_mouse_ipc::ClientState::pairing_code`].
+    pub(crate) fn set_pairing_code(&self, handle: ClientHandle, code: Option<String>) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.pairing_code = code;
+        }
+    }
+
+    pub(crate) fn pairing_code(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, state)| state.pairing_code.clone())
+    }
+
     /// Update the latency percentiles of a link. `update` only touches the
     /// fields its measurement owns (probes, send cadence or receive cadence).
     pub(crate) fn update_latency(

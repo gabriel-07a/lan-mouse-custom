@@ -113,6 +113,21 @@ async fn add_from_the_network_page_and_use(hostname: Option<&str>) {
                 .await
                 .expect("list pending");
             let pending = next_pending(&mut b_events).await;
+            // Before B approves, A shows the code B's request shows.
+            desk.wait_until(
+                "A shows the pairing code of B's request",
+                Duration::from_secs(10),
+                |desk| {
+                    desk.pc("A")
+                        .clients
+                        .get_client_states()
+                        .iter()
+                        .any(|(_, _, state)| {
+                            state.pairing_code.as_deref() == Some(pending.sas.as_str())
+                        })
+                },
+            )
+            .await;
             b_requests
                 .request(FrontendRequest::RespondPending {
                     fingerprint: pending.fingerprint,
@@ -131,6 +146,14 @@ async fn add_from_the_network_page_and_use(hostname: Option<&str>) {
                 |desk| connected(desk, "A"),
             )
             .await;
+            assert!(
+                desk.pc("A")
+                    .clients
+                    .get_client_states()
+                    .iter()
+                    .all(|(_, _, state)| state.pairing_code.is_none()),
+                "no code once approved"
+            );
 
             // The new entry is named after the beacon, not "unknown".
             let names: Vec<Option<String>> = desk

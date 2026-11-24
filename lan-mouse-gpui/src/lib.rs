@@ -307,6 +307,15 @@ fn normalized_fingerprint(config: &ClientConfig) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// "123456" as "123 456", on both PCs alike.
+fn spaced_code(code: &str) -> String {
+    if code.len() == 6 && code.is_ascii() {
+        format!("{} {}", &code[..3], &code[3..])
+    } else {
+        code.to_string()
+    }
+}
+
 /// One logical peer rendered as a single card: every configured client whose
 /// certificate fingerprint is the same device.
 #[derive(Clone, Debug, PartialEq)]
@@ -325,6 +334,8 @@ struct PeerAggregate {
     alive: bool,
     has_outgoing: bool,
     has_incoming: bool,
+    /// six-digit code while the other PC has not approved this one yet
+    pairing_code: Option<String>,
     last_pong_at: Option<u64>,
     rtt_ms: Option<u32>,
     jitter_ms: Option<u32>,
@@ -406,6 +417,9 @@ fn aggregate_peer(members: &[(ClientHandle, ClientConfig, ClientState)]) -> Opti
         alive: link_state.alive,
         has_outgoing,
         has_incoming,
+        pairing_code: members
+            .iter()
+            .find_map(|(_, _, state)| state.pairing_code.clone()),
         last_pong_at: members
             .iter()
             .filter_map(|(_, _, state)| state.last_pong_at)
@@ -1692,6 +1706,10 @@ impl Dashboard {
                 LinkState::Connecting if peer.has_outgoing => {
                     format!("link to {display_endpoint} up — waiting for a reply")
                 }
+                LinkState::Connecting if peer.pairing_code.is_some() => format!(
+                    "waiting for approval on the other PC — check that it shows the code {}",
+                    spaced_code(peer.pairing_code.as_deref().unwrap_or_default())
+                ),
                 LinkState::Connecting => format!("trying {display_endpoint} — no answer yet"),
                 LinkState::Reconnecting => {
                     format!("no reply for {stale_secs}s — reconnecting…{link_metrics}{last_pong}")
@@ -1716,6 +1734,10 @@ impl Dashboard {
                 LinkState::Connecting if peer.has_outgoing => {
                     format!("link para {display_endpoint} ativo — aguardando resposta")
                 }
+                LinkState::Connecting if peer.pairing_code.is_some() => format!(
+                    "aguardando aprovação no outro PC — confira se ele mostra o código {}",
+                    spaced_code(peer.pairing_code.as_deref().unwrap_or_default())
+                ),
                 LinkState::Connecting => {
                     format!("tentando {display_endpoint} — sem resposta ainda")
                 }
@@ -2979,7 +3001,7 @@ impl Dashboard {
             let sas = if request.sas.is_empty() {
                 "······".to_string()
             } else {
-                request.sas.clone()
+                spaced_code(&request.sas)
             };
             let card = div()
                 .flex()
@@ -4559,6 +4581,13 @@ pub fn run(local_commit: [u8; 8]) -> Result<FrontendExit, GpuiError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pairing_codes_are_shown_in_two_groups_of_three() {
+        assert_eq!(super::spaced_code("482913"), "482 913");
+        assert_eq!(super::spaced_code(""), "");
+        assert_eq!(super::spaced_code("12345"), "12345", "not a pairing code");
+    }
     use super::*;
 
     const NOW: u64 = 1_700_000_000_000;

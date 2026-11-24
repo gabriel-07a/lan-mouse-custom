@@ -246,6 +246,12 @@ pub struct ClientState {
     /// last connection-attempt/handshake error for this client, if any
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Six-digit pairing code while the other PC has not approved this one
+    /// yet: the dial saw its certificate, but it refused ours. The other
+    /// screen shows the same code in its connection request; matching codes
+    /// mean nothing sits in between. `None` once connected.
+    #[serde(default)]
+    pub pairing_code: Option<String>,
     /// Unix timestamp in milliseconds of the **last `Pong` received on the
     /// current outgoing link**, or `None` while no round-trip has been proven
     /// yet (fresh handshake, peer that never answers, or a service build that
@@ -1193,6 +1199,7 @@ mod tests {
             jitter_ms: Some(2),
             loss_percent: Some(0),
             last_error: Some("timeout".to_string()),
+            pairing_code: Some("482913".to_string()),
             last_pong_at: Some(1_700_000_000_123),
             dns_ips: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3))],
             ips: HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]),

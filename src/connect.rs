@@ -707,11 +707,29 @@ async fn peer_fingerprint(conn: &ArcConn) -> Option<String> {
         .map(|cert| crypto::generate_fingerprint(cert))
 }
 
+/// Where a dial records the fingerprint of the certificate the peer
+/// presented, also when the handshake then fails. A peer that has not
+/// approved us yet rejects our certificate after sending its own, so this is
+/// how the dialing side learns who it is waiting for and can show the same
+/// six-digit pairing code as the other screen.
+pub(crate) type SeenPeer = Arc<std::sync::Mutex<Option<String>>>;
+
+#[cfg(test)]
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
     timeout: Duration,
     expected_fingerprint: Option<String>,
+) -> Result<(ArcConn, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
+    connect_observed(addr, cert, timeout, expected_fingerprint, None).await
+}
+
+async fn connect_observed(
+    addr: SocketAddr,
+    cert: Certificate,
+    timeout: Duration,
+    expected_fingerprint: Option<String>,
+    seen: Option<SeenPeer>,
 ) -> Result<(ArcConn, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     let bind_addr = if addr.is_ipv4() {
@@ -762,7 +780,22 @@ async fn connect(
         }
         // Legacy/TOFU path: no pin known yet. The first successful connection
         // learns the fingerprint (see `connect_to_handle`).
-        None => config.insecure_skip_verify = true,
+        None => {
+            config.insecure_skip_verify = true;
+            // Only records, never rejects: the pin is enforced on the
+            // completed connection (see `connect_to_handle`).
+            if let Some(seen) = seen {
+                config.verify_peer_certificate = Some(Arc::new(
+                    move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
+                        if let Some(cert) = certs.first() {
+                            *seen.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(crypto::generate_fingerprint(cert));
+                        }
+                        Ok(())
+                    },
+                ));
+            }
+        }
     }
     let timeout = tokio::time::sleep(timeout);
     tokio::select! {
@@ -863,12 +896,21 @@ async fn connect_first(
     cert: Certificate,
     timeout: Duration,
     expected_fingerprint: Option<String>,
+    seen: Option<SeenPeer>,
 ) -> Result<(ArcConn, SocketAddr), LanMouseConnectionError> {
     let mut last_error = LanMouseConnectionError::NotConnected;
     let mut attempted = 0usize;
     for addr in addrs {
         attempted += 1;
-        match connect(addr, cert.clone(), timeout, expected_fingerprint.clone()).await {
+        match connect_observed(
+            addr,
+            cert.clone(),
+            timeout,
+            expected_fingerprint.clone(),
+            seen.clone(),
+        )
+        .await
+        {
             Ok(connected) => return Ok(connected),
             Err((addr, e)) => {
                 log::warn!("failed to connect to {addr}: `{e}`");
@@ -880,6 +922,22 @@ async fn connect_first(
         return Err(LanMouseConnectionError::NotConnected);
     }
     Err(last_error)
+}
+
+/// The pairing code to show after a refused dial, if the peer presented a
+/// certificate. Not for an impostor: when this client already has a pinned
+/// identity and the presented certificate is another one, showing a code to
+/// "compare" would invite approving the wrong machine.
+fn pairing_code_after_refusal(
+    own: &str,
+    presented: Option<&str>,
+    pinned: Option<&str>,
+) -> Option<String> {
+    let presented = presented?;
+    if pinned.is_some_and(|pin| !pin.eq_ignore_ascii_case(presented)) {
+        return None;
+    }
+    Some(crypto::sas_code(own, presented))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -954,6 +1012,7 @@ async fn connect_to_handle(
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
 
+    let seen: SeenPeer = Default::default();
     let result = async {
         if ctx.active(handle).is_some() {
             return Ok(());
@@ -992,7 +1051,14 @@ async fn connect_to_handle(
         // rotated certificate needs a second handshake otherwise. The pin is
         // enforced on the completed connection below, before it is installed
         // or any application data is exchanged.
-        let (conn, addr) = connect_first(addrs, ctx.cert.clone(), ADDRESS_TIMEOUT, None).await?;
+        let (conn, addr) = connect_first(
+            addrs,
+            ctx.cert.clone(),
+            ADDRESS_TIMEOUT,
+            None,
+            Some(seen.clone()),
+        )
+        .await?;
         verify_connected_peer(ctx, handle, &conn, expected.as_deref()).await?;
         log::info!("client ({handle}) connected @ {addr}");
 
@@ -1063,13 +1129,31 @@ async fn connect_to_handle(
     .await;
 
     ctx.connecting.borrow_mut().remove(&handle);
-    match &result {
-        Ok(()) => ctx.client_manager.set_last_error(handle, None),
+    let code = match &result {
+        Ok(()) => {
+            ctx.client_manager.set_last_error(handle, None);
+            None
+        }
         Err(error) => {
             log::warn!("client {handle} connect attempt failed: {error}");
             ctx.client_manager
                 .set_last_error(handle, Some(error.to_string()));
+            let presented = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            pairing_code_after_refusal(
+                &crypto::certificate_fingerprint(&ctx.cert),
+                presented.as_deref(),
+                ctx.client_manager.fingerprint(handle).as_deref(),
+            )
         }
+    };
+    if ctx.client_manager.pairing_code(handle) != code {
+        if let Some(code) = &code {
+            log::info!(
+                "client {handle} has not approved this PC yet; pairing code {code} (compare it with the request on the other PC)"
+            );
+        }
+        ctx.client_manager.set_pairing_code(handle, code);
+        ctx.notify_state_changed(handle);
     }
     if result.is_err() && ctx.client_manager.is_active(handle) {
         // Retry in the background even though no connection has been
@@ -2194,6 +2278,68 @@ mod tests {
                 listener.terminate().await;
             })
             .await;
+    }
+
+    /// The PC that dials learns who refused it: the listener's certificate
+    /// passes through the dialer's verifier before the listener rejects the
+    /// dialer's, so both screens can show the same pairing code.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_dial_still_sees_the_peer_certificate() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let port = free_udp_port();
+                let listener_cert = unique_cert("sas-listener");
+                let listener_fp = crypto::certificate_fingerprint(&listener_cert);
+                let client_cert = unique_cert("sas-client");
+                let client_fp = crypto::certificate_fingerprint(&client_cert);
+                let mut listener = listener_with_authorized(port, listener_cert, Vec::new()).await;
+
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                let seen = SeenPeer::default();
+                let result = connect_observed(
+                    addr,
+                    client_cert,
+                    Duration::from_secs(3),
+                    None,
+                    Some(seen.clone()),
+                )
+                .await;
+                assert!(result.is_err(), "an unapproved dial must not connect");
+                let presented = seen.lock().expect("lock").clone();
+                assert_eq!(presented.as_deref(), Some(listener_fp.as_str()));
+
+                // The code the dialer shows is the one the listener shows.
+                let dialer_code =
+                    pairing_code_after_refusal(&client_fp, presented.as_deref(), None)
+                        .expect("code");
+                assert_eq!(dialer_code, crypto::sas_code(&listener_fp, &client_fp));
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    #[test]
+    fn no_pairing_code_for_a_certificate_other_than_the_pinned_one() {
+        let own = "AA:AA";
+        assert_eq!(
+            pairing_code_after_refusal(own, None, None),
+            None,
+            "no certificate seen"
+        );
+        assert!(
+            pairing_code_after_refusal(own, Some("BB:BB"), None).is_some(),
+            "first contact"
+        );
+        assert!(
+            pairing_code_after_refusal(own, Some("bb:bb"), Some("BB:BB")).is_some(),
+            "the pinned peer, case aside"
+        );
+        assert_eq!(
+            pairing_code_after_refusal(own, Some("CC:CC"), Some("BB:BB")),
+            None,
+            "an impostor on the pinned peer's address"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

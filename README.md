@@ -71,6 +71,19 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
 - O serviço/daemon e o frontend são processos separados; fechar a janela não
   precisa derrubar o daemon (ver seção de fechamento abaixo).
 
+### Pareamento com código de 6 dígitos
+
+- Quando um PC pede conexão a outro que ainda não o aprovou, **os dois mostram
+  o mesmo código de 6 dígitos**: o que recebe, na janela de aprovação; o que
+  pediu, na linha do dispositivo ("aguardando aprovação no outro PC — confira
+  se ele mostra o código 482 913") e em `lan-mouse cli list`. Códigos iguais
+  significam que não há ninguém no meio; diferentes, recuse.
+- O código vem das impressões digitais dos dois certificados, então não muda
+  o protocolo: o PC que pediu enxerga o certificado do outro durante o
+  handshake, mesmo quando é recusado. Se o PC já tinha uma identidade salva e
+  outro certificado aparece no endereço dele, nenhum código é mostrado (seria
+  convidar a aprovar a máquina errada).
+
 ### Clipboard: Ctrl+C / Ctrl+V de texto e imagens
 
 - Sincronização de clipboard entre as máquinas: **texto simples, HTML e imagens

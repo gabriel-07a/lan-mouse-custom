@@ -565,6 +565,11 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     if let Some(latency) = describe_latency(&state.latency) {
                         println!("      latency: {latency}");
                     }
+                    if let Some(code) = &state.pairing_code {
+                        println!(
+                            "      waiting for approval on that PC: check that it shows the code {code}"
+                        );
+                    }
                 }
                 break;
             }
