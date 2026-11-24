@@ -158,6 +158,13 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
   caixa externa contava como borda, então nesse layout o empurrão nunca virava
   pressão e o dock não abria. Agora qualquer movimento que esbarra na borda de
   um monitor sem outro monitor continuando ali é reenviado como pressão.
+- As **barreiras de captura** (que detectam o cursor saindo para o outro PC)
+  ficam só nas bordas que têm um PC configurado. Antes havia barreira nas
+  quatro bordas, e a de baixo pegava o ponteiro antes do dock: o dock parava de
+  abrir depois da primeira captura, com o mouse remoto e com o local. Quando o
+  layout muda (um PC trocado de lado) ou um monitor é ligado/desligado, as
+  barreiras são trocadas na mesma sessão (`Disable` → barreiras → `Enable`),
+  sem o GNOME pedir permissão de novo.
 - Isso é testado num GNOME Shell real (headless, isolado da sessão):
   `scripts/gnome-headless.sh --test`, também com o notebook em escala 5/3 e
   com dois monitores desalinhados (veja `docs/testing/real-compositors.md`).
@@ -168,6 +175,27 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
   como a especificação pede; antes contavam a partir da criação do backend, o
   que quebraria gestos de borda baseados em tempo em compositores que usam o
   horário do frame.
+
+### Saída de emergência
+
+- Enquanto o teclado e o mouse deste PC controlam outro, **segurar o Shift
+  Direito sozinho por 3 segundos** e soltar traz o controle de volta, sempre.
+  Diferente do atalho configurável (`release_bind`, Ctrl+Shift+Super+Alt por
+  padrão), este não muda nem pode ser desligado: serve para nunca ficar sem
+  controle do próprio PC quando o outro para de responder. Só dispara se nada
+  mais for apertado no meio, então Shift+letra e arrastar com Shift não contam.
+
+### Windows: janelas de administrador
+
+- O Windows não deixa um programa comum mandar teclado e mouse para janelas
+  que rodam como administrador (Gerenciador de Tarefas, instaladores, Regedit,
+  terminal "como administrador"): controlado pelo outro PC, cliques e teclas
+  nessas janelas eram descartados. O instalador agora tem a opção **Control
+  administrator windows** (marcada por padrão): o Lan Mouse inicia no logon por
+  uma tarefa agendada com o privilégio mais alto do usuário, sem pedido do UAC,
+  e passa a controlar essas janelas. Desmarcada (ou se a tarefa não puder ser
+  criada), volta ao atalho da pasta Inicializar, sem privilégio. A tela de
+  bloqueio e o Ctrl+Alt+Del continuam fora do alcance de qualquer programa.
 
 ### Rede e lag (ajustes para o meu setup)
 

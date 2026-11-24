@@ -37,6 +37,8 @@
 
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!include "LogicLib.nsh"
+!include "Sections.nsh"
 
 !ifndef APPVERSION
   !define APPVERSION "0.2.13"
@@ -47,6 +49,7 @@
 !define PUBLISHER "Gabriel Arcanjo"
 !define EXENAME "lan-mouse.exe"
 !define FRONTENDEXENAME "lan-mouse-gpui.exe"
+!define TASKNAME "Lan Mouse"
 
 ; The only directories this installer/uninstaller may touch.
 !define LOCAL_USERDATA "$LOCALAPPDATA\lan-mouse"
@@ -378,14 +381,61 @@ Section "Lan Mouse" SEC_MAIN
   lan_mouse_firewall_ok:
 SectionEnd
 
+; Windows keeps programs from sending input to windows that run with higher
+; rights (UIPI): while a peer drives this PC, Task Manager, installers, Regedit
+; or an "as administrator" terminal in front would drop every key and click.
+; Started elevated, Lan Mouse can drive them too. Checked by default; it only
+; changes how "Start with Windows" starts it.
+Section "Control administrator windows" SEC_ELEVATED
+SectionEnd
+
 ; Checked by default: a KVM is only useful if it is running.
 Section "Start with Windows" SEC_STARTUP
+  ; Start from a clean state, so switching between the two ways works.
+  Delete "$SMSTARTUP\Lan Mouse.lnk"
+  nsExec::ExecToStack '"$SYSDIR\schtasks.exe" /Delete /TN "${TASKNAME}" /F'
+  Pop $0
+  Pop $1
+
+  ${If} ${SectionIsSelected} ${SEC_ELEVATED}
+    ; A logon task for every member of Users with their highest rights:
+    ; administrators get the elevated token without a UAC prompt, standard
+    ; users start normally. Priority 4 is normal (tasks default to 7, below
+    ; normal, which would delay input under load). The XML is UTF-16, which
+    ; schtasks reads reliably.
+    InitPluginsDir
+    FileOpen $2 "$PLUGINSDIR\task.xml" w
+    FileWriteWord $2 0xFEFF
+    FileWriteUTF16LE $2 '<?xml version="1.0" encoding="UTF-16"?>$\r$\n'
+    FileWriteUTF16LE $2 '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">$\r$\n'
+    FileWriteUTF16LE $2 '  <RegistrationInfo><Description>Starts Lan Mouse at logon with the user$\'s highest rights, so it can control administrator windows.</Description></RegistrationInfo>$\r$\n'
+    FileWriteUTF16LE $2 '  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>$\r$\n'
+    FileWriteUTF16LE $2 '  <Principals><Principal id="Users"><GroupId>S-1-5-32-545</GroupId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>$\r$\n'
+    FileWriteUTF16LE $2 '  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>4</Priority></Settings>$\r$\n'
+    FileWriteUTF16LE $2 '  <Actions Context="Users"><Exec><Command>"$INSTDIR\${EXENAME}"</Command></Exec></Actions>$\r$\n'
+    FileWriteUTF16LE $2 '</Task>$\r$\n'
+    FileClose $2
+    nsExec::ExecToStack '"$SYSDIR\schtasks.exe" /Create /TN "${TASKNAME}" /XML "$PLUGINSDIR\task.xml" /F'
+    Pop $0
+    Pop $1
+    ${If} $0 == "0"
+      StrCpy $0 "autostart: elevated logon task created"
+      Call LogInstallLine
+      Goto lan_mouse_startup_done
+    ${EndIf}
+    StrCpy $R3 "$0"
+    StrCpy $0 "autostart: elevated logon task FAILED (exit=$R3 $1); using the Startup shortcut"
+    Call LogInstallLine
+    DetailPrint "Warning: could not create the elevated logon task; Lan Mouse starts without administrator rights."
+  ${EndIf}
   CreateShortCut "$SMSTARTUP\Lan Mouse.lnk" "$INSTDIR\${EXENAME}" "" "$INSTDIR\icon.ico" 0
+  lan_mouse_startup_done:
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_MAIN} "Lan Mouse itself, its icons and shortcuts."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STARTUP} "Start Lan Mouse automatically on login (recommended)."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_ELEVATED} "Start it with administrator rights (no prompt), so a PC controlling this one can also use Task Manager, installers and other administrator windows."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Function .onInstSuccess
@@ -426,6 +476,9 @@ Section "Uninstall"
   un_user_data_done:
 
   Delete "$SMSTARTUP\Lan Mouse.lnk"
+  nsExec::ExecToStack '"$SYSDIR\schtasks.exe" /Delete /TN "${TASKNAME}" /F'
+  Pop $0
+  Pop $1
   Delete "$DESKTOP\Lan Mouse.lnk"
   Delete "$SMPROGRAMS\Lan Mouse\Lan Mouse.lnk"
   Delete "$SMPROGRAMS\Lan Mouse\Uninstall.lnk"
