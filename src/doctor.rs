@@ -989,4 +989,34 @@ mod tests {
         assert!(warnings[0].contains("legacy cache directory"));
         assert!(warnings[0].contains("/cache/lan-mouse/remote-desktop.token"));
     }
+
+    #[test]
+    fn policies_are_summarised_without_capability_details_when_denied() {
+        assert_eq!(
+            policy_summary(&lan_mouse_ipc::DirectionPolicy::deny()),
+            "denied"
+        );
+        let all = policy_summary(&lan_mouse_ipc::DirectionPolicy::allow_all());
+        assert!(all.starts_with("allowed ["), "{all}");
+        assert!(
+            all.contains("keyboard") && all.contains("clipboard"),
+            "{all}"
+        );
+    }
+
+    /// An empty or whitespace token file is a missing consent, not a present
+    /// one (the portal would show its dialog anyway).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn only_a_non_empty_token_file_counts_as_present() {
+        let dir = std::env::temp_dir().join(format!("lan-mouse-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("token");
+        assert!(!token_present(&token), "missing file");
+        std::fs::write(&token, " \n").unwrap();
+        assert!(!token_present(&token), "blank file");
+        std::fs::write(&token, "abc").unwrap();
+        assert!(token_present(&token));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

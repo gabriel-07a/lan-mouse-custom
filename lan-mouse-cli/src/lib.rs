@@ -1285,6 +1285,42 @@ mod tests {
     }
 
     #[test]
+    fn duration_edge_cases() {
+        assert_eq!(
+            parse_duration("0s").expect("zero"),
+            Some(1),
+            "never a zero-length deny"
+        );
+        assert_eq!(parse_duration(" 2H ").expect("case and spaces"), Some(7200));
+        assert_eq!(parse_duration("").expect("empty"), None);
+        assert_eq!(parse_duration("permanent").expect("permanent"), None);
+        for bad in ["10x", "m", "h2", "-5m", "1.5h"] {
+            assert!(parse_duration(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn capability_lists_become_policies() {
+        let none = parse_policy("none").expect("none");
+        assert!(!none.allowed, "an empty list denies the direction");
+        let all = parse_policy("all").expect("all");
+        assert!(all.allowed);
+        let some = parse_policy("pointer,keyboard").expect("list");
+        assert!(some.allowed);
+        assert_ne!(some.capabilities, all.capabilities, "clipboard left out");
+        assert!(parse_policy("pointer,teleport").is_err());
+    }
+
+    #[test]
+    fn ipv6_addresses_are_dropped_and_an_ipv6_only_list_is_refused() {
+        let v4: IpAddr = "192.168.1.20".parse().unwrap();
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+        assert_eq!(validate_ips(vec![v4, v6]).expect("mixed"), vec![v4]);
+        assert!(validate_ips(vec![v6]).is_err(), "nothing usable left");
+        assert_eq!(validate_ips(vec![]).expect("empty"), Vec::<IpAddr>::new());
+    }
+
+    #[test]
     fn unknown_subcommand_is_rejected() {
         assert!(CliArgs::try_parse_from(["lan-mouse-cli", "teleport"]).is_err());
     }

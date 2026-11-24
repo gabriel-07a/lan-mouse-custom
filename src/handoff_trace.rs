@@ -90,16 +90,22 @@ fn open_writer() -> Option<BufWriter<File>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok()?;
     }
-    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= MAX_TRACE_BYTES) {
-        let backup = path.with_extension("jsonl.1");
-        let _ = fs::rename(&path, backup);
-    }
+    rotate_if_full(&path, MAX_TRACE_BYTES);
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .ok()?;
     Some(BufWriter::new(file))
+}
+
+/// Move a trace that reached `max_bytes` to `<name>.jsonl.1`, replacing the
+/// previous backup: at most two files, the newest records never lost.
+fn rotate_if_full(path: &std::path::Path, max_bytes: u64) {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() >= max_bytes) {
+        let backup = path.with_extension("jsonl.1");
+        let _ = fs::rename(path, backup);
+    }
 }
 
 fn write_record(record: &serde_json::Value) {
@@ -203,5 +209,66 @@ mod tests {
         if !enabled() {
             event("controller", "test", None, None, &[]);
         }
+    }
+
+    fn temp(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("lan-mouse-trace-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_full_trace_becomes_the_single_backup() {
+        let dir = temp("rotate");
+        let path = dir.join("handoff-trace.jsonl");
+        let backup = dir.join("handoff-trace.jsonl.1");
+        fs::write(&backup, b"oldest").unwrap();
+        fs::write(&path, vec![b'x'; 100]).unwrap();
+
+        rotate_if_full(&path, 1000);
+        assert!(path.exists(), "below the limit nothing moves");
+        assert_eq!(fs::read(&backup).unwrap(), b"oldest");
+
+        rotate_if_full(&path, 100);
+        assert!(!path.exists(), "the full trace moved away");
+        assert_eq!(
+            fs::read(&backup).unwrap().len(),
+            100,
+            "it replaced the old backup"
+        );
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "never more than two files"
+        );
+
+        // nothing to rotate: no error, nothing created
+        rotate_if_full(&path, 100);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extra_fields_and_missing_ones_shape_the_record() {
+        let record = build_record("controller", "capture.begin", None, None, &[]);
+        let object = record.as_object().unwrap();
+        assert!(!object.contains_key("serial") && !object.contains_key("peer"));
+        assert!(object["ts_unix_us"].as_u64().unwrap() > 1_600_000_000_000_000);
+        let record = build_record(
+            "receiver",
+            "receiver.input_gap_exceeded",
+            Some(3),
+            Some("10.0.0.2:1"),
+            &[("gap_us", "9000".into()), ("dx", "-2.5".into())],
+        );
+        assert_eq!(record["gap_us"], "9000");
+        assert_eq!(
+            record["dx"], "-2.5",
+            "values are strings, as the schema says"
+        );
+        // one JSON object per line: no newline can sneak into a record
+        assert!(!serde_json::to_string(&record).unwrap().contains('\n'));
     }
 }

@@ -611,7 +611,7 @@ impl TryFrom<Linux> for Windows {
             Linux::KeyRewind => Err(()),
             Linux::KeyPhone => Err(()),
             Linux::KeyIso => Err(()),
-            Linux::KeyConfig => Err(()),
+            Linux::KeyConfig => Ok(Self::ALConsumerControlConfiguration),
             Linux::KeyHomepage => Ok(Self::ACHome),
             Linux::KeyRefresh => Ok(Self::ACRefresh),
             Linux::KeyExit => Err(()),
@@ -652,7 +652,7 @@ impl TryFrom<Linux> for Windows {
             Linux::KeyQuestion => Err(()),
             Linux::KeyEmail => Err(()),
             Linux::KeyChat => Err(()),
-            Linux::KeySearch => Err(()),
+            Linux::KeySearch => Ok(Self::ACSearch),
             Linux::KeyConnect => Err(()),
             Linux::KeyFinance => Err(()),
             Linux::KeySport => Err(()),
@@ -702,7 +702,9 @@ impl TryFrom<Windows> for Linux {
             Windows::Shutdown => Ok(Self::KeyPower),
             Windows::SystemSleep => Ok(Self::KeySleep),
             Windows::SystemWakeUp => Ok(Self::KeyWakeup),
-            Windows::ErrorRollOver => Ok(Self::KeyRo),
+            // "Too many keys pressed" from the keyboard, not a key: mapping it
+            // to KEY_RO typed "/" on ABNT2 during a rollover.
+            Windows::ErrorRollOver => Err(()),
             Windows::KeyA => Ok(Self::KeyA),
             Windows::KeyB => Ok(Self::KeyB),
             Windows::KeyC => Ok(Self::KeyC),
@@ -799,7 +801,9 @@ impl TryFrom<Windows> for Linux {
             Windows::Keypad0Insert => Ok(Self::KeyKp0),
             Windows::KeypadDot => Ok(Self::KeyKpDot),
             Windows::KeyNonUSSlashBar => Ok(Self::Key102nd),
-            Windows::KeyApplication => Ok(Self::KeyMenu),
+            // The context-menu key is KEY_COMPOSE on Linux keyboards (xkb maps
+            // it to "Menu"); KEY_MENU is another key there.
+            Windows::KeyApplication => Ok(Self::KeyCompose),
             Windows::KeypadEquals => Ok(Self::KeyKpequal),
             Windows::KeyF13 => Ok(Self::KeyF13),
             Windows::KeyF14 => Ok(Self::KeyF14),
@@ -839,11 +843,11 @@ impl TryFrom<Windows> for Linux {
             Windows::KeyMute => Ok(Self::KeyMute),
             Windows::KeyVolumeUp => Ok(Self::KeyVolumeUp),
             Windows::KeyVolumeDown => Ok(Self::KeyVolumeDown),
-            Windows::ALConsumerControlConfiguration => Err(()),
+            Windows::ALConsumerControlConfiguration => Ok(Self::KeyConfig),
             Windows::ALEmailReader => Ok(Self::KeyMail),
             Windows::ALCalculator => Ok(Self::KeyCalc),
             Windows::ALLocalMachineBrowser => Ok(Self::KeyFile),
-            Windows::ACSearch => Ok(Self::KeyWww),
+            Windows::ACSearch => Ok(Self::KeySearch),
             Windows::ACHome => Ok(Self::KeyHomepage),
             Windows::ACBack => Ok(Self::KeyBack),
             Windows::ACForward => Ok(Self::KeyForward),
@@ -899,6 +903,110 @@ mod tests {
         assert_eq!(
             Windows::try_from(0xE045u32).ok().map(|key| key as u32),
             Some(0xE045)
+        );
+    }
+
+    /// Linux keys without a Windows scan code of their own go to the
+    /// closest one; coming back they are that key, not the original.
+    const LINUX_APPROXIMATIONS: [Linux; 9] = [
+        Linux::KeyZenkakuhankaku, // F24
+        Linux::KeyKpJpComma,      // keypad comma
+        Linux::KeyLinefeed,       // Enter
+        Linux::KeyKpplusminus,    // keypad +
+        Linux::KeyMenu,           // Application (the context-menu key is KEY_COMPOSE)
+        Linux::KeyFind,           // Browser Search
+        Linux::KeyWww,            // Browser Search
+        Linux::KeyHelp,           // F1
+        Linux::KeyComputer,       // Browser Home
+    ];
+
+    /// Every Linux key with a Windows mapping comes back as itself, except
+    /// the documented approximations: a key that turns into another one on
+    /// the way back types the wrong thing on the other PC.
+    #[test]
+    fn every_linux_key_survives_the_round_trip() {
+        let mut mapped = 0;
+        for code in 0u32..=0x2ff {
+            let Ok(key) = Linux::try_from(code) else {
+                continue;
+            };
+            let Ok(windows) = Windows::try_from(key) else {
+                continue;
+            };
+            mapped += 1;
+            let back = Linux::try_from(windows);
+            if LINUX_APPROXIMATIONS.contains(&key) {
+                assert!(back.is_ok(), "{key:?} -> {windows:?} has no way back");
+            } else {
+                assert_eq!(
+                    back,
+                    Ok(key),
+                    "{key:?} -> {windows:?} ({:#x})",
+                    windows as u32
+                );
+            }
+        }
+        assert!(mapped >= 150, "only {mapped} Linux keys map to Windows");
+    }
+
+    /// Every Windows scan code is a Linux key that maps back to the same
+    /// code, except the two that are not keys.
+    #[test]
+    fn every_windows_scan_code_survives_the_round_trip() {
+        for code in 0u32..=0xe1ff {
+            let Ok(windows) = Windows::try_from(code) else {
+                continue;
+            };
+            match windows {
+                // not keys: dropped
+                Windows::ErrorRollOver => assert_eq!(Linux::try_from(windows), Err(())),
+                // Windows' synthetic shift around navigation keys
+                Windows::KeyFakeRightShift => {
+                    assert_eq!(Linux::try_from(windows), Ok(Linux::KeyRightShift))
+                }
+                _ => {
+                    let key = Linux::try_from(windows)
+                        .unwrap_or_else(|_| panic!("{windows:?} ({code:#x}) has no Linux key"));
+                    let back = Windows::try_from(key).map(|w| w as u32);
+                    assert_eq!(back, Ok(code), "{windows:?} ({code:#x}) -> {key:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_context_menu_key_opens_the_context_menu_on_linux() {
+        assert_eq!(
+            Linux::try_from(Windows::KeyApplication),
+            Ok(Linux::KeyCompose),
+            "KEY_COMPOSE is the Linux context-menu key"
+        );
+        assert_eq!(
+            Windows::try_from(Linux::KeyCompose).map(|w| w as u32),
+            Ok(0xe05d)
+        );
+    }
+
+    #[test]
+    fn a_keyboard_rollover_error_types_nothing() {
+        // KEY_RO is "/ ?" on ABNT2
+        assert_eq!(Linux::try_from(Windows::ErrorRollOver), Err(()));
+    }
+
+    #[test]
+    fn search_and_config_keys_cross_both_ways() {
+        assert_eq!(
+            Windows::try_from(Linux::KeySearch).map(|w| w as u32),
+            Ok(0xe065)
+        );
+        assert_eq!(Linux::try_from(Windows::ACSearch), Ok(Linux::KeySearch));
+        assert_eq!(
+            Linux::try_from(Windows::ALConsumerControlConfiguration),
+            Ok(Linux::KeyConfig)
+        );
+        assert_eq!(
+            Windows::try_from(Linux::KeyConfig).map(|w| w as u32),
+            Ok(Windows::ALConsumerControlConfiguration as u32)
         );
     }
 

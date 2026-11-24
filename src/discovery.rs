@@ -951,4 +951,120 @@ garbage line
         assert!(parse_reply(b"nope").is_none());
         assert!(parse_reply(MAGIC).is_none());
     }
+
+    fn beacon(fingerprint: Option<&str>) -> BeaconReply {
+        BeaconReply {
+            port: 4243,
+            link: LinkKind::Wired,
+            hostname: "DESKTOP-GABRIEL".into(),
+            version: "0.2.20".into(),
+            fingerprint: fingerprint.map(str::to_string),
+        }
+    }
+
+    /// A reply and an announcement carry the same JSON under different
+    /// magics; each parser only accepts its own, so an announcement is never
+    /// taken for the answer to our probe (or the other way round).
+    #[test]
+    fn replies_and_announcements_are_not_interchangeable() {
+        let reply = encode(MAGIC, &beacon(Some("aa"))).unwrap();
+        let announce = encode(ANNOUNCE_MAGIC, &beacon(Some("aa"))).unwrap();
+        assert!(parse_reply(&reply).is_some());
+        assert!(parse_announce(&announce).is_some());
+        assert!(parse_reply(&announce).is_none());
+        assert!(parse_announce(&reply).is_none());
+    }
+
+    /// Anything a host on the network sends to the discovery port: the
+    /// parsers must answer None, never panic.
+    #[test]
+    fn garbage_on_the_discovery_port_is_ignored() {
+        let mut huge = MAGIC.to_vec();
+        huge.extend(std::iter::repeat_n(b'{', 64 * 1024));
+        for payload in [
+            b"".to_vec(),
+            MAGIC[..4].to_vec(),
+            [MAGIC.as_slice(), b"{\"port\":\"not a number\"}"].concat(),
+            [MAGIC.as_slice(), b"null"].concat(),
+            [MAGIC.as_slice(), &[0xff, 0xfe, 0x00]].concat(),
+            huge,
+        ] {
+            assert!(parse_reply(&payload).is_none(), "{payload:?}");
+            assert!(parse_announce(&payload).is_none());
+        }
+    }
+
+    /// Builds before the fingerprint field still parse (Network page lists
+    /// them, without the identity).
+    #[test]
+    fn a_reply_from_an_older_build_without_a_fingerprint_parses() {
+        let json = br#"{"port":4242,"link":"Wireless","hostname":"old","version":"0.2.10"}"#;
+        let payload = [MAGIC.as_slice(), json].concat();
+        let Some(HostProbe::LanMouse(reply)) = parse_reply(&payload) else {
+            panic!("an older reply must parse");
+        };
+        assert_eq!(reply.fingerprint, None);
+        assert_eq!(reply.hostname, "old");
+    }
+
+    /// What the Network page shows for each kind of answer.
+    #[test]
+    fn a_probe_answer_becomes_the_listed_device() {
+        let ip = Ipv4Addr::new(192, 168, 166, 166);
+        let device = device_from_probe(ip, HostProbe::LanMouse(beacon(Some("aa:bb"))));
+        assert!(device.lan_mouse);
+        assert_eq!(
+            device.port,
+            Some(4243),
+            "the beacon's port, not the default"
+        );
+        assert_eq!(device.hostname.as_deref(), Some("DESKTOP-GABRIEL"));
+        assert_eq!(
+            device.link,
+            LinkKind::Wired,
+            "the peer knows its own medium"
+        );
+        assert_eq!(device.fingerprint.as_deref(), Some("aa:bb"));
+        assert!(
+            !device.fingerprint_verified,
+            "a beacon is not proof of identity"
+        );
+        assert!(!device.configured);
+
+        let host = device_from_probe(ip, HostProbe::HostOnly);
+        assert!(!host.lan_mouse);
+        assert_eq!(
+            (host.port, host.hostname, host.fingerprint),
+            (None, None, None)
+        );
+    }
+
+    /// The beacon rewrites only its own replies; anything else passes as is.
+    #[test]
+    fn only_beacon_replies_get_their_link_rewritten() {
+        assert_eq!(
+            with_link_for(b"other", IpAddr::from([127, 0, 0, 1])),
+            b"other"
+        );
+        let broken = [MAGIC.as_slice(), b"{not json"].concat();
+        assert_eq!(with_link_for(&broken, IpAddr::from([127, 0, 0, 1])), broken);
+        let reply = encode(MAGIC, &beacon(None)).unwrap();
+        let rewritten = with_link_for(&reply, IpAddr::from([127, 0, 0, 1]));
+        assert!(matches!(
+            parse_reply(&rewritten),
+            Some(HostProbe::LanMouse(BeaconReply { port: 4243, .. }))
+        ));
+    }
+
+    #[test]
+    fn a_refused_probe_means_no_lan_mouse_there() {
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(is_unreachable(&io::Error::from(kind)));
+        }
+        assert!(!is_unreachable(&io::Error::from(io::ErrorKind::TimedOut)));
+    }
 }

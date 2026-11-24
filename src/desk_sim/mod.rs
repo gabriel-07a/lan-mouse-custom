@@ -29,6 +29,8 @@ mod screen;
 #[cfg(test)]
 mod clipboard_scenarios;
 #[cfg(test)]
+mod frontend_scenarios;
+#[cfg(test)]
 mod lock_scenarios;
 #[cfg(test)]
 mod network_scenarios;

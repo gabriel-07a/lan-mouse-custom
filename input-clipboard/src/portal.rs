@@ -677,6 +677,80 @@ mod tests {
 mod mime_tests {
     use super::*;
 
+    /// What a file manager offers (Nautilus: both lists) becomes the local
+    /// list of paths, and the received paths are served in each list's own
+    /// syntax: Nautilus pastes from `x-special/gnome-copied-files`, most
+    /// other programs from `text/uri-list`.
+    #[test]
+    fn copied_files_are_read_and_served_in_both_list_formats() {
+        assert_eq!(format_for_mime(URI_LIST), Some(Format::Files));
+        assert_eq!(format_for_mime(GNOME_COPIED_FILES), Some(Format::Files));
+
+        let from_uris = item_for_mime(
+            Format::Files,
+            URI_LIST,
+            b"file:///home/ana/a%20b.txt\r\nfile:///home/ana/Fotos\r\n".to_vec(),
+        )
+        .expect("paths");
+        let from_gnome = item_for_mime(
+            Format::Files,
+            GNOME_COPIED_FILES,
+            b"copy\nfile:///home/ana/a%20b.txt\nfile:///home/ana/Fotos".to_vec(),
+        )
+        .expect("paths");
+        assert_eq!(from_uris, from_gnome);
+        assert_eq!(from_uris, b"/home/ana/a b.txt\n/home/ana/Fotos\n".to_vec());
+
+        let snapshot = ClipboardSnapshot::from_items([(Format::Files, from_uris)]);
+        let served_gnome = data_for_mime(&snapshot, GNOME_COPIED_FILES).expect("gnome list");
+        assert!(served_gnome.starts_with(b"copy\nfile:///home/ana/a%20b.txt"));
+        let served_uris = data_for_mime(&snapshot, URI_LIST).expect("uri list");
+        assert_eq!(
+            crate::files::paths_from_uri_list(&served_uris),
+            vec![
+                std::path::PathBuf::from("/home/ana/a b.txt"),
+                std::path::PathBuf::from("/home/ana/Fotos")
+            ]
+        );
+        // text and images are served as they are
+        let text = ClipboardSnapshot::from_items([(Format::Text, b"oi".to_vec())]);
+        assert_eq!(data_for_mime(&text, "text/plain"), Some(b"oi".to_vec()));
+    }
+
+    /// A list without any local file (only web links, or a cut list with a
+    /// bad header) is not a file copy.
+    #[test]
+    fn a_list_without_local_files_is_not_a_file_copy() {
+        assert_eq!(
+            item_for_mime(Format::Files, URI_LIST, b"https://example.com\r\n".to_vec()),
+            None
+        );
+        assert_eq!(
+            item_for_mime(
+                Format::Files,
+                GNOME_COPIED_FILES,
+                b"file:///etc/hosts".to_vec()
+            ),
+            None
+        );
+        // other formats pass through untouched
+        assert_eq!(
+            item_for_mime(Format::Png, "image/png", vec![1, 2, 3]),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn file_lists_rank_after_text_html_and_images() {
+        let ordered = ordered_mimes(&[
+            URI_LIST.to_string(),
+            "image/png".to_string(),
+            "text/plain".to_string(),
+        ]);
+        assert_eq!(ordered, vec!["text/plain", "image/png", URI_LIST]);
+        assert!(canonical_mimes().contains(&URI_LIST.to_string()));
+    }
+
     #[test]
     fn supported_mimes_come_first_and_in_cheap_order() {
         let mimes = vec![

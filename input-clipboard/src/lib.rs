@@ -735,3 +735,130 @@ mod tests {
         assert!(!Error::TooLarge.needs_backend_restart());
     }
 }
+
+#[cfg(test)]
+mod file_bundling_tests {
+    use std::{cell::Cell, path::PathBuf, rc::Rc};
+
+    use super::*;
+
+    fn temp(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lan-mouse-bundling-{label}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn limits(max_files: usize) -> Rc<Cell<Limits>> {
+        Rc::new(Cell::new(Limits {
+            max_files,
+            ..Limits::default()
+        }))
+    }
+
+    /// The copy that leaves: the files alone as a bundle; the file manager's
+    /// text (this PC's paths) stays behind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_copy_is_read_as_a_bundle_without_the_paths_text() {
+        let src = temp("src");
+        std::fs::write(src.join("a.txt"), b"conteudo").unwrap();
+        let local = SharedClipboard::new();
+        local.set_local(ClipboardSnapshot::from_items([
+            (Format::Files, files::local_item(&[src.join("a.txt")])),
+            (
+                Format::Text,
+                src.join("a.txt").to_string_lossy().as_bytes().to_vec(),
+            ),
+        ]));
+        let mut backend = FileBundling::with_root(local, limits(1 << 20), temp("root"));
+        let read = backend.read().await.unwrap();
+        assert_eq!(read.formats().collect::<Vec<_>>(), vec![Format::Files]);
+        let entries = files::decode(read.get(Format::Files).unwrap()).unwrap();
+        assert_eq!(entries[0].data.as_deref(), Some(b"conteudo".as_slice()));
+    }
+
+    /// Over the limit the files stay home, but what else was copied (the
+    /// paths as text) is still shared.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_copy_over_the_limit_shares_the_text_only() {
+        let src = temp("big");
+        std::fs::write(src.join("big.bin"), vec![7u8; 4096]).unwrap();
+        let local = SharedClipboard::new();
+        local.set_local(ClipboardSnapshot::from_items([
+            (Format::Files, files::local_item(&[src.join("big.bin")])),
+            (Format::Text, b"/somewhere/big.bin".to_vec()),
+        ]));
+        let mut backend = FileBundling::with_root(local, limits(1024), temp("root"));
+        let read = backend.read().await.unwrap();
+        assert_eq!(read.formats().collect::<Vec<_>>(), vec![Format::Text]);
+    }
+
+    /// Writing a received bundle puts this PC's extracted paths on the
+    /// clipboard, and reading that back yields the very same bundle, so the
+    /// sync layer recognises the echo by hash.
+    #[tokio::test(flavor = "current_thread")]
+    async fn writing_a_bundle_extracts_it_and_reads_back_identically() {
+        let src = temp("src");
+        std::fs::create_dir_all(src.join("pasta")).unwrap();
+        std::fs::write(src.join("pasta/x.txt"), b"x").unwrap();
+        let bundle = files::pack(&[src.join("pasta")], 1 << 20).unwrap();
+        let received = ClipboardSnapshot::from_items([(Format::Files, bundle)]);
+
+        let root = temp("root");
+        let local = SharedClipboard::new();
+        let mut backend = FileBundling::with_root(local.clone(), limits(1 << 20), root.clone());
+        backend.write(&received).await.unwrap();
+
+        let on_clipboard = local.current();
+        let paths = files::local_paths(on_clipboard.get(Format::Files).unwrap());
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with(&root), "{paths:?}");
+        assert_eq!(std::fs::read(paths[0].join("x.txt")).unwrap(), b"x");
+        assert!(
+            on_clipboard.get(Format::Text).is_some(),
+            "paths as text for editors"
+        );
+
+        let echo = backend.read().await.unwrap();
+        assert_eq!(echo.hash(), received.hash());
+    }
+
+    /// A hostile bundle is refused before anything is written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hostile_bundle_is_refused_and_writes_nothing() {
+        let root = temp("root");
+        let evil = files::encode(&[files::Entry {
+            path: "../escaped.txt".into(),
+            data: Some(b"x".to_vec()),
+        }]);
+        let mut backend =
+            FileBundling::with_root(SharedClipboard::new(), limits(1 << 20), root.clone());
+        let result = backend
+            .write(&ClipboardSnapshot::from_items([(Format::Files, evil)]))
+            .await;
+        assert!(result.is_err());
+        assert!(!root.parent().unwrap().join("escaped.txt").exists());
+        assert_eq!(std::fs::read_dir(&root).map(|d| d.count()).unwrap_or(0), 0);
+    }
+
+    /// Without files the wrapper changes nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_and_images_pass_through_unchanged() {
+        let local = SharedClipboard::new();
+        let copy = ClipboardSnapshot::from_items([
+            (Format::Text, b"oi".to_vec()),
+            (Format::Png, vec![0x89, b'P', b'N', b'G']),
+        ]);
+        local.set_local(copy.clone());
+        let mut backend = FileBundling::with_root(local.clone(), limits(1 << 20), temp("root"));
+        assert_eq!(backend.read().await.unwrap(), copy);
+        backend.write(&copy).await.unwrap();
+        assert_eq!(local.current(), copy);
+    }
+}
