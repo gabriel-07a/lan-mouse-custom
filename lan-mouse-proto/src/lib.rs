@@ -75,6 +75,11 @@ pub mod capabilities {
     /// the connection on an unknown event id, so the event must only be sent
     /// when the peer advertised this bit.
     pub const LOCK_SYNC: u32 = 1 << 11;
+    /// The peer accepts copied files and folders on the clipboard
+    /// ([`super::clipboard::MIME_FILES`]). Older peers reject a clipboard
+    /// frame with an unknown format id, so files are left out of what is
+    /// offered to a peer without this bit.
+    pub const CLIPBOARD_FILES: u32 = 1 << 12;
 }
 
 /// Bits of [`ProtoEvent::LockState`].
@@ -92,7 +97,8 @@ pub const CAPABILITIES: u32 = capabilities::ENTER_ACK
     | capabilities::RETURN_COORDINATE
     | capabilities::VERSION_INFO
     | capabilities::LATENCY_PROBE
-    | capabilities::LOCK_SYNC;
+    | capabilities::LOCK_SYNC
+    | capabilities::CLIPBOARD_FILES;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -1201,6 +1207,7 @@ mod extra_tests {
             capabilities::VERSION_INFO,
             capabilities::LATENCY_PROBE,
             capabilities::LOCK_SYNC,
+            capabilities::CLIPBOARD_FILES,
         ];
         for bit in bits {
             assert_ne!(bit, 0, "capability bits must be non-zero");
@@ -1226,6 +1233,7 @@ mod extra_tests {
                 | capabilities::VERSION_INFO
                 | capabilities::LATENCY_PROBE
                 | capabilities::LOCK_SYNC
+                | capabilities::CLIPBOARD_FILES
         );
     }
 

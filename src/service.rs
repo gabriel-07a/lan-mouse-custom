@@ -81,6 +81,8 @@ pub(crate) struct ServiceOptions {
     pub(crate) emulation_backend: Option<EmulationFactory>,
     /// clipboard backend replacing the OS one (portal/Wayland/X11/Windows)
     pub(crate) clipboard_backend: Option<crate::clipboard::ClipboardFactory>,
+    /// where received copied files are extracted (default: the user cache)
+    pub(crate) clipboard_received_dir: Option<std::path::PathBuf>,
     /// answer discovery probes even when `isolated` (never announces)
     pub(crate) discovery_beacon: bool,
     /// keyboard lock state source replacing the OS one
@@ -318,6 +320,7 @@ impl Service {
             clipboard_status_tx,
             devices.clone(),
             options.clipboard_backend,
+            options.clipboard_received_dir,
         );
 
         // create dns resolver

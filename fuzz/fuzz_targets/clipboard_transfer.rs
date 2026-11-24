@@ -19,6 +19,7 @@ fuzz_target!(|data: &[u8]| {
         max_html: 8 * 1024,
         max_image: 16 * 1024,
         max_snapshot: 24 * 1024,
+        max_files: 24 * 1024,
     };
     let now = Instant::now();
     let mut transfer: Option<IncomingTransfer> = None;

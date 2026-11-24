@@ -1402,6 +1402,7 @@ fn configured_limits_apply_live_and_enforce_the_boundary() {
         max_html: 100,
         max_image: 100,
         max_snapshot: 300,
+        max_files: 300,
     };
     net.set_limits(NODE_A, limits);
     net.set_limits(NODE_B, limits);

@@ -285,6 +285,9 @@ impl Clipboard for PortalClipboard {
         if snapshot.get(Format::Text).is_some() {
             mimes.push("text/plain");
         }
+        if snapshot.get(Format::Files).is_some() {
+            mimes.push(GNOME_COPIED_FILES);
+        }
         self.clipboard
             .set_selection(
                 &self.session,
@@ -321,6 +324,7 @@ fn canonical_mimes() -> Vec<String> {
         "UTF8_STRING",
         "text/html",
         "image/png",
+        "text/uri-list",
     ]
     .iter()
     .map(|mime| (*mime).to_string())
@@ -333,7 +337,8 @@ fn ordered_mimes(mimes: &[String]) -> Vec<String> {
         Some(Format::Text) => 0,
         Some(Format::Html) => 1,
         Some(Format::Png) => 2,
-        None => 3,
+        Some(Format::Files) => 3,
+        None => 4,
     };
     let mut ordered = mimes.to_vec();
     ordered.sort_by_key(|mime| rank(mime));
@@ -377,7 +382,9 @@ async fn read_selection(
         .await;
         match read {
             Ok(Ok(bytes)) if !bytes.is_empty() => {
-                snapshot.insert(format, bytes);
+                if let Some(item) = item_for_mime(format, &mime, bytes) {
+                    snapshot.insert(format, item);
+                }
             }
             Ok(Err(e)) => log::debug!("portal clipboard read of {mime} failed: {e}"),
             Err(_) => log::debug!("portal clipboard read of {mime} timed out"),
@@ -446,12 +453,44 @@ fn format_for_mime(mime: &str) -> Option<Format> {
         "text/plain" | "UTF8_STRING" => Some(Format::Text),
         "text/html" => Some(Format::Html),
         "image/png" => Some(Format::Png),
+        URI_LIST | GNOME_COPIED_FILES => Some(Format::Files),
         _ => None,
     }
 }
 
+/// File managers offer copied files as a URI list; Nautilus also as its own
+/// `copy\n<uris>` list, which it prefers when pasting.
+const URI_LIST: &str = "text/uri-list";
+const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
+
 fn data_for_mime(snapshot: &ClipboardSnapshot, mime: &str) -> Option<Vec<u8>> {
-    format_for_mime(mime).and_then(|format| snapshot.get(format).map(|bytes| bytes.to_vec()))
+    let format = format_for_mime(mime)?;
+    let item = snapshot.get(format)?;
+    if format == Format::Files {
+        let paths = crate::files::local_paths(item);
+        let base = mime.split(';').next().unwrap_or(mime).trim();
+        return Some(if base == GNOME_COPIED_FILES {
+            crate::files::gnome_copied(&paths)
+        } else {
+            crate::files::uri_list(&paths)
+        });
+    }
+    Some(item.to_vec())
+}
+
+/// What a selection pipe delivered, as this crate stores it: a file list
+/// becomes the local list of paths.
+fn item_for_mime(format: Format, mime: &str, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    if format != Format::Files {
+        return Some(bytes);
+    }
+    let base = mime.split(';').next().unwrap_or(mime).trim();
+    let paths = if base == GNOME_COPIED_FILES {
+        crate::files::paths_from_gnome_copied(&bytes)
+    } else {
+        crate::files::paths_from_uri_list(&bytes)
+    };
+    (!paths.is_empty()).then(|| crate::files::local_item(&paths))
 }
 
 /// Read a selection pipe to its end.

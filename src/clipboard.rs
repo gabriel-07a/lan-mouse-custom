@@ -284,7 +284,9 @@ impl ClipboardTask {
         status_tx: Sender<ClipboardStatus>,
         devices: Arc<RwLock<DeviceStore>>,
         custom_backend: Option<ClipboardFactory>,
+        received_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        let received_dir = received_dir.unwrap_or_else(input_clipboard::files::received_dir);
         let task = spawn_local(async move {
             let mut status = ClipboardStatus {
                 enabled: enabled.get(),
@@ -308,7 +310,7 @@ impl ClipboardTask {
                     wait_for_enable(&mut channels, &enabled).await;
                 }
                 let retries = if restarted { 3 } else { 0 };
-                let mut backend = create_backend(
+                let backend = create_backend(
                     &mut channels,
                     &enabled,
                     &mut status,
@@ -317,6 +319,13 @@ impl ClipboardTask {
                     custom_backend.as_ref(),
                 )
                 .await;
+                // Copied files travel as their contents (see input_clipboard::files).
+                let mut backend: Box<dyn Clipboard> =
+                    Box::new(input_clipboard::FileBundling::with_root(
+                        backend,
+                        limits.clone(),
+                        received_dir.clone(),
+                    ));
                 log::info!("using clipboard backend: {}", backend.backend_name());
                 status.backend = Some(backend.backend_name().to_string());
                 status.available = true;
@@ -360,6 +369,16 @@ impl ClipboardTask {
 
 /// Drop queued frames while no backend can consume them, so a peer cannot
 /// grow the unbounded channel while clipboard sync is unavailable.
+/// Whether the peer that dialed us from `addr` advertised copied files.
+fn incoming_accepts_files(channels: &Channels, addr: SocketAddr) -> bool {
+    channels
+        .incoming_caps
+        .read()
+        .expect("lock")
+        .get(&addr)
+        .is_some_and(|caps| caps & lan_mouse_proto::capabilities::CLIPBOARD_FILES != 0)
+}
+
 fn drain_frames<T>(rx: &mut Receiver<T>) {
     while let Some(Some(_)) = rx.recv().now_or_never() {}
 }
@@ -495,6 +514,11 @@ async fn run(
                         // still need a route, and frames are only accepted
                         // from registered peers.
                         sync.add_peer(handle);
+                        sync.set_peer_accepts_files(
+                            handle,
+                            client_manager
+                                .peer_supports(handle, lan_mouse_proto::capabilities::CLIPBOARD_FILES),
+                        );
                         let may_receive = policy_probe.peer_may_read(Route::Outgoing(handle));
                         sync.set_peer_may_receive(handle, may_receive);
                         if may_receive {
@@ -545,6 +569,7 @@ async fn run(
                     addr_peers.insert(addr, peer);
                     routes.borrow_mut().insert(peer, Route::Incoming(addr));
                     sync.add_peer(peer);
+                    sync.set_peer_accepts_files(peer, incoming_accepts_files(channels, addr));
                     let may_receive = policy_probe.peer_may_read(Route::Incoming(addr));
                     sync.set_peer_may_receive(peer, may_receive);
                     if may_receive {
@@ -716,6 +741,7 @@ async fn run(
                         next_peer = next_peer.wrapping_add(1);
                         routes.borrow_mut().insert(peer, Route::Incoming(addr));
                         sync.add_peer(peer);
+                        sync.set_peer_accepts_files(peer, incoming_accepts_files(channels, addr));
                         let may_receive = policy_probe.peer_may_read(Route::Incoming(addr));
                         sync.set_peer_may_receive(peer, may_receive);
                         if may_receive {

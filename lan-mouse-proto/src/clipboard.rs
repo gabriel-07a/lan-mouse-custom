@@ -17,6 +17,11 @@ use thiserror::Error;
 pub const MIME_TEXT: u8 = 1;
 pub const MIME_HTML: u8 = 2;
 pub const MIME_PNG: u8 = 3;
+/// Copied files and folders as one bundle (see `input_clipboard::files`).
+/// Only offered to peers that advertise
+/// [`crate::capabilities::CLIPBOARD_FILES`]: older decoders reject frames
+/// with an unknown format id.
+pub const MIME_FILES: u8 = 4;
 
 /// Payload bytes per chunk. Kept well below the path MTU so the DTLS record,
 /// UDP and IP headers still fit on Wi-Fi and VPN links.
@@ -193,7 +198,7 @@ impl ClipboardFrame {
                 let mut items = Vec::with_capacity(count);
                 for _ in 0..count {
                     let mime = reader.u8()?;
-                    if !matches!(mime, MIME_TEXT | MIME_HTML | MIME_PNG) {
+                    if !matches!(mime, MIME_TEXT | MIME_HTML | MIME_PNG | MIME_FILES) {
                         return Err(FrameError::InvalidMime(mime));
                     }
                     let size = reader.u32()?;
@@ -209,7 +214,7 @@ impl ClipboardFrame {
             FRAME_CHUNK => {
                 let serial = reader.u32()?;
                 let mime = reader.u8()?;
-                if !matches!(mime, MIME_TEXT | MIME_HTML | MIME_PNG) {
+                if !matches!(mime, MIME_TEXT | MIME_HTML | MIME_PNG | MIME_FILES) {
                     return Err(FrameError::InvalidMime(mime));
                 }
                 let offset = reader.u32()?;
@@ -230,7 +235,7 @@ impl ClipboardFrame {
             FRAME_ACK => {
                 let serial = reader.u32()?;
                 let mime = reader.u8()?;
-                if !matches!(mime, MIME_TEXT | MIME_HTML | MIME_PNG) {
+                if !matches!(mime, MIME_TEXT | MIME_HTML | MIME_PNG | MIME_FILES) {
                     return Err(FrameError::InvalidMime(mime));
                 }
                 Self::Ack {

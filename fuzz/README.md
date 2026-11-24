@@ -6,6 +6,7 @@ Requires nightly Rust and `cargo-fuzz`:
 cargo install cargo-fuzz
 cargo +nightly fuzz run proto_decode -- -max_total_time=60
 cargo +nightly fuzz run clipboard_transfer -- -max_total_time=60
+cargo +nightly fuzz run file_bundle -- -max_total_time=60
 ```
 
 Without nightly, stable can build the same instrumented binaries (no
@@ -31,6 +32,9 @@ rm -rf target
   `ClipboardFrame::decode` and `IncomingTransfer` without panicking or
   allocating past the limits; every decoded frame re-encodes to an equal frame
   that fits `MAX_CLIPBOARD_FRAME`.
+- `file_bundle`: any bytes as a copied-files bundle never panic the decoder;
+  what it accepts names only safe relative paths and re-encodes to the same
+  bytes.
 
 The CI quality workflow fuzzes each target for 60 s weekly and on manual
 dispatch.

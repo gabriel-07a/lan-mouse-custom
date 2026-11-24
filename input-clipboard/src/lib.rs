@@ -29,6 +29,8 @@ pub mod x11;
 pub use portal::available_version as portal_available_version;
 #[cfg(all(unix, not(target_os = "macos")))]
 pub use portal::restore_token_present as portal_restore_token_present;
+pub mod files;
+pub mod hdrop;
 pub mod sync;
 pub mod text;
 pub mod transfer;
@@ -45,6 +47,9 @@ pub enum Format {
     Text,
     Html,
     Png,
+    /// Copied files and folders: on this PC the list of paths, between PCs a
+    /// bundle of their contents (see [`files`]).
+    Files,
 }
 
 impl Format {
@@ -54,6 +59,7 @@ impl Format {
             Self::Text => "text/plain;charset=utf-8",
             Self::Html => "text/html",
             Self::Png => "image/png",
+            Self::Files => "text/uri-list",
         }
     }
 
@@ -63,6 +69,7 @@ impl Format {
             Self::Text => lan_mouse_proto::clipboard::MIME_TEXT,
             Self::Html => lan_mouse_proto::clipboard::MIME_HTML,
             Self::Png => lan_mouse_proto::clipboard::MIME_PNG,
+            Self::Files => lan_mouse_proto::clipboard::MIME_FILES,
         }
     }
 
@@ -71,6 +78,7 @@ impl Format {
             lan_mouse_proto::clipboard::MIME_TEXT => Some(Self::Text),
             lan_mouse_proto::clipboard::MIME_HTML => Some(Self::Html),
             lan_mouse_proto::clipboard::MIME_PNG => Some(Self::Png),
+            lan_mouse_proto::clipboard::MIME_FILES => Some(Self::Files),
             _ => None,
         }
     }
@@ -117,7 +125,11 @@ pub struct Limits {
     pub max_text: usize,
     pub max_html: usize,
     pub max_image: usize,
+    /// text, HTML and image together
     pub max_snapshot: usize,
+    /// copied files and folders, on their own (a copy with files carries
+    /// nothing else)
+    pub max_files: usize,
 }
 
 impl Default for Limits {
@@ -127,6 +139,7 @@ impl Default for Limits {
             max_html: 1024 * 1024,
             max_image: 8 * 1024 * 1024,
             max_snapshot: 10 * 1024 * 1024,
+            max_files: 64 * 1024 * 1024,
         }
     }
 }
@@ -137,12 +150,15 @@ impl Limits {
             Format::Text => self.max_text,
             Format::Html => self.max_html,
             Format::Png => self.max_image,
+            Format::Files => self.max_files,
         }
     }
 
-    /// Whether every representation fits and the total stays below the cap.
+    /// Whether every representation fits and text, HTML and image together
+    /// stay below the cap (files have their own).
     pub fn accepts(&self, snapshot: &ClipboardSnapshot) -> bool {
-        snapshot.total_len() <= self.max_snapshot
+        snapshot.total_len() - snapshot.get(Format::Files).map_or(0, <[u8]>::len)
+            <= self.max_snapshot
             && snapshot
                 .items
                 .iter()
@@ -197,6 +213,13 @@ impl ClipboardSnapshot {
 
     pub fn total_len(&self) -> usize {
         self.items.values().map(Vec::len).sum()
+    }
+
+    /// The same snapshot without one representation.
+    pub fn without(&self, format: Format) -> Self {
+        let mut items = self.items.clone();
+        items.remove(&format);
+        Self { items }
     }
 
     /// Canonical hash used for echo suppression and integrity checks.
@@ -381,6 +404,100 @@ impl Clipboard for SharedClipboard {
     }
 }
 
+/// Lower-case hex of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Wraps a backend so copied files travel as their contents (see [`files`]):
+/// reading packs the copied paths into a bundle (at most
+/// [`Limits::max_files`], read off the async thread), writing extracts a
+/// received bundle under [`files::received_dir`] and puts the extracted
+/// paths on the clipboard. Snapshots without files pass through unchanged.
+pub struct FileBundling<B> {
+    inner: B,
+    limits: std::rc::Rc<std::cell::Cell<Limits>>,
+    root: std::path::PathBuf,
+}
+
+impl<B> FileBundling<B> {
+    pub fn new(inner: B, limits: std::rc::Rc<std::cell::Cell<Limits>>) -> Self {
+        Self::with_root(inner, limits, files::received_dir())
+    }
+
+    pub fn with_root(
+        inner: B,
+        limits: std::rc::Rc<std::cell::Cell<Limits>>,
+        root: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            inner,
+            limits,
+            root,
+        }
+    }
+
+    async fn bundled(&self, snapshot: ClipboardSnapshot) -> ClipboardSnapshot {
+        if snapshot.get(Format::Files).is_none() {
+            return snapshot;
+        }
+        let max = self.limits.get().max_files;
+        let copy = snapshot.clone();
+        match tokio::task::spawn_blocking(move || files::bundle_snapshot(&copy, max)).await {
+            Ok(Ok(bundled)) => {
+                log::info!(
+                    "clipboard: copied files packed ({} bytes)",
+                    bundled.total_len()
+                );
+                bundled
+            }
+            Ok(Err(e)) => {
+                // still share what else was copied (the paths as text)
+                log::warn!("clipboard: not sending the copied files: {e}");
+                snapshot.without(Format::Files)
+            }
+            Err(e) => {
+                log::warn!("clipboard: packing the copied files failed: {e}");
+                snapshot.without(Format::Files)
+            }
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl<B: Clipboard> Clipboard for FileBundling<B> {
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    async fn read(&mut self) -> Result<ClipboardSnapshot, Error> {
+        let snapshot = self.inner.read().await?;
+        Ok(self.bundled(snapshot).await)
+    }
+
+    async fn write(&mut self, snapshot: &ClipboardSnapshot) -> Result<(), Error> {
+        if snapshot.get(Format::Files).is_none() {
+            return self.inner.write(snapshot).await;
+        }
+        let (copy, root) = (snapshot.clone(), self.root.clone());
+        let local = tokio::task::spawn_blocking(move || files::local_snapshot(&copy, &root))
+            .await
+            .map_err(|e| Error::Backend(format!("extracting the received files: {e}")))??;
+        log::info!(
+            "clipboard: received files extracted under {}",
+            self.root.display()
+        );
+        self.inner.write(&local).await
+    }
+
+    async fn changed(&mut self) -> Result<Option<ClipboardSnapshot>, Error> {
+        match self.inner.changed().await? {
+            Some(snapshot) => Ok(Some(self.bundled(snapshot).await)),
+            None => Ok(None),
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl<T: Clipboard + ?Sized> Clipboard for Box<T> {
     fn backend_name(&self) -> &'static str {
@@ -490,6 +607,7 @@ mod tests {
             max_html: 4,
             max_image: 4,
             max_snapshot: 8,
+            max_files: 8,
         };
         assert!(limits.accepts(&ClipboardSnapshot::from_items([(
             Format::Text,

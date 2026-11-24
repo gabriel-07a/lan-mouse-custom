@@ -102,6 +102,8 @@ jobs:
         run: cargo +nightly fuzz run proto_decode -- -max_total_time=60
       - name: Fuzz clipboard_transfer for 60 s
         run: cargo +nightly fuzz run clipboard_transfer -- -max_total_time=60
+      - name: Fuzz file_bundle for 60 s
+        run: cargo +nightly fuzz run file_bundle -- -max_total_time=60
 
   gnome:
     # Real GNOME Shell (headless, Ubuntu mode with the auto-hiding dock): the

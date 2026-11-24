@@ -98,6 +98,29 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
 - Histórico de clipboard/nuvem do Windows e áreas de transferência não
   autorizadas não são sincronizados.
 
+### Copiar e colar arquivos e pastas
+
+- Copie arquivos ou uma pasta inteira no gerenciador de arquivos (Nautilus,
+  Explorer) e cole com Ctrl+V no outro PC. O conteúdo vai junto com a cópia,
+  criptografado como o resto do clipboard; o outro PC extrai em
+  `~/.cache/lan-mouse/received/` (Linux) ou `%LOCALAPPDATA%\lan-mouse\received\`
+  (Windows) e o colar copia de lá para a pasta onde você colou. Ficam só as 8
+  cópias recebidas mais recentes.
+- Limite padrão: **64 MiB por cópia** (`[clipboard] max_files_bytes`, até
+  512 MiB). Uma cópia maior não envia os arquivos (só o texto com os caminhos)
+  e o log diz por quê. Links simbólicos ficam de fora; dois itens com o mesmo
+  nome viram "nome (2)".
+- Um pacote recebido nunca escreve fora da pasta dele: caminhos com `..`,
+  absolutos, com letra de unidade ou nomes que o Windows recusa (`CON`,
+  `nul.txt`...) fazem o pacote inteiro ser rejeitado.
+- Funciona com o portal do GNOME, com o Wayland data-control (sway, KDE) e no
+  Windows (`CF_HDROP`). No X11 só o texto continua sendo compartilhado.
+- Os dois PCs precisam desta versão: para um PC mais antigo a cópia vai sem
+  os arquivos (ele recusaria a cópia inteira com um formato que não conhece).
+- A cópia vai pelo mesmo canal do clipboard (blocos de 1 KiB com confirmação),
+  então arquivos grandes demoram: dezenas de MB levam alguns segundos na rede
+  cabeada e mais no Wi-Fi. Não há retomada de uma transferência interrompida.
+
 ### Caps Lock e Num Lock sincronizados
 
 - Caps Lock e Num Lock viram um estado só entre os PCs conectados: ligar em

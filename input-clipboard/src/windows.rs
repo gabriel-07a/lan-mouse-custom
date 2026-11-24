@@ -41,6 +41,8 @@ use crate::{
 const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
 const CF_DIBV5: u32 = 17;
+/// Copied files (Explorer), see [`crate::hdrop`].
+const CF_HDROP: u32 = 15;
 const MAX_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
 /// Extra attempts when a clipboard-change notification could not be read.
 ///
@@ -72,6 +74,8 @@ pub struct WindowsClipboard {
 struct Formats {
     html: u32,
     png: u32,
+    /// "Preferred DropEffect": copy or move on paste
+    drop_effect: u32,
     exclude: u32,
     include_in_history: u32,
     upload_to_cloud: u32,
@@ -92,6 +96,7 @@ impl Formats {
         Ok(Self {
             html: register(w!("HTML Format"))?,
             png: register(w!("PNG"))?,
+            drop_effect: register(w!("Preferred DropEffect"))?,
             exclude: register(w!("ExcludeClipboardContentFromMonitorProcessing"))?,
             include_in_history: register(w!("CanIncludeInClipboardHistory"))?,
             upload_to_cloud: register(w!("CanUploadToClipboardHistory"))?,
@@ -157,13 +162,14 @@ impl Clipboard for WindowsClipboard {
         // release it: decoding a multi-megabyte DIB into PNG can take tens of
         // milliseconds and holding the Win32 clipboard open blocks every other
         // application (clipboard managers, Office, remote desktop) meanwhile.
-        let (text, html, png, dib) = {
+        let (text, html, png, dib, files) = {
             let _guard = self.open().await?;
             if unsafe { self.is_secret() } {
                 log::debug!("windows clipboard is marked as secret, skipping");
                 return Ok(ClipboardSnapshot::default());
             }
             let text = unsafe { self.clipboard_bytes(CF_UNICODETEXT) };
+            let files = unsafe { self.clipboard_bytes(CF_HDROP) };
             let html = unsafe { self.clipboard_bytes(self.formats.html) };
             let mut png = unsafe { self.clipboard_bytes(self.formats.png) }
                 .map(|bytes| trim_png(&bytes))
@@ -184,10 +190,17 @@ impl Clipboard for WindowsClipboard {
             } else {
                 None
             };
-            (text, html, png, dib)
+            (text, html, png, dib, files)
         };
 
         let mut snapshot = ClipboardSnapshot::new();
+
+        if let Some(files) = files {
+            let paths = crate::hdrop::parse(&files);
+            if !paths.is_empty() {
+                snapshot.insert(Format::Files, crate::files::local_item(&paths));
+            }
+        }
 
         if let Some(text) = text.and_then(|bytes| utf16_text(&bytes)) {
             let text = crlf_to_lf(&text);
@@ -240,6 +253,15 @@ impl Clipboard for WindowsClipboard {
             let mut blob = cf_html::build(html);
             blob.push(0);
             unsafe { write_global(self.formats.html, &blob)? };
+        }
+
+        if let Some(files) = snapshot.get(Format::Files) {
+            let block = crate::hdrop::build(&crate::files::local_paths(files));
+            unsafe { write_global(CF_HDROP, &block)? };
+            let copy = crate::hdrop::DROPEFFECT_COPY.to_le_bytes();
+            if let Err(e) = unsafe { write_global(self.formats.drop_effect, &copy) } {
+                log::warn!("could not publish the drop effect for the received files: {e}");
+            }
         }
 
         if let Some(png) = snapshot.get(Format::Png) {

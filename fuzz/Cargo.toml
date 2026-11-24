@@ -25,3 +25,10 @@ path = "fuzz_targets/clipboard_transfer.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "file_bundle"
+path = "fuzz_targets/file_bundle.rs"
+test = false
+doc = false
+bench = false

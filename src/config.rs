@@ -125,6 +125,8 @@ struct ClipboardConfig {
     max_html_bytes: Option<usize>,
     max_image_bytes: Option<usize>,
     max_snapshot_bytes: Option<usize>,
+    /// copied files and folders (default 64 MiB)
+    max_files_bytes: Option<usize>,
 }
 
 /// Hard caps for the configurable clipboard limits.
@@ -135,6 +137,8 @@ struct ClipboardConfig {
 /// or corrupted clipboard offer into a multi-gigabyte allocation.
 const MAX_CLIPBOARD_REPRESENTATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLIPBOARD_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+/// Copied files are received into memory before they are written out.
+const MAX_CLIPBOARD_FILES_BYTES: usize = 512 * 1024 * 1024;
 
 impl ClipboardConfig {
     fn limits(&self) -> input_clipboard::Limits {
@@ -156,6 +160,10 @@ impl ClipboardConfig {
                 .max_snapshot_bytes
                 .unwrap_or(default.max_snapshot)
                 .min(MAX_CLIPBOARD_SNAPSHOT_BYTES),
+            max_files: self
+                .max_files_bytes
+                .unwrap_or(default.max_files)
+                .min(MAX_CLIPBOARD_FILES_BYTES),
         }
     }
 

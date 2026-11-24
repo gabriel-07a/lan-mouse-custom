@@ -341,6 +341,8 @@ impl DeskBuilder {
                 clipboard_backend: Some(Rc::new(move || {
                     Box::new(service_clipboard.clone()) as Box<dyn Clipboard>
                 })),
+                // received copied files stay inside this PC's temporary home
+                clipboard_received_dir: Some(env.state_dir().join("received")),
             };
             let mut service = Service::with_options(config, options)
                 .await

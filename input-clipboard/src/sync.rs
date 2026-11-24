@@ -15,7 +15,7 @@ use std::{
 use lan_mouse_proto::clipboard::{CHUNK_SIZE, ClipboardFrame};
 
 use crate::{
-    ClipboardSnapshot, Limits,
+    ClipboardSnapshot, Format, Limits,
     transfer::{IncomingTransfer, OutgoingTransfer},
 };
 
@@ -69,6 +69,10 @@ pub struct ClipboardSync<S: FrameSink> {
     /// registered -- so its inbound content and acknowledgements are accepted
     /// -- but our content is never offered to it.
     may_receive: HashSet<PeerId>,
+    /// Peers that accept copied files ([`Format::Files`]); others get the
+    /// copy without them (older builds reject a frame with an unknown
+    /// format id).
+    accepts_files: HashSet<PeerId>,
     outgoing: HashMap<PeerId, OutgoingTransfer>,
     incoming: HashMap<PeerId, IncomingTransfer>,
     /// Hash of the last snapshot written to the local clipboard on behalf of a
@@ -111,6 +115,7 @@ impl<S: FrameSink> ClipboardSync<S> {
             origin,
             peers: HashSet::new(),
             may_receive: HashSet::new(),
+            accepts_files: HashSet::new(),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             last_applied: None,
@@ -169,9 +174,19 @@ impl<S: FrameSink> ClipboardSync<S> {
             .filter(|peer| self.may_receive.contains(peer))
     }
 
+    /// Whether `peer` accepts copied files (it advertised the capability).
+    pub fn set_peer_accepts_files(&mut self, peer: PeerId, accepts: bool) {
+        if accepts {
+            self.accepts_files.insert(peer);
+        } else {
+            self.accepts_files.remove(&peer);
+        }
+    }
+
     pub fn remove_peer(&mut self, peer: PeerId) {
         self.peers.remove(&peer);
         self.may_receive.remove(&peer);
+        self.accepts_files.remove(&peer);
         self.outgoing.remove(&peer);
         // Frames queued before the disconnect must not complete an incoming
         // transfer after the peer is gone (a late chunk could otherwise apply
@@ -200,6 +215,9 @@ impl<S: FrameSink> ClipboardSync<S> {
         }
         if self.peers.remove(&from) {
             self.peers.insert(to);
+            if self.accepts_files.remove(&from) {
+                self.accepts_files.insert(to);
+            }
             if self.may_receive.remove(&from) {
                 self.may_receive.insert(to);
             }
@@ -296,6 +314,19 @@ impl<S: FrameSink> ClipboardSync<S> {
                 },
             );
         }
+        let stripped;
+        let snapshot = if snapshot.get(Format::Files).is_some()
+            && !self.accepts_files.contains(&peer)
+        {
+            stripped = snapshot.without(Format::Files);
+            if stripped.is_empty() {
+                log::info!("clipboard: peer {peer} does not accept copied files, not sending them");
+                return;
+            }
+            &stripped
+        } else {
+            snapshot
+        };
         let serial = self.next_serial();
         let mut transfer = OutgoingTransfer::new(serial, self.origin, snapshot);
         for frame in transfer.poll(now) {
@@ -1125,6 +1156,51 @@ mod dedupe_tests {
             .iter()
             .filter(|(_, frame)| matches!(frame, ClipboardFrame::Offer { .. }))
             .count()
+    }
+
+    /// Older peers reject a frame with an unknown format id: copied files are
+    /// only offered to peers that advertised them, the rest gets the copy
+    /// without the files (or nothing, when files were all there was).
+    #[test]
+    fn copied_files_go_only_to_peers_that_accept_them() {
+        let offered_formats = |wire: &Wire, peer: PeerId| -> Vec<Vec<u8>> {
+            wire.borrow()
+                .iter()
+                .filter(|(to, _)| *to == peer)
+                .filter_map(|(_, frame)| match frame {
+                    ClipboardFrame::Offer { items, .. } => {
+                        Some(items.iter().map(|(mime, _)| *mime).collect())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let wire: Wire = Default::default();
+        let mut sync = sync_with_peer(&wire);
+        sync.add_peer(3);
+        sync.set_peer_accepts_files(3, true);
+        let files_and_text = ClipboardSnapshot::from_items([
+            (Format::Files, b"LMF1-bundle".to_vec()),
+            (Format::Text, b"/home/ana/a.txt".to_vec()),
+        ]);
+        sync.on_local_change(files_and_text, Instant::now());
+        assert_eq!(
+            offered_formats(&wire, 2),
+            vec![vec![MIME_TEXT]],
+            "old peer: text only"
+        );
+        let to_new = offered_formats(&wire, 3);
+        assert_eq!(to_new.len(), 1);
+        assert!(to_new[0].contains(&lan_mouse_proto::clipboard::MIME_FILES));
+
+        wire.borrow_mut().clear();
+        let files_only = ClipboardSnapshot::from_items([(Format::Files, b"LMF1-other".to_vec())]);
+        sync.on_local_change(files_only, Instant::now());
+        assert!(
+            offered_formats(&wire, 2).is_empty(),
+            "nothing to send to the old peer"
+        );
+        assert_eq!(offered_formats(&wire, 3).len(), 1);
     }
 
     /// The compositor reports one change per MIME update; the same content

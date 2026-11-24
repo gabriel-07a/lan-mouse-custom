@@ -184,3 +184,54 @@ async fn assert_refused_then_recovers(desk: &Desk) {
     desk.copy_text("A", "depois");
     desk.wait_paste("B", &text("depois")).await;
 }
+
+/// A folder and a file copied on A (what a file manager puts on the
+/// clipboard: their paths) are pasted on B as files: extracted on B with
+/// their contents and structure, B's clipboard pointing at B's copies. Writing
+/// them must not bounce back to A as a new copy.
+#[tokio::test(flavor = "current_thread")]
+async fn copied_files_and_folders_paste_on_the_other_pc() {
+    use input_clipboard::files::{local_item, local_paths};
+    init_log();
+    LocalSet::new()
+        .run_until(async {
+            let desk = a_with_b_on_the_right().await;
+            let src =
+                std::env::temp_dir().join(format!("lan-mouse-desk-files-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&src);
+            std::fs::create_dir_all(src.join("Relatório/2026")).unwrap();
+            std::fs::write(src.join("Relatório/2026/notas.txt"), "olá do A").unwrap();
+            let png = fake_png(200 * 1024);
+            std::fs::write(src.join("foto.png"), &png).unwrap();
+            let copied = vec![src.join("Relatório"), src.join("foto.png")];
+            let on_a = ClipboardSnapshot::from_items([(Format::Files, local_item(&copied))]);
+            desk.copy("A", on_a.clone());
+
+            desk.wait_until("B pastes the files", Duration::from_secs(20), |desk| {
+                desk.paste("B").get(Format::Files).is_some()
+            })
+            .await;
+            let pasted = desk.paste("B");
+            let paths = local_paths(pasted.get(Format::Files).expect("files"));
+            assert_eq!(paths.len(), 2, "{paths:?}");
+            assert!(
+                paths.iter().all(|p| !p.starts_with(&src)),
+                "B points at its own copies"
+            );
+            assert!(paths[0].ends_with("Relatório") && paths[1].ends_with("foto.png"));
+            assert_eq!(
+                std::fs::read_to_string(paths[0].join("2026/notas.txt")).unwrap(),
+                "olá do A"
+            );
+            assert_eq!(std::fs::read(&paths[1]).unwrap(), png);
+            // plain-text paste gives B's paths
+            let text = String::from_utf8(pasted.get(Format::Text).expect("text").to_vec()).unwrap();
+            assert_eq!(text.lines().count(), 2);
+
+            // no echo: A keeps its own copy
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert_eq!(desk.paste("A"), on_a, "{}", desk.report());
+            let _ = std::fs::remove_dir_all(&src);
+        })
+        .await;
+}

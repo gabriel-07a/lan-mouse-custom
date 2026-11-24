@@ -329,9 +329,12 @@ impl IncomingTransfer {
             if size > limits.max_for(format) {
                 return Err(Error::TooLarge);
             }
-            total = total.saturating_add(size);
-            if total > limits.max_snapshot {
-                return Err(Error::TooLarge);
+            // files have their own cap (`max_for` above)
+            if format != Format::Files {
+                total = total.saturating_add(size);
+                if total > limits.max_snapshot {
+                    return Err(Error::TooLarge);
+                }
             }
             map.insert(
                 format,

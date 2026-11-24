@@ -146,6 +146,8 @@ fn read_offer(
         ("text/plain", Format::Text),
         ("text/html", Format::Html),
         ("image/png", Format::Png),
+        ("x-special/gnome-copied-files", Format::Files),
+        ("text/uri-list", Format::Files),
     ] {
         if snapshot.get(format).is_some() || !mime_types.iter().any(|m| m == mime) {
             continue;
@@ -167,7 +169,19 @@ fn read_offer(
                 );
             }
             Ok(_) if !data.is_empty() => {
-                snapshot.insert(format, data);
+                if format == Format::Files {
+                    // stored as the local list of paths
+                    let paths = if mime == "text/uri-list" {
+                        crate::files::paths_from_uri_list(&data)
+                    } else {
+                        crate::files::paths_from_gnome_copied(&data)
+                    };
+                    if !paths.is_empty() {
+                        snapshot.insert(format, crate::files::local_item(&paths));
+                    }
+                } else {
+                    snapshot.insert(format, data);
+                }
             }
             Ok(_) => {}
             Err(e) => log::debug!("wayland clipboard: could not read {mime}: {e}"),
@@ -192,6 +206,22 @@ impl Clipboard for WaylandClipboard {
 
         let mut sources = Vec::new();
         for (format, data) in snapshot.iter() {
+            if format == Format::Files {
+                let paths = crate::files::local_paths(data);
+                for (mime, bytes) in [
+                    ("text/uri-list", crate::files::uri_list(&paths)),
+                    (
+                        "x-special/gnome-copied-files",
+                        crate::files::gnome_copied(&paths),
+                    ),
+                ] {
+                    sources.push(MimeSource {
+                        source: Source::Bytes(bytes.into_boxed_slice()),
+                        mime_type: CopyMime::Specific(mime.to_string()),
+                    });
+                }
+                continue;
+            }
             sources.push(MimeSource {
                 source: Source::Bytes(data.to_vec().into_boxed_slice()),
                 mime_type: CopyMime::Specific(format.mime().to_string()),
