@@ -112,8 +112,9 @@ pub(crate) struct LibeiEmulation {
     ei_task: JoinHandle<()>,
     error: Arc<Mutex<Option<EmulationError>>>,
     libei_error: Arc<AtomicBool>,
-    _remote_desktop: RemoteDesktop,
-    session: Session<RemoteDesktop>,
+    /// the RemoteDesktop portal session that handed out the EIS socket;
+    /// `None` when the socket came from elsewhere ([`Self::with_eis_fd`])
+    portal: Option<(RemoteDesktop, Session<RemoteDesktop>)>,
     /// edge the peer entered through, while it drives this machine
     remote_edge: Option<PointerEdge>,
     /// normalised crossing coordinate along `remote_edge`, when the peer sent
@@ -512,10 +513,14 @@ impl AbsoluteTracker {
         let (x, y) = self.snap(clamped_x, clamped_y);
         let (min_x, max_x, min_y, max_y) = self.reached;
         self.reached = (min_x.min(x), max_x.max(x), min_y.min(y), max_y.max(y));
-        // A clamp means the motion ran off the last on-screen pixel. The
-        // compositor cannot be told that with an absolute event (out-of-region
-        // events are dropped), but a relative device can.
-        let pressed = clamped_x != raw_x || clamped_y != raw_y;
+        // A clamp or a snap means the motion ran off the last on-screen pixel:
+        // the outer edge of the layout, or the edge of one monitor where no
+        // other continues it (the bottom of a laptop panel next to a taller
+        // monitor sits inside the layout's bounding box, and that is where the
+        // dock is). The compositor cannot be told that with an absolute event
+        // (out-of-region events are dropped), but a relative device can; the
+        // compositor confines that motion to the monitors like `snap` does.
+        let pressed = x != raw_x || y != raw_y;
         // Remember the deepest point inside the screen reached since arming:
         // outward residual pushes the parked pointer at the edge and must not
         // count as a return until the user has actually used the screen.
@@ -989,7 +994,21 @@ impl LibeiEmulation {
     }
 
     pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
-        let (_remote_desktop, session, eifd) = get_ei_fd().await?;
+        let (remote_desktop, session, eifd) = get_ei_fd().await?;
+        Self::from_fd(eifd, Some((remote_desktop, session))).await
+    }
+
+    /// Emulate through an EIS socket obtained without the portal (e.g. from
+    /// Mutter's `org.gnome.Mutter.RemoteDesktop` D-Bus API in a headless test
+    /// session).
+    pub(crate) async fn with_eis_fd(eifd: OwnedFd) -> Result<Self, LibeiEmulationCreationError> {
+        Self::from_fd(eifd, None).await
+    }
+
+    async fn from_fd(
+        eifd: OwnedFd,
+        portal: Option<(RemoteDesktop, Session<RemoteDesktop>)>,
+    ) -> Result<Self, LibeiEmulationCreationError> {
         let stream = UnixStream::from(eifd);
         stream.set_nonblocking(true)?;
         let context = ei::Context::new(stream)?;
@@ -1017,8 +1036,7 @@ impl LibeiEmulation {
             ei_task,
             error,
             libei_error,
-            _remote_desktop,
-            session,
+            portal,
             remote_edge: None,
             entry_along: None,
             absolute: None,
@@ -1329,10 +1347,12 @@ impl Emulation for LibeiEmulation {
     async fn terminate(&mut self) {
         // A hung portal must not hang app shutdown: close on a best-effort
         // basis with a timeout, then abort the EIS task.
-        match tokio::time::timeout(Duration::from_secs(2), self.session.close()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("session.close(): {e}"),
-            Err(_) => log::warn!("session.close() timed out"),
+        if let Some((_, session)) = &self.portal {
+            match tokio::time::timeout(Duration::from_secs(2), session.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!("session.close(): {e}"),
+                Err(_) => log::warn!("session.close() timed out"),
+            }
         }
         self.ei_task.abort();
     }
@@ -2212,6 +2232,46 @@ mod absolute_tracker_tests {
         assert!(!tracker.apply_motion(0.0, 20.0).pressed);
         let (_, y) = tracker.absolute();
         assert!(y > 1080.0, "cursor must reach the lower monitor, got {y}");
+    }
+
+    /// Laptop panel (logical 1536x960, 236 px lower) left of a taller
+    /// monitor: the panel's bottom edge - where the dock is - lies inside the
+    /// layout's bounding box. Pushing down there is still pressure; before,
+    /// only the bounding box counted and the dock never opened.
+    fn laptop_and_monitor() -> AbsoluteTracker {
+        let regions = vec![(1536.0, 0.0, 4096.0, 1440.0), (0.0, 236.0, 1536.0, 1196.0)];
+        AbsoluteTracker::new_with_entry(PointerEdge::Right, 1, regions, 1.0, 1.0, Some(0.5))
+            .expect("offset monitors")
+    }
+
+    #[test]
+    fn the_bottom_of_a_monitor_inside_the_layout_box_is_pressure() {
+        let mut tracker = laptop_and_monitor();
+        established(&mut tracker);
+        // from the right edge of the big monitor onto the laptop panel
+        assert!(!tracker.apply_motion(-3300.0, 0.0).pressed);
+        let (x, _) = tracker.absolute();
+        assert!(x < 1536.0, "on the laptop panel, got x={x}");
+        assert!(!tracker.apply_motion(0.0, 475.0).pressed);
+        assert_eq!(tracker.absolute().1, 1195.0, "the panel's last row");
+        let push = tracker.apply_motion(0.0, 10.0);
+        assert!(push.pressed, "pushing below the panel must replay pressure");
+        assert_eq!(push.handoff, None);
+        assert_eq!(tracker.absolute().1, 1195.0);
+        // moving back up releases it
+        assert!(!tracker.apply_motion(0.0, -10.0).pressed);
+    }
+
+    /// Crossing from the taller monitor onto the panel at a height both
+    /// share is free motion, not pressure.
+    #[test]
+    fn crossing_onto_the_offset_panel_is_not_pressure() {
+        let mut tracker = laptop_and_monitor();
+        established(&mut tracker);
+        for _ in 0..100 {
+            assert!(!tracker.apply_motion(-40.0, 0.0).pressed);
+        }
+        assert!(tracker.absolute().0 < 1536.0);
     }
 
     /// Pushing past the entry edge reports the hand-off *and* the boundary

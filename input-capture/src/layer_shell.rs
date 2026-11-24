@@ -391,6 +391,16 @@ impl LayerShellInputCapture {
             state.register_global(global);
         }
 
+        // Wait for the outputs' geometry (wl_output / xdg_output `done`):
+        // without it a capture created right away has no output to put its
+        // barrier window on and fails with "no capture window available".
+        for _ in 0..2 {
+            if state.outputs.iter().all(|output| output.info.is_some()) {
+                break;
+            }
+            queue.roundtrip(&mut state)?;
+        }
+
         // flush outgoing events
         queue.flush()?;
 

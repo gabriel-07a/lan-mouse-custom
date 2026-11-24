@@ -30,9 +30,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Coverage report
-        # Initial threshold is deliberately low; raise it as the suite grows
-        # (the plan's target is 75% overall / 90% for core modules).
-        run: scripts/coverage.sh --check 55
+        # Same ratchet floor as the per-push job in rust.yml.
+        run: scripts/coverage.sh --check "$(cat .github/coverage-floor)"
 
       - name: Upload LCOV
         uses: actions/upload-artifact@v4
@@ -81,8 +80,7 @@ jobs:
         run: cargo mutants -p lan-mouse-proto --in-place --timeout 120
 
   fuzz:
-    name: fuzz smoke (manual)
-    if: github.event_name == 'workflow_dispatch'
+    name: fuzz smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -94,3 +92,39 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Fuzz proto_decode for 60 s
         run: cargo +nightly fuzz run proto_decode -- -max_total_time=60
+      - name: Fuzz clipboard_transfer for 60 s
+        run: cargo +nightly fuzz run clipboard_transfer -- -max_total_time=60
+
+  gnome:
+    # Real GNOME Shell (headless, Ubuntu mode with the auto-hiding dock): the
+    # libei backend on an EIS socket from Mutter, pushing the dock open from
+    # remote control on three monitor layouts (tests/gnome-headless/).
+    # The runner's GNOME is older than the desktops we ship to; kept
+    # non-blocking until it has a green baseline there.
+    name: GNOME e2e (headless gnome-shell)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev \
+            libwayland-dev libxkbcommon-dev \
+            gnome-shell gnome-shell-extension-ubuntu-dock ubuntu-session \
+            dconf-cli dbus-daemon
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Single monitor
+        run: RUST_LOG=input_emulation=debug scripts/gnome-headless.sh --test
+      - name: Laptop panel at 5/3 scale
+        env:
+          GNOME_HEADLESS_SIZE: 2560x1600
+          GNOME_HEADLESS_MONITORS: tests/gnome-headless/laptop-fractional.xml
+        run: RUST_LOG=input_emulation=debug scripts/gnome-headless.sh --test
+      - name: Panel next to a taller monitor
+        env:
+          GNOME_HEADLESS_SIZE: 2560x1600 2560x1440
+          GNOME_HEADLESS_MONITORS: tests/gnome-headless/laptop-and-monitor.xml
+        run: RUST_LOG=input_emulation=debug scripts/gnome-headless.sh --test
+

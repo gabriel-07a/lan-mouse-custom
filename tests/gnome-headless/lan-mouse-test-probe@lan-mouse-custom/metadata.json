@@ -1,0 +1,6 @@
+{
+  "uuid": "lan-mouse-test-probe@lan-mouse-custom",
+  "name": "Lan Mouse test probe",
+  "description": "Test-only: reports the pointer position and the Ubuntu Dock state of a headless test session to a file. Never installed outside scripts/gnome-headless.sh.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"]
+}

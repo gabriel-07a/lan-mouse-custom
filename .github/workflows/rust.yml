@@ -26,6 +26,43 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --check
 
+  coverage:
+    # Line-coverage floor (ratchet): .github/coverage-floor holds the minimum.
+    # Raise it when coverage grows; never lower it to make a change pass.
+    name: Coverage floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev \
+            libwayland-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Line coverage >= floor
+        run: scripts/coverage.sh --check "$(cat .github/coverage-floor)"
+
+  wlroots:
+    # Real compositor: headless sway drives the wlroots emulation and the
+    # layer-shell capture backends end to end (tests/wlroots_headless.rs).
+    name: wlroots e2e (headless sway)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev \
+            libwayland-dev libxkbcommon-dev sway
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Headless sway e2e
+        run: RUST_LOG=input_capture=debug scripts/sway-headless.sh --test
+
   ci:
     name: ${{ matrix.job }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

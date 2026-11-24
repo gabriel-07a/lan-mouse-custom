@@ -75,6 +75,11 @@ windows = { version = "0.61.2", features = [
     "Win32_UI_HiDpi",
 ] }
 
+[target.'cfg(all(unix, not(target_os = "macos")))'.dev-dependencies]
+# tests/gnome_headless.rs: Mutter's RemoteDesktop D-Bus API
+zbus = { version = "5.14", default-features = false, features = ["tokio"] }
+env_logger = "0.11.3"
+
 [features]
 default = ["wlroots", "x11", "remote_desktop_portal", "libei"]
 wlroots = [

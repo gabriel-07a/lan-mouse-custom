@@ -1,0 +1,26 @@
+<!-- One 2560x1600 panel at 5/3 scale (logical 1536x960), like a 16" laptop
+     with Ubuntu's fractional scaling. Size: GNOME_HEADLESS_SIZE=2560x1600 -->
+<monitors version="2">
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1.6666666269302368</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>Meta-0</connector>
+          <vendor>MetaVendor</vendor>
+          <product>MetaVirtualMonitor</product>
+          <serial>0x00</serial>
+        </monitorspec>
+        <mode>
+          <width>2560</width>
+          <height>1600</height>
+          <rate>60.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>

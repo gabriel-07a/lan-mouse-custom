@@ -1463,6 +1463,7 @@ dependencies = [
  "core-foundation",
  "core-foundation-sys",
  "core-graphics",
+ "env_logger",
  "futures",
  "input-event",
  "keycode",
@@ -1478,6 +1479,7 @@ dependencies = [
  "wayland-protocols-wlr",
  "windows",
  "x11",
+ "zbus",
 ]
 
 [[package]]

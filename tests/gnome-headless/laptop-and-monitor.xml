@@ -1,0 +1,45 @@
+<!-- The laptop panel (Meta-0, 2560x1600 at 5/3: logical 1536x960, primary,
+     dock) left of a 2560x1440 monitor at scale 1 (Meta-1), bottoms not
+     aligned: the panel is 236 px lower. Size: "2560x1600 2560x1440" -->
+<monitors version="2">
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>1536</x>
+      <y>0</y>
+      <scale>1</scale>
+      <monitor>
+        <monitorspec>
+          <connector>Meta-1</connector>
+          <vendor>MetaVendor</vendor>
+          <product>MetaVirtualMonitor</product>
+          <serial>0x01</serial>
+        </monitorspec>
+        <mode>
+          <width>2560</width>
+          <height>1440</height>
+          <rate>60.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+    <logicalmonitor>
+      <x>0</x>
+      <y>236</y>
+      <scale>1.6666666269302368</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>Meta-0</connector>
+          <vendor>MetaVendor</vendor>
+          <product>MetaVirtualMonitor</product>
+          <serial>0x00</serial>
+        </monitorspec>
+        <mode>
+          <width>2560</width>
+          <height>1600</height>
+          <rate>60.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>

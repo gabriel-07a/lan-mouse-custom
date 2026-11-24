@@ -120,6 +120,20 @@ clipboard em memória e manias de GNOME/Windows. Testa cruzar a borda e voltar
 e copiar/colar texto e imagem de ponta a ponta com `cargo test --lib desk_sim`.
 Use para todo bug de handoff ou clipboard que hoje só se reproduz na mão.
 
+## Compositores reais (headless)
+
+[real-compositors.md](real-compositors.md): GNOME Shell e sway headless,
+isolados da sessão, rodando os backends libei, wlroots e layer-shell de
+verdade (`scripts/gnome-headless.sh --test`, `scripts/sway-headless.sh --test`).
+Use para bugs que dependem do compositor (dock, barreiras de pressão, bordas
+com vários monitores) e que o simulador não reproduz.
+
+## Antes de enviar
+
+`scripts/check.sh` roda fmt, clippy `-D warnings` e todos os testes sem parar
+no primeiro alvo que falhar (`--windows` também faz o clippy do alvo Windows
+via Zig) e apaga o build no fim.
+
 Testes e scripts **não podem** abrir portais do desktop (o diálogo "Área de
 trabalho remota" aparece na tela de quem está desenvolvendo): injete backends
 falsos via `ServiceOptions` ou suba o daemon com `--no-clipboard`.

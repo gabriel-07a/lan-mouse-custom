@@ -187,6 +187,23 @@ impl InputEmulation {
         })
     }
 
+    /// The libei backend on an EIS socket the caller obtained itself instead
+    /// of through the RemoteDesktop portal (no consent dialog): e.g. from
+    /// Mutter's `org.gnome.Mutter.RemoteDesktop` D-Bus API in a headless test
+    /// compositor, or another EIS provider.
+    #[cfg(libei)]
+    pub async fn libei_with_eis_fd(
+        eis: std::os::fd::OwnedFd,
+    ) -> Result<InputEmulation, EmulationCreationError> {
+        Ok(Self {
+            emulation: Box::new(libei::LibeiEmulation::with_eis_fd(eis).await?),
+            backend: Backend::Libei,
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        })
+    }
+
     /// Wrap a backend implemented outside this crate.
     ///
     /// Key/button tracking and release on destroy are the same as for the OS

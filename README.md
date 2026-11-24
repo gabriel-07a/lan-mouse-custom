@@ -152,6 +152,15 @@ aditivas e negociadas por capability, para não quebrar peers antigos.
   então o dock volta a abrir com o mouse remoto. Vale para as quatro bordas
   (dock embaixo, hot corners etc.); o handoff de retorno continua tendo
   prioridade quando a borda é a de entrada.
+- Com **mais de um monitor**, a borda de um monitor pode ficar dentro da caixa
+  que envolve o layout: um notebook ao lado de um monitor mais alto, por
+  exemplo, tem o fundo (onde fica o dock) acima do fundo do layout. Antes só a
+  caixa externa contava como borda, então nesse layout o empurrão nunca virava
+  pressão e o dock não abria. Agora qualquer movimento que esbarra na borda de
+  um monitor sem outro monitor continuando ali é reenviado como pressão.
+- Isso é testado num GNOME Shell real (headless, isolado da sessão):
+  `scripts/gnome-headless.sh --test`, também com o notebook em escala 5/3 e
+  com dois monitores desalinhados (veja `docs/testing/real-compositors.md`).
 - Para conferir sem o outro PC: `cargo run --example edge_pressure_probe` faz o
   papel do peer (entra pela borda direita e empurra o ponteiro contra a borda
   inferior por ~2 s, movendo o cursor de verdade). O dock tem que aparecer.
