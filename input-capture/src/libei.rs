@@ -49,6 +49,9 @@ use super::{
     error::{CaptureError, LibeiCaptureCreationError},
 };
 
+/// How long to collect client registrations before creating a session.
+const CLIENT_SET_SETTLE: Duration = Duration::from_millis(300);
+
 /// Name of the InputCapture restore token file.
 ///
 /// The token is the user's persisted consent. The portal invalidates it after
@@ -499,6 +502,24 @@ async fn do_capture(
                 },
             }
         }
+        // The service registers its clients one by one; collect them before
+        // choosing the barrier set, so a start with two clients does not
+        // create a session for the first and ask again for the second.
+        let settle = tokio::time::sleep(CLIENT_SET_SETTLE);
+        tokio::pin!(settle);
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => return Ok(()),
+                _ = &mut settle => break,
+                event = capture_event.recv() => match event {
+                    Some(event) => apply_client_event(&mut active_clients, event),
+                    None => return Ok(()),
+                },
+            }
+        }
+        if active_clients.is_empty() {
+            continue;
+        }
 
         // ONE portal session for the whole run. Portals without persisted
         // consent (InputCapture v1, e.g. GNOME) present a permission dialog for
@@ -531,10 +552,14 @@ async fn do_capture(
         log::debug!("closing input capture session");
         close_capture_session(input_capture, &session).await;
         match result {
-            Ok(()) => {
-                // do_capture_session only returns Ok when shutdown was
-                // requested.
-                return Ok(());
+            Ok(SessionEnd::Shutdown) => return Ok(()),
+            Ok(SessionEnd::NewEdge(pos)) => {
+                log::info!(
+                    "a client is now configured on the {pos:?} edge, which this capture \
+                     session has no barrier for; starting a new session (the desktop may \
+                     ask for input-capture permission again)"
+                );
+                session_attempts = 0;
             }
             Err(e) => {
                 if cancellation_token.is_cancelled() {
@@ -598,7 +623,37 @@ struct CaptureSessionCtx<'a, S> {
     cancellation_token: &'a CancellationToken,
 }
 
-async fn do_capture_session<S>(ctx: CaptureSessionCtx<'_, S>) -> Result<(), CaptureError>
+/// Why a capture session ended without an error.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionEnd {
+    /// shutdown was requested
+    Shutdown,
+    /// a client was configured on an edge this session has no barrier for
+    NewEdge(Position),
+}
+
+/// The edges to install barriers for: the configured ones, in a fixed order.
+fn barrier_positions(active_clients: &[Position]) -> Vec<Position> {
+    [
+        Position::Left,
+        Position::Right,
+        Position::Top,
+        Position::Bottom,
+    ]
+    .into_iter()
+    .filter(|pos| active_clients.contains(pos))
+    .collect()
+}
+
+/// A configured edge without a barrier in this session, if any.
+fn new_edge(active_clients: &[Position], barrier_set: &[Position]) -> Option<Position> {
+    active_clients
+        .iter()
+        .copied()
+        .find(|pos| !barrier_set.contains(pos))
+}
+
+async fn do_capture_session<S>(ctx: CaptureSessionCtx<'_, S>) -> Result<SessionEnd, CaptureError>
 where
     S: futures::Stream + Unpin,
 {
@@ -616,25 +671,29 @@ where
     // The EIS connection persists across Enable()/Disable() cycles and across
     // activations; it is set up once per portal session (portal docs).
     let (context, _conn, mut ei_event_stream) = connect_to_eis(input_capture, session).await?;
-    // GNOME's InputCapture v1 forbids changing pointer barriers after the
-    // session is enabled ("Session already enabled") and a disabled session
-    // cannot be re-enabled, so changing a client position at runtime used to
-    // leave the new edge without a barrier and capture stopped working.
-    // Install barriers for every edge up front; activations for edges that do
-    // not belong to an enabled client are released immediately below, so a
-    // position change only changes the filter, never the barrier set.
-    const ALL_POSITIONS: [Position; 4] = [
-        Position::Left,
-        Position::Right,
-        Position::Top,
-        Position::Bottom,
-    ];
+    // Barriers only on the edges a client is configured for. A barrier on an
+    // unused edge is not harmless: it catches the pointer before the
+    // compositor's own edge barriers, so pushing into that edge never builds
+    // pressure (the auto-hidden Ubuntu Dock at the bottom, hot corners) - with
+    // the local mouse and with a peer driving this screen alike.
+    //
+    // GNOME's InputCapture v1 forbids changing barriers after the session is
+    // enabled ("Session already enabled") and a disabled session cannot be
+    // re-enabled. A client configured on a new edge therefore ends this
+    // session (`SessionEnd::NewEdge`) and the caller creates a new one, which
+    // asks for consent again on portals that cannot persist it; that only
+    // happens when the layout is reconfigured. Edges whose client went away
+    // keep their barrier until then and are released immediately below.
+    let barrier_set = barrier_positions(active_clients);
     let (barriers, pos_for_barrier_id) =
-        update_barriers(input_capture, session, &ALL_POSITIONS, next_barrier_id).await?;
+        update_barriers(input_capture, session, &barrier_set, next_barrier_id).await?;
     log::debug!("enabling session");
     input_capture.enable(session, Default::default()).await?;
     let mut activated = input_capture.receive_activated().await?;
     let current_pos = Rc::new(Cell::new(None));
+    // a new edge configured while the pointer was captured: rebuild the
+    // session once it is released
+    let mut pending_new_edge: Option<Position> = None;
 
     loop {
         tokio::select! {
@@ -654,7 +713,7 @@ where
                     &pos_for_barrier_id,
                 )
                 .await;
-                return Ok(());
+                return Ok(SessionEnd::Shutdown);
             }
             _ = notify_release.notified() => {
                 // Not capturing right now; nothing to hand back, and a target
@@ -671,11 +730,18 @@ where
             event = capture_event.recv() => match event {
                 Some(event) => {
                     apply_client_event(active_clients, event);
-                    // Keep the session alive while no client is enabled: closing
-                    // and recreating it would ask for consent again on portals
-                    // that cannot persist it (InputCapture v1, GNOME).
+                    // Keep the session alive while no client is enabled, or
+                    // when a client comes back on an edge that still has its
+                    // barrier: closing and recreating it would ask for consent
+                    // again on portals that cannot persist it (GNOME).
+                    if let Some(pos) = new_edge(active_clients, &barrier_set) {
+                        if current_pos.get().is_none() {
+                            return Ok(SessionEnd::NewEdge(pos));
+                        }
+                        pending_new_edge = Some(pos);
+                    }
                 }
-                None => return Ok(()),
+                None => return Ok(SessionEnd::Shutdown),
             },
             activated_event = activated.next() => {
                 let Some(activated_event) = activated_event else {
@@ -707,8 +773,9 @@ where
                 else {
                     continue;
                 };
-                // All four edges have a barrier; only the edges that belong
-                // to an enabled client may capture. Release immediately for a
+                // An edge keeps its barrier after its client went away (the
+                // set is fixed per session); only the edges that belong to an
+                // enabled client may capture. Release immediately for a
                 // position that is not configured, keeping the cursor on this
                 // screen.
                 if !active_clients.contains(&pos) {
@@ -801,7 +868,10 @@ where
                 // previous client's position.
                 current_pos.replace(None);
                 if cancellation_token.is_cancelled() {
-                    return Ok(());
+                    return Ok(SessionEnd::Shutdown);
+                }
+                if let Some(pos) = pending_new_edge.take() {
+                    return Ok(SessionEnd::NewEdge(pos));
                 }
             }
         }
@@ -1555,5 +1625,38 @@ mod shutdown_cleanup_tests {
             assert!(MAX_SHUTDOWN_ACTIVATION_RELEASES >= 4);
             assert!(MAX_SHUTDOWN_ACTIVATION_RELEASES <= 16);
         }
+    }
+}
+
+#[cfg(test)]
+mod barrier_set_tests {
+    use super::*;
+
+    /// Regression: barriers on all four edges caught the pointer at the
+    /// bottom before the Ubuntu Dock's pressure barrier, so with a peer only
+    /// on the left/right the dock stopped opening once capture had started.
+    #[test]
+    fn only_configured_edges_get_a_barrier() {
+        assert_eq!(barrier_positions(&[Position::Right]), vec![Position::Right]);
+        assert_eq!(
+            barrier_positions(&[Position::Right, Position::Left]),
+            vec![Position::Left, Position::Right],
+            "fixed order, no duplicates"
+        );
+        assert!(!barrier_positions(&[Position::Left, Position::Right]).contains(&Position::Bottom));
+    }
+
+    #[test]
+    fn only_an_edge_without_a_barrier_needs_a_new_session() {
+        let barriers = [Position::Left, Position::Right];
+        // reconnecting a client on an edge that has its barrier: no rebuild
+        assert_eq!(new_edge(&[Position::Right], &barriers), None);
+        // a client removed: the barrier stays, released on activation
+        assert_eq!(new_edge(&[], &barriers), None);
+        // a client moved to the top: that edge needs a barrier
+        assert_eq!(
+            new_edge(&[Position::Right, Position::Top], &barriers),
+            Some(Position::Top)
+        );
     }
 }
