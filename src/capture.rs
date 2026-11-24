@@ -696,6 +696,8 @@ struct CaptureTask {
     disconnected_since: Option<Instant>,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
+    /// fixed way home: Right Shift held alone for 3 s
+    emergency: crate::emergency_release::EmergencyRelease,
     request_rx: Receiver<CaptureRequest>,
     selected_backend: Rc<Cell<Option<input_capture::Backend>>>,
     state: State,
@@ -748,6 +750,7 @@ impl CaptureTask {
             event_tx: parts.event_tx,
             request_rx: parts.request_rx,
             release_bind: Rc::new(RefCell::new(parts.release_bind)),
+            emergency: Default::default(),
             selected_backend: parts.selected_backend,
             state: Default::default(),
         }
@@ -1277,7 +1280,14 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
+            self.emergency.reset();
             return self.release_capture(capture, None).await;
+        }
+        if let CaptureEvent::Input(input) = &event {
+            if self.emergency.on_event(input, Instant::now()) {
+                log::info!("releasing capture: Right Shift held for 3 s (emergency release)");
+                return self.release_capture(capture, None).await;
+            }
         }
 
         if !self.outgoing_event_allowed(handle, &event) {

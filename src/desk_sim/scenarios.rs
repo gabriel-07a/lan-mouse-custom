@@ -241,3 +241,42 @@ async fn the_link_reports_latency_percentiles() {
         })
         .await;
 }
+
+/// The fixed way home: while A drives B, Right Shift held alone for 3 s on
+/// A's keyboard brings the keyboard and mouse back to A; a short Shift does
+/// not.
+#[tokio::test(flavor = "current_thread")]
+async fn holding_right_shift_brings_the_keyboard_home() {
+    init_log();
+    LocalSet::new()
+        .run_until(async {
+            let desk = Desk::builder()
+                .pc("A", 1920, 1080)
+                .pc("B", 1920, 1080)
+                .place("B", Position::Right, "A")
+                .place("A", Position::Left, "B")
+                .start()
+                .await;
+            desk.move_mouse(1200.0, 0.0).await;
+            desk.wait_focus("B").await;
+
+            const RIGHT_SHIFT: u32 = 54;
+            desk.key_hold_on("A", RIGHT_SHIFT, Duration::from_millis(300))
+                .await;
+            desk.hold(
+                "a short Shift keeps B in control",
+                Duration::from_millis(300),
+                |d| d.focus() == Focus::On("B"),
+            )
+            .await;
+
+            desk.key_hold_on(
+                "A",
+                RIGHT_SHIFT,
+                crate::emergency_release::HOLD + Duration::from_millis(100),
+            )
+            .await;
+            desk.wait_focus("A").await;
+        })
+        .await;
+}

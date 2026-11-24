@@ -309,6 +309,21 @@ impl ScreenState {
     /// local capture is active the key goes to the peer and the local OS
     /// never sees it (the real grab); otherwise a lock key toggles the local
     /// lock.
+    /// One key event typed on this PC's keyboard (1 = down, 0 = up); goes to
+    /// the capture while it is captured, like a real grab.
+    pub(crate) fn key_event(&mut self, key: u32, state: u8) {
+        if let Some(edge) = self.captured {
+            self.send_capture(
+                edge,
+                CaptureEvent::Input(Event::Keyboard(input_event::KeyboardEvent::Key {
+                    time: 0,
+                    key,
+                    state,
+                })),
+            );
+        }
+    }
+
     pub(crate) fn key_tap(&mut self, key: u32) {
         if let Some(edge) = self.captured {
             for state in [1, 0] {

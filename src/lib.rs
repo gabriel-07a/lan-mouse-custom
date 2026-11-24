@@ -14,6 +14,7 @@ mod devices;
 mod discovery;
 mod dns;
 pub mod doctor;
+mod emergency_release;
 mod emulation;
 pub mod emulation_test;
 mod handoff_trace;

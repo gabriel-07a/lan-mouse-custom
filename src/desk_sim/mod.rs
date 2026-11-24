@@ -441,6 +441,14 @@ impl Desk {
         tokio::task::yield_now().await;
     }
 
+    /// A key held down on `name`'s keyboard for `hold` (real time).
+    pub(crate) async fn key_hold_on(&self, name: &str, key: u32, hold: Duration) {
+        lock(&self.pc(name).screen).key_event(key, 1);
+        tokio::time::sleep(hold).await;
+        lock(&self.pc(name).screen).key_event(key, 0);
+        tokio::task::yield_now().await;
+    }
+
     /// Ctrl+C on `name`: the user copies `snapshot` there.
     pub(crate) fn copy(&self, name: &str, snapshot: ClipboardSnapshot) {
         self.pc(name).clipboard.set_local(snapshot);
