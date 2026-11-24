@@ -50,3 +50,25 @@ SWAY=$PWD/root/usr/bin/sway SWAY_LD_LIBRARY_PATH=$PWD/root/usr/lib/x86_64-linux-
 O primeiro teste achou um defeito real: a captura layer-shell criada logo após
 o construtor ainda não conhecia os monitores e falhava com "no capture window
 available"; o construtor agora espera a geometria dos outputs.
+
+## Screenshots da interface
+
+`scripts/gui-screenshots.sh <pasta>` abre a interface GPUI em modo de
+demonstração (`LAN_MOUSE_GPUI_DEMO=1`: dispositivos fixos cobrindo todos os
+estados, nomes longos, código de pareamento, pedido pendente, scan) dentro do
+GNOME headless e tira um PNG por página e tamanho de tela, sem tocar no
+desktop. Use para revisar layout (elementos cortados, sobrepostos, sem
+tradução) antes e depois de mexer na interface.
+
+```sh
+(cd lan-mouse-gpui && RUSTFLAGS="-L native=$PWD/../.tools/xkblib" cargo build)
+scripts/gui-screenshots.sh /tmp/ui
+GUI_LANGUAGE=pt-br GUI_SIZES="1024x2400" GUI_PAGES="devices settings" \
+  scripts/gui-screenshots.sh /tmp/ui-pt     # tela alta: a página inteira
+```
+
+Variáveis: `GUI_SIZES` (padrão `1920x1080 1366x768 1024x700`), `GUI_PAGES`
+(`devices network settings add`; `add` abre o diálogo de adicionar),
+`GUI_LANGUAGE` (`en` / `pt-br`). A extensão de teste fotografa a tela quando
+`$LAN_MOUSE_TEST_PROBE.shot` aparece com o caminho do PNG.
+

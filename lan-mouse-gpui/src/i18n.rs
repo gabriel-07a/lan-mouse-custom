@@ -15,11 +15,19 @@ pub(crate) enum Language {
 
 impl Language {
     pub(crate) fn load() -> Self {
-        let Some(path) = Self::path() else {
-            return Self::English;
-        };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::English;
+        // `LAN_MOUSE_GPUI_LANGUAGE=pt-br|en` wins over the saved choice (UI
+        // screenshots, demo mode).
+        let text = match std::env::var("LAN_MOUSE_GPUI_LANGUAGE") {
+            Ok(text) => text,
+            Err(_) => {
+                let Some(path) = Self::path() else {
+                    return Self::English;
+                };
+                let Ok(text) = std::fs::read_to_string(path) else {
+                    return Self::English;
+                };
+                text
+            }
         };
         match text.trim().to_ascii_lowercase().as_str() {
             "pt-br" | "pt_br" | "portuguese" => Self::PortugueseBrazil,
@@ -71,6 +79,14 @@ impl Language {
                 "Connect" => "Conectar",
                 "Cancel" => "Cancelar",
                 "Disconnect" => "Desconectar",
+                "Demo mode" => "Demonstração",
+                "fingerprint (optional, advanced)" => "impressão digital (opcional, avançado)",
+                "the other PC is on the" => "posição do outro PC:",
+                "Approve this PC on the other one and check that it shows this code" => {
+                    "Aprove este PC no outro e confira se ele mostra este código"
+                }
+                "Service running" => "Serviço ativo",
+                "Service offline" => "Serviço parado",
                 "Go to this PC" => "Ir para este PC",
                 "Edit" => "Editar",
                 "Remove" => "Remover",
@@ -133,7 +149,7 @@ impl Language {
                 "Disable" => "Desativar",
                 "Enable" => "Ativar",
                 "Copy address" => "Copiar endereço",
-                "Copy fingerprint" => "Copiar fingerprint",
+                "Copy fingerprint" => "Copiar impressão digital",
                 "Approve" => "Aprovar",
                 "No known devices." => "Nenhum dispositivo conhecido.",
                 "No devices yet" => "Nenhum dispositivo ainda",

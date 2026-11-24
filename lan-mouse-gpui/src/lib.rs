@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod cursor_extension;
+mod demo;
 mod i18n;
 
 use gpui::{
@@ -431,7 +432,9 @@ fn aggregate_peer(members: &[(ClientHandle, ClientConfig, ClientState)]) -> Opti
         loss_percent: link_state.loss_percent,
         rtt_p99_us: link_state.latency.rtt_p99_us,
         peer_commit: members.iter().find_map(|(_, _, state)| state.peer_commit),
-        peer_app_version: members.iter().find_map(|(_, _, state)| state.peer_app_version),
+        peer_app_version: members
+            .iter()
+            .find_map(|(_, _, state)| state.peer_app_version),
         compatibility: members
             .iter()
             .map(|(_, _, state)| state.compatibility.clone())
@@ -866,6 +869,23 @@ impl Dashboard {
     fn new(cx: &mut Context<Self>, local_commit: [u8; 8]) -> Self {
         let (tx, rx) = async_channel::unbounded();
 
+        if demo::enabled() {
+            for event in demo::events() {
+                let _ = tx.send_blocking(BridgeMessage::Event(Box::new(event)));
+            }
+        } else {
+            Self::spawn_bridge(tx);
+        }
+        let mut dashboard = Self::new_with_bridge(cx, local_commit, rx);
+        if demo::page() == Some("add") {
+            dashboard.add_device();
+        }
+        dashboard
+    }
+
+    /// The service bridge: a thread that connects over IPC and forwards
+    /// every event.
+    fn spawn_bridge(tx: async_channel::Sender<BridgeMessage>) {
         std::thread::spawn(move || {
             let (mut reader, writer) = match lan_mouse_ipc::connect() {
                 Ok(connection) => connection,
@@ -898,7 +918,13 @@ impl Dashboard {
                 }
             }
         });
+    }
 
+    fn new_with_bridge(
+        cx: &mut Context<Self>,
+        local_commit: [u8; 8],
+        rx: async_channel::Receiver<BridgeMessage>,
+    ) -> Self {
         cx.spawn(async move |this, cx| {
             while let Ok(message) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
@@ -960,7 +986,11 @@ impl Dashboard {
             status: Language::load()
                 .tr("Connecting to Lan Mouse service…")
                 .to_string(),
-            page: Page::Devices,
+            page: match demo::page() {
+                Some("network") => Page::Network,
+                Some("settings") => Page::Settings,
+                _ => Page::Devices,
+            },
             selected_client: None,
             hostname: hostname::get()
                 .ok()
@@ -1004,9 +1034,9 @@ impl Dashboard {
                 Language::PortugueseBrazil => {
                     format!("Não foi possível adicionar {ip}:{port} (sem resposta do serviço)")
                 }
-                Language::English => format!(
-                    "Could not add {ip}:{port} (the service did not answer)"
-                ),
+                Language::English => {
+                    format!("Could not add {ip}:{port} (the service did not answer)")
+                }
             },
             false,
         ));
@@ -1622,7 +1652,6 @@ impl Dashboard {
         &self,
         page: Page,
         label: &'static str,
-        icon: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let selected = self.page == page;
@@ -1631,7 +1660,7 @@ impl Dashboard {
             .flex()
             .items_center()
             .gap_3()
-            .px_3()
+            .pr_3()
             .py_2()
             .rounded_md()
             .cursor_pointer()
@@ -1640,10 +1669,75 @@ impl Dashboard {
             } else {
                 rgb(SIDEBAR)
             })
+            .hover(|style| style.bg(rgb(0x1a2029)))
             .text_color(if selected { rgb(TEXT) } else { rgb(MUTED) })
-            .child(div().text_base().child(icon))
+            // selection marker instead of glyph icons, which fall back to
+            // different fonts and sizes per platform
+            .child(div().w(px(3.0)).h(px(18.0)).rounded_full().bg(if selected {
+                rgb(ACCENT)
+            } else {
+                rgb(SIDEBAR)
+            }))
             .child(div().text_sm().child(label))
             .on_click(cx.listener(move |this, _, _, _| this.switch_page(page)))
+    }
+
+    /// Bottom of the sidebar: service state as a dot and a short word, the
+    /// healthy link count, and the last status message on one line.
+    fn render_sidebar_status(&self) -> impl IntoElement + use<> {
+        let (dot, state) = if demo::enabled() {
+            (AMBER, self.tr("Demo mode"))
+        } else if self.writer.is_some() {
+            (GREEN, self.tr("Service running"))
+        } else if self.status.starts_with("Lost") || self.status.starts_with("Service error") {
+            (RED, self.tr("Service offline"))
+        } else {
+            (AMBER, self.tr("Connecting…"))
+        };
+        let links = self.healthy_link_count();
+        let links = match self.language {
+            Language::PortugueseBrazil => format!("{links} link(s) ativo(s)"),
+            Language::English => format!("{links} active link(s)"),
+        };
+        let message = self.status.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(8.0))
+                            .h(px(8.0))
+                            .rounded_full()
+                            .bg(rgb(dot)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(rgb(TEXT))
+                            .child(state),
+                    ),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(links))
+            .when(!message.is_empty() && !demo::enabled(), |this| {
+                this.child(
+                    div()
+                        .id("sidebar-status-message")
+                        .w_full()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(message),
+                )
+            })
     }
 
     /// Render one logical peer card (one or more configured clients sharing a
@@ -1706,10 +1800,9 @@ impl Dashboard {
                 LinkState::Connecting if peer.has_outgoing => {
                     format!("link to {display_endpoint} up — waiting for a reply")
                 }
-                LinkState::Connecting if peer.pairing_code.is_some() => format!(
-                    "waiting for approval on the other PC — check that it shows the code {}",
-                    spaced_code(peer.pairing_code.as_deref().unwrap_or_default())
-                ),
+                LinkState::Connecting if peer.pairing_code.is_some() => {
+                    "waiting for approval on the other PC".to_string()
+                }
                 LinkState::Connecting => format!("trying {display_endpoint} — no answer yet"),
                 LinkState::Reconnecting => {
                     format!("no reply for {stale_secs}s — reconnecting…{link_metrics}{last_pong}")
@@ -1734,10 +1827,9 @@ impl Dashboard {
                 LinkState::Connecting if peer.has_outgoing => {
                     format!("link para {display_endpoint} ativo — aguardando resposta")
                 }
-                LinkState::Connecting if peer.pairing_code.is_some() => format!(
-                    "aguardando aprovação no outro PC — confira se ele mostra o código {}",
-                    spaced_code(peer.pairing_code.as_deref().unwrap_or_default())
-                ),
+                LinkState::Connecting if peer.pairing_code.is_some() => {
+                    "aguardando aprovação no outro PC".to_string()
+                }
                 LinkState::Connecting => {
                     format!("tentando {display_endpoint} — sem resposta ainda")
                 }
@@ -1786,7 +1878,9 @@ impl Dashboard {
         let go_to_offered = peer.active
             && matches!(
                 state,
-                LinkState::Connected | LinkState::ConnectedBidirectional | LinkState::ConnectedDegraded
+                LinkState::Connected
+                    | LinkState::ConnectedBidirectional
+                    | LinkState::ConnectedDegraded
             );
         let go_to_handle = peer.primary;
         let edit_members = peer.members.clone();
@@ -1840,7 +1934,7 @@ impl Dashboard {
                             .bg(rgb(state_bg))
                             .text_color(rgb(state_color))
                             .text_xs()
-                            .child(state.badge()),
+                            .child(self.tr(state.badge())),
                     ),
             )
             .child(
@@ -1943,7 +2037,44 @@ impl Dashboard {
                             )
                         },
                     )
-                    .when(peer.last_error.is_some(), |this| {
+                    // While the other PC has not approved this one the
+                    // handshake "fails" by design: the code is the news, not
+                    // the error.
+                    .when_some(peer.pairing_code.clone(), |this, code| {
+                        this.child(
+                            div()
+                                .mt_1()
+                                .px_3()
+                                .py_2()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x5c4a17))
+                                .bg(rgb(0x2a2412))
+                                .child(
+                                    div()
+                                        .min_w(px(0.0))
+                                        .text_sm()
+                                        .text_color(rgb(AMBER))
+                                        .child(self.tr(
+                                            "Approve this PC on the other one and check that it shows this code",
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xl()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(spaced_code(&code)),
+                                ),
+                        )
+                    })
+                    .when(peer.last_error.is_some() && peer.pairing_code.is_none(), |this| {
                         this.child(
                             div()
                                 .w_full()
@@ -1985,7 +2116,7 @@ impl Dashboard {
                                     .text_color(rgb(if is_current { ACCENT } else { TEXT }))
                                     .text_xs()
                                     .cursor_pointer()
-                                    .child(position_label(side))
+                                    .child(self.tr(position_label(side)))
                                     .on_click(cx.listener(move |this, _, _, _| {
                                         this.set_position(&side_members, side)
                                     }))
@@ -2054,7 +2185,13 @@ impl Dashboard {
                         move |this, _, _, _| this.delete_peer(&delete_members),
                     )),
             )
-            .child(self.render_metric_sparkline(primary))
+            // A chart needs a few samples; one bar (or none) read as broken.
+            .when(
+                self.metric_history
+                    .get(&primary)
+                    .is_some_and(|samples| samples.len() >= 2),
+                |this| this.child(self.render_metric_sparkline(primary)),
+            )
             .into_any_element()
     }
 
@@ -2234,12 +2371,7 @@ impl Dashboard {
             .bg(rgb(background))
             .border_b_1()
             .border_color(rgb(border))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(TEXT))
-                    .child(message.clone()),
-            )
+            .child(div().text_sm().text_color(rgb(TEXT)).child(message.clone()))
             .child(self.action_button(
                 "dismiss-add-notice",
                 self.tr("OK"),
@@ -2300,6 +2432,9 @@ impl Dashboard {
     }
 }
 
+/// Widest the page content gets; wider windows center it.
+const CONTENT_MAX_WIDTH: f32 = 1040.0;
+
 impl Render for Dashboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rem_size = px(16.0);
@@ -2333,29 +2468,12 @@ impl Render for Dashboard {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(self.sidebar_item(Page::Devices, self.tr("Devices"), "◉", cx))
-                    .child(self.sidebar_item(Page::Network, self.tr("Network"), "⌁", cx))
-                    .child(self.sidebar_item(Page::Settings, self.tr("Settings"), "⚙", cx)),
+                    .child(self.sidebar_item(Page::Devices, self.tr("Devices"), cx))
+                    .child(self.sidebar_item(Page::Network, self.tr("Network"), cx))
+                    .child(self.sidebar_item(Page::Settings, self.tr("Settings"), cx)),
             )
             .child(div().flex_grow())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(self.status.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(format!("{} active link(s)", self.healthy_link_count())),
-                    ),
-            );
+            .child(self.render_sidebar_status());
 
         let content = match self.page {
             Page::Devices => self.render_devices(cx).into_any_element(),
@@ -2367,12 +2485,7 @@ impl Render for Dashboard {
         // height: the titlebar/banner heights vary, and a fixed content height
         // clipped the bottom of the Settings cards (the extension row made the
         // card taller than the old estimate).
-        let shell = div()
-            .flex()
-            .flex_1()
-            .min_h(px(0.0))
-            .child(sidebar)
-            .child(
+        let shell = div().flex().flex_1().min_h(px(0.0)).child(sidebar).child(
             div()
                 .flex()
                 .flex_col()
@@ -2381,56 +2494,67 @@ impl Render for Dashboard {
                 .child(
                     div()
                         .h(px(64.0))
+                        .flex_none()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .px_6()
+                        .justify_center()
                         .border_b_1()
                         .border_color(rgb(BORDER))
                         .child(
                             div()
-                                .text_lg()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT))
-                                .child(match self.page {
-                                    Page::Devices => self.tr("Devices"),
-                                    Page::Network => self.tr("Network"),
-                                    Page::Settings => self.tr("Settings"),
+                                .w_full()
+                                .max_w(px(CONTENT_MAX_WIDTH))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_6()
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(match self.page {
+                                            Page::Devices => self.tr("Devices"),
+                                            Page::Network => self.tr("Network"),
+                                            Page::Settings => self.tr("Settings"),
+                                        }),
+                                )
+                                .when(self.page == Page::Devices, |this| {
+                                    this.child(
+                                        div()
+                                            .id("add-device")
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .bg(rgb(ACCENT))
+                                            .text_color(rgb(0x081018))
+                                            .text_sm()
+                                            .cursor_pointer()
+                                            .child(self.tr("+ Add device"))
+                                            .on_click(cx.listener(|this, _, window, _| {
+                                                this.add_device();
+                                                window.focus(&this.add_focus);
+                                            })),
+                                    )
+                                })
+                                .when(self.page == Page::Network, |this| {
+                                    this.child(
+                                        div()
+                                            .id("scan-network-header")
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .bg(rgb(ACCENT))
+                                            .text_color(rgb(0x081018))
+                                            .text_sm()
+                                            .cursor_pointer()
+                                            .child(self.tr("Scan network"))
+                                            .on_click(
+                                                cx.listener(|this, _, _, _| this.start_scan()),
+                                            ),
+                                    )
                                 }),
-                        )
-                        .when(self.page == Page::Devices, |this| {
-                            this.child(
-                                div()
-                                    .id("add-device")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(ACCENT))
-                                    .text_color(rgb(0x081018))
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .child(self.tr("+ Add device"))
-                                    .on_click(cx.listener(|this, _, window, _| {
-                                        this.add_device();
-                                        window.focus(&this.add_focus);
-                                    })),
-                            )
-                        })
-                        .when(self.page == Page::Network, |this| {
-                            this.child(
-                                div()
-                                    .id("scan-network-header")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(ACCENT))
-                                    .text_color(rgb(0x081018))
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .child(self.tr("Scan network"))
-                                    .on_click(cx.listener(|this, _, _, _| this.start_scan())),
-                            )
-                        }),
+                        ),
                 )
                 .when(self.add_notice.is_some(), |this| {
                     this.child(self.render_add_notice(cx))
@@ -2447,9 +2571,19 @@ impl Render for Dashboard {
                         .w_full()
                         .flex_1()
                         .min_h(px(0.0))
-                        .overflow_scroll()
+                        .overflow_y_scroll()
                         .scrollbar_width(px(8.0))
-                        .child(content),
+                        .child(
+                            // Cards stretched to 1900 px put a label and its
+                            // button a screen apart; keep a readable column.
+                            div().w_full().flex().justify_center().child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(CONTENT_MAX_WIDTH))
+                                    .min_w(px(0.0))
+                                    .child(content),
+                            ),
+                        ),
                 ),
         );
 
@@ -2700,7 +2834,6 @@ impl Dashboard {
             return div().into_any_element();
         };
         let focus = self.add_focus.clone();
-        let host_focus = focus.clone();
         let host_active = dialog.field == AddField::Hostname;
         let port_active = dialog.field == AddField::Port;
         let fp_active = dialog.field == AddField::Fingerprint;
@@ -2726,170 +2859,68 @@ impl Dashboard {
             .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr(
                 "Type a hostname or IPv4 address. Tab switches fields, Enter adds, Esc cancels.",
             )))
+            .child(self.text_field(
+                "add-field-host",
+                self.tr("hostname / IP"),
+                &dialog.hostname,
+                "192.168.1.20",
+                host_active,
+                AddField::Hostname,
+                cx,
+            ))
+            .child(self.text_field(
+                "add-field-port",
+                self.tr("port"),
+                &dialog.port,
+                "4242",
+                port_active,
+                AddField::Port,
+                cx,
+            ))
+            .child(self.text_field(
+                "add-field-fingerprint",
+                self.tr("fingerprint (optional, advanced)"),
+                &dialog.fingerprint,
+                "AA:BB:CC:…",
+                fp_active,
+                AddField::Fingerprint,
+                cx,
+            ))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
-                    .gap_2()
-                    .child(self.action_button(
-                        "add-field-host",
-                        self.tr("Host"),
-                        0x1d2430,
-                        if host_active { ACCENT } else { TEXT },
-                        cx,
-                        move |this, _, window, _| {
-                            if let Some(dialog) = this.add_dialog.as_mut() {
-                                dialog.field = AddField::Hostname;
-                            }
-                            window.focus(&host_focus);
-                        },
-                    ))
-                    .child(self.action_button(
-                        "add-field-port",
-                        self.tr("Port"),
-                        0x1d2430,
-                        if port_active { ACCENT } else { TEXT },
-                        cx,
-                        |this, _, window, _| {
-                            if let Some(dialog) = this.add_dialog.as_mut() {
-                                dialog.field = AddField::Port;
-                            }
-                            window.focus(&this.add_focus);
-                        },
-                    ))
-                    .child(self.action_button(
-                        "add-field-fingerprint",
-                        self.tr("Fingerprint"),
-                        0x1d2430,
-                        if fp_active { ACCENT } else { TEXT },
-                        cx,
-                        |this, _, window, _| {
-                            if let Some(dialog) = this.add_dialog.as_mut() {
-                                dialog.field = AddField::Fingerprint;
-                            }
-                            window.focus(&this.add_focus);
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(if host_active { ACCENT } else { MUTED }))
-                            .child(self.tr("hostname / IP")),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(TEXT))
-                            .child(format!("{}▌", dialog.hostname)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(if port_active { ACCENT } else { MUTED }))
-                            .child(self.tr("port")),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(TEXT))
-                            .child(format!("{}▌", dialog.port)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(if fp_active { ACCENT } else { MUTED }))
-                            .child("fingerprint (optional, advanced)"),
-                    )
-                    .child(div().text_sm().text_color(rgb(TEXT)).child(
-                        if dialog.fingerprint.is_empty() {
-                            "—".to_string()
-                        } else {
-                            format!("{}▌", dialog.fingerprint)
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
                     .items_center()
                     .gap_2()
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child("peer is on the"),
+                            .child(self.tr("the other PC is on the")),
                     )
-                    .child(self.action_button(
-                        "add-pos-left",
-                        "Left",
-                        0x1d2430,
-                        TEXT,
-                        cx,
-                        |this, _, _, _| {
-                            if let Some(dialog) = this.add_dialog.as_mut() {
-                                dialog.position = Position::Left;
-                            }
-                        },
-                    ))
-                    .child(self.action_button(
-                        "add-pos-right",
-                        "Right",
-                        0x1d2430,
-                        TEXT,
-                        cx,
-                        |this, _, _, _| {
-                            if let Some(dialog) = this.add_dialog.as_mut() {
-                                dialog.position = Position::Right;
-                            }
-                        },
-                    ))
-                    .child(self.action_button(
-                        "add-pos-top",
-                        "Top",
-                        0x1d2430,
-                        TEXT,
-                        cx,
-                        |this, _, _, _| {
-                            if let Some(dialog) = this.add_dialog.as_mut() {
-                                dialog.position = Position::Top;
-                            }
-                        },
-                    ))
-                    .child(self.action_button(
-                        "add-pos-bottom",
-                        "Bottom",
-                        0x1d2430,
-                        TEXT,
-                        cx,
-                        |this, _, _, _| {
-                            if let Some(dialog) = this.add_dialog.as_mut() {
-                                dialog.position = Position::Bottom;
-                            }
-                        },
-                    ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(ACCENT))
-                            .child(position_label(dialog.position)),
+                    .children(
+                        [
+                            Position::Left,
+                            Position::Right,
+                            Position::Top,
+                            Position::Bottom,
+                        ]
+                        .into_iter()
+                        .map(|side| {
+                            let selected = dialog.position == side;
+                            self.action_button(
+                                SharedString::from(format!("add-pos-{}", position_label(side))),
+                                self.tr(position_label(side)),
+                                if selected { 0x1b2a3a } else { 0x1d2430 },
+                                if selected { ACCENT } else { TEXT },
+                                cx,
+                                move |this, _, _, _| {
+                                    if let Some(dialog) = this.add_dialog.as_mut() {
+                                        dialog.position = side;
+                                    }
+                                },
+                            )
+                        }),
                     ),
             )
             .child(
@@ -2898,7 +2929,7 @@ impl Dashboard {
                     .gap_2()
                     .child(self.action_button(
                         "add-dialog-submit",
-                        "Add device",
+                        self.tr("Add device"),
                         ACCENT,
                         0x081018,
                         cx,
@@ -2914,6 +2945,59 @@ impl Dashboard {
                     )),
             )
             .into_any_element()
+    }
+
+    /// A labelled text box of the Add device form: the active one has an
+    /// accent border and the caret; clicking a box makes it active.
+    #[allow(clippy::too_many_arguments)]
+    fn text_field(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        value: &str,
+        placeholder: &'static str,
+        active: bool,
+        field: AddField,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let shown = if value.is_empty() && !active {
+            div().text_color(rgb(0x4b5563)).child(placeholder)
+        } else if active {
+            div().text_color(rgb(TEXT)).child(format!("{value}▏"))
+        } else {
+            div().text_color(rgb(TEXT)).child(value.to_string())
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(if active { ACCENT } else { MUTED }))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(id)
+                    .w_full()
+                    .max_w(px(420.0))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(0x0b0f16))
+                    .border_1()
+                    .border_color(rgb(if active { ACCENT } else { BORDER }))
+                    .text_sm()
+                    .cursor_text()
+                    .child(shown)
+                    .on_click(cx.listener(move |this, _, window, _| {
+                        if let Some(dialog) = this.add_dialog.as_mut() {
+                            dialog.field = field;
+                        }
+                        window.focus(&this.add_focus);
+                    })),
+            )
     }
 
     fn render_identity_card(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -3049,7 +3133,12 @@ impl Dashboard {
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(rgb(AMBER))
-                                .child(format!("Connection request from {name}")),
+                                .child(match self.language {
+                                    Language::PortugueseBrazil => {
+                                        format!("Pedido de conexão de {name}")
+                                    }
+                                    Language::English => format!("Connection request from {name}"),
+                                }),
                         )
                         .child(
                             div()
@@ -3059,10 +3148,19 @@ impl Dashboard {
                                 .child(sas),
                         ),
                 )
-                .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                    "{} · {} attempt(s)",
-                    request.addr, request.attempts
-                )))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(match self.language {
+                            Language::PortugueseBrazil => {
+                                format!("{} · {} tentativa(s)", request.addr, request.attempts)
+                            }
+                            Language::English => {
+                                format!("{} · {} attempt(s)", request.addr, request.attempts)
+                            }
+                        }),
+                )
                 .when(cert_warning.is_some(), move |this| {
                     this.child(
                         div()
@@ -3114,14 +3212,17 @@ impl Dashboard {
 
         let pending = self.pending.len();
         let has_pending = pending > 0;
+        // Natural height: the page grows and the shell's content area scrolls.
+        // A full-height flex column here shrank every card to a sliver once
+        // the list no longer fit (names cut in half on smaller screens).
         div()
             .id("devices-page")
-            .size_full()
+            .w_full()
             .flex()
             .flex_col()
             .gap_3()
             .p_6()
-            .overflow_y_scroll()
+            .pb_12()
             .child(
                 div().flex().items_center().justify_between().child(
                     div()
@@ -3192,12 +3293,12 @@ impl Dashboard {
         let scanned = !self.discovered.is_empty();
         div()
             .id("network-page")
-            .size_full()
+            .w_full()
             .flex()
             .flex_col()
             .gap_3()
             .p_6()
-            .overflow_y_scroll()
+            .pb_12()
             .child(
                 div()
                     .text_sm()
@@ -3530,10 +3631,14 @@ impl Dashboard {
                             .w_full()
                             .text_sm()
                             .text_color(rgb(MUTED))
-                            .child(format!(
-                                "listening port {} · build {}",
-                                self.port, local_commit
-                            )),
+                            .child(match self.language {
+                                Language::PortugueseBrazil => {
+                                    format!("porta {} · compilação {}", self.port, local_commit)
+                                }
+                                Language::English => {
+                                    format!("listening port {} · build {}", self.port, local_commit)
+                                }
+                            }),
                     )
                     .child(self.action_button(
                         "change-port",
@@ -3683,23 +3788,27 @@ impl Dashboard {
                 .clone()
                 .or_else(|| entry.addr.clone())
                 .unwrap_or_default();
+            // Wrapped, not truncated: a truncated line here rendered as a lone
+            // "…" (the text was measured before the row had a width).
             history_rows.push(
                 div()
+                    .w_full()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(
                         div()
+                            .w_full()
                             .min_w(px(0.0))
-                            .truncate()
                             .text_sm()
                             .text_color(rgb(TEXT))
                             .child(format!("{} · {subject}", entry.event)),
                     )
                     .child(
                         div()
+                            .w_full()
                             .min_w(px(0.0))
-                            .truncate()
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .child(format!("{when} {detail}")),
@@ -3833,9 +3942,11 @@ impl Dashboard {
                     .text_color(rgb(TEXT))
                     .child(self.tr("About")),
             )
-            .child(div().text_sm().text_color(rgb(TEXT)).child(
-                self.tr("Lan Mouse — unofficial fork · GPUI frontend · GPL-3.0-or-later"),
-            ))
+            .child(
+                div().text_sm().text_color(rgb(TEXT)).child(
+                    self.tr("Lan Mouse — unofficial fork · GPUI frontend · GPL-3.0-or-later"),
+                ),
+            )
             .child(
                 div()
                     .text_xs()
@@ -3866,10 +3977,8 @@ impl Dashboard {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .p_4()
-                .rounded_lg()
-                .bg(rgb(CARD))
-                .border_1()
+                .py_3()
+                .border_t_1()
                 .border_color(rgb(BORDER))
                 .child(
                     div()
@@ -3959,12 +4068,20 @@ impl Dashboard {
                 );
             rows.push(row);
         }
+        // One section card like the others, the devices as divided rows
+        // (not cards floating under a loose heading).
         div()
             .flex()
             .flex_col()
             .gap_2()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(BORDER))
             .child(
                 div()
+                    .pb_1()
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
@@ -3973,17 +4090,9 @@ impl Dashboard {
             .when(rows.is_empty(), |this| {
                 this.child(
                     div()
-                        .p_4()
-                        .rounded_lg()
-                        .bg(rgb(CARD))
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(MUTED))
-                                .child(self.tr("No known devices.")),
-                        ),
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(self.tr("No known devices.")),
                 )
             })
             .children(rows)
@@ -4423,10 +4532,7 @@ fn clamp_window_to_screen(desired: (f32, f32), screen: Option<(f32, f32)>) -> (f
         return desired;
     };
     let margin = 48.0;
-    let width = desired
-        .0
-        .min((screen_width - margin).max(640.0))
-        .max(480.0);
+    let width = desired.0.min((screen_width - margin).max(640.0)).max(480.0);
     let height = desired
         .1
         .min((screen_height - margin).max(480.0))
@@ -4435,14 +4541,12 @@ fn clamp_window_to_screen(desired: (f32, f32), screen: Option<(f32, f32)>) -> (f
 }
 
 fn main_window_options(cx: &mut App) -> WindowOptions {
-    let display = cx
-        .primary_display()
-        .map(|display| {
-            (
-                f32::from(display.bounds().size.width),
-                f32::from(display.bounds().size.height),
-            )
-        });
+    let display = cx.primary_display().map(|display| {
+        (
+            f32::from(display.bounds().size.width),
+            f32::from(display.bounds().size.height),
+        )
+    });
     let desired = (f32::from(px(980.0)), f32::from(px(720.0)));
     let (width, height) = clamp_window_to_screen(desired, display);
     log::info!(
@@ -5174,7 +5278,6 @@ mod tests {
         assert_eq!(aggregate.position, lan_mouse_ipc::Position::Left);
     }
 }
-
 
 #[cfg(test)]
 mod window_scale_tests {

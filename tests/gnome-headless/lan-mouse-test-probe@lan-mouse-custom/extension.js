@@ -4,6 +4,7 @@
 // shell can tell what the user would have seen.
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
@@ -61,7 +62,33 @@ export default class TestProbe extends Extension {
         }
     }
 
+    // `<probe>.shot` holds a PNG path: take a screenshot of the whole stage
+    // there, then write `<path>.done` (UI screenshots of the GPUI window).
+    _maybeScreenshot() {
+        if (this._shooting)
+            return;
+        const trigger = Gio.File.new_for_path(`${this._path}.shot`);
+        if (!trigger.query_exists(null))
+            return;
+        const [, bytes] = trigger.load_contents(null);
+        const target = new TextDecoder().decode(bytes).trim();
+        trigger.delete(null);
+        this._shooting = true;
+        const file = Gio.File.new_for_path(target);
+        const stream = file.replace(null, false, Gio.FileCreateFlags.NONE, null);
+        const shooter = new Shell.Screenshot();
+        Promise.resolve(shooter.screenshot(false, stream)).then(() => {
+            stream.close(null);
+            GLib.file_set_contents(`${target}.done`, 'ok');
+        }).catch(e => {
+            GLib.file_set_contents(`${target}.done`, `error: ${e}`);
+        }).finally(() => {
+            this._shooting = false;
+        });
+    }
+
     _write() {
+        this._maybeScreenshot();
         const [x, y] = global.get_pointer();
         const monitor = Main.layoutManager.primaryMonitor;
         const dock = this._dockState();
