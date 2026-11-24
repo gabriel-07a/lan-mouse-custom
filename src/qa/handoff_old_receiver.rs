@@ -36,8 +36,8 @@
 //! consumes the *coalesced* delta the source actually sends, so each observed
 //! aggregate is replayed as one receiver-visible event. The provenance check
 //! [`corpus_is_grounded_in_the_local_handoff_trace`] validates that grounding
-//! against the trace files when they exist on the machine (it skips in CI,
-//! where the trace is absent).
+//! against the trace files on request (`LAN_MOUSE_AUDIT_HANDOFF_TRACE=1`; the
+//! trace is a rotating log, so the audit is not part of a default run).
 //!
 //! Result: the current-tree guard leaks the post-forward residual into the old
 //! receiver (both receiver models fire a `LeaveAt`); the final window-only
@@ -58,12 +58,9 @@ use std::{
 };
 
 /// Production coalescer, compiled read-only into this test crate (same
-/// technique as `tests/qa_handoff_shutdown.rs`): the "forward deltas are not
+/// technique as `src/qa/handoff_shutdown.rs`): the "forward deltas are not
 /// delayed" contract is asserted against the real leading-edge/burst logic.
-#[path = "../src/coalesce.rs"]
-mod coalesce;
-
-use coalesce::MotionCoalescer;
+use crate::coalesce::MotionCoalescer;
 
 /// The production guard constants, pinned here so the model cannot silently
 /// drift from `src/capture.rs` (see
@@ -77,7 +74,7 @@ const HANDOFF_REVERSE_GUARD: Duration = Duration::from_millis(200);
 
 /// Source of the production guard, compiled into the test binary for the
 /// model/implementation parity check.
-const CAPTURE_SOURCE: &str = include_str!("../src/capture.rs");
+const CAPTURE_SOURCE: &str = include_str!("../../src/capture.rs");
 
 /// `input_capture::CaptureHandle` used by the coalescer contract test.
 const HANDLE: input_capture::CaptureHandle = 7;
@@ -1689,11 +1686,20 @@ fn harness_guard_model_matches_the_production_guard() {
     );
 }
 
-/// The magnitudes in [`Scene`]s are expanded from real trace records. When the
-/// local trace file exists, every cited record must still be present; when it
-/// does not (CI, a fresh machine) the check is skipped.
+/// The magnitudes in [`Scene`]s are expanded from real trace records. The
+/// audit is opt-in (`LAN_MOUSE_AUDIT_HANDOFF_TRACE=1`): the trace is a
+/// rotating log, so on a machine that keeps using Lan Mouse the cited records
+/// rotate out and a default run would stay red for no code change. Run it
+/// when re-grounding the corpus (Appendix B of
+/// docs/testing/handoff-old-receiver-harness.md).
 #[test]
 fn corpus_is_grounded_in_the_local_handoff_trace() {
+    if std::env::var_os("LAN_MOUSE_AUDIT_HANDOFF_TRACE").is_none() {
+        eprintln!(
+            "skipped: set LAN_MOUSE_AUDIT_HANDOFF_TRACE=1 to audit the corpus against the local trace"
+        );
+        return;
+    }
     let files = existing_trace_files();
     if files.is_empty() {
         eprintln!(

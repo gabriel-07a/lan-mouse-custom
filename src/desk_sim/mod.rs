@@ -316,9 +316,11 @@ impl DeskBuilder {
                 discovery_beacon: self.discoverable,
                 // the PC's own lock state, as the OS would report it
                 lock_reader: Some(Rc::new(move || {
+                    let mut state = lock(&lock_screen);
+                    state.lock_reads += 1;
                     Some(crate::lock_sync::Locks {
                         known: lan_mouse_proto::lock_bits::CAPS | lan_mouse_proto::lock_bits::NUM,
-                        on: lock(&lock_screen).locks,
+                        on: state.locks,
                     })
                 })),
                 ipc_socket: Some(env.runtime_dir().join("lan-mouse-socket.sock")),
@@ -536,6 +538,26 @@ impl Desk {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+    }
+
+    /// Wait until every service has run `polls` more lock polls. A poll reads
+    /// the state and sends any change before the next one starts, so after
+    /// a few polls on every PC a lock change (and any echo of it) has gone
+    /// round; counting polls instead of sleeping keeps that true on a slow
+    /// machine and returns sooner on a fast one.
+    pub(crate) async fn settle_lock_polls(&self, polls: usize) {
+        let start: Vec<usize> = self.pcs.iter().map(|pc| pc.state().lock_reads).collect();
+        self.wait_until(
+            &format!("{polls} lock polls on every PC"),
+            Duration::from_secs(10),
+            |desk| {
+                desk.pcs
+                    .iter()
+                    .zip(&start)
+                    .all(|(pc, start)| pc.state().lock_reads >= start + polls)
+            },
+        )
+        .await;
     }
 
     /// Wait until the hand PC's cursor is on `name`.

@@ -10,7 +10,7 @@ Independent verification of the two regressions reported for this cycle:
 This document records the automated checks, the independent regression audit,
 the exact commands and results, the remaining risks, and the Windows/Ubuntu
 manual checklist. Written by the verifier: **no production source file was
-edited by this verification**; the verifier added `tests/qa_handoff_shutdown.rs`,
+edited by this verification**; the verifier added `src/qa/handoff_shutdown.rs`,
 `scripts/qa-handoff-shutdown.sh` and this document. One production line was
 applied by the Team Lead during verification to fix a pre-existing Windows
 compile error found by this audit (§3.3, §6.2).
@@ -28,7 +28,7 @@ for the Windows GNU target after the one-line fix found here.
 | `cargo test --workspace --all-features` | **PASS** — 750 passed, 0 failed, 1 ignored (pre-existing X11-display test) |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **PASS** (no warnings) |
 | Windows cross-check (`x86_64-pc-windows-gnu`, zig wrapper) | **PASS** after the one-line fix; before it **FAIL** (`E0282`, pre-existing — §3.3/§6.2) |
-| `tests/qa_handoff_shutdown.rs` | **PASS** — 36/36 |
+| `src/qa/handoff_shutdown.rs` | **PASS** — 36/36 |
 | `scripts/qa-handoff-shutdown.sh` | **PASS** — 28/28 checks |
 | headless build (`--no-default-features`) | **PASS** |
 
@@ -90,13 +90,13 @@ Lead after this audit reported it; see §3.3 and §6.2).
 
 ### 2.4 Verifier artifacts (new files)
 
-- `tests/qa_handoff_shutdown.rs` — deterministic L2 contract harness (§3.1);
+- `src/qa/handoff_shutdown.rs` — deterministic L2 contract harness (§3.1);
 - `scripts/qa-handoff-shutdown.sh` — black-box daemon lifecycle harness (§3.2);
 - `docs/testing/handoff-and-shutdown-verification.md` — this document.
 
 ## 3. Automated verification
 
-### 3.1 Deterministic harness: `tests/qa_handoff_shutdown.rs`
+### 3.1 Deterministic harness: `src/qa/handoff_shutdown.rs`
 
 `capture::CaptureTask` and `service::Service` are private to the binary crate,
 so the harness compiles the pure modules into the test crate with `#[path]`
@@ -123,7 +123,7 @@ The `#[path]` include also re-runs the modules' own unit tests in the
 integration binary (cursor_hide 10, coalesce 14), so the run reports 36 tests.
 
 ```sh
-cargo test -p lan-mouse --test qa_handoff_shutdown
+cargo test -p lan-mouse --lib -- qa::handoff_shutdown
 # test result: ok. 36 passed; 0 failed; 0 ignored
 ```
 
@@ -411,7 +411,7 @@ forward motion) is validated only by unit tests and manual T1/T4.
 
 ### 6.5 Harness limitations
 
-- `tests/qa_handoff_shutdown.rs` compiles copies of the pure modules into the
+- `src/qa/handoff_shutdown.rs` compiles copies of the pure modules into the
   test crate: it pins their behaviour but not the service wiring; the black-box
   script covers the Linux daemon wiring.
 - The black-box script uses the dummy capture/emulation backends, so it proves
@@ -430,7 +430,7 @@ forward motion) is validated only by unit tests and manual T1/T4.
 
 ```sh
 # 1. deterministic contracts
-cargo test -p lan-mouse --test qa_handoff_shutdown
+cargo test -p lan-mouse --lib -- qa::handoff_shutdown
 
 # 2. black-box daemon lifecycle (builds the headless binary itself)
 scripts/qa-handoff-shutdown.sh

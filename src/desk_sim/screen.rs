@@ -40,7 +40,7 @@ const EDGE_RETURN_MAX_ATTEMPTS: u8 = 3;
 /// OS quirks of a virtual PC, on top of the baseline backend contract.
 ///
 /// The numbers come from real traces (see `docs/analysis/handoff-bidirectional.md`
-/// and the models in `tests/qa_handoff_bidirectional.rs`). Each field is
+/// and the models in `src/capture/qa_bidirectional.rs`). Each field is
 /// what the OS backend *delivers to lan-mouse*, so the service's own guards
 /// are what is being tested.
 #[derive(Clone, Debug)]
@@ -174,6 +174,8 @@ pub(crate) struct ScreenState {
     pub(crate) locks: u8,
     /// lock keys injected by the emulation backend (lock sync)
     pub(crate) injected_lock_taps: usize,
+    /// times the service read this PC's lock state (one per lock poll)
+    pub(crate) lock_reads: usize,
     pub(crate) log: Vec<Logged>,
     pub(crate) personality: Personality,
     /// backswing still owed after the first user motion of this capture
@@ -208,6 +210,7 @@ impl ScreenState {
             injected_other: Vec::new(),
             locks: 0,
             injected_lock_taps: 0,
+            lock_reads: 0,
             log: Vec::new(),
             personality: Personality::baseline(),
             pending_backswing: None,

@@ -14,7 +14,7 @@
 # both sides with the position-aware source filter + receiver re-entry gate.
 #
 # Legs:
-#   1. independent replay harness (tests/qa_handoff_bidirectional.rs): the
+#   1. independent replay harness (src/capture/qa_bidirectional.rs): the
 #      shipping `src/capture.rs` CaptureTask is driven in both directions and
 #      its forwarded deltas feed independent current/0.2.18 receiver models;
 #   2. same-build candidate validation: version metadata, Ubuntu local
@@ -75,9 +75,9 @@ fingerprint() {
         echo "hashes:"
         for f in src/capture.rs input-emulation/src/libei.rs src/service.rs \
                  lan-mouse-proto/src/lib.rs \
-                 tests/qa_handoff_bidirectional.rs \
-                 tests/qa_handoff_old_receiver.rs \
-                 tests/qa_handoff_old_receiver_verify.rs \
+                 src/capture/qa_bidirectional.rs \
+                 src/qa/handoff_old_receiver.rs \
+                 src/capture/qa_old_receiver_verify.rs \
                  scripts/qa-handoff-bidirectional.sh \
                  docs/testing/handoff-bidirectional-verification.md; do
             [ -f "$f" ] && sha256sum "$f"
@@ -105,7 +105,7 @@ replay_checks() {
     say ""
     say "== 1. Independent bidirectional replay (shipping capture task) =="
     run_gate "replay: shipped src/capture.rs vs current/0.2.18 receiver models" \
-        cargo test --test qa_handoff_bidirectional
+        cargo test --lib -- capture::qa_bidirectional
 }
 
 # --- leg 2: same-build candidate validation --------------------------------
@@ -189,12 +189,12 @@ gates() {
     run_gate "cargo test -p lan-mouse --lib" cargo test -p lan-mouse --lib
     run_gate "cargo test -p input-emulation --lib (receiver deadband/settle)" \
         cargo test -p input-emulation --lib
-    run_gate "cargo test --test qa_handoff_old_receiver_verify (previous verifier gate)" \
-        cargo test --test qa_handoff_old_receiver_verify
-    run_gate "cargo test --test qa_handoff_old_receiver (task-5 harness)" \
-        cargo test --test qa_handoff_old_receiver
-    run_gate "cargo test --test qa_handoff_shutdown (shutdown contract)" \
-        cargo test --test qa_handoff_shutdown
+    run_gate "cargo test --lib -- capture::qa_old_receiver_verify (previous verifier gate)" \
+        cargo test --lib -- capture::qa_old_receiver_verify
+    run_gate "cargo test --lib -- qa::handoff_old_receiver (task-5 harness)" \
+        cargo test --lib -- qa::handoff_old_receiver
+    run_gate "cargo test --lib -- qa::handoff_shutdown (shutdown contract)" \
+        cargo test --lib -- qa::handoff_shutdown
     run_gate "cargo test --test qa_clipboard_atomicity (clipboard regression)" \
         cargo test --test qa_clipboard_atomicity
     run_gate "cargo test --test qa_connection_state (connect state regression)" \

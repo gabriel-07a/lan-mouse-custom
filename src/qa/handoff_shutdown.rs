@@ -42,18 +42,8 @@ use std::{
     time::Duration,
 };
 
-/// Source file compiled into this test crate instead of the binary crate.
-#[allow(dead_code)]
-#[path = "../src/cursor_hide.rs"]
-mod cursor_hide;
-
-/// Source file compiled into this test crate instead of the binary crate.
-#[allow(dead_code)]
-#[path = "../src/coalesce.rs"]
-mod coalesce;
-
-use coalesce::MotionCoalescer;
-use cursor_hide::{CursorHide, HEARTBEAT_INTERVAL};
+use crate::coalesce::MotionCoalescer;
+use crate::cursor_hide::{CursorHide, HEARTBEAT_INTERVAL};
 
 /// Self-deleting temporary directory, unique per test and process so parallel
 /// test binaries cannot collide.
@@ -343,7 +333,7 @@ fn shutdown_removes_markers_this_instance_never_wrote() {
 #[test]
 fn the_service_heartbeat_fits_inside_the_extension_freshness_window() {
     let extension =
-        include_str!("../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/extension.js");
+        include_str!("../../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/extension.js");
     let heartbeat_ms = parse_js_integer(extension, "HEARTBEAT_MS")
         .expect("extension must keep a HEARTBEAT_MS constant");
     let freshness = Duration::from_millis(heartbeat_ms);
@@ -366,10 +356,10 @@ fn the_service_heartbeat_fits_inside_the_extension_freshness_window() {
 #[test]
 fn the_extension_version_is_consistent_everywhere() {
     let extension =
-        include_str!("../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/extension.js");
-    let installer = include_str!("../lan-mouse-gpui/src/cursor_extension.rs");
+        include_str!("../../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/extension.js");
+    let installer = include_str!("../../lan-mouse-gpui/src/cursor_extension.rs");
     let metadata =
-        include_str!("../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/metadata.json");
+        include_str!("../../linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom/metadata.json");
 
     let js_version = parse_js_string(extension, "EXTENSION_VERSION")
         .expect("extension.js must keep an EXTENSION_VERSION constant");
@@ -508,7 +498,7 @@ fn a_discrete_flush_does_not_end_the_handoff_burst_window() {
 /// run.
 #[test]
 fn the_handoff_uses_a_bounded_residual_filter_not_a_timed_settle() {
-    let capture = include_str!("../src/capture.rs");
+    let capture = include_str!("../../src/capture.rs");
     assert!(
         !capture.contains("ENTER_MOTION_SETTLE"),
         "a timed motion settle after Begin must not be reintroduced: it drops the first \

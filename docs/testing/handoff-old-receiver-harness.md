@@ -12,7 +12,7 @@ window-only guard from task-7). It records the receiver model, the trace basis
 of the replay corpus, the exact commands/results, the pass/fail evidence for
 the current tree vs. the final guard, and the remaining risks. No production
 file was edited; the only files owned by this harness are
-`tests/qa_handoff_old_receiver.rs` and this document.
+`src/qa/handoff_old_receiver.rs` and this document.
 
 ## Verdict
 
@@ -24,9 +24,9 @@ again once the window ends. The pre-fix source guard fails the same corpus.
 
 | gate | result |
 |---|---|
-| `cargo test --test qa_handoff_old_receiver` | **PASS** — 31/31 (17 harness tests + 14 `src/coalesce.rs` unit tests compiled in read-only) |
+| `cargo test --lib -- qa::handoff_old_receiver` | **PASS** — 31/31 (17 harness tests + 14 `src/coalesce.rs` unit tests compiled in read-only) |
 | `cargo clippy --test qa_handoff_old_receiver -- -D warnings` | **PASS** — no warnings |
-| `rustfmt --edition 2021 --check tests/qa_handoff_old_receiver.rs` | **PASS** — no diff |
+| `rustfmt --edition 2021 --check src/qa/handoff_old_receiver.rs` | **PASS** — no diff |
 | current tree @ `8b6981d` replay (model of the old guard) | **FAIL** — old receiver returns on all 5 reverse scenes, under both receiver models |
 | final window-only guard replay of the same corpus | **PASS** — 0 returns, 0 reverse deltas forwarded inside the guard, 5/5 scenes |
 | serial-2 `34.9 px` burst (`-17.96` + `-16.94`) | **PASS** — both reverse deltas dropped whole, old receiver stays `12.39 px` inside |
@@ -44,7 +44,7 @@ again once the window ends. The pre-fix source guard fails the same corpus.
 | base commit | `8b6981d` (`main`, the tree the user reports the bug on) |
 | working tree | `src/capture.rs` modified by task-4 and finalised by task-7 (window-only reverse guard) |
 | verified `src/capture.rs` | sha256 `a1a3909f35078511532a17744c09070298d21e60fa930045fd94a19248ede640` (`git hash-object` `bd8627a4005702525e58b05505578d0d3d4ab3fd`); diff vs `8b6981d`: 497 insertions / 171 deletions |
-| added by this harness | `tests/qa_handoff_old_receiver.rs`, `docs/testing/handoff-old-receiver-harness.md` |
+| added by this harness | `src/qa/handoff_old_receiver.rs`, `docs/testing/handoff-old-receiver-harness.md` |
 | host | Ubuntu 26.04, Linux 7.0.0, x86_64 |
 | toolchain | `rustc 1.99.0` (2026-09-28), `cargo 1.99.0` |
 | date | 2026-11-13 |
@@ -246,7 +246,7 @@ Raw evidence printed by the harness (`--nocapture`, abridged):
 [window-only] serial3_63_27px_single_warp: dropped 63.272 px, telemetry [remaining 0.0], forwarded [65.33959197998047], receiver outward = -65.340 px
 ```
 
-## 6. Test inventory (`tests/qa_handoff_old_receiver.rs`)
+## 6. Test inventory (`src/qa/handoff_old_receiver.rs`)
 
 | test | asserts |
 |---|---|
@@ -266,10 +266,10 @@ Raw evidence printed by the harness (`--nocapture`, abridged):
 | `coalescer_flushes_the_first_forward_of_a_handoff_immediately` | real `src/coalesce.rs` leading-edge flush, no batch delay |
 | `observed_delta_grid_matches_the_contract` | deterministic sweep 5 observed forwards x 6 observed reverse quanta (30 combinations, including `63.27 px`): current tree returns iff `residual > forward + 3 px`; final guard never returns and drops everything |
 | `harness_guard_model_matches_the_production_guard` | model/source parity (constants, helper, telemetry saturation, window-only comment; superseded budget/pre-fix behaviour absent) |
-| `corpus_is_grounded_in_the_local_handoff_trace` | every cited trace record still present (skips when no trace exists) |
+| `corpus_is_grounded_in_the_local_handoff_trace` | every cited trace record still present (opt-in: `LAN_MOUSE_AUDIT_HANDOFF_TRACE=1`) |
 
 The 14 extra tests in the run are `src/coalesce.rs`'s own unit tests, compiled
-in read-only through `#[path]` exactly like `tests/qa_handoff_shutdown.rs` does;
+in read-only through `#[path]` exactly like `src/qa/handoff_shutdown.rs` does;
 they are not part of this harness's assertions.
 
 ## 7. Commands and results
@@ -278,16 +278,16 @@ they are not part of this harness's assertions.
 cd /home/gabriel/code/lan-mouse-custom
 
 # Harness (also prints the replay evidence with --nocapture)
-cargo test --test qa_handoff_old_receiver
+cargo test --lib -- qa::handoff_old_receiver
 # -> running 31 tests; test result: ok. 31 passed; 0 failed
 
-cargo test --test qa_handoff_old_receiver -- --nocapture --test-threads=1
+cargo test --lib -- qa::handoff_old_receiver -- --nocapture --test-threads=1
 # -> [current-tree]/[window-only] evidence lines quoted in section 5
 
-cargo clippy --test qa_handoff_old_receiver -- -D warnings
+cargo clippy -p lan-mouse --lib --tests -- -D warnings
 # -> Finished `dev` profile ... (no warnings)
 
-rustfmt --edition 2021 --check tests/qa_handoff_old_receiver.rs
+rustfmt --edition 2021 --check src/qa/handoff_old_receiver.rs
 # -> no diff
 
 # Cross-reference: the final production guard tests (task-7)
@@ -333,9 +333,11 @@ end-to-end feeling. The manual matrix is in §9.
 The harness does not execute `capture::CaptureTask` (private binary module); it
 models the guard and receiver as pure functions. Drift is bounded by the
 model-parity test (§4.3), the behavioural production unit tests, and the
-independent task-6 verification. The trace-provenance test is local-only: it
-skips when no `handoff-trace.jsonl` exists (CI, fresh machine) and fails if the
-local trace has rotated the cited records away - in that case re-ground the
+independent task-6 verification. The trace-provenance test is opt-in
+(`LAN_MOUSE_AUDIT_HANDOFF_TRACE=1`): the trace rotates at 5 MiB, so on a machine
+in daily use the cited records rotate out and a default run would fail with no
+code change. With the variable set it skips when no `handoff-trace.jsonl`
+exists and fails if the cited records are gone - in that case re-ground the
 corpus and update §3.
 
 ### 8.4 Delivery/coalescing is not simulated byte-for-byte
@@ -393,8 +395,9 @@ Ubuntu tree with the final window-only guard):
 ## Appendix B - updating the corpus
 
 The trace rotates at 5 MiB with one backup. When the cited records rotate out,
-`corpus_is_grounded_in_the_local_handoff_trace` fails and lists the missing
+`LAN_MOUSE_AUDIT_HANDOFF_TRACE=1 cargo test --lib -- qa::handoff_old_receiver`
+makes `corpus_is_grounded_in_the_local_handoff_trace` fail and lists the missing
 `stage/serial/dx/dy` tuples. Re-read a fresh trace (same reproduction as
 `docs/testing/handoff-trace.md`), replace the `TraceBasis` entries in
-`tests/qa_handoff_old_receiver.rs`, keep the per-scene deltas consistent with the
+`src/qa/handoff_old_receiver.rs`, keep the per-scene deltas consistent with the
 new aggregates, and update the tables in §3 and §5.

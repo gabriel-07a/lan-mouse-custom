@@ -9,7 +9,7 @@
 # The harness has three independent legs:
 #
 #   1. dynamic replay of the shipping `src/capture.rs` (read-only `include!`
-#      into `tests/qa_handoff_old_receiver_verify.rs`, real `CaptureTask`
+#      into `src/capture/qa_old_receiver_verify.rs`, real `CaptureTask`
 #      driven with trace-shaped deltas) against an independently written
 #      Windows 0.2.18 receiver model;
 #   2. a pre-fix sensitivity check: the same harness compiled against the
@@ -17,7 +17,7 @@
 #      show the leaked -17 px backswing, proving the test detects the bug;
 #   3. the required repo gates: fmt, workspace tests, clippy -D warnings, the
 #      Windows cross-compile with the repo-vendored zig wrapper, the existing
-#      `tests/qa_handoff_shutdown.rs` and `scripts/qa-handoff-shutdown.sh`.
+#      `src/qa/handoff_shutdown.rs` and `scripts/qa-handoff-shutdown.sh`.
 #
 # Usage:
 #   scripts/qa-handoff-old-receiver.sh                 # all checks
@@ -39,6 +39,8 @@ cd "$REPO_ROOT"
 OUT="${QA_OUT:-$REPO_ROOT/target/qa-old-receiver}"
 LOG="$OUT/logs"
 PREFIX_REF="${QA_PRE_FIX_REF:-8b6981d}"
+# Last commit where the verifier was a standalone integration test.
+STANDALONE_VERIFIER_REF="${QA_STANDALONE_VERIFIER_REF:-5bcf133}"
 KEEP="${QA_KEEP:-0}"
 SKIP_WINDOWS="${QA_SKIP_WINDOWS:-0}"
 SKIP_PREFIX="${QA_SKIP_PREFIX:-0}"
@@ -68,8 +70,8 @@ fingerprint() {
         echo "status:"
         git status --porcelain=v1 2>/dev/null || true
         echo "hashes:"
-        for f in src/capture.rs tests/qa_handoff_old_receiver_verify.rs \
-                 tests/qa_handoff_old_receiver.rs \
+        for f in src/capture.rs src/capture/qa_old_receiver_verify.rs \
+                 src/qa/handoff_old_receiver.rs \
                  docs/testing/handoff-old-receiver-verification.md; do
             [ -f "$f" ] && sha256sum "$f"
         done
@@ -99,14 +101,10 @@ replay_checks() {
     say ""
     say "== 1. Dynamic replay of the shipping capture task =="
     run_gate "replay: shipping src/capture.rs vs Windows 0.2.18 receiver model" \
-        cargo test --test qa_handoff_old_receiver_verify
+        cargo test --lib -- capture::qa_old_receiver_verify
 
-    if [ -f tests/qa_handoff_old_receiver.rs ]; then
-        run_gate "replay: task-5 old-receiver harness" \
-            cargo test --test qa_handoff_old_receiver
-    else
-        skip "replay: task-5 harness (tests/qa_handoff_old_receiver.rs absent)"
-    fi
+    run_gate "replay: task-5 old-receiver harness" \
+        cargo test --lib -- qa::handoff_old_receiver
 
     if [ "$SKIP_PREFIX" = "1" ]; then
         skip "sensitivity: pre-fix build must fail on the leaked backswing (QA_SKIP_PREFIX=1)"
@@ -121,7 +119,11 @@ replay_checks() {
         fail "sensitivity: cannot materialize pre-fix tree $PREFIX_REF"
         return
     fi
-    cp tests/qa_handoff_old_receiver_verify.rs "$prefix/tests/"
+    # The verifier now lives inside the crate (src/capture/); the pre-fix tree
+    # gets the last standalone version, which compiles its own copy of that
+    # tree's src/capture.rs.
+    git show "$STANDALONE_VERIFIER_REF:tests/qa_handoff_old_receiver_verify.rs" \
+        >"$prefix/tests/qa_handoff_old_receiver_verify.rs"
     # Adapt the harness to the pre-fix API: the pre-fix (8b6981d)
     # CaptureTask has none of the later guard fields (residual budget, fixed
     # window, position-aware band/deadline, remote-entry dwell) and its guard
@@ -217,8 +219,8 @@ gates() {
     run_gate "cargo fmt --check" cargo fmt --check
     run_gate "cargo test -p lan-mouse --lib (capture guard unit tests)" \
         cargo test -p lan-mouse --lib
-    run_gate "cargo test --test qa_handoff_shutdown (existing lifecycle contract)" \
-        cargo test --test qa_handoff_shutdown
+    run_gate "cargo test --lib -- qa::handoff_shutdown (existing lifecycle contract)" \
+        cargo test --lib -- qa::handoff_shutdown
     run_gate "cargo test --test qa_clipboard_atomicity (clipboard regression audit)" \
         cargo test --test qa_clipboard_atomicity
     run_gate "cargo test --test qa_connection_state (connect/disconnect regression audit)" \

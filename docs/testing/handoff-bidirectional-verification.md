@@ -16,7 +16,7 @@ Reported symptoms (both directions on the same desk):
    controlling, cycling with `releasing capture: ... entered this device`.
 
 **No production file is edited by this verification.** Deliverables owned by
-the verifier: `tests/qa_handoff_bidirectional.rs`,
+the verifier: `src/capture/qa_bidirectional.rs`,
 `scripts/qa-handoff-bidirectional.sh`, this document.
 
 ## Verdict
@@ -36,7 +36,7 @@ same-build manual matrix are in §7/§8.
 
 | headline gate | result |
 |---|---|
-| independent bidirectional replay (`tests/qa_handoff_bidirectional.rs`) | **PASS** — 85/85 |
+| independent bidirectional replay (`src/capture/qa_bidirectional.rs`) | **PASS** — 85/85 |
 | same-build 0.2.19 candidate (version, Ubuntu release build, Windows cross, packaging) | **PASS** |
 | `cargo test --workspace --all-features` | **PASS** — 961 passed, 0 failed |
 | `cargo clippy … -D warnings` / `cargo fmt --check` | **PASS** — clean |
@@ -62,8 +62,8 @@ same-build manual matrix are in §7/§8.
 |---|---|
 | `src/capture.rs` | `4f3dd3210aabdab18f4785103bd3ef8ae49514883aa9f9203932cdf15f1b2e26` (`git hash-object` `62a81bfe…`) |
 | `input-emulation/src/libei.rs` | `9135f6ea1394801549021267c50ef875c2ff505e2d706f43e9e18e6feb07d571` |
-| `tests/qa_handoff_bidirectional.rs` | `8cea93b3afdad69461db0fa856c70ca770beafa099f6e1993ca2e0435de23f62` |
-| `tests/qa_handoff_old_receiver_verify.rs` (adapted) | `dcfc63356071e5cee5fb5af326fd1c09dd1526e5f3fbc60c98ccc8bce5a80115` |
+| `src/capture/qa_bidirectional.rs` | `8cea93b3afdad69461db0fa856c70ca770beafa099f6e1993ca2e0435de23f62` |
+| `src/capture/qa_old_receiver_verify.rs` (adapted) | `dcfc63356071e5cee5fb5af326fd1c09dd1526e5f3fbc60c98ccc8bce5a80115` |
 | `scripts/qa-handoff-bidirectional.sh` | `1354fb466af419d28c25968d2a6f7c84d5e872a1d7cfdca45beff61fc4323fc1` |
 | `scripts/qa-handoff-old-receiver.sh` (adaptation fix) | `d9571f68994eccb30ab145b94a851c066a4338100d85e8009b91789c327840e3` |
 
@@ -170,7 +170,7 @@ _See above; exact hashes and results in §5._
 
 ## 4. Deterministic verification method
 
-`tests/qa_handoff_bidirectional.rs` compiles the shipping `src/capture.rs`
+`src/capture/qa_bidirectional.rs` compiles the shipping `src/capture.rs`
 read-only into the test crate (`mod capture { include!(...) }`, tiny stubs for
 the unrelated `client`/`config`/`connect` modules) and drives the private
 `CaptureTask::handle_capture_event` with trace-shaped delta sequences for both
@@ -198,7 +198,7 @@ churn is reproducible, so a green run is meaningful. Static sentinels pin the
 bounded constants in both production files so a future tuning change that
 reintroduces a wide/long filter fails loudly. Cursor hide/park/shutdown are
 re-checked from the shipped `src/cursor_hide.rs`; the previous verifier
-harness `tests/qa_handoff_old_receiver_verify.rs` is adapted to the new
+harness `src/capture/qa_old_receiver_verify.rs` is adapted to the new
 position-aware contract and stays in the regression set.
 
 ## 5. Gates and results
@@ -212,7 +212,7 @@ summary: **17/17 checks passed, 0 failed, 0 skipped**. Raw logs:
 
 | gate | command | result |
 |---|---|---|
-| independent bidirectional replay | `cargo test --test qa_handoff_bidirectional` | **PASS** — 85/85 |
+| independent bidirectional replay | `cargo test --lib -- capture::qa_bidirectional` | **PASS** — 85/85 |
 | candidate version metadata | `Cargo.toml` / `lan-mouse-gpui/Cargo.toml` = `0.2.19` | **PASS** |
 | Ubuntu local release build | `cargo build -p lan-mouse --release --no-default-features` | **PASS** — `lan-mouse 0.2.19`, `commit_hash:ac728e59` |
 | Windows cross-compile | `cargo check --workspace --all-targets --exclude lan-mouse-gtk --target x86_64-pc-windows-gnu` (vendored zig wrappers) | **PASS** — `Finished dev profile` |
@@ -220,9 +220,9 @@ summary: **17/17 checks passed, 0 failed, 0 skipped**. Raw logs:
 | formatting | `cargo fmt --check` | **PASS** — no diff |
 | guard unit tests | `cargo test -p lan-mouse --lib` | **PASS** — 286/286 |
 | receiver deadband/settle tests | `cargo test -p input-emulation --lib` | **PASS** — 83/83 |
-| previous verifier gate (adapted) | `cargo test --test qa_handoff_old_receiver_verify` | **PASS** — 79/79 |
-| task-5 old-receiver harness | `cargo test --test qa_handoff_old_receiver` | **PASS** — 31/31 |
-| shutdown lifecycle contract | `cargo test --test qa_handoff_shutdown` | **PASS** — 36/36 |
+| previous verifier gate (adapted) | `cargo test --lib -- capture::qa_old_receiver_verify` | **PASS** — 79/79 |
+| task-5 old-receiver harness | `cargo test --lib -- qa::handoff_old_receiver` | **PASS** — 31/31 |
+| shutdown lifecycle contract | `cargo test --lib -- qa::handoff_shutdown` | **PASS** — 36/36 |
 | clipboard regression | `cargo test --test qa_clipboard_atomicity` | **PASS** — 32/32 |
 | connect/disconnect regression | `cargo test --test qa_connection_state` | **PASS** — 7/7 |
 | whole workspace | `cargo test --workspace --all-features` | **PASS** — 961 passed, 0 failed |

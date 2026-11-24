@@ -85,7 +85,7 @@ real, onde os dois backends mexem no mesmo cursor.
 Cada campo descreve o que o backend do SO **entrega para o lan-mouse**, então
 o que está sendo testado são os guards do próprio serviço. Os números vêm de
 traces reais ([handoff-bidirectional.md](../analysis/handoff-bidirectional.md)
-§4.2 e os modelos em `tests/qa_handoff_bidirectional.rs`).
+§4.2 e os modelos em `src/capture/qa_bidirectional.rs`).
 
 | Personalidade | Lado | Mania |
 |---|---|---|

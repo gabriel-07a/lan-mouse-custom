@@ -17,7 +17,7 @@ outward push beyond its edge margin). The result was an enter/leave churn that
 also prevented the source cursor hide from settling.
 
 **No production file was edited by this verification.** The verifier owns
-`tests/qa_handoff_old_receiver_verify.rs`,
+`src/capture/qa_old_receiver_verify.rs`,
 `scripts/qa-handoff-old-receiver.sh` and this document only.
 
 ## Verdict
@@ -33,7 +33,7 @@ Windows/Ubuntu matrix are in §7.
 
 | headline gate | result |
 |---|---|
-| independent real-source replay (`tests/qa_handoff_old_receiver_verify.rs`) | **PASS** — 73/73 |
+| independent real-source replay (`src/capture/qa_old_receiver_verify.rs`) | **PASS** — 73/73 |
 | pre-fix sensitivity (pinned `8b6981d` tree) | **PASS** — pre-fix forwards the `-17 px` backswing and the old receiver returns; first forward was already immediate |
 | old Windows receiver returns on replayed trace scenes | **0** (fixed tree); 1+ on the pre-fix tree |
 | cursor hide / park shutdown contract | **PASS** — 36/36 shutdown contract + daemon black-box 28/28 |
@@ -47,7 +47,7 @@ Windows/Ubuntu matrix are in §7.
 | repository | `/home/gabriel/code/lan-mouse-custom` |
 | branch / HEAD | `main` @ `8b6981d` (local-only branch, nothing pushed) |
 | production change under test | `src/capture.rs` working-tree change only (task-4 + task-7), pinned below |
-| verifier files | `tests/qa_handoff_old_receiver_verify.rs`, `scripts/qa-handoff-old-receiver.sh`, this document |
+| verifier files | `src/capture/qa_old_receiver_verify.rs`, `scripts/qa-handoff-old-receiver.sh`, this document |
 | old receiver under test | Windows `v0.2.18` = `5233b05` (local tag) |
 | host | Ubuntu 26.04, Linux `7.0.0-43-generic`, x86_64, `rustc 1.99.0` (2026-09-28), `cargo 1.99.0`, zig `0.15.2` |
 | Windows cross target | `x86_64-pc-windows-gnu` + repo-vendored zig 0.15.2 compiler/archiver/linker wrapper |
@@ -67,12 +67,12 @@ e820c998909b157d075bbacbe6a094d881575055638069d1624936139ec80d00  # sha256 of `g
 Verifier/peer harness files in the verified tree:
 
 ```
-3fb3efbb2274e7653a9ec4e2f4ac139669918dc8725da697852b8e106437e953  tests/qa_handoff_old_receiver_verify.rs
-95a78c5ac13a9760328ae431b20b793ce2bf4a3eeb3090a1b12557f76ca3ca90  tests/qa_handoff_old_receiver.rs   (task-5 + task-8)
+3fb3efbb2274e7653a9ec4e2f4ac139669918dc8725da697852b8e106437e953  src/capture/qa_old_receiver_verify.rs
+95a78c5ac13a9760328ae431b20b793ce2bf4a3eeb3090a1b12557f76ca3ca90  src/qa/handoff_old_receiver.rs   (task-5 + task-8)
 ff40664ccd5b5aa6ae6e7d16bada6b6d787d81ec0baaf7008ac38a133a716ddd  scripts/qa-handoff-old-receiver.sh
 ```
 
-task-5's independent harness (`tests/qa_handoff_old_receiver.rs`,
+task-5's independent harness (`src/qa/handoff_old_receiver.rs`,
 `docs/testing/handoff-old-receiver-harness.md`) is present in the verified
 tree. task-8 reconciled that harness with the final window-only guard (its
 earlier model still encoded the superseded 32 px budget decision); this
@@ -105,7 +105,7 @@ Semantics verified:
 
 ## 3. Old receiver model (v0.2.18 / `5233b05`)
 
-The model in `tests/qa_handoff_old_receiver_verify.rs` is written from the
+The model in `src/capture/qa_old_receiver_verify.rs` is written from the
 v0.2.18 source (`input-emulation/src/libei.rs`), independently of the current
 production code:
 
@@ -136,7 +136,7 @@ produce that trace, so a regression in either half is caught.
 
 ## 4. How the shipping source is exercised (no production hooks)
 
-`tests/qa_handoff_old_receiver_verify.rs` wraps
+`src/capture/qa_old_receiver_verify.rs` wraps
 
 ```rust
 mod capture { include!("../src/capture.rs"); /* verifier replay driver */ }
@@ -161,12 +161,12 @@ after; the script records them in `target/qa-old-receiver/tree.txt` and
 
 | gate | command | result |
 |---|---|---|
-| independent real-source replay | `cargo test --test qa_handoff_old_receiver_verify` | **PASS** — 73/73 (includes the shipping file's own `cfg(test)` modules) |
+| independent real-source replay | `cargo test --lib -- capture::qa_old_receiver_verify` | **PASS** — 73/73 (includes the shipping file's own `cfg(test)` modules) |
 | pre-fix sensitivity (must fail) | same harness compiled against `git archive 8b6981d`, pinned tests | **PASS** — pre-fix forwards `[(3.0,0.0),(-17.0,0.0),(4.0,0.0)]` and the old receiver returns; the first-forward test passes on both trees |
-| task-5 harness (reconciled by task-8) | `cargo test --test qa_handoff_old_receiver` | **PASS** — 31/31 |
+| task-5 harness (reconciled by task-8) | `cargo test --lib -- qa::handoff_old_receiver` | **PASS** — 31/31 |
 | formatting | `cargo fmt --check` | **PASS** — no diff |
 | guard unit tests (shipping lib) | `cargo test -p lan-mouse --lib` | **PASS** — 280 passed |
-| shutdown lifecycle contract | `cargo test --test qa_handoff_shutdown` | **PASS** — 36/36 |
+| shutdown lifecycle contract | `cargo test --lib -- qa::handoff_shutdown` | **PASS** — 36/36 |
 | clipboard regression | `cargo test --test qa_clipboard_atomicity` | **PASS** — 32/32 |
 | connect/disconnect regression | `cargo test --test qa_connection_state` | **PASS** — 7/7 |
 | whole workspace | `cargo test --workspace --all-features` | **PASS** — 859 passed, 0 failed, 1 ignored (`input-emulation` `x11::tests::connects_to_the_x_server`, requires a display; pre-existing) |
@@ -291,8 +291,8 @@ The old-receiver conclusions above still hold on the final 0.2.19 tree
   immediately;
 - a guarded source therefore still feeds the old Windows 0.2.18 receiver only
   inward motion, so it produces **0** `LeaveAt` triggers for the same trace
-  scenes (re-verified by `tests/qa_handoff_bidirectional.rs` and by the
-  adapted `tests/qa_handoff_old_receiver_verify.rs`);
+  scenes (re-verified by `src/capture/qa_bidirectional.rs` and by the
+  adapted `src/capture/qa_old_receiver_verify.rs`);
 - the old receiver harness's "return after the window" helper now expires both
   deadlines (the fixed 200 ms telemetry window and the 250 ms position-aware
   bound): under the final guard a reverse gesture is only "genuine" after the

@@ -10,10 +10,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 lan-mouse-proto = { path = "../lan-mouse-proto" }
+input-clipboard = { path = "../input-clipboard" }
 
 [[bin]]
 name = "proto_decode"
 path = "fuzz_targets/proto_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clipboard_transfer"
+path = "fuzz_targets/clipboard_transfer.rs"
 test = false
 doc = false
 bench = false

@@ -21,6 +21,8 @@ mod latency;
 mod listen;
 mod lock_sync;
 mod net_tuning;
+#[cfg(test)]
+mod qa;
 mod reset;
 pub mod service;
 mod service_core;

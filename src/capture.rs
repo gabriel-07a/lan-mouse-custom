@@ -232,38 +232,18 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let selected_backend: Rc<Cell<Option<input_capture::Backend>>> = Default::default();
-        let capture_task = CaptureTask {
-            active_client: None,
+        let capture_task = CaptureTask::new(TaskParts {
             backend,
             custom_backend,
             cancellation_token: cancellation_token.clone(),
-            captures: Default::default(),
-            coalescer: MotionCoalescer::new(motion_batch_ms),
-            outgoing_caps: Default::default(),
-            lock_keys_suppressed_until: None,
             conn: Box::new(conn),
-            enter: EnterState::default(),
-            enter_along: None,
-            residual_reverse_px: None,
-            reverse_guard_until: None,
-            handoff_inward_px: None,
-            handoff_leading_until: None,
-            handoff_begin_at: None,
-            trace_window_until: None,
-            trace_last_motion: None,
-            last_enter_pair: None,
-            sensitivity: Default::default(),
-            remote_peer: None,
-            remote_peer_since: None,
-            enter_only_take_back_sent: false,
+            motion_batch_ms,
             grace: Duration::from_millis(connect_grace_ms),
-            disconnected_since: None,
+            release_bind,
             event_tx,
             request_rx,
-            release_bind: Rc::new(RefCell::new(release_bind)),
             selected_backend: selected_backend.clone(),
-            state: Default::default(),
-        };
+        });
         let task = spawn_local(capture_task.run());
         Self {
             cancellation_token,
@@ -719,6 +699,81 @@ struct CaptureTask {
     request_rx: Receiver<CaptureRequest>,
     selected_backend: Rc<Cell<Option<input_capture::Backend>>>,
     state: State,
+}
+
+/// Everything [`CaptureTask::new`] needs; the rest of the task starts empty.
+struct TaskParts {
+    backend: Option<input_capture::Backend>,
+    custom_backend: Option<CaptureFactory>,
+    cancellation_token: CancellationToken,
+    conn: Box<dyn CaptureConnection>,
+    motion_batch_ms: u64,
+    grace: Duration,
+    release_bind: Vec<scancode::Linux>,
+    event_tx: Sender<ICaptureEvent>,
+    request_rx: Receiver<CaptureRequest>,
+    selected_backend: Rc<Cell<Option<input_capture::Backend>>>,
+}
+
+impl CaptureTask {
+    /// The only place that lists the task's fields: tests build tasks through
+    /// [`Self::for_test`], so a new field does not break them.
+    fn new(parts: TaskParts) -> Self {
+        Self {
+            active_client: None,
+            backend: parts.backend,
+            custom_backend: parts.custom_backend,
+            cancellation_token: parts.cancellation_token,
+            captures: Default::default(),
+            coalescer: MotionCoalescer::new(parts.motion_batch_ms),
+            outgoing_caps: Default::default(),
+            lock_keys_suppressed_until: None,
+            conn: parts.conn,
+            enter: EnterState::default(),
+            enter_along: None,
+            residual_reverse_px: None,
+            reverse_guard_until: None,
+            handoff_inward_px: None,
+            handoff_leading_until: None,
+            handoff_begin_at: None,
+            trace_window_until: None,
+            trace_last_motion: None,
+            last_enter_pair: None,
+            sensitivity: Default::default(),
+            remote_peer: None,
+            remote_peer_since: None,
+            enter_only_take_back_sent: false,
+            grace: parts.grace,
+            disconnected_since: None,
+            event_tx: parts.event_tx,
+            request_rx: parts.request_rx,
+            release_bind: Rc::new(RefCell::new(parts.release_bind)),
+            selected_backend: parts.selected_backend,
+            state: Default::default(),
+        }
+    }
+
+    /// A task on the dummy backend with coalescing off (every motion is
+    /// observable on its own), a 1 s connect grace and no captures. Returns
+    /// the `ICaptureEvent` receiver the service would read.
+    #[cfg(test)]
+    fn for_test(conn: Box<dyn CaptureConnection>) -> (Self, Receiver<ICaptureEvent>) {
+        let (event_tx, event_rx) = channel();
+        let (_request_tx, request_rx) = channel();
+        let task = Self::new(TaskParts {
+            backend: Some(input_capture::Backend::Dummy),
+            custom_backend: None,
+            cancellation_token: CancellationToken::new(),
+            conn,
+            motion_batch_ms: 0,
+            grace: Duration::from_millis(1000),
+            release_bind: Vec::new(),
+            event_tx,
+            request_rx,
+            selected_backend: Default::default(),
+        });
+        (task, event_rx)
+    }
 }
 
 impl CaptureTask {
@@ -2225,40 +2280,8 @@ mod capture_handle_tests {
         captures: Vec<(CaptureHandle, Position, CaptureType)>,
         conn: Box<dyn CaptureConnection>,
     ) -> (CaptureTask, Receiver<ICaptureEvent>) {
-        let (event_tx, event_rx) = channel();
-        let (_request_tx, request_rx) = channel();
-        let task = CaptureTask {
-            active_client: None,
-            backend: Some(input_capture::Backend::Dummy),
-            custom_backend: None,
-            cancellation_token: CancellationToken::new(),
-            captures,
-            coalescer: MotionCoalescer::new(0),
-            conn,
-            enter: EnterState::default(),
-            enter_along: None,
-            residual_reverse_px: None,
-            reverse_guard_until: None,
-            handoff_inward_px: None,
-            handoff_leading_until: None,
-            handoff_begin_at: None,
-            trace_window_until: None,
-            trace_last_motion: None,
-            last_enter_pair: None,
-            sensitivity: HashMap::new(),
-            outgoing_caps: HashMap::new(),
-            lock_keys_suppressed_until: None,
-            remote_peer: None,
-            remote_peer_since: None,
-            enter_only_take_back_sent: false,
-            grace: Duration::from_millis(1000),
-            disconnected_since: None,
-            event_tx,
-            release_bind: Rc::new(RefCell::new(Vec::new())),
-            request_rx,
-            selected_backend: Default::default(),
-            state: State::default(),
-        };
+        let (mut task, event_rx) = CaptureTask::for_test(conn);
+        task.captures = captures;
         (task, event_rx)
     }
 
@@ -3419,3 +3442,11 @@ mod lock_key_tests {
         assert!(!is_suppressed_lock_key(&motion, until, now));
     }
 }
+
+/// Mixed-build hand-off verification harnesses. They drive the private
+/// `CaptureTask` directly, so they live under this module instead of
+/// compiling a copy of it into an integration test.
+#[cfg(test)]
+mod qa_bidirectional;
+#[cfg(test)]
+mod qa_old_receiver_verify;

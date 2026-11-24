@@ -36,178 +36,6 @@
 #![allow(dead_code)]
 
 // ---------------------------------------------------------------------------
-// Minimal stubs for the modules `src/capture.rs` pulls in.
-//
-// Only the items the capture module (including its own unit tests) references
-// are provided. Nothing here is under test: the connection and client manager
-// are replaced by the in-memory `ReplayConnection` inside `mod capture`.
-// ---------------------------------------------------------------------------
-
-mod client {
-    use std::cell::RefCell;
-
-    /// Records the peer capabilities the stub connection queries.
-    #[derive(Clone, Default)]
-    pub struct ClientManager {
-        caps: RefCell<Vec<Option<u32>>>,
-    }
-
-    impl ClientManager {
-        pub(crate) fn add_with_config(
-            &self,
-            _config: crate::config::ConfigClient,
-        ) -> lan_mouse_ipc::ClientHandle {
-            let mut caps = self.caps.borrow_mut();
-            caps.push(None);
-            (caps.len() - 1) as lan_mouse_ipc::ClientHandle
-        }
-
-        pub(crate) fn set_peer_hello(
-            &self,
-            handle: lan_mouse_ipc::ClientHandle,
-            _commit: Option<[u8; 8]>,
-            _proto_version: u8,
-            capabilities: u32,
-            _app_version: Option<lan_mouse_proto::AppVersion>,
-        ) {
-            let mut caps = self.caps.borrow_mut();
-            if let Some(slot) = caps.get_mut(handle as usize) {
-                *slot = Some(capabilities);
-            }
-        }
-
-        pub(crate) fn peer_capabilities(&self, handle: lan_mouse_ipc::ClientHandle) -> Option<u32> {
-            self.caps.borrow().get(handle as usize).copied().flatten()
-        }
-    }
-}
-
-mod config {
-    use std::{collections::HashSet, net::IpAddr};
-
-    /// Copy of the production config entry shape used by one capture unit test.
-    pub struct ConfigClient {
-        pub ips: HashSet<IpAddr>,
-        pub hostname: Option<String>,
-        pub port: u16,
-        pub pos: lan_mouse_ipc::Position,
-        pub active: bool,
-        pub enter_hook: Option<String>,
-        pub leave_hook: Option<String>,
-        pub sensitivity: u16,
-        pub fingerprint: Option<String>,
-    }
-}
-
-mod connect {
-    use std::time::Duration;
-
-    use input_capture::CaptureHandle;
-    use lan_mouse_proto::ProtoEvent;
-
-    #[derive(Debug)]
-    pub(crate) enum LanMouseConnectionError {
-        NotConnected,
-    }
-
-    impl std::fmt::Display for LanMouseConnectionError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::NotConnected => f.write_str("not connected"),
-            }
-        }
-    }
-
-    impl std::error::Error for LanMouseConnectionError {}
-
-    /// Stub of the real DTLS connection. The replay drives the capture task
-    /// through its `CaptureConnection` seam instead, so these methods are only
-    /// needed to make the production source compile.
-    pub(crate) struct LanMouseConnection {
-        manager: crate::client::ClientManager,
-    }
-
-    impl LanMouseConnection {
-        pub(crate) fn new(
-            _cert: webrtc_dtls::crypto::Certificate,
-            manager: crate::client::ClientManager,
-            _connect_grace_ms: u64,
-        ) -> Self {
-            Self { manager }
-        }
-
-        pub(crate) fn peer_supports_enter_ack(&self, handle: CaptureHandle) -> bool {
-            self.manager
-                .peer_capabilities(handle)
-                .is_some_and(|caps| caps & lan_mouse_proto::capabilities::ENTER_ACK != 0)
-        }
-
-        pub(crate) fn peer_supports_serialized_leave(&self, handle: CaptureHandle) -> bool {
-            self.manager
-                .peer_capabilities(handle)
-                .is_some_and(|caps| caps & lan_mouse_proto::capabilities::SERIALIZED_LEAVE != 0)
-        }
-
-        pub(crate) fn peer_supports_edge_coordinate(&self, handle: CaptureHandle) -> bool {
-            self.manager
-                .peer_capabilities(handle)
-                .is_some_and(|caps| caps & lan_mouse_proto::capabilities::EDGE_COORDINATE != 0)
-        }
-
-        pub(crate) fn peer_rtt_ms(&self, _handle: CaptureHandle) -> Option<u32> {
-            None
-        }
-
-        pub(crate) fn is_connected(&self, _handle: CaptureHandle) -> bool {
-            true
-        }
-
-        pub(crate) fn ensure_connected(&self, _handle: CaptureHandle) {}
-
-        pub(crate) async fn send_with_grace(
-            &self,
-            _event: ProtoEvent,
-            _handle: CaptureHandle,
-            _grace: Duration,
-        ) -> Result<(), LanMouseConnectionError> {
-            Ok(())
-        }
-
-        pub(crate) async fn send_now(
-            &self,
-            _event: ProtoEvent,
-            _handle: CaptureHandle,
-        ) -> Result<(), LanMouseConnectionError> {
-            Ok(())
-        }
-
-        pub(crate) async fn recv(&mut self) -> (CaptureHandle, ProtoEvent) {
-            std::future::pending().await
-        }
-
-        pub(crate) async fn disconnect(&self, _handle: CaptureHandle) {}
-
-        pub(crate) async fn drop_transport(&self, _handle: CaptureHandle) {}
-
-        pub(crate) fn peer_supports(&self, _handle: CaptureHandle, _cap: u32) -> bool {
-            false
-        }
-    }
-}
-
-#[path = "../src/coalesce.rs"]
-mod coalesce;
-#[path = "../src/crypto.rs"]
-mod crypto;
-#[path = "../src/cursor_hide.rs"]
-mod cursor_hide;
-#[path = "../src/handoff_trace.rs"]
-mod handoff_trace;
-#[path = "../src/lock_sync.rs"]
-#[allow(dead_code)]
-mod lock_sync;
-
-// ---------------------------------------------------------------------------
 // Production capture task, compiled read-only from the shipping source file.
 //
 // The module is wrapped in `mod capture` so the exact `src/capture.rs` that
@@ -216,8 +44,8 @@ mod lock_sync;
 // the previous verifier used for `cursor_hide`/`coalesce`).
 // ---------------------------------------------------------------------------
 
-mod capture {
-    include!("../src/capture.rs");
+mod replay {
+    use crate::capture::*;
 
     // ---- verifier replay driver (test-only code, not production) -----------
 
@@ -286,42 +114,10 @@ mod capture {
     fn replay_task(
         captures: Vec<(CaptureHandle, Position, CaptureType)>,
     ) -> (CaptureTask, Rc<RefCell<Vec<ProtoEvent>>>) {
-        let (event_tx, _event_rx) = channel();
-        let (_request_tx, request_rx) = channel();
         let sent: Rc<RefCell<Vec<ProtoEvent>>> = Rc::new(RefCell::new(Vec::new()));
         let conn = ReplayConnection { sent: sent.clone() };
-        let task = CaptureTask {
-            active_client: None,
-            backend: Some(input_capture::Backend::Dummy),
-            custom_backend: None,
-            cancellation_token: CancellationToken::new(),
-            captures,
-            coalescer: MotionCoalescer::new(0),
-            conn: Box::new(conn),
-            enter: EnterState::default(),
-            enter_along: None,
-            residual_reverse_px: None,
-            reverse_guard_until: None,
-            handoff_inward_px: None,
-            handoff_leading_until: None,
-            handoff_begin_at: None,
-            trace_window_until: None,
-            trace_last_motion: None,
-            last_enter_pair: None,
-            sensitivity: HashMap::new(),
-            outgoing_caps: HashMap::new(),
-            lock_keys_suppressed_until: None,
-            remote_peer: None,
-            remote_peer_since: None,
-            enter_only_take_back_sent: false,
-            grace: Duration::from_millis(1000),
-            disconnected_since: None,
-            event_tx,
-            release_bind: Rc::new(RefCell::new(Vec::new())),
-            request_rx,
-            selected_backend: Default::default(),
-            state: State::default(),
-        };
+        let (mut task, _events) = CaptureTask::for_test(Box::new(conn));
+        task.captures = captures;
         (task, sent)
     }
 
@@ -401,13 +197,13 @@ mod capture {
     #[tokio::test(flavor = "current_thread")]
     async fn the_first_forward_delta_is_forwarded_immediately_with_its_exact_value() {
         let (mut task, sent) = replay_task(vec![(
-            crate::HANDLE,
-            crate::SOURCE_POS,
+            super::HANDLE,
+            super::SOURCE_POS,
             CaptureType::Default,
         )]);
-        let mut input_capture = crate::dummy_capture().await;
+        let mut input_capture = super::dummy_capture().await;
 
-        replay_begin_at(&mut task, &mut input_capture, crate::HANDLE, 0.5).await;
+        replay_begin_at(&mut task, &mut input_capture, super::HANDLE, 0.5).await;
         assert!(
             sent.borrow()
                 .iter()
@@ -417,7 +213,7 @@ mod capture {
 
         // Deliberately do NOT send the Ack first: the first crossing motion must
         // not be gated on the handshake round trip.
-        replay_motion(&mut task, &mut input_capture, crate::HANDLE, 2.0, 0.0).await;
+        replay_motion(&mut task, &mut input_capture, super::HANDLE, 2.0, 0.0).await;
 
         let forwarded = forwarded_motions(&sent.borrow());
         assert_eq!(
@@ -426,8 +222,8 @@ mod capture {
             "the first forward motion must be forwarded at once and unchanged"
         );
 
-        let mut receiver = crate::old_receiver::OldWindowsReceiver::new(
-            crate::old_receiver::OldWindowsReceiver::edge_for_capture_pos(crate::SOURCE_POS),
+        let mut receiver = super::old_receiver::OldWindowsReceiver::new(
+            super::old_receiver::OldWindowsReceiver::edge_for_capture_pos(super::SOURCE_POS),
         );
         receiver.feed(&forwarded);
         assert!(
@@ -445,16 +241,16 @@ mod capture {
     #[tokio::test(flavor = "current_thread")]
     async fn the_post_forward_backswing_is_suppressed_and_the_old_receiver_never_returns() {
         let (mut task, sent) = replay_task(vec![(
-            crate::HANDLE,
-            crate::SOURCE_POS,
+            super::HANDLE,
+            super::SOURCE_POS,
             CaptureType::Default,
         )]);
-        let mut input_capture = crate::dummy_capture().await;
+        let mut input_capture = super::dummy_capture().await;
 
-        replay_begin_at(&mut task, &mut input_capture, crate::HANDLE, 0.5).await;
+        replay_begin_at(&mut task, &mut input_capture, super::HANDLE, 0.5).await;
         replay_ack(&mut task);
-        for (dx, dy) in crate::RAW_TRACE {
-            replay_motion(&mut task, &mut input_capture, crate::HANDLE, dx, dy).await;
+        for (dx, dy) in super::RAW_TRACE {
+            replay_motion(&mut task, &mut input_capture, super::HANDLE, dx, dy).await;
         }
 
         let forwarded = forwarded_motions(&sent.borrow());
@@ -464,8 +260,8 @@ mod capture {
             "only the forward deltas may reach the old receiver (got {forwarded:?})"
         );
 
-        let mut receiver = crate::old_receiver::OldWindowsReceiver::new(
-            crate::old_receiver::OldWindowsReceiver::edge_for_capture_pos(crate::SOURCE_POS),
+        let mut receiver = super::old_receiver::OldWindowsReceiver::new(
+            super::old_receiver::OldWindowsReceiver::edge_for_capture_pos(super::SOURCE_POS),
         );
         let returns = receiver.feed(&forwarded);
         assert_eq!(
@@ -489,17 +285,17 @@ mod capture {
     #[tokio::test(flavor = "current_thread")]
     async fn a_genuine_return_after_the_guard_window_is_forwarded() {
         let (mut task, sent) = replay_task(vec![(
-            crate::HANDLE,
-            crate::SOURCE_POS,
+            super::HANDLE,
+            super::SOURCE_POS,
             CaptureType::Default,
         )]);
-        let mut input_capture = crate::dummy_capture().await;
+        let mut input_capture = super::dummy_capture().await;
 
-        replay_begin_at(&mut task, &mut input_capture, crate::HANDLE, 0.5).await;
+        replay_begin_at(&mut task, &mut input_capture, super::HANDLE, 0.5).await;
         replay_ack(&mut task);
-        replay_motion(&mut task, &mut input_capture, crate::HANDLE, 3.0, 0.0).await;
+        replay_motion(&mut task, &mut input_capture, super::HANDLE, 3.0, 0.0).await;
         replay_expire_reverse_guard(&mut task);
-        replay_motion(&mut task, &mut input_capture, crate::HANDLE, -8.0, 0.0).await;
+        replay_motion(&mut task, &mut input_capture, super::HANDLE, -8.0, 0.0).await;
 
         let forwarded = forwarded_motions(&sent.borrow());
         assert_eq!(
@@ -508,8 +304,8 @@ mod capture {
             "a reverse gesture after the guard window is user intent and must pass"
         );
 
-        let mut receiver = crate::old_receiver::OldWindowsReceiver::new(
-            crate::old_receiver::OldWindowsReceiver::edge_for_capture_pos(crate::SOURCE_POS),
+        let mut receiver = super::old_receiver::OldWindowsReceiver::new(
+            super::old_receiver::OldWindowsReceiver::edge_for_capture_pos(super::SOURCE_POS),
         );
         receiver.feed(&forwarded);
         assert_eq!(
@@ -549,17 +345,17 @@ mod capture {
 
         for (label, raw) in scenes {
             let (mut task, sent) = replay_task(vec![(
-                crate::HANDLE,
-                crate::SOURCE_POS,
+                super::HANDLE,
+                super::SOURCE_POS,
                 CaptureType::Default,
             )]);
-            let mut input_capture = crate::dummy_capture().await;
-            replay_begin_at(&mut task, &mut input_capture, crate::HANDLE, 0.5).await;
+            let mut input_capture = super::dummy_capture().await;
+            replay_begin_at(&mut task, &mut input_capture, super::HANDLE, 0.5).await;
             replay_ack(&mut task);
             let mut reversed = 0.0;
             for &(dx, dy) in raw {
                 reversed += (-dx).max(0.0);
-                replay_motion(&mut task, &mut input_capture, crate::HANDLE, dx, dy).await;
+                replay_motion(&mut task, &mut input_capture, super::HANDLE, dx, dy).await;
             }
             assert!(
                 reversed > 32.0,
@@ -576,8 +372,8 @@ mod capture {
                 "{label}: the forward crossing motion must still be forwarded"
             );
 
-            let mut receiver = crate::old_receiver::OldWindowsReceiver::new(
-                crate::old_receiver::OldWindowsReceiver::edge_for_capture_pos(crate::SOURCE_POS),
+            let mut receiver = super::old_receiver::OldWindowsReceiver::new(
+                super::old_receiver::OldWindowsReceiver::edge_for_capture_pos(super::SOURCE_POS),
             );
             assert_eq!(
                 receiver.feed(&forwarded),
@@ -599,17 +395,17 @@ mod capture {
             input_capture::Position::Top,
             input_capture::Position::Bottom,
         ] {
-            let receiver_edge = crate::old_receiver::OldWindowsReceiver::edge_for_capture_pos(pos);
-            let (fwd_dx, fwd_dy) = crate::old_receiver::capture_delta(receiver_edge, 0.0, 3.0);
+            let receiver_edge = super::old_receiver::OldWindowsReceiver::edge_for_capture_pos(pos);
+            let (fwd_dx, fwd_dy) = super::old_receiver::capture_delta(receiver_edge, 0.0, 3.0);
             let (small_rev_dx, small_rev_dy) =
-                crate::old_receiver::capture_delta(receiver_edge, 5.0, 0.0);
+                super::old_receiver::capture_delta(receiver_edge, 5.0, 0.0);
             let (backswing_dx, backswing_dy) =
-                crate::old_receiver::capture_delta(receiver_edge, 17.0, 0.0);
-            let (fwd2_dx, fwd2_dy) = crate::old_receiver::capture_delta(receiver_edge, 0.0, 4.0);
+                super::old_receiver::capture_delta(receiver_edge, 17.0, 0.0);
+            let (fwd2_dx, fwd2_dy) = super::old_receiver::capture_delta(receiver_edge, 0.0, 4.0);
 
-            let (mut task, sent) = replay_task(vec![(crate::HANDLE, pos, CaptureType::Default)]);
-            let mut input_capture = crate::dummy_capture().await;
-            replay_begin_at(&mut task, &mut input_capture, crate::HANDLE, 0.5).await;
+            let (mut task, sent) = replay_task(vec![(super::HANDLE, pos, CaptureType::Default)]);
+            let mut input_capture = super::dummy_capture().await;
+            replay_begin_at(&mut task, &mut input_capture, super::HANDLE, 0.5).await;
             replay_ack(&mut task);
             for (dx, dy) in [
                 (small_rev_dx, small_rev_dy),
@@ -617,20 +413,20 @@ mod capture {
                 (backswing_dx, backswing_dy),
                 (fwd2_dx, fwd2_dy),
             ] {
-                replay_motion(&mut task, &mut input_capture, crate::HANDLE, dx, dy).await;
+                replay_motion(&mut task, &mut input_capture, super::HANDLE, dx, dy).await;
             }
 
             let forwarded = forwarded_motions(&sent.borrow());
             assert_eq!(
                 forwarded,
                 vec![
-                    crate::old_receiver::capture_delta(receiver_edge, 0.0, 3.0),
-                    crate::old_receiver::capture_delta(receiver_edge, 0.0, 4.0)
+                    super::old_receiver::capture_delta(receiver_edge, 0.0, 3.0),
+                    super::old_receiver::capture_delta(receiver_edge, 0.0, 4.0)
                 ],
                 "{pos:?}: only forward deltas may be forwarded"
             );
 
-            let mut receiver = crate::old_receiver::OldWindowsReceiver::new(receiver_edge);
+            let mut receiver = super::old_receiver::OldWindowsReceiver::new(receiver_edge);
             assert_eq!(
                 receiver.feed(&forwarded),
                 0,
@@ -954,7 +750,7 @@ fn a_first_forward_delta_moves_every_old_receiver_edge_inward_without_returning(
 /// unbounded suppression would make the report pass but the cursor stick.
 #[test]
 fn the_handoff_guard_is_bounded_and_reverse_only() {
-    let source = include_str!("../src/capture.rs");
+    let source = include_str!("../../src/capture.rs");
     assert!(
         !source.contains("ENTER_MOTION_SETTLE"),
         "a timed all-motion settle must not return: it is the reported stutter"
@@ -989,7 +785,7 @@ fn a_stable_capture_keeps_the_hide_and_shutdown_removes_both_markers() {
     let hide_path = dir.join("cursor-hide");
     let park_path = dir.join("cursor-park");
 
-    let mut hide = cursor_hide::CursorHide::with_path(Some(hide_path.clone()));
+    let mut hide = crate::cursor_hide::CursorHide::with_path(Some(hide_path.clone()));
     hide.enter(7);
     assert!(
         hide_path.exists(),
@@ -1027,7 +823,7 @@ fn a_stable_capture_keeps_the_hide_and_shutdown_removes_both_markers() {
     // Shutdown/close: both keep-hiding artefacts must go before the (possibly
     // failing) backend/portal teardown.
     {
-        let mut hide = cursor_hide::CursorHide::with_path(Some(hide_path.clone()));
+        let mut hide = crate::cursor_hide::CursorHide::with_path(Some(hide_path.clone()));
         hide.park();
         assert!(
             park_path.exists(),
@@ -1042,7 +838,7 @@ fn a_stable_capture_keeps_the_hide_and_shutdown_removes_both_markers() {
 
     // Dropping the state (every exit path) must be equally safe.
     {
-        let mut hide = cursor_hide::CursorHide::with_path(Some(hide_path.clone()));
+        let mut hide = crate::cursor_hide::CursorHide::with_path(Some(hide_path.clone()));
         hide.enter(9);
         hide.park();
     }

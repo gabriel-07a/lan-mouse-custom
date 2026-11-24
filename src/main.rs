@@ -497,6 +497,27 @@ mod shutdown_tests {
         assert!(matches!(child.try_wait(), Ok(Some(_))));
     }
 
+    /// Linux: poll the `SigIgn` mask in `/proc/<pid>/status` (SIGINT is bit
+    /// 1). Elsewhere there is no such file; fall back to a fixed wait.
+    fn wait_until_sigint_ignored(pid: u32) {
+        let status = format!("/proc/{pid}/status");
+        let ignores_sigint = || {
+            let text = std::fs::read_to_string(&status).ok()?;
+            let mask = text.lines().find_map(|l| l.strip_prefix("SigIgn:"))?;
+            let mask = u64::from_str_radix(mask.trim(), 16).ok()?;
+            Some(mask & (1 << (libc::SIGINT - 1)) != 0)
+        };
+        if ignores_sigint().is_none() {
+            std::thread::sleep(Duration::from_millis(200));
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ignores_sigint() != Some(true) {
+            assert!(Instant::now() < deadline, "the shell never ignored SIGINT");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn stubborn_daemon_is_killed_after_the_grace_period() {
         // SIGINT ignored: the bounded wait must give up and SIGKILL it.
@@ -504,10 +525,10 @@ mod shutdown_tests {
             .args(["-c", "trap '' INT; exec sleep 30"])
             .spawn()
             .expect("spawn sh");
-        // Let the shell install the ignored-SIGINT disposition before we
-        // signal it; otherwise the test races the exec and would pass for the
-        // wrong reason.
-        std::thread::sleep(Duration::from_millis(200));
+        // Wait until the shell has installed the ignored-SIGINT disposition
+        // before we signal it; otherwise the test races the exec and would
+        // pass for the wrong reason.
+        wait_until_sigint_ignored(child.id());
         let grace = Duration::from_millis(150);
         let start = Instant::now();
         shutdown_service_with_grace(&mut child, grace);

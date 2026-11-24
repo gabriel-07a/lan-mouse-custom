@@ -31,9 +31,15 @@ async fn desk_with(configure: impl FnOnce(super::DeskBuilder) -> super::DeskBuil
     configure(builder).start().await
 }
 
-/// Long enough for several 100 ms lock polls plus a network round-trip:
-/// anything still bouncing would show up as extra injected taps.
-const SETTLE: Duration = Duration::from_millis(800);
+/// Lock polls every PC runs before a check: a change is read and sent in
+/// one poll, applied by the peer, read back there in the next and, if it
+/// bounced, re-sent and applied again. Anything still bouncing after this
+/// many polls shows up as extra injected taps.
+const SETTLE_POLLS: usize = 6;
+
+async fn settle(desk: &Desk) {
+    desk.settle_lock_polls(SETTLE_POLLS).await;
+}
 
 async fn wait_locks(desk: &Desk, name: &'static str, bits: u8, on: u8) {
     desk.wait_until(
@@ -55,12 +61,12 @@ async fn caps_lock_on_one_pc_lights_the_other_and_back() {
         .run_until(async {
             let desk = desk_with(|b| b).await;
             // Let both services take their baseline reading.
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
 
             desk.key_tap_on("A", KEY_CAPSLOCK).await;
             assert_eq!(desk.pc("A").locks() & CAPS, CAPS, "the local key toggles A");
             wait_locks(&desk, "B", CAPS, CAPS).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             assert_eq!(desk.pc("A").locks() & CAPS, CAPS, "{}", desk.report());
             assert_eq!(desk.pc("B").locks() & CAPS, CAPS, "{}", desk.report());
             assert_eq!(taps(&desk, "B"), 1, "B toggled exactly once");
@@ -68,7 +74,7 @@ async fn caps_lock_on_one_pc_lights_the_other_and_back() {
 
             desk.key_tap_on("B", KEY_CAPSLOCK).await;
             wait_locks(&desk, "A", CAPS, 0).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             assert_eq!(desk.pc("B").locks() & CAPS, 0);
             assert_eq!(taps(&desk, "A"), 1);
             assert_eq!(taps(&desk, "B"), 1, "no extra toggle on B");
@@ -82,15 +88,15 @@ async fn num_lock_syncs_both_ways_without_touching_caps_lock() {
     LocalSet::new()
         .run_until(async {
             let desk = desk_with(|b| b).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
 
             desk.key_tap_on("B", KEY_NUMLOCK).await;
             wait_locks(&desk, "A", NUM, NUM).await;
             // let A's service read the synced state before the user acts
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             desk.key_tap_on("A", KEY_NUMLOCK).await;
             wait_locks(&desk, "B", NUM, 0).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             for name in ["A", "B"] {
                 assert_eq!(desk.pc(name).locks(), 0, "{name}: {}", desk.report());
             }
@@ -108,14 +114,14 @@ async fn a_lock_key_typed_while_controlling_the_peer_lights_both_keyboards() {
     LocalSet::new()
         .run_until(async {
             let desk = desk_with(|b| b).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             desk.move_mouse(1200.0, 0.0).await;
             desk.wait_focus("B").await;
 
             desk.key_tap_on("A", KEY_CAPSLOCK).await;
             wait_locks(&desk, "B", CAPS, CAPS).await;
             wait_locks(&desk, "A", CAPS, CAPS).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             assert_eq!(desk.pc("A").locks() & CAPS, CAPS, "{}", desk.report());
             assert_eq!(desk.pc("B").locks() & CAPS, CAPS, "{}", desk.report());
             // the forwarded key on B, the synced toggle on A, nothing more
@@ -136,7 +142,7 @@ async fn the_controlling_keyboard_wins_the_handoff() {
             // Diverged before either service took a reading: a baseline is
             // not a change, so nothing is broadcast.
             let desk = desk_with(|b| b.locks("A", CAPS)).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             assert_eq!(desk.pc("B").locks(), 0, "a baseline is not a change");
 
             desk.move_mouse(1200.0, 0.0).await;
@@ -151,7 +157,7 @@ async fn the_controlling_keyboard_wins_the_handoff() {
                 desk.move_mouse(1000.0, 0.0).await;
                 desk.wait_focus("B").await;
             }
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             assert_eq!(
                 taps(&desk, "A") + taps(&desk, "B"),
                 before,
@@ -170,16 +176,16 @@ async fn num_lock_stays_local_when_its_sync_is_disabled() {
     LocalSet::new()
         .run_until(async {
             let desk = desk_with(|b| b.top_config("A", "sync_num_lock = false")).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
 
             desk.key_tap_on("B", KEY_NUMLOCK).await;
             desk.key_tap_on("A", KEY_CAPSLOCK).await;
             wait_locks(&desk, "B", CAPS, CAPS).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             assert_eq!(desk.pc("A").locks() & NUM, 0, "A ignores B's Num Lock");
 
             desk.key_tap_on("A", KEY_NUMLOCK).await;
-            tokio::time::sleep(SETTLE).await;
+            settle(&desk).await;
             assert_eq!(
                 desk.pc("B").locks() & NUM,
                 NUM,
