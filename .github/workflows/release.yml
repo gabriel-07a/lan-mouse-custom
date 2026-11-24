@@ -12,7 +12,7 @@ on:
         default: ""
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,7 +26,9 @@ jobs:
     runs-on: ubuntu-24.04
     container: rust:bookworm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: install dependencies
         run: |
           apt-get update
@@ -48,7 +50,7 @@ jobs:
           version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           ./scripts/package-deb.sh "$version"
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lan-mouse-linux-x86_64
           path: |
@@ -60,15 +62,17 @@ jobs:
   windows-gpui-frontend:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - name: Build GPUI frontend (MSVC, static CRT)
         working-directory: lan-mouse-gpui
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release
       - name: Upload GPUI frontend
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lan-mouse-gpui-windows
           path: lan-mouse-gpui/target/release/lan-mouse-gpui.exe
@@ -83,14 +87,16 @@ jobs:
       WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
       WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Download GPUI frontend
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: lan-mouse-gpui-windows
           path: lan-mouse-windows
       # The service builds with the MSYS2 GNU toolchain (mingw-w64 target).
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2
         with:
           msystem: UCRT64
           install: >-
@@ -279,13 +285,13 @@ jobs:
 
       - name: Upload smoke-test diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lan-mouse-windows-smoke-diagnostics
           path: ${{ runner.temp }}/lan-mouse-smoke-diagnostics
           if-no-files-found: ignore
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lan-mouse-windows-x86_64
           path: |
@@ -296,9 +302,12 @@ jobs:
     name: "Release"
     needs: [linux-release-build, windows-release-build]
     runs-on: ubuntu-latest
+    # the only job that writes: it publishes the GitHub release
+    permissions:
+      contents: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       - name: Generate SHA-256 checksums
         run: |
           set -euo pipefail
@@ -310,7 +319,7 @@ jobs:
         run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: Publish pre-release (branch build)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: ${{ format('{0}-{1}', github.event.inputs.name || github.ref_name, steps.vars.outputs.short_sha) }}
@@ -327,7 +336,7 @@ jobs:
             SHA256SUMS.txt
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           name: ${{ github.ref_name }}

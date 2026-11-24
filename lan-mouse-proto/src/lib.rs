@@ -1,6 +1,5 @@
 use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
-use paste::paste;
 use std::{
     fmt::{Debug, Display, Formatter},
     mem::size_of,
@@ -700,49 +699,45 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
 }
 
 macro_rules! decode_impl {
-    ($t:ty) => {
-        paste! {
-            fn [<decode_ $t>](data: &mut &[u8]) -> Result<$t, ProtocolError> {
-                let (int_bytes, rest) = data
-                    .split_at_checked(size_of::<$t>())
-                    .ok_or(ProtocolError::Truncated)?;
-                *data = rest;
-                Ok($t::from_be_bytes(int_bytes.try_into().unwrap()))
-            }
+    ($name:ident, $t:ty) => {
+        fn $name(data: &mut &[u8]) -> Result<$t, ProtocolError> {
+            let (int_bytes, rest) = data
+                .split_at_checked(size_of::<$t>())
+                .ok_or(ProtocolError::Truncated)?;
+            *data = rest;
+            Ok(<$t>::from_be_bytes(int_bytes.try_into().unwrap()))
         }
     };
 }
 
-decode_impl!(u8);
-decode_impl!(u16);
-decode_impl!(u128);
-decode_impl!(u32);
-decode_impl!(i32);
-decode_impl!(f32);
-decode_impl!(f64);
+decode_impl!(decode_u8, u8);
+decode_impl!(decode_u16, u16);
+decode_impl!(decode_u128, u128);
+decode_impl!(decode_u32, u32);
+decode_impl!(decode_i32, i32);
+decode_impl!(decode_f32, f32);
+decode_impl!(decode_f64, f64);
 
 macro_rules! encode_impl {
-    ($t:ty) => {
-        paste! {
-            fn [<encode_ $t>](buf: &mut &mut [u8], amt: &mut usize, n: $t) {
-                let src = n.to_be_bytes();
-                let data = std::mem::take(buf);
-                let (int_bytes, rest) = data.split_at_mut(size_of::<$t>());
-                int_bytes.copy_from_slice(&src);
-                *amt += size_of::<$t>();
-                *buf = rest
-            }
+    ($name:ident, $t:ty) => {
+        fn $name(buf: &mut &mut [u8], amt: &mut usize, n: $t) {
+            let src = n.to_be_bytes();
+            let data = std::mem::take(buf);
+            let (int_bytes, rest) = data.split_at_mut(size_of::<$t>());
+            int_bytes.copy_from_slice(&src);
+            *amt += size_of::<$t>();
+            *buf = rest
         }
     };
 }
 
-encode_impl!(u8);
-encode_impl!(u16);
-encode_impl!(u128);
-encode_impl!(u32);
-encode_impl!(i32);
-encode_impl!(f32);
-encode_impl!(f64);
+encode_impl!(encode_u8, u8);
+encode_impl!(encode_u16, u16);
+encode_impl!(encode_u128, u128);
+encode_impl!(encode_u32, u32);
+encode_impl!(encode_i32, i32);
+encode_impl!(encode_f32, f32);
+encode_impl!(encode_f64, f64);
 
 #[cfg(test)]
 mod tests {

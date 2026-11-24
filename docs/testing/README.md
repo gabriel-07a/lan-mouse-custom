@@ -128,6 +128,15 @@ verdade (`scripts/gnome-headless.sh --test`, `scripts/sway-headless.sh --test`).
 Use para bugs que dependem do compositor (dock, barreiras de pressão, bordas
 com vários monitores) e que o simulador não reproduz.
 
+## Auditoria (supply chain)
+
+`.github/workflows/audit.yml` roda a cada push e toda semana:
+`cargo deny check` nos dois workspaces (vulnerabilidades conhecidas das
+dependências, licenças compatíveis com GPL-3.0, só crates.io; exceções com
+motivo em `deny.toml`) e `zizmor` nos workflows (actions fixadas por hash,
+sem credencial persistida, permissões mínimas). Uma action nova entra fixada:
+`uses: dono/repo@<sha do commit> # vN`.
+
 ## Antes de enviar
 
 `scripts/check.sh` roda fmt, clippy `-D warnings` e todos os testes sem parar

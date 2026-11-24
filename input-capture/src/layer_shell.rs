@@ -415,7 +415,11 @@ impl LayerShellInputCapture {
         };
         state.read_guard = Some(read_guard);
 
-        let inner = AsyncFd::new(Inner { queue, state })?;
+        // SAFETY: `Inner` owns the Wayland connection behind `queue`, so the
+        // fd `as_raw_fd` returns stays open and unchanged until the AsyncFd
+        // (and with it `Inner`) is dropped; nothing else closes or replaces it.
+        let inner =
+            unsafe { AsyncFd::register(Inner { queue, state }) }.map_err(io::Error::from)?;
 
         Ok(LayerShellInputCapture(inner))
     }

@@ -1,0 +1,54 @@
+name: Audit
+
+# Supply-chain and workflow checks:
+# - cargo-deny (deny.toml): known vulnerabilities in dependencies, licenses
+#   compatible with GPL-3.0-or-later, crates only from crates.io; both
+#   workspaces (the GUI has its own lockfile);
+# - zizmor: security mistakes in these workflows (unpinned actions,
+#   persisted credentials, broad permissions, injection).
+# Weekly as well, because a new advisory can fail an unchanged tree.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "40 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Main workspace
+        run: cargo deny --manifest-path Cargo.toml check
+      - name: GUI workspace (lan-mouse-gpui)
+        run: cargo deny --manifest-path lan-mouse-gpui/Cargo.toml check
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: zizmor@1.32.0
+      - name: Workflows
+        # informational findings (e.g. "superfluous action") do not fail
+        run: zizmor --offline --min-severity low .github/workflows/

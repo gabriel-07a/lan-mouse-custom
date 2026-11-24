@@ -16,7 +16,9 @@ jobs:
     name: coverage (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux dependencies
         run: |
@@ -24,17 +26,17 @@ jobs:
           sudo apt-get install -y libx11-dev libxtst-dev \
             libwayland-dev libxkbcommon-dev
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - uses: taiki-e/install-action@41e135bca37b18b5a9cc134855b5b3bccbedbf26 # cargo-llvm-cov
+      - uses: taiki-e/install-action@2b545d4fd42fdd72ed2a44eab8fedd1850e8f731 # nextest
 
       - name: Coverage report
         # Same ratchet floor as the per-push job in rust.yml.
         run: scripts/coverage.sh --check "$(cat .github/coverage-floor)"
 
       - name: Upload LCOV
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-lcov
           path: target/coverage/lcov.info
@@ -44,7 +46,9 @@ jobs:
     name: flake detection (3 runs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux dependencies
         run: |
@@ -52,9 +56,9 @@ jobs:
           sudo apt-get install -y libx11-dev libxtst-dev \
             libwayland-dev libxkbcommon-dev
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - uses: taiki-e/install-action@2b545d4fd42fdd72ed2a44eab8fedd1850e8f731 # nextest
 
       - name: Repeat the workspace suite
         run: scripts/test-repeat.sh --runs 3 --all-features
@@ -64,7 +68,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux dependencies
         run: |
@@ -72,9 +78,9 @@ jobs:
           sudo apt-get install -y libx11-dev libxtst-dev \
             libwayland-dev libxkbcommon-dev
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-mutants
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - uses: taiki-e/install-action@d192932f0b384f15948fe5e42d0ec7349e4a0dd8 # cargo-mutants
 
       - name: Mutate the protocol crate
         run: cargo mutants -p lan-mouse-proto --in-place --timeout 120
@@ -83,9 +89,11 @@ jobs:
     name: fuzz smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           workspaces: fuzz
       - name: Install cargo-fuzz
@@ -105,7 +113,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -113,8 +123,8 @@ jobs:
             libwayland-dev libxkbcommon-dev \
             gnome-shell gnome-shell-extension-ubuntu-dock ubuntu-session \
             dconf-cli dbus-daemon
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Single monitor
         run: RUST_LOG=input_emulation=debug scripts/gnome-headless.sh --test
       - name: Laptop panel at 5/3 scale

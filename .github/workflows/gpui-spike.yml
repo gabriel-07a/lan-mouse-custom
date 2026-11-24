@@ -7,6 +7,9 @@ concurrency:
   group: gpui-spike-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build GPUI spike (${{ matrix.os }})
@@ -19,8 +22,10 @@ jobs:
           - windows-2022
           - windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -28,7 +33,7 @@ jobs:
           sudo apt-get install -y \
             libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libfontconfig1-dev libfreetype-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           workspaces: spike/gpui -> target
       - name: Build spike (Linux)
