@@ -663,7 +663,23 @@ impl Barriers {
     ) -> Result<(), ashpd::Error> {
         let positions = barrier_positions(active_clients);
         log::info!("capture edges: {:?} -> {positions:?}", self.positions);
-        input_capture.disable(session, Default::default()).await?;
+        // a session without barriers is already disabled (see below)
+        if !self.positions.is_empty() {
+            input_capture.disable(session, Default::default()).await?;
+        }
+        if positions.is_empty() {
+            // No client left: a disabled session has no barrier at all (the
+            // dock and hot corners work), and it is enabled again with the
+            // next client - no new session, no consent dialog. Whether the
+            // portal accepts an enabled session without barriers is not
+            // something to find out here.
+            *self = Self {
+                positions,
+                barriers: Vec::new(),
+                ids: HashMap::new(),
+            };
+            return Ok(());
+        }
         let (barriers, ids) =
             update_barriers(input_capture, session, &positions, next_barrier_id).await?;
         input_capture.enable(session, Default::default()).await?;
