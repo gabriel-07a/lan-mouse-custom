@@ -1,7 +1,7 @@
 use futures::{Stream, StreamExt};
 use lan_mouse_proto::{
     MAX_EVENT_SIZE, ProtoEvent,
-    clipboard::{ClipboardFrame, MAX_CLIPBOARD_FRAME, is_clipboard_frame},
+    clipboard::{ClipboardFrame, is_clipboard_frame},
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
@@ -216,6 +216,9 @@ pub(crate) enum ListenEvent {
         addr: SocketAddr,
     },
 }
+
+/// Largest UDP payload; receive buffers of transports are this large.
+pub(crate) const MAX_DATAGRAM: usize = 65_536;
 
 /// Per-IP handshake budget: a hostile LAN peer cannot force an unbounded
 /// number of certificate verifications/tasks. Well above anything a normal
@@ -887,7 +890,11 @@ async fn read_loop(ctx: ReadLoopCtx) -> Result<(), Error> {
         authorized,
         adopted,
     } = ctx;
-    let mut b = [0u8; MAX_CLIPBOARD_FRAME];
+    // Room for any UDP datagram: DTLS fails a read into a smaller buffer
+    // (the datagram is dropped, but the error ended the session), so one
+    // oversized frame from a newer peer disconnected it. Too large to decode
+    // now means "skip it", like any other unknown frame.
+    let mut b = vec![0u8; MAX_DATAGRAM];
     let mut blocked = 0u64;
     let addr = logical_addr;
 
@@ -1383,3 +1390,7 @@ mod limiter_flood_tests {
         assert!(limiter.allow(known), "a tracked peer lost its budget");
     }
 }
+
+#[cfg(test)]
+#[path = "net_tests/listen_suite.rs"]
+mod net_suite;

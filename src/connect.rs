@@ -5,7 +5,7 @@ use crate::devices::DeviceStore;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
     MAX_EVENT_SIZE, ProtoEvent,
-    clipboard::{ClipboardFrame, MAX_CLIPBOARD_FRAME, is_clipboard_frame},
+    clipboard::{ClipboardFrame, is_clipboard_frame},
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
@@ -1474,7 +1474,8 @@ async fn latency_probe(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnect
 
 async fn receive_loop(ctx: ConnCtx, handle: ClientHandle, active: ActiveConnection) {
     let addr = active.addr;
-    let mut buf = [0u8; MAX_CLIPBOARD_FRAME];
+    // any datagram fits: see `listen::MAX_DATAGRAM`
+    let mut buf = vec![0u8; crate::listen::MAX_DATAGRAM];
     loop {
         if !ctx.is_current(handle, active.generation) {
             return;
@@ -3789,3 +3790,7 @@ mod tests {
             .await;
     }
 }
+
+#[cfg(test)]
+#[path = "net_tests/connect_suite.rs"]
+mod net_suite;

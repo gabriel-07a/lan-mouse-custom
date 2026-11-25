@@ -21,6 +21,8 @@ mod handoff_trace;
 mod latency;
 mod listen;
 mod lock_sync;
+#[cfg(test)]
+mod net_tests;
 mod net_tuning;
 #[cfg(test)]
 mod qa;
