@@ -347,6 +347,12 @@ thread_local! {
     static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+    /// where the cursor is held during a capture: the entry point, or the
+    /// display centre with [`OS_ACCELERATION`]
+    static PIN: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+    /// an absolute device moved during this capture: the held cursor's
+    /// position means nothing for it, so the raw path forwards its motion
+    static ABSOLUTE_DEVICE_SEEN: Cell<bool> = const { Cell::new(false) };
     /// physical pixels per logical pixel on the entry monitor (see
     /// [`monitor_scale`]); the wire carries logical pixels so peers with a
     /// different display scale move the cursor at the same logical speed.
@@ -723,6 +729,9 @@ fn release_active_client_at(target: Option<(i32, i32)>) {
     LAST_RELEASE.replace(Some(Instant::now()));
     PREV_POS.replace(None);
     hide_hidden_pointer();
+    // Held at the display centre (system acceleration): without a return
+    // coordinate the cursor goes back to where it left, not mid-screen.
+    let target = target.or_else(|| (PIN.get() != ENTRY_POINT.get()).then(|| ENTRY_POINT.get()));
     if let Some((x, y)) = target {
         unsafe {
             let _ = SetCursorPos(x, y);
@@ -747,6 +756,13 @@ fn activate(pos: Position, at: (i32, i32)) {
     let entry_point = DISPLAYS
         .with_borrow(|(displays, _, _)| display_util::clamp_to_display_bounds(displays, at, at));
     ENTRY_POINT.replace(entry_point);
+    ABSOLUTE_DEVICE_SEEN.set(false);
+    let pin = if OS_ACCELERATION.load(Ordering::Relaxed) {
+        DISPLAYS.with_borrow(|(displays, _, _)| display_util::pin_point(displays, entry_point))
+    } else {
+        entry_point
+    };
+    PIN.set(pin);
     // Physical pixels per logical pixel on the monitor the pointer is pinned
     // to. Raw counts are proportional to physical pixels at the default
     // pointer speed, so dividing by the scale yields logical 96-DPI units
@@ -760,11 +776,11 @@ fn activate(pos: Position, at: (i32, i32)) {
     // Show the overlay under the pinned pointer *before* moving the cursor:
     // the resulting WM_SETCURSOR is delivered to the overlay and removes the
     // local cursor for the duration of the capture.
-    show_hidden_pointer(entry_point);
+    show_hidden_pointer(pin);
     unsafe {
-        let _ = SetCursorPos(entry_point.0, entry_point.1);
+        let _ = SetCursorPos(pin.0, pin.1);
     }
-    log::debug!("ENTERED @ {at:?}, pinned to {entry_point:?}");
+    log::debug!("ENTERED @ {at:?}, entry {entry_point:?}, pinned to {pin:?}");
     // Carry the exact crossing coordinate along the edge so the peer can
     // continue the pointer from the same relative position.
     let begin = match DISPLAYS
@@ -956,14 +972,17 @@ unsafe fn process_raw_input(lparam: LPARAM) {
         }
         // Absolute devices already report screen positions: their deltas are
         // real pixels and the pointer speed setting does not apply to them.
-        unsafe { handle_mouse_delta(dx, dy, 1.0) };
+        if ACTIVE_CLIENT.get().is_some() {
+            ABSOLUTE_DEVICE_SEEN.set(true);
+        }
+        unsafe { handle_mouse_delta(dx, dy, 1.0, true) };
         return;
     }
     let (dx, dy) = (mouse.lLastX, mouse.lLastY);
     if dx == 0 && dy == 0 {
         return;
     }
-    unsafe { handle_mouse_delta(dx, dy, POINTER_SPEED.get()) };
+    unsafe { handle_mouse_delta(dx, dy, POINTER_SPEED.get(), false) };
 }
 
 /// Multiplier Windows applies to mouse counts for a pointer speed setting
@@ -1007,8 +1026,10 @@ fn system_pointer_speed() -> i32 {
 ///
 /// `speed` scales the forwarded motion (the pointer speed setting for relative
 /// devices, `1.0` for absolute ones); barrier detection uses the raw delta.
-unsafe fn handle_mouse_delta(dx: i32, dy: i32, speed: f64) {
+unsafe fn handle_mouse_delta(dx: i32, dy: i32, speed: f64, absolute: bool) {
     match ACTIVE_CLIENT.get() {
+        // the hook forwards what Windows made of this report
+        Some(_) if !absolute && os_acceleration_active() => {}
         Some(pos) => {
             let scale = DPI_SCALE.get().max(0.1) / speed;
             let _ = try_send_event(
@@ -1021,7 +1042,7 @@ unsafe fn handle_mouse_delta(dx: i32, dy: i32, speed: f64) {
             );
             // The low level hook does not freeze the pointer; park it on the
             // entry point after every movement so it cannot drift.
-            let (ex, ey) = ENTRY_POINT.get();
+            let (ex, ey) = PIN.get();
             unsafe {
                 let _ = SetCursorPos(ex, ey);
                 // Windows 10 may restore the arrow when the pointer window
@@ -1108,8 +1129,21 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     }
 
     // Motion is forwarded from raw input; only block it from local apps here
-    // (forwarding it too would double every movement).
+    // (forwarding it too would double every movement). With the system
+    // acceleration the hook forwards it instead: the event carries where
+    // Windows would put the held cursor, and blocking it keeps it held.
     if wparam.0 == WM_MOUSEMOVE as usize {
+        if os_acceleration_active() {
+            let pt = mouse_low_level.pt;
+            if let Some((dx, dy)) =
+                display_util::accelerated_delta((pt.x, pt.y), PIN.get(), DPI_SCALE.get())
+            {
+                let _ = try_send_event(
+                    pos,
+                    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy })),
+                );
+            }
+        }
         return LRESULT(1);
     }
 
@@ -1217,16 +1251,44 @@ fn sync_active_capture_to_displays() {
     });
     ENTRY_POINT.replace((entry_x, entry_y));
     DPI_SCALE.replace(unsafe { monitor_scale((entry_x, entry_y)) });
+    let pin = if OS_ACCELERATION.load(Ordering::Relaxed) {
+        DISPLAYS
+            .with_borrow(|(displays, _, _)| display_util::pin_point(displays, (entry_x, entry_y)))
+    } else {
+        (entry_x, entry_y)
+    };
+    PIN.set(pin);
     // Keep the overlay under the pinned pointer and re-pin the cursor to the
     // (possibly clamped) entry point.
-    show_hidden_pointer((entry_x, entry_y));
+    show_hidden_pointer(pin);
     unsafe {
-        let _ = SetCursorPos(entry_x, entry_y);
+        let _ = SetCursorPos(pin.0, pin.1);
     }
     log::info!("capture pinned point refreshed after display change: ({entry_x}, {entry_y})");
 }
 
 static DISPLAY_RESOLUTION_GENERATION: AtomicI32 = AtomicI32::new(1);
+
+/// Forward the motion Windows computes (pointer speed and "Enhance pointer
+/// precision" applied) instead of raw counts. Opt-in while it is checked with
+/// real mice: see [`set_os_acceleration`].
+static OS_ACCELERATION: AtomicBool = AtomicBool::new(false);
+
+/// Use the system pointer acceleration for the motion sent to peers.
+///
+/// While capturing, the cursor is held at the centre of its display and
+/// every move the hook sees is blocked; where Windows would have put the
+/// cursor, minus where it is, is exactly the motion the user gets on this
+/// screen, curve included. Absolute devices (tablets, remote desktop) keep
+/// the raw-input path.
+pub(crate) fn set_os_acceleration(on: bool) {
+    OS_ACCELERATION.store(on, Ordering::Relaxed);
+}
+
+/// Whether this capture forwards the system-accelerated motion.
+fn os_acceleration_active() -> bool {
+    OS_ACCELERATION.load(Ordering::Relaxed) && !ABSOLUTE_DEVICE_SEEN.get()
+}
 
 fn update_display_regions(
     displays: &mut Vec<RECT>,

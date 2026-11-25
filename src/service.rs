@@ -301,6 +301,7 @@ impl Service {
         );
         emulation.set_absolute_sensitivity(config.absolute_pointer_sensitivity());
         capture.set_drag_across(config.drag_across());
+        input_capture::set_windows_os_acceleration(config.windows_pointer_acceleration());
         let clipboard_enabled_initial = config.clipboard_enabled();
         let clipboard_enabled = Rc::new(Cell::new(clipboard_enabled_initial));
         let clipboard_limits = Rc::new(Cell::new(config.clipboard_limits()));

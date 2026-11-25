@@ -12,6 +12,8 @@ use super::{Capture, CaptureError, CaptureEvent, Position};
 mod display_util;
 mod event_thread;
 
+pub(crate) use event_thread::set_os_acceleration;
+
 /// Mouse buttons physically down right now, as Linux `BTN_*` codes.
 ///
 /// Asked when a capture begins: the hook has not swallowed anything of the

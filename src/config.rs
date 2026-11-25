@@ -103,6 +103,9 @@ struct ConfigToml {
     /// what a drag (button held) does at the edge to another PC: "hold"
     /// (default) or "cross"
     drag_across: Option<lan_mouse_ipc::DragAcross>,
+    /// Windows: send the motion with the system pointer acceleration
+    /// ("Enhance pointer precision") instead of raw counts; off by default
+    windows_pointer_acceleration: Option<bool>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     /// known devices with identity and permission policies (config v2)
@@ -1458,6 +1461,14 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Windows: forward the system-accelerated motion (opt-in).
+    pub fn windows_pointer_acceleration(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.windows_pointer_acceleration)
+            .unwrap_or(false)
+    }
+
     pub fn set_drag_across(&mut self, policy: lan_mouse_ipc::DragAcross) {
         self.config_toml
             .get_or_insert_with(Default::default)
@@ -2112,6 +2123,14 @@ address = "192.168.1.50"
 
 #[cfg(test)]
 mod absolute_pointer_sensitivity_tests {
+    #[test]
+    fn windows_pointer_acceleration_is_opt_in() {
+        let off: ConfigToml = toml::from_str("").expect("parse");
+        assert_eq!(off.windows_pointer_acceleration, None);
+        let on: ConfigToml = toml::from_str("windows_pointer_acceleration = true").expect("parse");
+        assert_eq!(on.windows_pointer_acceleration, Some(true));
+    }
+
     use super::*;
 
     #[test]

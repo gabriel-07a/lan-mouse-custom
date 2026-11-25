@@ -38,6 +38,16 @@ mod dummy;
 
 pub type CaptureHandle = u64;
 
+/// Windows: send peers the motion with the system pointer acceleration
+/// ("Enhance pointer precision") instead of raw counts times the pointer
+/// speed. No effect on other systems.
+pub fn set_windows_os_acceleration(on: bool) {
+    #[cfg(windows)]
+    windows::set_os_acceleration(on);
+    #[cfg(not(windows))]
+    let _ = on;
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// capture on this capture handle is now active

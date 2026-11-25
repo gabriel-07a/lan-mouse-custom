@@ -213,3 +213,176 @@ async fn windows_backends_initialize_and_move_cursor_and_trigger_barrier() {
         })
         .await;
 }
+
+/// One relative mouse report, as a mouse makes it (Windows accelerates it).
+fn relative_report(dx: i32, dy: i32) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput,
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// "Enhance pointer precision" on (restored on drop).
+struct PointerPrecision([i32; 3]);
+
+impl PointerPrecision {
+    fn enable() -> Option<Self> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SPI_GETMOUSE, SPI_SETMOUSE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        };
+        let mut saved = [0i32; 3];
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETMOUSE,
+                0,
+                Some(saved.as_mut_ptr().cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .ok()?;
+            let mut on = [6i32, 10, 1];
+            SystemParametersInfoW(
+                SPI_SETMOUSE,
+                0,
+                Some(on.as_mut_ptr().cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .ok()?;
+        }
+        Some(Self(saved))
+    }
+}
+
+impl Drop for PointerPrecision {
+    fn drop(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SPI_SETMOUSE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        };
+        unsafe {
+            let _ = SystemParametersInfoW(
+                SPI_SETMOUSE,
+                0,
+                Some(self.0.as_mut_ptr().cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+        }
+    }
+}
+
+/// With the system acceleration on, the motion sent to the peer is what
+/// Windows itself makes of the mouse reports: a fast move goes as far on the
+/// peer as it would on this screen, curve included.
+#[tokio::test(flavor = "current_thread")]
+async fn the_peer_gets_the_motion_windows_makes_of_the_mouse() {
+    use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+    unsafe {
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let Some(start) = cursor_pos() else {
+        eprintln!("skipped: no cursor in this session");
+        return;
+    };
+    let Some(_precision) = PointerPrecision::enable() else {
+        eprintln!("skipped: the pointer precision setting cannot be changed");
+        return;
+    };
+    const REPORTS: [i32; 6] = [3, 12, 25, 40, 25, 12];
+
+    // what Windows makes of these reports on this screen
+    let centre = (start.0.max(400), start.1.max(400));
+    unsafe {
+        let _ = SetCursorPos(centre.0, centre.1);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let before = cursor_pos().expect("cursor");
+    for dx in REPORTS {
+        relative_report(dx, 0);
+        tokio::time::sleep(Duration::from_millis(8)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let local = f64::from(cursor_pos().expect("cursor").0 - before.0);
+    let raw: i32 = REPORTS.iter().sum();
+    eprintln!("Windows moved the cursor {local} px for {raw} counts");
+
+    let local_set = tokio::task::LocalSet::new();
+    local_set
+        .run_until(async {
+            input_capture::set_windows_os_acceleration(true);
+            let mut emulation = InputEmulation::new(Some(EmulationBackend::Windows))
+                .await
+                .expect("emulation");
+            emulation.create(0).await;
+            let mut capture = InputCapture::new(Some(CaptureBackend::Windows))
+                .await
+                .expect("capture");
+            capture.create(0, Position::Left).await.expect("left");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for _ in 0..25 {
+                emulation
+                    .consume(
+                        Event::Pointer(PointerEvent::Motion {
+                            time: 0,
+                            dx: -400.0,
+                            dy: 0.0,
+                        }),
+                        0,
+                    )
+                    .await
+                    .expect("sweep left");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let begun = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match capture.next().await {
+                        Some(Ok((_, event))) if event.is_begin() => return true,
+                        Some(_) => continue,
+                        None => return false,
+                    }
+                }
+            })
+            .await;
+            if !matches!(begun, Ok(true)) {
+                eprintln!("skipped: the session did not deliver the crossing");
+                input_capture::set_windows_os_acceleration(false);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for dx in REPORTS {
+                relative_report(dx, 0);
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+            let mut forwarded = 0.0;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+            while let Ok(Some(Ok((_, event)))) =
+                tokio::time::timeout_at(deadline, capture.next()).await
+            {
+                if let CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, .. })) = event
+                {
+                    forwarded += dx;
+                }
+            }
+            eprintln!("forwarded {forwarded} px (Windows moved {local} px)");
+            capture.release().await.expect("release");
+            input_capture::set_windows_os_acceleration(false);
+            assert!(local > 0.0, "Windows did not move the cursor at all");
+            assert!(
+                (forwarded - local).abs() <= local * 0.1 + 2.0,
+                "the peer got {forwarded} px where Windows moves {local} px"
+            );
+        })
+        .await;
+}

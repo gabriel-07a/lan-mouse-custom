@@ -305,9 +305,74 @@ fn scale_normalized_delta(delta: i32, extent: i32) -> i32 {
     if scaled == 0 { delta.signum() } else { scaled }
 }
 
+/// Where the cursor is held while capturing with the system pointer
+/// acceleration: the centre of the display under `point` (the whole desktop's
+/// when the layout does not know it). Far from every edge, so the position
+/// Windows computes for a move is never clamped by a display border.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn pin_point(displays: &[RECT], point: (i32, i32)) -> (i32, i32) {
+    let display = displays.iter().find(|&d| is_within_dp_region(point, d));
+    let (left, top, right, bottom) = match display {
+        Some(d) => (d.left, d.top, d.right, d.bottom),
+        None => match desktop_bounds(displays) {
+            Some(bounds) => bounds,
+            None => return point,
+        },
+    };
+    ((left + right) / 2, (top + bottom) / 2)
+}
+
+/// The motion Windows made of one mouse report while the cursor is held at
+/// `pin`: where it would have put the cursor (`target`, after the pointer
+/// speed and "Enhance pointer precision") minus where it is, in logical
+/// pixels of a display with `scale` physical pixels per logical one.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn accelerated_delta(
+    target: (i32, i32),
+    pin: (i32, i32),
+    scale: f64,
+) -> Option<(f64, f64)> {
+    let (dx, dy) = (target.0 - pin.0, target.1 - pin.1);
+    if dx == 0 && dy == 0 {
+        return None;
+    }
+    let scale = scale.max(0.1);
+    Some((f64::from(dx) / scale, f64::from(dy) / scale))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cursor_is_held_at_the_centre_of_its_display() {
+        let displays = [rect(0, 0, 1920, 1080), rect(1920, -200, 4480, 1240)];
+        assert_eq!(pin_point(&displays, (0, 540)), (960, 540));
+        assert_eq!(pin_point(&displays, (1919, 10)), (960, 540));
+        assert_eq!(pin_point(&displays, (4479, 1239)), (3200, 520));
+        // not on any display: the desktop centre
+        assert_eq!(pin_point(&displays, (-5000, 0)), (2240, 520));
+        assert_eq!(pin_point(&[], (7, 8)), (7, 8));
+    }
+
+    #[test]
+    fn the_os_motion_is_read_off_the_held_cursor() {
+        assert_eq!(accelerated_delta((960, 540), (960, 540), 1.0), None);
+        assert_eq!(
+            accelerated_delta((1000, 530), (960, 540), 1.0),
+            Some((40.0, -10.0))
+        );
+        // 150 % display: 30 physical px are 20 logical
+        assert_eq!(
+            accelerated_delta((990, 540), (960, 540), 1.5),
+            Some((20.0, 0.0))
+        );
+        // a broken scale never divides by zero
+        assert_eq!(
+            accelerated_delta((961, 540), (960, 540), 0.0),
+            Some((10.0, 0.0))
+        );
+    }
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
         RECT {
