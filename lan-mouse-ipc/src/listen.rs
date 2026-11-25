@@ -181,6 +181,11 @@ struct FrontendConnection {
     /// its side open without reading would retain the fd forever and defeat
     /// the connection cap.
     closed: Arc<AtomicBool>,
+    /// The first line was a JSON message. Until then the peer is not known
+    /// to be a frontend: a browser tricked into POSTing to the loopback port
+    /// (Windows) sends HTTP header lines first, and its body could carry a
+    /// valid request. Such a connection is closed before the body is read.
+    speaks_json: bool,
 }
 
 impl Stream for FrontendConnection {
@@ -195,7 +200,22 @@ impl Stream for FrontendConnection {
             return Poll::Ready(None);
         }
         match self.lines.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(line))) => Poll::Ready(Some(ClientEvent::Line(line))),
+            Poll::Ready(Some(Ok(line))) => {
+                if !self.speaks_json {
+                    if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                        self.finished = true;
+                        return Poll::Ready(Some(ClientEvent::Closed {
+                            id: self.id,
+                            reason: io::Error::new(
+                                ErrorKind::InvalidData,
+                                "the first IPC message is not JSON (not a frontend)",
+                            ),
+                        }));
+                    }
+                    self.speaks_json = true;
+                }
+                Poll::Ready(Some(ClientEvent::Line(line)))
+            }
             Poll::Ready(Some(Err(reason))) => {
                 self.finished = true;
                 Poll::Ready(Some(ClientEvent::Closed {
@@ -478,6 +498,7 @@ impl Stream for AsyncFrontendListener {
                         lines: LineStream::new(rx, MAX_MESSAGE_LINE),
                         finished: false,
                         closed: closed.clone(),
+                        speaks_json: false,
                     });
                     self.closed_flags.insert(id, closed);
                     self.tx_streams.push((id, tx));

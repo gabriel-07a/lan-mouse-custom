@@ -1784,6 +1784,8 @@ mod ipc_tests {
             .await
             .expect("listener");
         let mut raw = raw_connect(&path).await;
+        // a frontend first (the first line must be JSON), then a bad line
+        write_raw(&mut raw, &request_line(&FrontendRequest::ListDevices)).await;
         write_raw(&mut raw, b"this is not json\n").await;
         write_raw(&mut raw, &request_line(&FrontendRequest::Enumerate())).await;
 
@@ -1844,6 +1846,62 @@ mod ipc_tests {
             );
         }
         write_raw(&mut raw, &line[split..]).await;
+        wait_for_request(&mut listener, |request| {
+            matches!(request, FrontendRequest::Enumerate())
+        })
+        .await;
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A web page can make the browser POST to the loopback IPC port
+    /// (Windows): the HTTP header lines are not requests, but the body can
+    /// carry one, e.g. authorizing an attacker's certificate. The first line
+    /// of a connection must be a JSON message, so such a connection is closed
+    /// before its body is read.
+    #[tokio::test]
+    async fn an_http_request_cannot_smuggle_a_command_in_its_body() {
+        use tokio::io::AsyncReadExt as _;
+
+        let path = socket_path("http");
+        let mut listener = AsyncFrontendListener::new_at(path.clone())
+            .await
+            .expect("listener");
+        let mut attacker = raw_connect(&path).await;
+        let body = request_line(&FrontendRequest::AuthorizeKey(
+            "evil".to_string(),
+            "AA:BB".to_string(),
+        ));
+        let mut request = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:5252\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        write_raw(&mut attacker, &request).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while let Ok(Some(item)) = tokio::time::timeout_at(deadline, listener.next()).await {
+            if let Ok(request) = item {
+                assert!(
+                    !matches!(request, FrontendRequest::AuthorizeKey(..)),
+                    "a command smuggled in an HTTP body was accepted"
+                );
+            }
+        }
+        // and the connection was dropped
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_secs(2), attacker.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "connection still open: {read:?}"
+        );
+
+        // a real frontend still works, unknown later lines included
+        let mut good = raw_connect(&path).await;
+        write_raw(&mut good, &request_line(&FrontendRequest::ListDevices)).await;
+        write_raw(&mut good, b"{\"SomeFutureRequest\":1}\n").await;
+        write_raw(&mut good, &request_line(&FrontendRequest::Enumerate())).await;
         wait_for_request(&mut listener, |request| {
             matches!(request, FrontendRequest::Enumerate())
         })
