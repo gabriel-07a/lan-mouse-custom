@@ -77,6 +77,9 @@ struct ReadLoopCtx {
     dtls_tx: Sender<ListenEvent>,
     devices: Arc<RwLock<DeviceStore>>,
     authorized: Arc<RwLock<HashMap<String, String>>>,
+    /// Permissions of a device adopted by this very handshake (pairing
+    /// window or address rule), used until the service has registered it.
+    adopted: Option<DirectionPolicy>,
 }
 
 /// What the accept task must do with a freshly authenticated connection.
@@ -221,6 +224,8 @@ const HANDSHAKES_PER_IP: u32 = 20;
 const HANDSHAKE_WINDOW: Duration = Duration::from_secs(60);
 /// Hard cap on simultaneous accepted connections.
 const MAX_LIVE_CONNECTIONS: usize = 128;
+/// Addresses the handshake limiter tracks at most.
+const MAX_TRACKED_ADDRESSES: usize = 4096;
 
 /// Simple sliding-window attempt limiter, keyed by peer address.
 struct AttemptLimiter {
@@ -241,6 +246,15 @@ impl AttemptLimiter {
     /// Record an attempt and report whether it is within the budget.
     fn allow(&mut self, ip: IpAddr) -> bool {
         let now = std::time::Instant::now();
+        if !self.attempts.contains_key(&ip) && self.attempts.len() >= MAX_TRACKED_ADDRESSES {
+            self.prune();
+            if self.attempts.len() >= MAX_TRACKED_ADDRESSES {
+                // Every slot is a live entry: a flood of forged source
+                // addresses. Refuse new addresses until entries expire
+                // instead of growing (and scanning) the table without bound.
+                return false;
+            }
+        }
         let entry = self.attempts.entry(ip).or_insert((0, now));
         if now.duration_since(entry.1) >= self.window {
             *entry = (0, now);
@@ -341,9 +355,6 @@ impl LanMouseListener {
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 let addr = normalize_addr(addr);
-                                if limiter.attempts.len() > 1024 {
-                                    limiter.prune();
-                                }
                                 // An explicit "allow again" after a local
                                 // disconnect grants a few handshake attempts so
                                 // the per-IP limiter cannot delay the user's
@@ -441,6 +452,7 @@ impl LanMouseListener {
                                                 // stays, only the transport is replaced.
                                                 let _ = old.close().await;
                                             }
+                                            let mut adoption = None;
                                             if plan.replacement {
                                                 log::info!(
                                                     "peer {fingerprint} reconnected from {addr}; \
@@ -456,7 +468,6 @@ impl LanMouseListener {
                                                 // handshake actually succeeded, so
                                                 // a failed/aborted handshake
                                                 // cannot leave an orphaned pin.
-                                                let mut adoption = None;
                                                 let mut pairing_lost_race = false;
                                                 if let Some(source) =
                                                     auto_source.lock().expect("lock").take()
@@ -537,7 +548,7 @@ impl LanMouseListener {
                                                     incoming,
                                                     outgoing,
                                                     from_pairing,
-                                                )) = adoption
+                                                )) = adoption.clone()
                                                 {
                                                     authorized
                                                         .write()
@@ -571,6 +582,7 @@ impl LanMouseListener {
                                                 dtls_tx: listen_tx,
                                                 devices,
                                                 authorized,
+                                                adopted: adoption.map(|(_, incoming, _, _)| incoming),
                                             }));
                                         }
                                         Err(e) => {
@@ -674,7 +686,7 @@ impl LanMouseListener {
         }
     }
 
-    /// Close the live incoming session of \`fingerprint\`, if any.
+    /// Close the live incoming session of `fingerprint`, if any.
     ///
     /// Identity is the certificate fingerprint, so this also covers sessions
     /// that never registered a capture zone: the service only tracks zones for
@@ -765,7 +777,6 @@ fn per_connection_verify(
                 return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
             };
             let fingerprint = crypto::generate_fingerprint(cert);
-            *recorded.lock().expect("lock") = Some(fingerprint.clone());
 
             // A revoked device must stay revoked: the deny list wins over the
             // authorized map, the address allowlist and an open pairing window.
@@ -791,6 +802,11 @@ fn per_connection_verify(
                 );
                 return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
             }
+
+            // Only a device the user can still decide about becomes a request
+            // to approve; a revoked or just-disconnected one retrying every
+            // few seconds reopened the approval dialog over and over.
+            *recorded.lock().expect("lock") = Some(fingerprint.clone());
 
             if authorized.read().expect("lock").contains_key(&fingerprint) {
                 return Ok(());
@@ -869,6 +885,7 @@ async fn read_loop(ctx: ReadLoopCtx) -> Result<(), Error> {
         dtls_tx,
         devices,
         authorized,
+        adopted,
     } = ctx;
     let mut b = [0u8; MAX_CLIPBOARD_FRAME];
     let mut blocked = 0u64;
@@ -896,7 +913,8 @@ async fn read_loop(ctx: ReadLoopCtx) -> Result<(), Error> {
                     // them made the opposite direction time out for a device
                     // that may write but not read the clipboard.
                     if frame.is_content() {
-                        let clipboard_policy = incoming_policy(&devices, &authorized, &fingerprint);
+                        let clipboard_policy =
+                            incoming_policy(&devices, &authorized, &fingerprint, adopted);
                         if !(clipboard_policy.allowed
                             && clipboard_policy.capabilities.allows_clipboard_write())
                         {
@@ -920,7 +938,7 @@ async fn read_loop(ctx: ReadLoopCtx) -> Result<(), Error> {
         }
         match ProtoEvent::try_from(&b[..n]) {
             Ok(event) => {
-                if !event_allowed(&devices, &authorized, &fingerprint, &event) {
+                if !event_allowed(&devices, &authorized, &fingerprint, adopted, &event) {
                     blocked = blocked.saturating_add(1);
                     if blocked == 1 || blocked.is_multiple_of(1000) {
                         log::warn!(
@@ -968,17 +986,24 @@ async fn read_loop(ctx: ReadLoopCtx) -> Result<(), Error> {
 /// that was just auto-authorized, or a pre-permissions test/legacy setup) is
 /// only trusted when it is in the listener's authorized map; that keeps the
 /// safe default (deny unknown devices) without dropping the first events of
-/// a freshly authorized session.
+/// a freshly authorized session. A device adopted by this session's own
+/// handshake gets the permissions it was adopted with, never more: the
+/// service registers them asynchronously, and the "authorized, allow all"
+/// fallback used to let a pointer-only pairing type keys in that gap.
 fn incoming_policy(
     devices: &RwLock<DeviceStore>,
     authorized: &RwLock<HashMap<String, String>>,
     fingerprint: &str,
+    adopted: Option<DirectionPolicy>,
 ) -> lan_mouse_ipc::DirectionPolicy {
     let store = devices.read().expect("lock");
     if store.is_known(fingerprint) {
         return store.incoming(fingerprint);
     }
     drop(store);
+    if let Some(adopted) = adopted {
+        return adopted;
+    }
     if authorized.read().expect("lock").contains_key(fingerprint) {
         lan_mouse_ipc::DirectionPolicy::allow_all()
     } else {
@@ -991,9 +1016,10 @@ fn event_allowed(
     devices: &RwLock<DeviceStore>,
     authorized: &RwLock<HashMap<String, String>>,
     fingerprint: &str,
+    adopted: Option<DirectionPolicy>,
     event: &ProtoEvent,
 ) -> bool {
-    let policy = incoming_policy(devices, authorized, fingerprint);
+    let policy = incoming_policy(devices, authorized, fingerprint, adopted);
     match event {
         ProtoEvent::Input(InputEvent::Pointer(
             PointerEvent::Motion { .. }
@@ -1047,18 +1073,31 @@ mod policy_tests {
     fn enter_at_is_gated_by_the_same_policy_as_enter() {
         let fingerprint = "aa:bb";
         let denied = RwLock::new(HashMap::new());
-        assert!(!event_allowed(&devices(), &denied, fingerprint, &enter(1)));
+        assert!(!event_allowed(
+            &devices(),
+            &denied,
+            fingerprint,
+            None,
+            &enter(1)
+        ));
         assert!(
-            !event_allowed(&devices(), &denied, fingerprint, &enter_at(2)),
+            !event_allowed(&devices(), &denied, fingerprint, None, &enter_at(2)),
             "an unknown peer must not bypass the Enter policy via EnterAt"
         );
 
         let allowed = authorized(fingerprint);
-        assert!(event_allowed(&devices(), &allowed, fingerprint, &enter(3)));
         assert!(event_allowed(
             &devices(),
             &allowed,
             fingerprint,
+            None,
+            &enter(3)
+        ));
+        assert!(event_allowed(
+            &devices(),
+            &allowed,
+            fingerprint,
+            None,
             &enter_at(4)
         ));
     }
@@ -1077,19 +1116,63 @@ mod policy_tests {
             key: 30,
             state: 1,
         }));
-        assert!(!event_allowed(&devices(), &denied, fingerprint, &motion));
-        assert!(!event_allowed(&devices(), &denied, fingerprint, &key));
+        assert!(!event_allowed(
+            &devices(),
+            &denied,
+            fingerprint,
+            None,
+            &motion
+        ));
+        assert!(!event_allowed(&devices(), &denied, fingerprint, None, &key));
         assert!(event_allowed(
             &devices(),
             &denied,
             fingerprint,
+            None,
             &ProtoEvent::Ack(1)
         ));
         assert!(event_allowed(
             &devices(),
             &denied,
             fingerprint,
+            None,
             &ProtoEvent::Leave(0)
+        ));
+    }
+
+    /// A device the pairing window adopted with mouse only is held to that
+    /// from its very first packet, before the service has registered it.
+    #[test]
+    fn an_adopted_device_gets_only_the_adopted_permissions() {
+        let fingerprint = "ee:ff";
+        let allowed = authorized(fingerprint);
+        let mouse_only = DirectionPolicy {
+            allowed: true,
+            capabilities: Capabilities::POINTER,
+        };
+        let key = ProtoEvent::Input(InputEvent::Keyboard(input_event::KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 1,
+        }));
+        let motion = ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        }));
+        assert!(!event_allowed(
+            &devices(),
+            &allowed,
+            fingerprint,
+            Some(mouse_only),
+            &key
+        ));
+        assert!(event_allowed(
+            &devices(),
+            &allowed,
+            fingerprint,
+            Some(mouse_only),
+            &motion
         ));
     }
 }
@@ -1216,5 +1299,87 @@ mod session_tests {
     fn unknown_fingerprint_is_never_current() {
         let sessions = HashMap::new();
         assert!(!session_is_current(&sessions, "missing", 1));
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    fn verify_with(
+        devices: DeviceStore,
+        authorized: HashMap<String, String>,
+    ) -> (VerifyPeerCertificateFn, Arc<Mutex<Option<String>>>) {
+        let recorded: Arc<Mutex<Option<String>>> = Default::default();
+        let verify = per_connection_verify(
+            Arc::new(RwLock::new(authorized)),
+            Default::default(),
+            Default::default(),
+            Arc::new(RwLock::new(devices)),
+            Arc::new(RwLock::new(true)),
+            "192.168.1.20:4242".parse().unwrap(),
+            recorded.clone(),
+            Default::default(),
+        );
+        (verify, recorded)
+    }
+
+    const CERT: &[u8] = b"a peer certificate";
+
+    /// A device the user disconnected keeps retrying (legacy peers do): the
+    /// handshake is refused, but it must not come back as a request to
+    /// approve - that reopened the approval dialog every few seconds for a
+    /// device the user had just disconnected on purpose.
+    #[test]
+    fn a_locally_disconnected_device_is_refused_without_a_new_request() {
+        let fingerprint = crypto::generate_fingerprint(CERT);
+        let mut devices = DeviceStore::default();
+        devices.suppress_reconnect(fingerprint.clone(), "192.168.1.20".parse().unwrap());
+        let authorized = HashMap::from([(fingerprint, "pc".to_string())]);
+        let (verify, recorded) = verify_with(devices, authorized);
+        assert!(verify(&[CERT.to_vec()], &[]).is_err());
+        assert_eq!(*recorded.lock().unwrap(), None);
+    }
+
+    /// Same for a revoked device: refused, and no approval request.
+    #[test]
+    fn a_revoked_device_is_refused_without_a_new_request() {
+        let fingerprint = crypto::generate_fingerprint(CERT);
+        let mut devices = DeviceStore::default();
+        devices.deny(fingerprint);
+        let (verify, recorded) = verify_with(devices, HashMap::new());
+        assert!(verify(&[CERT.to_vec()], &[]).is_err());
+        assert_eq!(*recorded.lock().unwrap(), None);
+    }
+
+    /// An unknown device is refused and becomes a request to approve.
+    #[test]
+    fn an_unknown_device_becomes_a_request() {
+        let (verify, recorded) = verify_with(DeviceStore::default(), HashMap::new());
+        assert!(verify(&[CERT.to_vec()], &[]).is_err());
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some(crypto::generate_fingerprint(CERT))
+        );
+    }
+}
+
+#[cfg(test)]
+mod limiter_flood_tests {
+    use super::*;
+
+    /// UDP source addresses are free to forge: a flood from distinct
+    /// addresses must not grow the table without bound, and addresses that
+    /// were already being tracked keep their (honest) budget.
+    #[test]
+    fn a_spoofed_address_flood_does_not_grow_the_table() {
+        let mut limiter = AttemptLimiter::new(HANDSHAKES_PER_IP, HANDSHAKE_WINDOW);
+        let known: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(limiter.allow(known));
+        for n in 0..50_000u32 {
+            limiter.allow(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n)));
+        }
+        assert!(limiter.attempts.len() <= MAX_TRACKED_ADDRESSES);
+        assert!(limiter.allow(known), "a tracked peer lost its budget");
     }
 }
