@@ -268,3 +268,132 @@ async fn pushing_against_the_bottom_edge_under_remote_control_opens_the_dock() {
         })
         .await;
 }
+
+/// The cursor-hiding extension's state files, in the headless session's
+/// runtime dir.
+fn cursor_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("runtime dir")).join("lan-mouse")
+}
+
+/// Whether the extension reports the cursor hidden (`None`: no status yet).
+fn cursor_hidden() -> Option<bool> {
+    let status = std::fs::read_to_string(cursor_dir().join("cursor-extension-status")).ok()?;
+    if status.contains("tracker=0") {
+        return None;
+    }
+    Some(status.contains("inhibited=1"))
+}
+
+async fn wait_cursor(hidden: bool, within: Duration) -> Duration {
+    let started = std::time::Instant::now();
+    while started.elapsed() < within {
+        if cursor_hidden() == Some(hidden) {
+            return started.elapsed();
+        }
+        tokio::time::sleep(Duration::from_micros(200)).await;
+    }
+    panic!(
+        "the cursor did not become {} within {within:?} (status: {:?})",
+        if hidden { "hidden" } else { "visible" },
+        std::fs::read_to_string(cursor_dir().join("cursor-extension-status"))
+    );
+}
+
+/// The return hand-off on the Ubuntu side, as the user feels it: the
+/// keyboard and mouse come back from the peer (the service parks the cursor
+/// with the "return" marker and drops the heartbeat) and the hand keeps
+/// moving. The cursor must show with the first movement - not after a poll
+/// tick or a distance threshold - and must stay hidden while nothing moves
+/// (a border flap must not flash it).
+#[tokio::test(flavor = "current_thread")]
+async fn the_cursor_reappears_with_the_first_movement_after_a_return() {
+    if probe_path().is_none() {
+        eprintln!("skipped: run through scripts/gnome-headless.sh --test");
+        return;
+    }
+    let _ = env_logger::builder().is_test(true).try_init();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (bus, session, fd) = mutter_eis().await;
+            let mut emulation = InputEmulation::libei_with_eis_fd(fd)
+                .await
+                .expect("libei on EIS");
+            emulation.create(0).await;
+            wait_devices(&mut emulation).await;
+            let screen = read_probe().expect("probe");
+            walk_to(
+                &mut emulation,
+                screen.mx + screen.width / 2,
+                screen.my + screen.height / 2,
+            )
+            .await;
+
+            let dir = cursor_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let heartbeat = dir.join("cursor-hide");
+            let park = dir.join("cursor-park");
+            let mut hide_delays = Vec::new();
+            let mut show_delays = Vec::new();
+            for round in 0..10 {
+                // driving the peer: heartbeat, cursor hidden
+                std::fs::write(&heartbeat, b"1").unwrap();
+                hide_delays.push(wait_cursor(true, Duration::from_secs(2)).await);
+
+                // control comes back: park first, then the heartbeat goes
+                std::fs::write(&park, b"return").unwrap();
+                std::fs::remove_file(&heartbeat).unwrap();
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                assert_eq!(
+                    cursor_hidden(),
+                    Some(true),
+                    "round {round}: the cursor showed before the mouse moved"
+                );
+
+                // the hand moves: 3 px every 4 ms (a mouse at moderate speed)
+                let started = std::time::Instant::now();
+                let shown = loop {
+                    motion(&mut emulation, if round % 2 == 0 { 3.0 } else { -3.0 }, 0.0).await;
+                    let step = std::time::Instant::now();
+                    let mut visible = false;
+                    while step.elapsed() < Duration::from_millis(4) {
+                        if cursor_hidden() == Some(false) {
+                            visible = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_micros(200)).await;
+                    }
+                    if visible {
+                        break started.elapsed();
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "round {round}: the cursor never showed while the mouse moved"
+                    );
+                };
+                show_delays.push(shown);
+                assert!(
+                    !park.exists(),
+                    "round {round}: the park marker was left behind"
+                );
+            }
+            hide_delays.sort();
+            show_delays.sort();
+            eprintln!(
+                "cursor hide after the heartbeat: median {:?}, worst {:?}",
+                hide_delays[hide_delays.len() / 2],
+                hide_delays.last().unwrap()
+            );
+            eprintln!(
+                "cursor show after the first movement: median {:?}, worst {:?}",
+                show_delays[show_delays.len() / 2],
+                show_delays.last().unwrap()
+            );
+            let worst = *show_delays.last().unwrap();
+            assert!(
+                worst <= Duration::from_millis(15),
+                "the cursor took up to {worst:?} to reappear after the mouse moved"
+            );
+            stop(&bus, &session).await;
+        })
+        .await;
+}

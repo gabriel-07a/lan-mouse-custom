@@ -3,13 +3,18 @@
 // The service keeps a heartbeat file in the user's runtime directory while a
 // peer is being controlled. Freshness is checked here as well, so a crashed
 // service cannot leave the cursor hidden forever.
+//
+// Reacting is event driven: a directory monitor sees the service's marker
+// files change and the cursor tracker reports pointer movement, so hiding on
+// a hand-off and showing on the return happen at once. The poll below only
+// expires a stale heartbeat and backs the events up.
 
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const HEARTBEAT_MS = 3_000;
-const EXTENSION_VERSION = '8';
+const EXTENSION_VERSION = '9';
 const POLL_MS = 50;
 // Ignore pointer movement right after a hand-off: the peer may still deliver
 // a few injected motion events while it releases its capture. Requiring two
@@ -22,6 +27,10 @@ const PARK_CONFIRM_POLLS = 2;
 // cursor is shown on the first poll that sees real movement: with the
 // settle/confirm delays above a fast hand appeared only mid-screen.
 const PARK_KIND_RETURN = 'return';
+// After an own return any real movement shows the cursor: the hand is still
+// moving back, and no peer injects motion that could be mistaken for it.
+const PARK_MOVE_PX_RETURN = 0;
+const MARKERS = ['cursor-hide', 'cursor-park'];
 
 export default class LanMouseCursorExtension extends Extension {
     enable() {
@@ -54,6 +63,8 @@ export default class LanMouseCursorExtension extends Extension {
         this._parkAwayPolls = 0;
         this._parkSettleMs = PARK_SETTLE_MS;
         this._parkConfirmPolls = PARK_CONFIRM_POLLS;
+        this._parkMovePx = PARK_MOVE_PX;
+        this._positionId = 0;
         this._loadedFile = Gio.File.new_for_path(
             `${runtime}/cursor-extension-loaded`
         );
@@ -64,6 +75,21 @@ export default class LanMouseCursorExtension extends Extension {
             GLib.file_set_contents(this._loadedFile.get_path(), EXTENSION_VERSION);
         } catch (_error) {}
         this._writeStatus('loaded');
+
+        // Marker changes arrive at once instead of on the next poll tick.
+        try {
+            this._monitor = Gio.File.new_for_path(runtime).monitor_directory(
+                Gio.FileMonitorFlags.NONE,
+                null
+            );
+            this._monitor.set_rate_limit(0);
+            this._monitor.connect('changed', (_monitor, file) => {
+                if (MARKERS.includes(file.get_basename()))
+                    this._sync();
+            });
+        } catch (_error) {
+            this._monitor = null;
+        }
 
         this._pollId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
@@ -81,6 +107,14 @@ export default class LanMouseCursorExtension extends Extension {
             GLib.source_remove(this._pollId);
             this._pollId = 0;
         }
+        if (this._monitor) {
+            this._monitor.cancel();
+            this._monitor = null;
+        }
+        if (this._positionId && this._cursorTracker) {
+            this._cursorTracker.disconnect(this._positionId);
+        }
+        this._positionId = 0;
         this._stateFile = null;
         this._setInhibited(false);
         this._uninhibitSeat();
@@ -110,6 +144,20 @@ export default class LanMouseCursorExtension extends Extension {
         }
         if (!this._cursorTracker && !this._trackerError) {
             this._trackerError = 'Mutter CursorTracker unavailable';
+        }
+        if (this._cursorTracker && !this._positionId) {
+            // Pointer movement while parked shows the cursor at once.
+            try {
+                this._positionId = this._cursorTracker.connect(
+                    'position-invalidated',
+                    () => {
+                        if (this._parkOrigin)
+                            this._sync();
+                    }
+                );
+            } catch (_error) {
+                this._positionId = 0;
+            }
         }
         return this._cursorTracker !== null;
     }
@@ -239,6 +287,7 @@ export default class LanMouseCursorExtension extends Extension {
                     const ownReturn = this._readParkKind() === PARK_KIND_RETURN;
                     this._parkSettleMs = ownReturn ? 0 : PARK_SETTLE_MS;
                     this._parkConfirmPolls = ownReturn ? 1 : PARK_CONFIRM_POLLS;
+                    this._parkMovePx = ownReturn ? PARK_MOVE_PX_RETURN : PARK_MOVE_PX;
                     // Hide on the first observation: waiting for the next
                     // poll adds a visible delay to the return hand-off.
                     hide = true;
@@ -247,7 +296,7 @@ export default class LanMouseCursorExtension extends Extension {
                 } else {
                     const dx = x - this._parkOrigin[0];
                     const dy = y - this._parkOrigin[1];
-                    if (Math.hypot(dx, dy) > PARK_MOVE_PX) {
+                    if (Math.hypot(dx, dy) > this._parkMovePx) {
                         this._parkAwayPolls += 1;
                         if (this._parkAwayPolls >= this._parkConfirmPolls) {
                             try {

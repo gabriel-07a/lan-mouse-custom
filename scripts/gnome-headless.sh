@@ -5,7 +5,8 @@
 # Nothing touches the user's desktop: the shell gets its own D-Bus session,
 # runtime dir, dconf database, config/data/cache dirs and no input devices
 # (headless). The test probe extension (tests/gnome-headless/) reports the
-# pointer and the dock state to $LAN_MOUSE_TEST_PROBE.
+# pointer and the dock state to $LAN_MOUSE_TEST_PROBE; the shipping cursor
+# extension (linux/gnome-extension/) is installed and enabled as well.
 #
 # Usage:
 #   scripts/gnome-headless.sh <command> [args...]
@@ -59,6 +60,10 @@ mkdir -p "$work"/{run,home,config,data/gnome-shell/extensions,cache,state}
 chmod 700 "$work/run"
 cp -r "$repo/tests/gnome-headless/lan-mouse-test-probe@lan-mouse-custom" \
     "$work/data/gnome-shell/extensions/"
+# The shipping cursor-hiding extension too: it only acts on the marker files
+# in the (isolated) runtime dir, so it is inert unless a test writes them.
+cp -r "$repo/linux/gnome-extension/lan-mouse-cursor@lan-mouse-custom" \
+    "$work/data/gnome-shell/extensions/"
 
 if [[ -n "${GNOME_HEADLESS_MONITORS:-}" ]]; then
     cp "$GNOME_HEADLESS_MONITORS" "$work/config/monitors.xml"
@@ -68,7 +73,7 @@ fi
 # (with no windows open intellihide would keep the dock shown).
 cat >"$work/dconf.ini" <<'EOF'
 [org/gnome/shell]
-enabled-extensions=['lan-mouse-test-probe@lan-mouse-custom']
+enabled-extensions=['lan-mouse-test-probe@lan-mouse-custom', 'lan-mouse-cursor@lan-mouse-custom']
 disable-user-extensions=false
 welcome-dialog-last-shown-version='999'
 
