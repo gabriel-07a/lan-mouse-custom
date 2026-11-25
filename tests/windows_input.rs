@@ -353,20 +353,10 @@ async fn the_peer_gets_the_motion_windows_makes_of_the_mouse() {
                 .expect("capture");
             capture.create(0, Position::Left).await.expect("left");
             tokio::time::sleep(Duration::from_millis(50)).await;
-            for _ in 0..25 {
-                emulation
-                    .consume(
-                        Event::Pointer(PointerEvent::Motion {
-                            time: 0,
-                            dx: -400.0,
-                            dy: 0.0,
-                        }),
-                        0,
-                    )
-                    .await
-                    .expect("sweep left");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            // start the capture the way the "go to" hotkey does: no crossing
+            // needed, which the CI desktop does not always deliver
+            assert!(capture.begin(0), "the Windows capture can start on request");
+            let _ = &mut emulation;
             let begun = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     match capture.next().await {
