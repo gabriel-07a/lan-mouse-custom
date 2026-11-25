@@ -767,7 +767,8 @@ async fn connect_observed(
                         return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
                     };
                     let actual = crypto::generate_fingerprint(cert);
-                    if actual == expected {
+                    // same rule as `pin_decision`
+                    if actual.eq_ignore_ascii_case(&expected) {
                         Ok(())
                     } else {
                         log::warn!(

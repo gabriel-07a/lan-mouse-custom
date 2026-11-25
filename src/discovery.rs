@@ -786,6 +786,19 @@ pub async fn probe_lan_mouse(
 mod tests {
     use super::*;
 
+    /// "Test this host" on a machine where nothing listens must say no: the
+    /// closed port answers with ICMP port-unreachable, which is not a DTLS
+    /// listener.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_port_is_not_reported_as_lan_mouse() {
+        let closed = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let addr = closed.local_addr().expect("addr");
+        drop(closed);
+        let cert = webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["test".to_owned()])
+            .expect("cert");
+        assert!(!probe_lan_mouse(addr, cert, Duration::from_secs(2)).await);
+    }
+
     #[test]
     fn unanswered_arp_entries_are_not_hosts() {
         // Real shape of /proc/net/arp right after a subnet sweep.
