@@ -314,7 +314,10 @@ que o fork está público. Só não trate como suporte oficial.
    `lan-mouse-custom-setup-x86_64.exe`), além de `SHA256SUMS.txt`.
 2. Instale/extraia os binários e abra o app nas duas máquinas.
 3. Adicione o outro PC como cliente (hostname ou IP), escolha a posição da tela
-   e autorize o certificado.
+   e autorize o certificado. Um nome de computador sem domínio (por exemplo
+   `DESKTOP-ABC`) que o sistema não resolve é tentado de novo como
+   `DESKTOP-ABC.local` (mDNS), que é como Windows e macOS se anunciam na rede
+   local.
 4. Cruze a borda nos dois sentidos, em alturas diferentes (10%, 50%, 90%).
 5. Se algo estranhar, rode com log de debug:
    ```sh
