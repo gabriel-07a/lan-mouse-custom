@@ -51,6 +51,12 @@ pub(crate) struct X11Emulation {
     /// Keycode range accepted by the X server (see ::ref x11_keycode).
     min_keycode: u32,
     max_keycode: u32,
+    /// edge the peer driving this screen entered through
+    remote_edge: Option<PointerEdge>,
+    /// service notifier for the return hand-off (the remote pointer pushed
+    /// past the entry edge); X11 only clamps the pointer and tells nobody
+    edge_return: Option<crate::EdgeReturnNotifier>,
+    edge_return_latch: super::absolute::EdgeReturnLatch,
 }
 
 unsafe impl Send for X11Emulation {}
@@ -104,7 +110,67 @@ impl X11Emulation {
             subpixel: Default::default(),
             min_keycode,
             max_keycode,
+            remote_edge: None,
+            edge_return: None,
+            edge_return_latch: Default::default(),
         })
+    }
+
+    /// Pointer position on the root window and the root window's size.
+    fn pointer_and_screen(&self) -> Option<((i32, i32), (i32, i32))> {
+        let (mut root_return, mut child_return) = (0, 0);
+        let (mut root_x, mut root_y, mut win_x, mut win_y) = (0, 0, 0, 0);
+        let mut mask = 0;
+        let screen = unsafe { xlib::XDefaultScreen(self.display) };
+        let found = unsafe {
+            xlib::XQueryPointer(
+                self.display,
+                xlib::XDefaultRootWindow(self.display),
+                &mut root_return,
+                &mut child_return,
+                &mut root_x,
+                &mut root_y,
+                &mut win_x,
+                &mut win_y,
+                &mut mask,
+            )
+        };
+        if found == 0 {
+            return None;
+        }
+        let size = unsafe {
+            (
+                xlib::XDisplayWidth(self.display, screen),
+                xlib::XDisplayHeight(self.display, screen),
+            )
+        };
+        Some(((root_x, root_y), size))
+    }
+
+    /// A peer drives this screen and its motion pushes past the edge it came
+    /// in through: report the return hand-off with where along that edge.
+    fn check_edge_return(&mut self, dx: i32, dy: i32) {
+        let Some(entry) = self.remote_edge else {
+            return;
+        };
+        let Some((pointer, size)) = self.pointer_and_screen() else {
+            return;
+        };
+        match pushed_past(entry, pointer, (dx, dy), size) {
+            Some(along) => {
+                let Some(notifier) = &self.edge_return else {
+                    return;
+                };
+                if self
+                    .edge_return_latch
+                    .request(entry, std::time::Instant::now())
+                    .is_some()
+                {
+                    let _ = notifier.send((entry, Some(along)));
+                }
+            }
+            None => self.edge_return_latch.clear(),
+        }
     }
 
     fn relative_motion(&self, dx: i32, dy: i32) {
@@ -242,7 +308,18 @@ impl Drop for X11Emulation {
 
 #[async_trait]
 impl Emulation for X11Emulation {
+    fn set_edge_return_notifier(&mut self, notifier: crate::EdgeReturnNotifier) {
+        self.edge_return = Some(notifier);
+    }
+
+    async fn end_remote_control(&mut self) {
+        self.remote_edge = None;
+        self.edge_return_latch.clear();
+    }
+
     async fn begin_remote_control(&mut self, edge: PointerEdge, along: Option<f32>) {
+        self.remote_edge = Some(edge);
+        self.edge_return_latch.clear();
         let Some(along) = along else {
             return;
         };
@@ -261,6 +338,7 @@ impl Emulation for X11Emulation {
                 PointerEvent::Motion { time: _, dx, dy } => {
                     let (move_x, move_y) = self.subpixel.consume(dx, dy);
                     if move_x != 0 || move_y != 0 {
+                        self.check_edge_return(move_x, move_y);
                         self.relative_motion(move_x, move_y);
                     }
                 }
@@ -311,9 +389,77 @@ impl Emulation for X11Emulation {
     }
 }
 
+/// Where along `edge` (0.0 = top/left) the pointer at `pointer` leaves a
+/// `size` screen if it moves by `delta`, when that motion pushes out through
+/// `edge`; `None` while it stays inside.
+fn pushed_past(
+    edge: PointerEdge,
+    pointer: (i32, i32),
+    delta: (i32, i32),
+    size: (i32, i32),
+) -> Option<f32> {
+    let (x, y) = (pointer.0 + delta.0, pointer.1 + delta.1);
+    let (width, height) = size;
+    if width <= 1 || height <= 1 {
+        return None;
+    }
+    let along = |value: i32, extent: i32| {
+        (f64::from(value.clamp(0, extent - 1)) / f64::from(extent - 1)) as f32
+    };
+    match edge {
+        PointerEdge::Left if x < 0 => Some(along(y, height)),
+        PointerEdge::Right if x > width - 1 => Some(along(y, height)),
+        PointerEdge::Top if y < 0 => Some(along(x, width)),
+        PointerEdge::Bottom if y > height - 1 => Some(along(x, width)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The return hand-off: only a push out through the entry edge counts,
+    /// and it carries where along that edge the pointer left.
+    #[test]
+    fn a_push_out_through_the_entry_edge_is_the_return() {
+        let size = (1920, 1080);
+        assert_eq!(
+            pushed_past(PointerEdge::Left, (0, 540), (-3, 0), size),
+            Some(540.0 / 1079.0)
+        );
+        assert_eq!(
+            pushed_past(PointerEdge::Left, (2, 540), (-1, 0), size),
+            None,
+            "still inside"
+        );
+        assert_eq!(
+            pushed_past(PointerEdge::Left, (0, 540), (4, 0), size),
+            None,
+            "moving in"
+        );
+        assert_eq!(
+            pushed_past(PointerEdge::Right, (1919, 0), (2, 0), size),
+            Some(0.0)
+        );
+        assert_eq!(
+            pushed_past(PointerEdge::Top, (1919, 0), (0, -1), size),
+            Some(1.0)
+        );
+        assert_eq!(
+            pushed_past(PointerEdge::Bottom, (960, 1079), (0, 1), size),
+            Some(960.0 / 1919.0)
+        );
+        // another edge is not the return: the cursor is just clamped there
+        assert_eq!(
+            pushed_past(PointerEdge::Left, (1919, 540), (5, 0), size),
+            None
+        );
+        assert_eq!(
+            pushed_past(PointerEdge::Left, (0, 0), (-1, 0), (0, 0)),
+            None
+        );
+    }
 
     #[test]
     fn keycodes_are_shifted_by_eight() {

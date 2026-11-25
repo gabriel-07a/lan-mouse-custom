@@ -362,7 +362,7 @@ pub(crate) struct EdgeReturnLatch {
     last: Option<Instant>,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, x11)), allow(dead_code))]
 impl EdgeReturnLatch {
     /// Re-arm the latch: the remote pointer is back inside the screen (or the
     /// session ended), so the next edge contact is a new hand-off.
