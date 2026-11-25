@@ -293,3 +293,49 @@ async fn speed_pairing_and_address_rules_round_trip() {
         })
         .await;
 }
+
+/// The drag setting the GUI and the CLI change is stored and announced, and
+/// it changes what a drag at the edge does.
+#[tokio::test(flavor = "current_thread")]
+async fn the_drag_setting_round_trips_and_applies() {
+    init_log();
+    LocalSet::new()
+        .run_until(async {
+            let desk = a_and_b().await;
+            let (mut events, mut requests) = frontend(&desk, "A").await;
+            send(&mut requests, FrontendRequest::Sync).await;
+            let initial = expect_event(&mut events, "the drag setting", |event| match event {
+                FrontendEvent::DragAcross(policy) => Some(*policy),
+                _ => None,
+            })
+            .await;
+            assert_eq!(
+                initial,
+                lan_mouse_ipc::DragAcross::Hold,
+                "hold is the default"
+            );
+
+            send(
+                &mut requests,
+                FrontendRequest::SetDragAcross(lan_mouse_ipc::DragAcross::Cross),
+            )
+            .await;
+            let changed = expect_event(&mut events, "the new drag setting", |event| match event {
+                FrontendEvent::DragAcross(policy) if *policy != initial => Some(*policy),
+                _ => None,
+            })
+            .await;
+            assert_eq!(changed, lan_mouse_ipc::DragAcross::Cross);
+
+            // a drag now crosses, and A's app gets the button back up
+            desk.button_on("A", 0x110, 1).await;
+            desk.move_mouse(1200.0, 0.0).await;
+            desk.wait_focus("B").await;
+            desk.wait_until("A's app let go of the drag", Duration::from_secs(2), |d| {
+                d.pc("A").state().app_buttons.is_empty()
+            })
+            .await;
+            desk.button_on("A", 0x110, 0).await;
+        })
+        .await;
+}

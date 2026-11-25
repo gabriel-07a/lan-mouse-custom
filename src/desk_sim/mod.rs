@@ -24,10 +24,18 @@
 //!
 //! See `docs/testing/desk-simulator.md` for the guide.
 
+mod metrics;
+mod relay;
 mod screen;
 
 #[cfg(test)]
+mod bad_network;
+#[cfg(test)]
 mod clipboard_scenarios;
+#[cfg(test)]
+mod fluidity;
+#[cfg(test)]
+mod fluidity_matrix;
 #[cfg(test)]
 mod frontend_scenarios;
 #[cfg(test)]
@@ -36,6 +44,8 @@ mod lock_scenarios;
 mod network_scenarios;
 #[cfg(test)]
 mod os_scenarios;
+#[cfg(test)]
+mod random_walk;
 #[cfg(test)]
 mod scenarios;
 #[cfg(test)]
@@ -151,6 +161,17 @@ impl Pc {
         })
     }
 
+    /// Where the driven cursor last left this screen, normalised along the
+    /// entry edge: an edge return of the emulation, or (layer-shell) the
+    /// capture strip the injected pointer touched.
+    pub(crate) fn last_leave_along(&self) -> Option<f32> {
+        self.state().log.iter().rev().find_map(|l| match l.event {
+            ScreenEvent::EdgeReturn { along, .. } => Some(along),
+            ScreenEvent::CaptureBegin { along, .. } => Some(along),
+            _ => None,
+        })
+    }
+
     fn count(&self, predicate: impl Fn(&ScreenEvent) -> bool) -> usize {
         self.state()
             .log
@@ -178,6 +199,8 @@ pub(crate) struct DeskBuilder {
     discoverable: bool,
     /// Caps Lock / Num Lock state per PC before its service starts
     initial_locks: Vec<(&'static str, u8)>,
+    /// every link goes through a relay that loses, delays and duplicates
+    impairment: Option<relay::Impairment>,
 }
 
 impl DeskBuilder {
@@ -240,6 +263,12 @@ impl DeskBuilder {
         self
     }
 
+    /// Put a bad network between the PCs (both directions of every link).
+    pub(crate) fn impaired(mut self, impairment: relay::Impairment) -> Self {
+        self.impairment = Some(impairment);
+        self
+    }
+
     pub(crate) fn hand(mut self, hand: Hand) -> Self {
         self.hand = hand;
         self
@@ -259,6 +288,29 @@ impl DeskBuilder {
                 .position(|(n, ..)| *n == name)
                 .unwrap_or_else(|| panic!("unknown PC {name}"));
             ports[index]
+        };
+        // the port `of` dials to reach `target`: the target itself, or the
+        // relay that impairs that link
+        let mut relays = Vec::new();
+        let mut dial_ports = Vec::new();
+        for (n, &(of, _, target)) in self.links.iter().enumerate() {
+            let port = match self.impairment {
+                Some(impairment) => {
+                    let (port, task) =
+                        relay::spawn(port_of(target), impairment, n as u64 + 1).await;
+                    relays.push(task);
+                    port
+                }
+                None => port_of(target),
+            };
+            dial_ports.push(((of, target), port));
+        }
+        let dial_port = |of: &str, target: &str| {
+            dial_ports
+                .iter()
+                .find(|((o, t), _)| *o == of && *t == target)
+                .map(|(_, port)| *port)
+                .expect("link")
         };
 
         let mut pcs = Vec::new();
@@ -291,7 +343,7 @@ impl DeskBuilder {
                      port = {}\n\
                      activate_on_startup = true\n",
                     position_name(side),
-                    port_of(target),
+                    dial_port(name, target),
                 )
                 .expect("write to string");
             }
@@ -370,22 +422,32 @@ impl DeskBuilder {
         let links = self
             .links
             .iter()
-            .map(|&(of, _, target)| (of, port_of(target)))
+            .map(|&(of, _, target)| (of, dial_port(of, target)))
             .collect();
+        let link_wait = if self.impairment.is_some() {
+            // a DTLS handshake loses whole flights on a lossy link: several
+            // dial attempts and their back-off before the link is up
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(10)
+        };
         let desk = Desk {
+            relays,
             pcs,
             links,
             layout: self.links,
             hand: self.hand,
             started: Instant::now(),
         };
-        desk.wait_for_links().await;
+        desk.wait_for_links(link_wait).await;
         desk
     }
 }
 
 /// A running set of virtual PCs.
 pub(crate) struct Desk {
+    /// network impairment relays (aborted with the desk)
+    relays: Vec<JoinHandle<()>>,
     pcs: Vec<Pc>,
     /// `(of, target port)` for every configured client
     links: Vec<(&'static str, u16)>,
@@ -399,6 +461,9 @@ impl Drop for Desk {
     fn drop(&mut self) {
         for pc in &self.pcs {
             pc.task.abort();
+        }
+        for relay in &self.relays {
+            relay.abort();
         }
     }
 }
@@ -437,6 +502,13 @@ impl Desk {
             lock(&pc.screen).local_motion(sx, sy);
         }
         // let the services process the last events before the caller looks
+        tokio::task::yield_now().await;
+    }
+
+    /// The user presses (1) or releases (0) `button` on the mouse attached to
+    /// `name` (Linux `BTN_*` code).
+    pub(crate) async fn button_on(&self, name: &str, button: u32, state: u32) {
+        lock(&self.pc(name).screen).local_button(button, state);
         tokio::task::yield_now().await;
     }
 
@@ -663,22 +735,18 @@ impl Desk {
     }
 
     /// Every configured client is connected and its peer can emulate.
-    async fn wait_for_links(&self) {
-        self.wait_until(
-            "every configured link connected",
-            Duration::from_secs(10),
-            |desk| {
-                desk.links.iter().all(|&(of, port)| {
-                    desk.pc(of)
-                        .clients
-                        .get_client_states()
-                        .iter()
-                        .any(|(_, config, state)| {
-                            config.port == port && state.alive && state.active_addr.is_some()
-                        })
-                })
-            },
-        )
+    async fn wait_for_links(&self, within: Duration) {
+        self.wait_until("every configured link connected", within, |desk| {
+            desk.links.iter().all(|&(of, port)| {
+                desk.pc(of)
+                    .clients
+                    .get_client_states()
+                    .iter()
+                    .any(|(_, config, state)| {
+                        config.port == port && state.alive && state.active_addr.is_some()
+                    })
+            })
+        })
         .await;
     }
 }

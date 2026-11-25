@@ -397,3 +397,77 @@ async fn the_cursor_reappears_with_the_first_movement_after_a_return() {
         })
         .await;
 }
+
+async fn buttons_held(bus: &zbus::Connection) -> Option<u32> {
+    let reply = bus
+        .call_method(
+            Some("org.gnome.Shell"),
+            "/dev/lanmouse/Cursor",
+            Some("dev.lanmouse.Cursor"),
+            "ButtonsHeld",
+            &(),
+        )
+        .await
+        .ok()?;
+    reply.body().deserialize().ok()
+}
+
+/// The cursor extension tells which mouse buttons are down (the capture
+/// portal cannot): a drag reaching the edge must be recognised.
+#[tokio::test(flavor = "current_thread")]
+async fn the_cursor_extension_reports_a_held_button() {
+    if probe_path().is_none() {
+        eprintln!("skipped: run through scripts/gnome-headless.sh --test");
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (bus, session, fd) = mutter_eis().await;
+            let mut emulation = InputEmulation::libei_with_eis_fd(fd)
+                .await
+                .expect("libei on EIS");
+            emulation.create(0).await;
+            wait_devices(&mut emulation).await;
+
+            let mut mask = None;
+            for _ in 0..100 {
+                mask = buttons_held(&bus).await;
+                if mask.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(mask.map(|m| m & 0x1f00), Some(0), "no button down at first");
+
+            let button = |state| {
+                Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button: input_event::BTN_LEFT,
+                    state,
+                })
+            };
+            emulation.consume(button(1), 0).await.expect("press");
+            let mut held = 0;
+            for _ in 0..50 {
+                held = buttons_held(&bus).await.unwrap_or(0) & 0x1f00;
+                if held != 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(held, 1 << 8, "the left button is down");
+
+            emulation.consume(button(0), 0).await.expect("release");
+            let mut after = 1;
+            for _ in 0..50 {
+                after = buttons_held(&bus).await.unwrap_or(1) & 0x1f00;
+                if after == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(after, 0, "released");
+            stop(&bus, &session).await;
+        })
+        .await;
+}

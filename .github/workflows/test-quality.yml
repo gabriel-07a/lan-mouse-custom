@@ -42,6 +42,31 @@ jobs:
           path: target/coverage/lcov.info
           if-no-files-found: error
 
+  desk-matrix:
+    # The full hand-off matrix of the desk simulator (every OS pair, side,
+    # screen size and scenario), the long random walks of two people using
+    # both PCs at once, and the bad-network runs. `cargo test` only runs the
+    # user's own desk layout of each; see docs/testing/handoff-fluidity.md.
+    name: desk simulator, full matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev \
+            libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+
+      - name: Full matrix, long walks, bad networks
+        run: cargo test --lib -- --ignored "desk_sim::"
+
   flake:
     name: flake detection (3 runs)
     runs-on: ubuntu-latest

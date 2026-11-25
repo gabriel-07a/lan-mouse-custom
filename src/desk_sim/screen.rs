@@ -62,6 +62,22 @@ pub(crate) struct Personality {
     /// there besides the emulation's edge return (Windows hooks see injected
     /// input).
     pub(crate) injected_crossing_begins_capture: bool,
+    /// The OS has a capture backend at all (X11 has none: it can only be
+    /// driven, never drive).
+    pub(crate) capture_available: bool,
+    /// The capture starts when the pointer *touches* the edge pixel, not when
+    /// it pushes past it (layer-shell: a 1 px surface on the edge). Injected
+    /// pointer motion reaching that pixel starts it too.
+    pub(crate) begin_on_edge_touch: bool,
+    /// The emulation backend reports a push past the entry edge (libei and
+    /// Windows track the pointer; wlroots and X11 cannot).
+    pub(crate) emulation_edge_return: bool,
+    /// The capture backend can tell which mouse buttons are held.
+    pub(crate) reports_buttons: bool,
+    /// The capture backend notices this PC's own mouse while a peer drives it
+    /// (Windows hooks flag injected input; Wayland and X11 share one cursor
+    /// between the physical mouse and the virtual pointer).
+    pub(crate) detects_local_input: bool,
 }
 
 impl Personality {
@@ -73,6 +89,11 @@ impl Personality {
             post_forward_backswing: None,
             begin_jitter_px: None,
             injected_crossing_begins_capture: false,
+            capture_available: true,
+            begin_on_edge_touch: false,
+            emulation_edge_return: true,
+            reports_buttons: true,
+            detects_local_input: false,
         }
     }
 
@@ -85,6 +106,12 @@ impl Personality {
             post_forward_backswing: Some(-17.0),
             begin_jitter_px: Some(2.0),
             injected_crossing_begins_capture: false,
+            capture_available: true,
+            begin_on_edge_touch: false,
+            emulation_edge_return: true,
+            // through the cursor extension
+            reports_buttons: true,
+            detects_local_input: false,
         }
     }
 
@@ -96,6 +123,46 @@ impl Personality {
             post_forward_backswing: None,
             begin_jitter_px: None,
             injected_crossing_begins_capture: true,
+            capture_available: true,
+            begin_on_edge_touch: false,
+            emulation_edge_return: true,
+            reports_buttons: true,
+            detects_local_input: true,
+        }
+    }
+
+    /// sway and other wlroots compositors (layer-shell capture + virtual
+    /// pointer emulation). The capture surface is a 1 px strip on the edge:
+    /// touching it begins the capture, the injected pointer included, and that
+    /// is how a return is noticed (the virtual pointer reports no position).
+    pub(crate) fn sway() -> Self {
+        Self {
+            label: "sway",
+            activation_backswing: Vec::new(),
+            post_forward_backswing: None,
+            begin_jitter_px: None,
+            injected_crossing_begins_capture: true,
+            capture_available: true,
+            begin_on_edge_touch: true,
+            emulation_edge_return: false,
+            reports_buttons: false,
+            detects_local_input: false,
+        }
+    }
+
+    /// X11 (XTest emulation; no capture backend).
+    pub(crate) fn x11() -> Self {
+        Self {
+            label: "x11",
+            activation_backswing: Vec::new(),
+            post_forward_backswing: None,
+            begin_jitter_px: None,
+            injected_crossing_begins_capture: false,
+            capture_available: false,
+            begin_on_edge_touch: false,
+            emulation_edge_return: true,
+            reports_buttons: false,
+            detects_local_input: false,
         }
     }
 }
@@ -141,6 +208,8 @@ pub(crate) enum ScreenEvent {
     EdgeReturn { edge: PointerEdge, along: f32 },
     /// a [`Personality`] quirk fired
     Quirk(&'static str),
+    /// the first injected motion after a peer started driving this screen
+    FirstInjectedMotion,
 }
 
 /// A [`ScreenEvent`] with the time it happened.
@@ -176,6 +245,13 @@ pub(crate) struct ScreenState {
     pub(crate) injected_lock_taps: usize,
     /// times the service read this PC's lock state (one per lock poll)
     pub(crate) lock_reads: usize,
+    /// mouse buttons the user physically holds on this PC's mouse
+    pub(crate) physical_buttons: HashSet<u32>,
+    /// buttons the app under this PC's cursor believes are down (pressed by
+    /// the local mouse or injected by a peer, not released yet)
+    pub(crate) app_buttons: HashSet<u32>,
+    /// keys the app on this PC believes are down (injected by a peer)
+    pub(crate) app_keys: HashSet<u32>,
     pub(crate) log: Vec<Logged>,
     pub(crate) personality: Personality,
     /// backswing still owed after the first user motion of this capture
@@ -184,6 +260,8 @@ pub(crate) struct ScreenState {
     capture_tx: Option<UnboundedSender<(Position, CaptureEvent)>>,
     edge_return: Option<EdgeReturnNotifier>,
     edge_contact: Option<EdgeContact>,
+    /// a peer drives this screen and has not moved the pointer yet
+    awaiting_first_motion: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +289,9 @@ impl ScreenState {
             locks: 0,
             injected_lock_taps: 0,
             lock_reads: 0,
+            physical_buttons: HashSet::new(),
+            app_buttons: HashSet::new(),
+            app_keys: HashSet::new(),
             log: Vec::new(),
             personality: Personality::baseline(),
             pending_backswing: None,
@@ -218,6 +299,7 @@ impl ScreenState {
             capture_tx: None,
             edge_return: None,
             edge_contact: None,
+            awaiting_first_motion: false,
         }
     }
 
@@ -264,6 +346,11 @@ impl ScreenState {
 
     /// The user moved the mouse that is physically attached to this PC.
     pub(crate) fn local_motion(&mut self, dx: f64, dy: f64) {
+        if let Some(entry) = self.remote_edge {
+            if self.personality.detects_local_input && self.captured.is_none() {
+                self.send_capture(to_position(entry), CaptureEvent::LocalActivity);
+            }
+        }
         if let Some(edge) = self.captured {
             // captured: the OS cursor does not move, the delta goes to the peer
             self.send_capture(edge, CaptureEvent::Input(motion(dx, dy)));
@@ -274,15 +361,25 @@ impl ScreenState {
             return;
         }
         let (x, y) = (self.cursor.0 + dx, self.cursor.1 + dy);
+        // layer-shell: reaching the edge pixel is enough
+        let touch = if self.personality.begin_on_edge_touch {
+            1.0
+        } else {
+            0.0
+        };
         let crossed = [
-            (Position::Left, x < 0.0),
-            (Position::Right, x > self.max_x()),
-            (Position::Top, y < 0.0),
-            (Position::Bottom, y > self.max_y()),
+            (Position::Left, x < touch, dx < 0.0),
+            (Position::Right, x > self.max_x() - touch, dx > 0.0),
+            (Position::Top, y < touch, dy < 0.0),
+            (Position::Bottom, y > self.max_y() - touch, dy > 0.0),
         ]
         .into_iter()
-        .find(|&(edge, past)| past && self.barriers.contains(&edge))
-        .map(|(edge, _)| edge);
+        .find(|&(edge, past, outward)| past && outward && self.barriers.contains(&edge))
+        .map(|(edge, ..)| edge)
+        // Wayland implicit grab: while a button is down the pointer focus
+        // stays on the surface that got the press, so the layer-shell strip
+        // never sees the pointer and nothing crosses.
+        .filter(|_| !(self.personality.begin_on_edge_touch && !self.physical_buttons.is_empty()));
         self.cursor = (x.clamp(0.0, self.max_x()), y.clamp(0.0, self.max_y()));
         if let Some(edge) = crossed {
             self.begin_capture(edge);
@@ -294,6 +391,33 @@ impl ScreenState {
                 self.send_backswing(edge, delta);
             }
             self.pending_backswing = self.personality.post_forward_backswing;
+        }
+    }
+
+    /// The user presses (`state` 1) or releases (0) a button of the mouse
+    /// attached to this PC. While captured it goes to the peer, like the real
+    /// grab; otherwise the app under the local cursor gets it.
+    pub(crate) fn local_button(&mut self, button: u32, state: u32) {
+        if state == 0 {
+            self.physical_buttons.remove(&button);
+        } else {
+            self.physical_buttons.insert(button);
+        }
+        if let Some(edge) = self.captured {
+            self.send_capture(
+                edge,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button,
+                    state,
+                })),
+            );
+            return;
+        }
+        if state == 0 {
+            self.app_buttons.remove(&button);
+        } else {
+            self.app_buttons.insert(button);
         }
     }
 
@@ -384,6 +508,7 @@ impl ScreenState {
         // like the libei/Windows absolute trackers: warp to the crossing point
         // (edge centre when the peer sent no coordinate)
         self.place_on_edge(to_position(edge), along.unwrap_or(0.5));
+        self.awaiting_first_motion = true;
         self.record(ScreenEvent::RemoteBegin { edge, along });
     }
 
@@ -405,29 +530,38 @@ impl ScreenState {
             self.local_motion(dx, dy);
             return;
         }
+        if std::mem::take(&mut self.awaiting_first_motion) {
+            self.record(ScreenEvent::FirstInjectedMotion);
+        }
         let (x, y) = (self.cursor.0 + dx, self.cursor.1 + dy);
         self.cursor = (x.clamp(0.0, self.max_x()), y.clamp(0.0, self.max_y()));
         let Some(edge) = self.remote_edge else {
             return;
         };
         self.jittery_begin();
-        let pushed_past = match edge {
-            PointerEdge::Left => x < 0.0,
-            PointerEdge::Right => x > self.max_x(),
-            PointerEdge::Top => y < 0.0,
-            PointerEdge::Bottom => y > self.max_y(),
+        let touch = if self.personality.begin_on_edge_touch {
+            1.0
+        } else {
+            0.0
         };
-        if !pushed_past {
-            self.edge_contact = None;
-            return;
-        }
+        let (past, touched) = match edge {
+            PointerEdge::Left => (x < 0.0, x < touch && dx < 0.0),
+            PointerEdge::Right => (x > self.max_x(), x > self.max_x() - touch && dx > 0.0),
+            PointerEdge::Top => (y < 0.0, y < touch && dy < 0.0),
+            PointerEdge::Bottom => (y > self.max_y(), y > self.max_y() - touch && dy > 0.0),
+        };
         let entry = to_position(edge);
-        if self.personality.injected_crossing_begins_capture
+        if (past || touched)
+            && self.personality.injected_crossing_begins_capture
             && self.captured.is_none()
             && self.barriers.contains(&entry)
         {
             self.record(ScreenEvent::Quirk("injected crossing seen by capture"));
             self.begin_capture(entry);
+        }
+        if !past || !self.personality.emulation_edge_return {
+            self.edge_contact = None;
+            return;
         }
         let now = Instant::now();
         let fire = match &mut self.edge_contact {
@@ -558,8 +692,21 @@ impl Stream for SimCapture {
 
 #[async_trait]
 impl input_capture::Capture for SimCapture {
+    async fn held_buttons(&mut self) -> Option<Vec<u32>> {
+        let state = lock(&self.screen);
+        state.personality.reports_buttons.then(|| {
+            let mut held: Vec<u32> = state.physical_buttons.iter().copied().collect();
+            held.sort_unstable();
+            held
+        })
+    }
+
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let mut state = lock(&self.screen);
+        if !state.personality.capture_available {
+            // no capture backend on this OS: the barrier never exists
+            return Ok(());
+        }
         state.barriers.insert(pos);
         state.record(ScreenEvent::BarrierCreated(pos));
         Ok(())
@@ -622,6 +769,23 @@ impl input_emulation::Emulation for SimEmulation {
         match event {
             Event::Pointer(PointerEvent::Motion { dx, dy, .. }) => state.injected_motion(dx, dy),
             other => {
+                match other {
+                    Event::Pointer(PointerEvent::Button {
+                        button, state: 0, ..
+                    }) => {
+                        state.app_buttons.remove(&button);
+                    }
+                    Event::Pointer(PointerEvent::Button { button, .. }) => {
+                        state.app_buttons.insert(button);
+                    }
+                    Event::Keyboard(input_event::KeyboardEvent::Key { key, state: 0, .. }) => {
+                        state.app_keys.remove(&key);
+                    }
+                    Event::Keyboard(input_event::KeyboardEvent::Key { key, .. }) => {
+                        state.app_keys.insert(key);
+                    }
+                    _ => {}
+                }
                 // An injected lock key press toggles the lock like the OS does.
                 if let Event::Keyboard(input_event::KeyboardEvent::Key { key, state: 1, .. }) =
                     other

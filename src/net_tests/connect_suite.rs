@@ -232,3 +232,76 @@ fn events_keep_their_order_across_the_first_handshake() {
         l.listener.terminate().await;
     });
 }
+
+/// Pointer motion from a peer that has not entered this machine (it
+/// overtook its `Enter`, or trails its `Leave`) is not applied: it would move
+/// this machine's own pointer across its barriers and start a capture back
+/// towards that peer, and the two PCs then drove each other.
+#[test]
+fn motion_from_a_peer_that_has_not_entered_is_not_applied() {
+    run(async {
+        let peer = cert("gate-peer");
+        let l = ListenerSetup::default()
+            .authorize(&peer)
+            .start(cert("gate-listener"))
+            .await;
+        let port = l.port;
+        let injected = crate::capture::LastInjected::default();
+        let (clipboard_tx, _clipboard_rx) = local_channel::mpsc::channel();
+        let _emulation = crate::emulation::Emulation::with_factory(
+            Some(input_emulation::Backend::Dummy),
+            None,
+            l.listener,
+            clipboard_tx,
+            None,
+            injected.clone(),
+        );
+        let conn = crate::net_tests::dial(port, peer, WAIT)
+            .await
+            .expect("dial");
+        let motion = |dx: f64| {
+            ProtoEvent::Input(input_event::Event::Pointer(
+                input_event::PointerEvent::Motion {
+                    time: 0,
+                    dx,
+                    dy: 0.0,
+                },
+            ))
+        };
+        let settle = || tokio::time::sleep(Duration::from_millis(150));
+
+        crate::net_tests::send(&conn, motion(5.0)).await;
+        settle().await;
+        assert_eq!(
+            injected.get(),
+            (0.0, 0.0),
+            "motion before the Enter was applied"
+        );
+
+        crate::net_tests::send(
+            &conn,
+            ProtoEvent::EnterAt {
+                pos: Position::Left,
+                serial: 1,
+                along: 0.5,
+            },
+        )
+        .await;
+        crate::net_tests::send(&conn, motion(3.0)).await;
+        settle().await;
+        assert_eq!(
+            injected.get(),
+            (3.0, 0.0),
+            "motion after the Enter was dropped"
+        );
+
+        crate::net_tests::send(&conn, ProtoEvent::Leave(0)).await;
+        crate::net_tests::send(&conn, motion(9.0)).await;
+        settle().await;
+        assert_eq!(
+            injected.get(),
+            (3.0, 0.0),
+            "motion after the Leave was applied"
+        );
+    });
+}
