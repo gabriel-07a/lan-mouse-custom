@@ -306,10 +306,18 @@ async fn the_peer_gets_the_motion_windows_makes_of_the_mouse() {
     }
     let Some(start) = cursor_pos() else {
         eprintln!("skipped: no cursor in this session");
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no cursor on the CI desktop"
+        );
         return;
     };
     let Some(_precision) = PointerPrecision::enable() else {
         eprintln!("skipped: the pointer precision setting cannot be changed");
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "the pointer precision setting cannot be changed on the CI desktop"
+        );
         return;
     };
     const REPORTS: [i32; 6] = [3, 12, 25, 40, 25, 12];
@@ -371,6 +379,12 @@ async fn the_peer_gets_the_motion_windows_makes_of_the_mouse() {
             .await;
             if !matches!(begun, Ok(true)) {
                 report("pointer precision: skipped, the session did not deliver the crossing");
+                // the CI runners have an interactive desktop: a skip there
+                // would hide that nothing was measured
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "the CI desktop did not deliver the crossing (Windows moved {local} px)"
+                );
                 input_capture::set_windows_os_acceleration(false);
                 return;
             }
@@ -394,7 +408,11 @@ async fn the_peer_gets_the_motion_windows_makes_of_the_mouse() {
             ));
             capture.release().await.expect("release");
             input_capture::set_windows_os_acceleration(false);
-            assert!(local > 0.0, "Windows did not move the cursor at all");
+            assert!(
+                local > f64::from(raw),
+                "with pointer precision on, Windows moved {local} px for {raw} counts: \
+                 no curve to compare against"
+            );
             assert!(
                 (forwarded - local).abs() <= local * 0.1 + 2.0,
                 "the peer got {forwarded} px where Windows moves {local} px"
