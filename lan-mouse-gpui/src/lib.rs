@@ -828,6 +828,8 @@ struct Dashboard {
     absolute_sensitivity: u16,
     /// what a drag that reaches the edge does (service setting)
     drag_across: lan_mouse_ipc::DragAcross,
+    /// Windows: motion sent to peers follows the system acceleration
+    windows_pointer_acceleration: bool,
     clipboard_status: ClipboardStatus,
     pairing_active: bool,
     pairing_review: Vec<DeviceView>,
@@ -1021,6 +1023,7 @@ impl Dashboard {
             emulation_status: Status::Disabled,
             absolute_sensitivity: 100,
             drag_across: Default::default(),
+            windows_pointer_acceleration: false,
             clipboard_status: ClipboardStatus::default(),
             pairing_active: false,
             pairing_review: Vec::new(),
@@ -1113,6 +1116,60 @@ impl Dashboard {
             )
             .child(div().w_full().text_xs().text_color(rgb(MUTED)).child(self.tr(
                 "hold: a drag stays on this PC until the button is let go; cross: the drag ends at the edge and the cursor goes over",
+            )))
+    }
+
+    /// Windows only: whether the motion sent to peers follows the system
+    /// pointer acceleration, with what that means for the user.
+    fn render_windows_acceleration(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let choice = |on: bool| {
+            if self.windows_pointer_acceleration == on {
+                (ACCENT, 0x081018)
+            } else {
+                (0x1d2430, TEXT)
+            }
+        };
+        let (on_bg, on_fg) = choice(true);
+        let (off_bg, off_fg) = choice(false);
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(self.tr("Windows mouse acceleration on the other PC")),
+                    )
+                    .child(self.action_button(
+                        "windows-acceleration-on",
+                        self.tr("On"),
+                        on_bg,
+                        on_fg,
+                        cx,
+                        |this, _, _, _| {
+                            this.send(FrontendRequest::SetWindowsPointerAcceleration(true))
+                        },
+                    ))
+                    .child(self.action_button(
+                        "windows-acceleration-off",
+                        self.tr("Off"),
+                        off_bg,
+                        off_fg,
+                        cx,
+                        |this, _, _, _| {
+                            this.send(FrontendRequest::SetWindowsPointerAcceleration(false))
+                        },
+                    )),
+            )
+            .child(div().w_full().text_xs().text_color(rgb(MUTED)).child(self.tr(
+                "When this PC's mouse controls another PC, the cursor there follows Windows' pointer acceleration (\"Enhance pointer precision\"): a fast move goes as far there as it does here. Off: it follows the raw mouse counts and the pointer speed only, so fast moves travel less. Experimental: keep it off with a drawing tablet or over Remote Desktop.",
             )))
     }
 
@@ -1238,6 +1295,9 @@ impl Dashboard {
                 self.absolute_sensitivity = percent;
             }
             FrontendEvent::DragAcross(policy) => self.drag_across = policy,
+            FrontendEvent::WindowsPointerAcceleration(on) => {
+                self.windows_pointer_acceleration = on;
+            }
             FrontendEvent::CaptureStatus(status) => self.capture_status = status,
             FrontendEvent::EmulationStatus(status) => self.emulation_status = status,
             FrontendEvent::ClipboardStatus(status) => self.clipboard_status = status,
@@ -3804,6 +3864,9 @@ impl Dashboard {
                     )),
             )
             .child(self.render_drag_across(cx))
+            .when(cfg!(windows) || demo::enabled(), |this| {
+                this.child(self.render_windows_acceleration(cx))
+            })
             .child(
                 div()
                     .flex()

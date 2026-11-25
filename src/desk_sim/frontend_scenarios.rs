@@ -339,3 +339,50 @@ async fn the_drag_setting_round_trips_and_applies() {
         })
         .await;
 }
+
+/// The Windows acceleration switch of the GUI/CLI is stored and announced.
+#[tokio::test(flavor = "current_thread")]
+async fn the_windows_acceleration_setting_round_trips() {
+    init_log();
+    LocalSet::new()
+        .run_until(async {
+            let desk = a_and_b().await;
+            let (mut events, mut requests) = frontend(&desk, "A").await;
+            send(&mut requests, FrontendRequest::Sync).await;
+            let initial = expect_event(
+                &mut events,
+                "the acceleration setting",
+                |event| match event {
+                    FrontendEvent::WindowsPointerAcceleration(on) => Some(*on),
+                    _ => None,
+                },
+            )
+            .await;
+            assert!(!initial, "off by default");
+            send(
+                &mut requests,
+                FrontendRequest::SetWindowsPointerAcceleration(true),
+            )
+            .await;
+            assert!(
+                expect_event(&mut events, "acceleration on", |event| match event {
+                    FrontendEvent::WindowsPointerAcceleration(true) => Some(true),
+                    _ => None,
+                })
+                .await
+            );
+            send(
+                &mut requests,
+                FrontendRequest::SetWindowsPointerAcceleration(false),
+            )
+            .await;
+            assert!(
+                !expect_event(&mut events, "acceleration off", |event| match event {
+                    FrontendEvent::WindowsPointerAcceleration(false) => Some(false),
+                    _ => None,
+                })
+                .await
+            );
+        })
+        .await;
+}

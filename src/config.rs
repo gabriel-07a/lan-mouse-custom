@@ -1469,6 +1469,12 @@ impl Config {
             .unwrap_or(false)
     }
 
+    pub fn set_windows_pointer_acceleration(&mut self, on: bool) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .windows_pointer_acceleration = on.then_some(true);
+    }
+
     pub fn set_drag_across(&mut self, policy: lan_mouse_ipc::DragAcross) {
         self.config_toml
             .get_or_insert_with(Default::default)
@@ -2123,6 +2129,18 @@ address = "192.168.1.50"
 
 #[cfg(test)]
 mod absolute_pointer_sensitivity_tests {
+    #[test]
+    fn windows_pointer_acceleration_round_trips_through_the_setter() {
+        let env = lan_mouse_test_support::env::TestEnv::new("windows-accel-setter");
+        let path = env.write("config.toml", "");
+        let mut config = Config::load_for_test(&path).expect("config");
+        assert!(!config.windows_pointer_acceleration());
+        config.set_windows_pointer_acceleration(true);
+        assert!(config.windows_pointer_acceleration());
+        config.set_windows_pointer_acceleration(false);
+        assert!(!config.windows_pointer_acceleration());
+    }
+
     #[test]
     fn windows_pointer_acceleration_is_opt_in() {
         let off: ConfigToml = toml::from_str("").expect("parse");

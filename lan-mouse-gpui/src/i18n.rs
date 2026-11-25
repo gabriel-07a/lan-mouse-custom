@@ -241,6 +241,14 @@ impl Language {
                     "aplica quando outro PC controla este computador; 100% = 1:1"
                 }
                 "Dragging to the edge" => "Arrastando até a borda",
+                "Windows mouse acceleration on the other PC" => {
+                    "Aceleração do mouse do Windows no outro PC"
+                }
+                "On" => "Ligada",
+                "Off" => "Desligada",
+                "When this PC's mouse controls another PC, the cursor there follows Windows' pointer acceleration (\"Enhance pointer precision\"): a fast move goes as far there as it does here. Off: it follows the raw mouse counts and the pointer speed only, so fast moves travel less. Experimental: keep it off with a drawing tablet or over Remote Desktop." => {
+                    "Quando o mouse deste PC controla outro PC, o cursor de lá segue a aceleração do Windows (\"Aprimorar precisão do ponteiro\"): um movimento rápido anda lá o mesmo que aqui. Desligada: segue só as contagens do mouse e a velocidade do ponteiro, e movimentos rápidos andam menos. Experimental: deixe desligada se usar mesa digitalizadora ou Área de Trabalho Remota."
+                }
                 "Hold at the edge" => "Segurar na borda",
                 "Cross" => "Atravessar",
                 "hold: a drag stays on this PC until the button is let go; cross: the drag ends at the edge and the cursor goes over" => {

@@ -783,6 +783,9 @@ pub enum FrontendEvent {
     AbsoluteSensitivity(u16),
     /// what a drag that reaches the edge does
     DragAcross(DragAcross),
+    /// Windows: the motion sent to peers follows the system pointer
+    /// acceleration
+    WindowsPointerAcceleration(bool),
     /// capture status
     CaptureStatus(Status),
     /// emulation status
@@ -988,6 +991,9 @@ pub enum FrontendRequest {
     SetAbsoluteSensitivity(u16),
     /// what a drag that reaches the edge does
     SetDragAcross(DragAcross),
+    /// Windows: make the motion sent to peers follow the system pointer
+    /// acceleration ("Enhance pointer precision")
+    SetWindowsPointerAcceleration(bool),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// pin (or clear) the expected certificate fingerprint of a client

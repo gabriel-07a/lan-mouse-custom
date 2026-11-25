@@ -149,6 +149,11 @@ enum CliSubcommand {
     /// `hold` keeps it on this PC until the button is let go, `cross` ends it
     /// at the edge and lets the cursor go over
     DragAcross { policy: DragPolicy },
+    /// Windows: the cursor on the other PC follows Windows' pointer
+    /// acceleration ("Enhance pointer precision") - a fast move goes as far
+    /// there as here. Experimental; keep it off with a drawing tablet or over
+    /// Remote Desktop
+    WindowsAcceleration { state: OnOff },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
     /// list known devices with their permissions
@@ -759,6 +764,20 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 .await?;
             settle(&mut rx, Some(id)).await?;
         }
+        CliSubcommand::WindowsAcceleration { state } => {
+            let on = state == OnOff::On;
+            tx.request(FrontendRequest::SetWindowsPointerAcceleration(on))
+                .await?;
+            loop {
+                if let FrontendEvent::WindowsPointerAcceleration(now) = next_event(&mut rx).await? {
+                    println!(
+                        "Windows pointer acceleration: {}",
+                        if now { "on" } else { "off" }
+                    );
+                    break;
+                }
+            }
+        }
         CliSubcommand::DragAcross { policy } => {
             let policy = match policy {
                 DragPolicy::Hold => lan_mouse_ipc::DragAcross::Hold,
@@ -1368,4 +1387,11 @@ mod tests {
 pub enum DragPolicy {
     Hold,
     Cross,
+}
+
+/// `on` / `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnOff {
+    On,
+    Off,
 }

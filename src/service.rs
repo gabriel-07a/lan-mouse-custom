@@ -774,6 +774,13 @@ impl Service {
                 self.set_absolute_sensitivity(percent);
                 self.save_config();
             }
+            FrontendRequest::SetWindowsPointerAcceleration(on) => {
+                self.config.set_windows_pointer_acceleration(on);
+                // read by the Windows capture when the next capture begins
+                input_capture::set_windows_os_acceleration(on);
+                self.save_config();
+                self.notify_frontend(FrontendEvent::WindowsPointerAcceleration(on));
+            }
             FrontendRequest::SetDragAcross(policy) => {
                 self.config.set_drag_across(policy);
                 self.capture.set_drag_across(policy);
@@ -1558,6 +1565,9 @@ impl Service {
             .is_some_and(PairingWindow::is_open);
         self.notify_frontend(FrontendEvent::PairingActive(pairing_active));
         self.notify_frontend(FrontendEvent::DragAcross(self.config.drag_across()));
+        self.notify_frontend(FrontendEvent::WindowsPointerAcceleration(
+            self.config.windows_pointer_acceleration(),
+        ));
         self.broadcast_devices();
         self.broadcast_pending();
     }
