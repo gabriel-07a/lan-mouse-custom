@@ -214,6 +214,18 @@ async fn windows_backends_initialize_and_move_cursor_and_trigger_barrier() {
         .await;
 }
 
+/// Note a measurement where a CI run shows it (the job summary on GitHub
+/// Actions; stderr otherwise, which the harness only prints on failure).
+fn report(line: &str) {
+    eprintln!("{line}");
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = writeln!(file, "- {line}");
+        }
+    }
+}
+
 /// One relative mouse report, as a mouse makes it (Windows accelerates it).
 fn relative_report(dx: i32, dy: i32) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -316,7 +328,9 @@ async fn the_peer_gets_the_motion_windows_makes_of_the_mouse() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let local = f64::from(cursor_pos().expect("cursor").0 - before.0);
     let raw: i32 = REPORTS.iter().sum();
-    eprintln!("Windows moved the cursor {local} px for {raw} counts");
+    report(&format!(
+        "pointer precision: Windows moved the cursor {local} px for {raw} counts"
+    ));
 
     let local_set = tokio::task::LocalSet::new();
     local_set
@@ -356,7 +370,7 @@ async fn the_peer_gets_the_motion_windows_makes_of_the_mouse() {
             })
             .await;
             if !matches!(begun, Ok(true)) {
-                eprintln!("skipped: the session did not deliver the crossing");
+                report("pointer precision: skipped, the session did not deliver the crossing");
                 input_capture::set_windows_os_acceleration(false);
                 return;
             }
@@ -375,7 +389,9 @@ async fn the_peer_gets_the_motion_windows_makes_of_the_mouse() {
                     forwarded += dx;
                 }
             }
-            eprintln!("forwarded {forwarded} px (Windows moved {local} px)");
+            report(&format!(
+                "pointer precision: the peer got {forwarded} px (Windows moved {local} px)"
+            ));
             capture.release().await.expect("release");
             input_capture::set_windows_os_acceleration(false);
             assert!(local > 0.0, "Windows did not move the cursor at all");
