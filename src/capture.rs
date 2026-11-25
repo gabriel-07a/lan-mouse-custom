@@ -1277,6 +1277,20 @@ impl CaptureTask {
         }
     }
 
+    /// Send a key release to the driven peer right away (no-op for any other
+    /// event, or when nothing is driven).
+    async fn forward_key_release_now(&self, input: &Event) {
+        let Event::Keyboard(KeyboardEvent::Key { state: 0, .. }) = input else {
+            return;
+        };
+        let Some(handle) = self.active_client else {
+            return;
+        };
+        if let Err(e) = self.conn.send_now(ProtoEvent::Input(*input), handle).await {
+            log::debug!("could not send the key release to client {handle}: {e}");
+        }
+    }
+
     /// [`CaptureRequest::Enter`]: start a capture for `handle` without the
     /// pointer crossing its edge.
     async fn enter_client(
@@ -1363,12 +1377,20 @@ impl CaptureTask {
         if let CaptureEvent::Input(input) = &event {
             if self.emergency.on_event(input, Instant::now()) {
                 log::info!("releasing capture: Right Shift held for 3 s (emergency release)");
+                // The peer saw Right Shift go down; the release that fired the
+                // escape is already off the pressed-key list, so the release
+                // below would not send it.
+                self.forward_key_release_now(input).await;
                 return self.release_capture(capture, None).await;
             }
             match self.switch_hotkey.on_event(input) {
                 crate::switch_hotkey::Verdict::Forward => {}
                 crate::switch_hotkey::Verdict::Swallow => return Ok(()),
                 crate::switch_hotkey::Verdict::Switch(target) => {
+                    // "Next" fires on a modifier's release: hand it to the peer
+                    // too, or it keeps that modifier held (a digit chord fires
+                    // on the digit's press, which the peer never sees).
+                    self.forward_key_release_now(input).await;
                     log::info!(
                         "switch hotkey: {target:?} (driving {:?})",
                         self.active_client
@@ -2994,6 +3016,89 @@ mod capture_handle_tests {
             }
         }
         assert!(switched, "the service was not told to switch");
+        capture.terminate().await.expect("terminate");
+    }
+
+    fn key_ups(sent: &Rc<RefCell<Vec<ProtoEvent>>>) -> Vec<u32> {
+        sent.borrow()
+            .iter()
+            .filter_map(|event| match event {
+                ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    key, state: 0, ..
+                })) => Some(*key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn type_keys(task: &mut CaptureTask, capture: &mut InputCapture, keys: &[(u32, u8)]) {
+        for &(key, state) in keys {
+            let event = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key,
+                state,
+            }));
+            task.handle_capture_event(capture, (7, event))
+                .await
+                .expect("key");
+        }
+    }
+
+    /// AltGr + Right Shift fires on the release of the first of the two: the
+    /// peer saw that key go down, so it must also see it go up, or it is
+    /// left holding Shift (or AltGr) after the keyboard moved away.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_next_pc_hotkey_leaves_no_key_held_on_the_peer() {
+        let fake = FakeConnection::new();
+        let sent = fake.sent.clone();
+        let (mut task, _events) = capture_task_with_events(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("begin");
+        type_keys(&mut task, &mut capture, &[(100, 1), (54, 1), (54, 0)]).await;
+        assert!(
+            key_ups(&sent).contains(&54),
+            "Right Shift was never released on the peer"
+        );
+        capture.terminate().await.expect("terminate");
+    }
+
+    /// The emergency release fires on Right Shift's release; the peer must
+    /// get that release before the keyboard comes home.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_emergency_release_leaves_no_shift_held_on_the_peer() {
+        let fake = FakeConnection::new();
+        let sent = fake.sent.clone();
+        let (mut task, _events) = capture_task_with_events(
+            vec![(7, Position::Left, CaptureType::Default)],
+            Box::new(fake),
+        );
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .expect("dummy capture");
+        task.handle_capture_event(&mut capture, (7, CaptureEvent::BeginAt(0.5)))
+            .await
+            .expect("begin");
+        type_keys(&mut task, &mut capture, &[(54, 1)]).await;
+        // as if Right Shift had been held for the whole hold time
+        task.emergency = crate::emergency_release::EmergencyRelease::held_since_for_test(
+            Instant::now() - crate::emergency_release::HOLD,
+        );
+        type_keys(&mut task, &mut capture, &[(54, 0)]).await;
+        assert_eq!(
+            task.active_client, None,
+            "the emergency release brought the keyboard home"
+        );
+        assert!(
+            key_ups(&sent).contains(&54),
+            "Right Shift was never released on the peer"
+        );
         capture.terminate().await.expect("terminate");
     }
 

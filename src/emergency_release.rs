@@ -53,6 +53,14 @@ impl EmergencyRelease {
         }
     }
 
+    /// A hold that started at `since` (tests).
+    #[cfg(test)]
+    pub(crate) fn held_since_for_test(since: Instant) -> Self {
+        Self {
+            held_since: Some(since),
+        }
+    }
+
     /// Forget a half-done hold (the capture ended some other way).
     pub(crate) fn reset(&mut self) {
         self.held_since = None;
