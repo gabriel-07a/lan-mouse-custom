@@ -237,6 +237,8 @@ enum EmulationRequest {
     /// Walk the local pointer into this edge (hotkey / "go to" on a desktop
     /// that only starts a capture at its edge barrier).
     PushPointer(input_capture::Position),
+    /// let go of these mouse buttons on this machine (a drag ended at the edge)
+    ReleaseButtons(Vec<u32>),
     /// The capture began (or the user went home): stop walking the pointer.
     StopPointerPush,
     ChangePort(u16),
@@ -266,7 +268,14 @@ impl Emulation {
         clipboard_tx: Sender<(std::net::SocketAddr, ClipboardFrame)>,
         devices: Option<Arc<RwLock<DeviceStore>>>,
     ) -> Self {
-        Self::with_factory(backend, None, listener, clipboard_tx, devices)
+        Self::with_factory(
+            backend,
+            None,
+            listener,
+            clipboard_tx,
+            devices,
+            Default::default(),
+        )
     }
 
     /// Like [`Emulation::new`]; a `custom_backend` replaces the OS backend.
@@ -276,6 +285,7 @@ impl Emulation {
         listener: LanMouseListener,
         clipboard_tx: Sender<(std::net::SocketAddr, ClipboardFrame)>,
         devices: Option<Arc<RwLock<DeviceStore>>>,
+        last_injected: crate::capture::LastInjected,
     ) -> Self {
         let selected_backend: Rc<Cell<Option<input_emulation::Backend>>> = Default::default();
         let emulation_proxy =
@@ -292,6 +302,7 @@ impl Emulation {
             reply_rx,
             devices,
             fingerprints: Default::default(),
+            last_injected,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -398,6 +409,14 @@ impl Emulation {
     pub(crate) fn tap_keys(&self, keys: Vec<u32>) {
         self.request_tx
             .send(EmulationRequest::TapKeys(keys))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Inject a release of `buttons` into this machine's own desktop.
+    pub(crate) fn release_buttons_locally(&self, buttons: Vec<u32>) {
+        self.request_tx
+            .send(EmulationRequest::ReleaseButtons(buttons))
             .ok()
             .unwrap_or_default();
     }
@@ -544,6 +563,8 @@ struct ListenTask {
     devices: Option<Arc<RwLock<DeviceStore>>>,
     /// peer fingerprint per live connection, used for permission events
     fingerprints: HashMap<SocketAddr, String>,
+    /// the last pointer motion a peer injected (read by the capture task)
+    last_injected: crate::capture::LastInjected,
 }
 
 impl ListenTask {
@@ -656,6 +677,13 @@ impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut last_response = HashMap::new();
+        // Peers that entered this machine (an `Enter` since their last
+        // `Leave`). Pointer motion from anybody else is not applied: it would
+        // move this machine's own pointer as if it were local, across its
+        // barriers, and start a capture back towards that peer - both PCs then
+        // drove each other. It happens when a motion overtakes the `Enter`
+        // (reordering, a lost `Enter`), or a stale one follows the `Leave`.
+        let mut driving: std::collections::HashSet<SocketAddr> = Default::default();
         // Last `Enter` serial seen per connection, used to swallow
         // retransmissions without re-triggering `ReleaseNotify`.
         let mut last_enter = EnterDeduper::default();
@@ -683,12 +711,15 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter { pos, serial } => {
+                                driving.insert(addr);
                                 self.handle_enter(addr, pos, serial, None, &mut last_enter).await;
                             }
                             ProtoEvent::EnterAt { pos, serial, along } => {
+                                driving.insert(addr);
                                 self.handle_enter(addr, pos, serial, Some(along), &mut last_enter).await;
                             }
                             ProtoEvent::Leave(_) => {
+                                driving.remove(&addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                 // The peer is no longer driving this machine.
@@ -706,8 +737,13 @@ impl ListenTask {
                                     .unwrap_or_default();
                             }
                             ProtoEvent::Input(event) => {
-                                if matches!(event, Event::Pointer(PointerEvent::Motion { .. })) {
+                                if let Event::Pointer(PointerEvent::Motion { dx, dy, .. }) = event {
+                                    if !driving.contains(&addr) {
+                                        log::debug!("dropping motion from {addr}: it has not entered this machine");
+                                        continue;
+                                    }
                                     recv_cadence.entry(addr).or_default().record(Instant::now());
+                                    self.last_injected.set((dx, dy));
                                 }
                                 self.emulation_proxy.consume(event, addr)
                             }
@@ -846,6 +882,7 @@ impl ListenTask {
                             .unwrap_or_default();
                     }
                     Some(ListenEvent::Closed { addr }) => {
+                        driving.remove(&addr);
                         self.fingerprints.remove(&addr);
                         if last_response.remove(&addr).is_some() {
                             self.emulation_proxy.remove(addr);
@@ -919,6 +956,15 @@ impl ListenTask {
                     }
                     EmulationRequest::TapKeys(keys) => self.emulation_proxy.tap_keys(&keys),
                     EmulationRequest::PushPointer(pos) => push = Some(PointerPush::new(pos)),
+                    EmulationRequest::ReleaseButtons(buttons) => {
+                        for button in buttons {
+                            self.emulation_proxy.inject_local(Event::Pointer(PointerEvent::Button {
+                                time: 0,
+                                button,
+                                state: 0,
+                            }));
+                        }
+                    }
                     EmulationRequest::StopPointerPush => push = None,
                     EmulationRequest::SetAbsoluteSensitivity(percent) => self
                         .emulation_proxy
@@ -960,6 +1006,7 @@ impl ListenTask {
                         .collect();
                     for addr in expired {
                         log::warn!("releasing keys: {addr} not responding!");
+                        driving.remove(&addr);
                         self.emulation_proxy.remove(addr);
                         last_response.remove(&addr);
                         last_enter.clear(addr);
@@ -1395,7 +1442,7 @@ impl EmulationTask {
             // Local lock toggle, not peer input: no hand-off bookkeeping.
             let handle = self.handle_for(emulation, addr).await;
             return emulation
-                .consume(event, handle)
+                .consume_untracked(event, handle)
                 .await
                 .map_err(InputEmulationError::from);
         }
@@ -1971,6 +2018,7 @@ mod tests {
             reply_rx,
             devices: None,
             fingerprints: HashMap::new(),
+            last_injected: Default::default(),
         };
         let _ = request_tx;
         (task, event_rx, replies)

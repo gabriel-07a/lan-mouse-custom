@@ -15,6 +15,10 @@ impl X11InputCapture {
 
 #[async_trait]
 impl Capture for X11InputCapture {
+    async fn held_buttons(&mut self) -> Option<Vec<u32>> {
+        None
+    }
+
     async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
         Ok(())
     }

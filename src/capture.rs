@@ -120,7 +120,13 @@ impl CaptureConnection for LanMouseConnection {
 /// backend failure), exactly like [`InputCapture::new`] is for OS backends.
 pub(crate) type CaptureFactory = Rc<dyn Fn() -> InputCapture>;
 
+/// The last pointer motion a remote peer injected into this machine, shared
+/// by the emulation (which writes it) and the capture task (which reads it to
+/// tell a return push at the entry edge from settling jitter there).
+pub(crate) type LastInjected = Rc<Cell<(f64, f64)>>;
+
 pub(crate) struct Capture {
+    last_injected: LastInjected,
     cancellation_token: CancellationToken,
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
@@ -163,6 +169,9 @@ pub(crate) enum ICaptureEvent {
     /// The backend cannot start a capture by itself: walk the local pointer
     /// into this edge so its barrier starts it (see [`Capture::enter`]).
     PushPointer(CaptureHandle, Position),
+    /// A drag reached the edge with `drag_across = "cross"`: let go of these
+    /// buttons on this machine before the capture is retried.
+    ReleaseLocalButtons(Vec<u32>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +210,8 @@ enum CaptureRequest {
     /// edge a remote peer entered through while it drives this machine;
     /// `None` means no peer is driving us
     SetRemotePeer(Option<lan_mouse_ipc::Position>),
+    /// what a drag that reaches the edge does
+    SetDragAcross(lan_mouse_ipc::DragAcross),
     /// send this machine's keyboard lock state to the client
     SendLocks(CaptureHandle, crate::lock_sync::Locks),
     /// do not forward lock keys until the given instant (a lock key was just
@@ -243,7 +254,9 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let selected_backend: Rc<Cell<Option<input_capture::Backend>>> = Default::default();
+        let last_injected = LastInjected::default();
         let capture_task = CaptureTask::new(TaskParts {
+            last_injected: last_injected.clone(),
             backend,
             custom_backend,
             cancellation_token: cancellation_token.clone(),
@@ -257,6 +270,7 @@ impl Capture {
         });
         let task = spawn_local(capture_task.run());
         Self {
+            last_injected,
             cancellation_token,
             request_tx,
             task,
@@ -404,8 +418,18 @@ impl Capture {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
 
+    /// What a drag that reaches the edge does.
+    pub(crate) fn set_drag_across(&self, policy: lan_mouse_ipc::DragAcross) {
+        let _ = self.request_tx.send(CaptureRequest::SetDragAcross(policy));
+    }
+
     /// A remote peer started driving this machine from `peer`'s edge, or
     /// stopped driving it (`None`).
+    /// Shared with the emulation, which records what peers inject.
+    pub(crate) fn last_injected(&self) -> LastInjected {
+        self.last_injected.clone()
+    }
+
     pub(crate) fn set_remote_peer(&self, peer: Option<lan_mouse_ipc::Position>) {
         let _ = self.request_tx.send(CaptureRequest::SetRemotePeer(peer));
     }
@@ -501,6 +525,8 @@ const HANDOFF_POSITION_GUARD: Duration = Duration::from_millis(250);
 /// take-back after this short dwell is still reported (once per driving
 /// session; the service retries a request until the peer confirms).
 const REMOTE_ENTRY_DWELL: Duration = Duration::from_millis(300);
+/// How often a drag held at an edge checks whether its button is up again.
+const DRAG_HOLD_POLL: Duration = Duration::from_millis(20);
 /// How often the motion coalescing ratio is logged.
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -633,6 +659,8 @@ impl EnterState {
 }
 
 struct CaptureTask {
+    /// see [`LastInjected`]
+    last_injected: LastInjected,
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     /// replaces `backend` when set (desk simulator)
@@ -705,6 +733,14 @@ struct CaptureTask {
     /// When the remote peer started driving this machine (edge change or
     /// `None` -> `Some`), used for the incoming-capture take-back dwell.
     remote_peer_since: Option<Instant>,
+    /// what a drag that reaches the edge does
+    drag_across: lan_mouse_ipc::DragAcross,
+    /// buttons this machine already let go of for a drag that crossed
+    /// (`drag_across = "cross"`); their physical release, which arrives while
+    /// captured, belongs to nobody and is not forwarded
+    drag_released: std::collections::HashSet<u32>,
+    /// an edge whose barrier is away while a drag holds at it
+    held_drag: Option<(CaptureHandle, Position)>,
     /// Whether a local take-back request was already surfaced for the current
     /// remote-driving session. The service retries a `request_handoff` until
     /// the peer confirms, so one request per session is enough; repeated
@@ -732,6 +768,7 @@ struct CaptureTask {
 
 /// Everything [`CaptureTask::new`] needs; the rest of the task starts empty.
 struct TaskParts {
+    last_injected: LastInjected,
     backend: Option<input_capture::Backend>,
     custom_backend: Option<CaptureFactory>,
     cancellation_token: CancellationToken,
@@ -749,6 +786,7 @@ impl CaptureTask {
     /// [`Self::for_test`], so a new field does not break them.
     fn new(parts: TaskParts) -> Self {
         Self {
+            last_injected: parts.last_injected,
             active_client: None,
             backend: parts.backend,
             custom_backend: parts.custom_backend,
@@ -771,6 +809,9 @@ impl CaptureTask {
             sensitivity: Default::default(),
             remote_peer: None,
             remote_peer_since: None,
+            drag_across: Default::default(),
+            drag_released: Default::default(),
+            held_drag: None,
             enter_only_take_back_sent: false,
             grace: parts.grace,
             disconnected_since: None,
@@ -794,6 +835,7 @@ impl CaptureTask {
         let (event_tx, event_rx) = channel();
         let (_request_tx, request_rx) = channel();
         let task = Self::new(TaskParts {
+            last_injected: Default::default(),
             backend: Some(input_capture::Backend::Dummy),
             custom_backend: None,
             cancellation_token: CancellationToken::new(),
@@ -893,15 +935,118 @@ impl CaptureTask {
             );
             return false;
         }
+        // Within the dwell a begin is settling jitter unless the peer's last
+        // injected motion pushed out through the entry edge: that is a
+        // return, however soon it comes (a backend that sees the injected
+        // pointer touch its capture strip, like layer-shell, reports nothing
+        // else, so the dwell used to keep the cursor on this screen).
         if self
             .remote_peer_since
             .is_some_and(|since| since.elapsed() < REMOTE_ENTRY_DWELL)
+            && !self.last_injected_pushes_out()
         {
             log::debug!("ignoring incoming-capture begin during the remote-entry dwell");
             return false;
         }
         self.enter_only_take_back_sent = true;
         true
+    }
+
+    /// A capture began: decide what a drag (a held mouse button) does. `false`
+    /// means the capture was given back and nothing crosses this time.
+    ///
+    /// - `hold`: the cursor stays at the edge until the button is let go;
+    /// - `cross`: the button is let go on this machine (the drag ends at the
+    ///   edge) and the next push crosses. The release must happen with the
+    ///   pointer free: input injected during a capture would be captured too.
+    async fn drag_allows_crossing(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+    ) -> Result<bool, CaptureError> {
+        let held = capture.held_buttons().await.unwrap_or_default();
+        if held.is_empty() {
+            self.drag_released.clear();
+            return Ok(true);
+        }
+        match self.drag_across {
+            lan_mouse_ipc::DragAcross::Hold => {
+                log::debug!("holding a drag at the edge: buttons {held:?} are down");
+                capture.release().await?;
+                // Take the barrier away while the button is down: the
+                // pointer then rests at the edge like on a plain screen,
+                // instead of activating and being released on every push.
+                if let Some(pos) = self.get_pos(handle) {
+                    capture.destroy(handle).await?;
+                    self.held_drag = Some((handle, pos));
+                }
+                Ok(false)
+            }
+            lan_mouse_ipc::DragAcross::Cross => {
+                if held
+                    .iter()
+                    .all(|button| self.drag_released.contains(button))
+                {
+                    return Ok(true);
+                }
+                capture.release().await?;
+                self.drag_released.extend(held.iter().copied());
+                self.event_tx
+                    .send(ICaptureEvent::ReleaseLocalButtons(held))
+                    .ok()
+                    .unwrap_or_default();
+                Ok(false)
+            }
+        }
+    }
+
+    /// A drag held at the edge: once every button is up again, put the
+    /// barrier back.
+    async fn resume_held_drag(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        if !capture.held_buttons().await.unwrap_or_default().is_empty() {
+            return Ok(());
+        }
+        if let Some((handle, pos)) = self.held_drag.take() {
+            // the client may have gone meanwhile
+            if self.get_pos(handle) == Some(pos) {
+                log::debug!("drag over: restoring the {pos} edge");
+                capture.create(handle, pos).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Someone used this machine's own mouse while a peer drives it: the last
+    /// hand that moved wins, so ask the peer to let go (the same take-back an
+    /// incoming-capture begin requests), once per driving session.
+    fn on_local_activity(&mut self, handle: CaptureHandle, capture_type: CaptureType) {
+        if capture_type != CaptureType::EnterOnly
+            || self.remote_peer.is_none()
+            || self.enter_only_take_back_sent
+        {
+            return;
+        }
+        log::info!("this machine's own mouse moved while a peer drives it: taking control back");
+        self.enter_only_take_back_sent = true;
+        self.event_tx
+            .send(ICaptureEvent::CaptureBegin(handle, None))
+            .ok()
+            .unwrap_or_default();
+    }
+
+    /// Whether the last motion a peer injected points out of this screen
+    /// through the edge it entered by.
+    fn last_injected_pushes_out(&self) -> bool {
+        let Some(edge) = self.remote_peer else {
+            return false;
+        };
+        let (dx, dy) = self.last_injected.get();
+        match edge {
+            lan_mouse_ipc::Position::Left => dx < 0.0,
+            lan_mouse_ipc::Position::Right => dx > 0.0,
+            lan_mouse_ipc::Position::Top => dy < 0.0,
+            lan_mouse_ipc::Position::Bottom => dy > 0.0,
+        }
     }
 
     /// Send the keyboard lock state to a peer that understands lock sync.
@@ -948,6 +1093,7 @@ impl CaptureTask {
                         CaptureRequest::SetRemotePeer(peer) => {
                             self.update_remote_peer(peer);
                         }
+                        CaptureRequest::SetDragAcross(policy) => self.drag_across = policy,
                         // Lock sync works while the capture backend is down
                         // (e.g. a machine that only receives input).
                         CaptureRequest::SendLocks(h, locks) => self.send_locks(h, locks).await,
@@ -1030,6 +1176,8 @@ impl CaptureTask {
 
         // Report the coalescing ratio periodically so the effect of
         // `motion_batch_ms` can be verified from the logs.
+        let mut drag_poll = tokio::time::interval(DRAG_HOLD_POLL);
+        drag_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut stats_interval = tokio::time::interval(STATS_INTERVAL);
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         stats_interval.tick().await;
@@ -1069,6 +1217,9 @@ impl CaptureTask {
                             self.release_capture(capture, None).await?;
                         }
                     }
+                },
+                _ = drag_poll.tick(), if self.held_drag.is_some() => {
+                    self.resume_held_drag(capture).await?;
                 },
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
@@ -1195,6 +1346,7 @@ impl CaptureTask {
                         self.update_remote_peer(peer);
                         capture.set_remote_peer(peer.map(to_capture_pos));
                     }
+                    CaptureRequest::SetDragAcross(policy) => self.drag_across = policy,
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture, None).await?,
                     CaptureRequest::Create(h, p, t) => {
@@ -1250,6 +1402,8 @@ impl CaptureTask {
             }
             CaptureEvent::Input(Event::Pointer(_)) => caps.contains(Capabilities::POINTER),
             CaptureEvent::Input(Event::Keyboard(_)) => caps.contains(Capabilities::KEYBOARD),
+            // handled before any policy check (`on_local_activity`)
+            CaptureEvent::LocalActivity => false,
         }
     }
 
@@ -1350,6 +1504,11 @@ impl CaptureTask {
             return Ok(());
         };
 
+        if matches!(event, CaptureEvent::LocalActivity) {
+            self.on_local_activity(handle, capture_type);
+            return Ok(());
+        }
+
         // While a peer drives this machine, a barrier begin on an outgoing
         // capture is the injected pointer being pushed back toward the peer.
         // Only the incoming (EnterOnly) capture may act on it: it sends the
@@ -1373,6 +1532,25 @@ impl CaptureTask {
             log::info!("releasing capture: release-bind pressed");
             self.emergency.reset();
             return self.release_capture(capture, None).await;
+        }
+        if let CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+            button, state: 0, ..
+        })) = &event
+        {
+            if self.drag_released.remove(button) {
+                // the drag this release ends was already ended on this machine
+                return Ok(());
+            }
+            if self.active_client.is_none() && capture_type == CaptureType::Default {
+                // The button went up in the moment a capture was being given
+                // back (a drag held at the edge): nobody is driven, so it
+                // belongs to the app on this machine, which saw the press.
+                self.event_tx
+                    .send(ICaptureEvent::ReleaseLocalButtons(vec![*button]))
+                    .ok()
+                    .unwrap_or_default();
+                return Ok(());
+            }
         }
         if let CaptureEvent::Input(input) = &event {
             if self.emergency.on_event(input, Instant::now()) {
@@ -1459,6 +1637,9 @@ impl CaptureTask {
 
         // activated a new client
         if event.is_begin() && Some(handle) != self.active_client {
+            if !self.drag_allows_crossing(capture, handle).await? {
+                return Ok(());
+            }
             // The peer is unreachable (e.g. the user clicked Connect while the
             // other machine is off). The backend has already grabbed/locked
             // the local pointer for this begin, but without a transport the
@@ -1728,6 +1909,8 @@ impl CaptureTask {
         }
 
         let event = match event {
+            // handled at the top of `handle_capture_event`
+            CaptureEvent::LocalActivity => return Ok(()),
             CaptureEvent::Begin | CaptureEvent::BeginAt(_) => {
                 let event = self.enter_event(handle, opposite_pos);
                 handoff_trace::event(

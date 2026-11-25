@@ -738,6 +738,11 @@ fn wayland_protocol_error(e: wayland_client::backend::protocol::ProtocolError) -
 
 #[async_trait]
 impl Capture for LayerShellInputCapture {
+    // a Wayland client cannot see the seat's buttons outside its own surfaces
+    async fn held_buttons(&mut self) -> Option<Vec<u32>> {
+        None
+    }
+
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.add_client(pos)?;
         let inner = self.0.get_mut();

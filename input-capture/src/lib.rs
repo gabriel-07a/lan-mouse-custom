@@ -49,6 +49,12 @@ pub enum CaptureEvent {
     BeginAt(f32),
     /// input event coming from capture handle
     Input(Event),
+    /// While a peer drives this machine, someone used this machine's own
+    /// mouse (physical input, not the peer's injected input). Reported on the
+    /// edge the peer entered through; the last hand that moved wins, so the
+    /// peer is asked to let go. Only backends that can tell physical from
+    /// injected input report it (Windows).
+    LocalActivity,
 }
 
 impl CaptureEvent {
@@ -72,6 +78,7 @@ impl Display for CaptureEvent {
             CaptureEvent::Begin => write!(f, "begin capture"),
             CaptureEvent::BeginAt(along) => write!(f, "begin capture at {along:.3}"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
+            CaptureEvent::LocalActivity => write!(f, "local input while driven"),
         }
     }
 }
@@ -236,6 +243,12 @@ impl InputCapture {
             return false;
         };
         self.capture.begin(pos)
+    }
+
+    /// Mouse buttons held down right now (`None`: the backend cannot tell).
+    /// See [`Capture::held_buttons`].
+    pub async fn held_buttons(&mut self) -> Option<Vec<u32>> {
+        self.capture.held_buttons().await
     }
 
     /// The edge a capture handle sits on.
@@ -442,6 +455,11 @@ pub trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>>
     fn begin(&mut self, _pos: Position) -> bool {
         false
     }
+
+    /// Mouse buttons (Linux `BTN_*` codes) held down on this machine right
+    /// now, or `None` when the backend cannot tell. Asked when a capture
+    /// begins, to decide what a drag that reaches the edge does.
+    async fn held_buttons(&mut self) -> Option<Vec<u32>>;
 }
 
 async fn create_backend(
@@ -542,6 +560,10 @@ mod tests {
 
     #[async_trait]
     impl Capture for MockCapture {
+        async fn held_buttons(&mut self) -> Option<Vec<u32>> {
+            None
+        }
+
         async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
             let mut log = self.log.lock().expect("mock log");
             if log.fail_next_create {

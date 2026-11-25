@@ -351,6 +351,19 @@ impl InputEmulation {
         }
     }
 
+    /// Inject `event` as is, without the held-key/button bookkeeping of
+    /// [`Self::consume`]. For input this machine makes itself (lock sync
+    /// taps, letting go of a drag that ended at the edge): its release must
+    /// reach the desktop even though no press went through this handle, and
+    /// nothing of it needs releasing later.
+    pub async fn consume_untracked(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        self.emulation.consume(event, handle).await
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());

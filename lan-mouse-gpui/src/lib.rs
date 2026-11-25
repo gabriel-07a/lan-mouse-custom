@@ -826,6 +826,8 @@ struct Dashboard {
     emulation_status: Status,
     /// sensitivity of input received from peers through the absolute pointer
     absolute_sensitivity: u16,
+    /// what a drag that reaches the edge does (service setting)
+    drag_across: lan_mouse_ipc::DragAcross,
     clipboard_status: ClipboardStatus,
     pairing_active: bool,
     pairing_review: Vec<DeviceView>,
@@ -1018,6 +1020,7 @@ impl Dashboard {
             capture_status: Status::Disabled,
             emulation_status: Status::Disabled,
             absolute_sensitivity: 100,
+            drag_across: Default::default(),
             clipboard_status: ClipboardStatus::default(),
             pairing_active: false,
             pairing_review: Vec::new(),
@@ -1060,6 +1063,57 @@ impl Dashboard {
 
     fn set_add_notice(&mut self, message: String, success: bool) {
         self.add_notice = Some((message, success));
+    }
+
+    /// What a drag that reaches the edge does: two choices, the current one
+    /// highlighted.
+    fn render_drag_across(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use lan_mouse_ipc::DragAcross;
+        let choice = |policy: DragAcross| {
+            if self.drag_across == policy {
+                (ACCENT, 0x081018)
+            } else {
+                (0x1d2430, TEXT)
+            }
+        };
+        let (hold_bg, hold_fg) = choice(DragAcross::Hold);
+        let (cross_bg, cross_fg) = choice(DragAcross::Cross);
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(self.tr("Dragging to the edge")),
+                    )
+                    .child(self.action_button(
+                        "drag-across-hold",
+                        self.tr("Hold at the edge"),
+                        hold_bg,
+                        hold_fg,
+                        cx,
+                        |this, _, _, _| this.send(FrontendRequest::SetDragAcross(DragAcross::Hold)),
+                    ))
+                    .child(self.action_button(
+                        "drag-across-cross",
+                        self.tr("Cross"),
+                        cross_bg,
+                        cross_fg,
+                        cx,
+                        |this, _, _, _| this.send(FrontendRequest::SetDragAcross(DragAcross::Cross)),
+                    )),
+            )
+            .child(div().w_full().text_xs().text_color(rgb(MUTED)).child(self.tr(
+                "hold: a drag stays on this PC until the button is let go; cross: the drag ends at the edge and the cursor goes over",
+            )))
     }
 
     fn tr(&self, english: &'static str) -> &'static str {
@@ -1183,6 +1237,7 @@ impl Dashboard {
             FrontendEvent::AbsoluteSensitivity(percent) => {
                 self.absolute_sensitivity = percent;
             }
+            FrontendEvent::DragAcross(policy) => self.drag_across = policy,
             FrontendEvent::CaptureStatus(status) => self.capture_status = status,
             FrontendEvent::EmulationStatus(status) => self.emulation_status = status,
             FrontendEvent::ClipboardStatus(status) => self.clipboard_status = status,
@@ -3748,6 +3803,7 @@ impl Dashboard {
                         self.tr("applies when another PC controls this computer; 100% = 1:1"),
                     )),
             )
+            .child(self.render_drag_across(cx))
             .child(
                 div()
                     .flex()

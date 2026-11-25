@@ -547,6 +547,20 @@ impl Capabilities {
 
 /// Permission granted in one direction between two devices.
 ///
+/// What a drag (a mouse button held down) does when it reaches the edge to
+/// another PC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DragAcross {
+    /// the cursor stays at the edge until the button is let go, so the drag
+    /// goes on on this PC (a drag cannot continue on the other one)
+    #[default]
+    Hold,
+    /// the drag ends at the edge (the button is let go on this PC) and the
+    /// cursor crosses
+    Cross,
+}
+
 /// `incoming` is authoritative and enforced by the machine that receives the
 /// input; `outgoing` is a local guard that decides whether this machine may
 /// control the peer.
@@ -767,6 +781,8 @@ pub enum FrontendEvent {
     /// sensitivity of input received from peers through the absolute pointer,
     /// in percent (100 = screen-relative 1:1)
     AbsoluteSensitivity(u16),
+    /// what a drag that reaches the edge does
+    DragAcross(DragAcross),
     /// capture status
     CaptureStatus(Status),
     /// emulation status
@@ -970,6 +986,8 @@ pub enum FrontendRequest {
     /// update the sensitivity of input received from peers through the
     /// absolute pointer (also used by backends that use absolute injection)
     SetAbsoluteSensitivity(u16),
+    /// what a drag that reaches the edge does
+    SetDragAcross(DragAcross),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// pin (or clear) the expected certificate fingerprint of a client

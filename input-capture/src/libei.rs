@@ -185,6 +185,43 @@ pub struct LibeiInputCapture {
     /// the capture task already reported its final state; polling a finished
     /// JoinHandle again would panic
     finished: bool,
+    /// for asking the cursor extension which buttons are held
+    session_bus: Option<ashpd::zbus::Connection>,
+}
+
+/// Mouse buttons held right now, from the Lan Mouse cursor extension: the
+/// capture portal does not tell. `None` when the extension does not answer
+/// (not installed, an older version, not GNOME), within a short timeout.
+async fn held_buttons_from_extension(bus: &ashpd::zbus::Connection) -> Option<Vec<u32>> {
+    let call = bus.call_method(
+        Some("org.gnome.Shell"),
+        "/dev/lanmouse/Cursor",
+        Some("dev.lanmouse.Cursor"),
+        "ButtonsHeld",
+        &(),
+    );
+    let reply = tokio::time::timeout(Duration::from_millis(50), call)
+        .await
+        .ok()?
+        .ok()?;
+    let mask: u32 = reply.body().deserialize().ok()?;
+    Some(buttons_in_clutter_mask(mask))
+}
+
+/// Linux `BTN_*` codes of the buttons set in a Clutter modifier mask
+/// (`CLUTTER_BUTTON1_MASK` .. `CLUTTER_BUTTON5_MASK` are bits 8..12; 1 is
+/// left, 2 middle, 3 right; 4/5 are the wheel and not held buttons).
+fn buttons_in_clutter_mask(mask: u32) -> Vec<u32> {
+    use input_event::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+    [
+        (1 << 8, BTN_LEFT),
+        (1 << 9, BTN_MIDDLE),
+        (1 << 10, BTN_RIGHT),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| mask & bit != 0)
+    .map(|(_, button)| button)
+    .collect()
 }
 
 /// returns (start pos, end pos), inclusive
@@ -464,6 +501,7 @@ impl LibeiInputCapture {
             cancellation_token,
             terminated: false,
             finished: false,
+            session_bus: None,
         };
 
         Ok(producer)
@@ -1261,6 +1299,13 @@ async fn handle_ei_event(
 
 #[async_trait]
 impl LanMouseInputCapture for LibeiInputCapture {
+    async fn held_buttons(&mut self) -> Option<Vec<u32>> {
+        if self.session_bus.is_none() {
+            self.session_bus = ashpd::zbus::Connection::session().await.ok();
+        }
+        held_buttons_from_extension(self.session_bus.as_ref()?).await
+    }
+
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let _ = self
             .notify_capture
@@ -1460,6 +1505,19 @@ mod token_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_buttons_are_read_from_the_clutter_mask() {
+        use input_event::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+        assert!(buttons_in_clutter_mask(0).is_empty());
+        // shift (bit 0) and a wheel bit (11) are not held buttons
+        assert!(buttons_in_clutter_mask(1 | 1 << 11).is_empty());
+        assert_eq!(buttons_in_clutter_mask(1 << 8), vec![BTN_LEFT]);
+        assert_eq!(
+            buttons_in_clutter_mask(1 << 8 | 1 << 9 | 1 << 10),
+            vec![BTN_LEFT, BTN_MIDDLE, BTN_RIGHT]
+        );
+    }
+
     use super::*;
 
     #[test]

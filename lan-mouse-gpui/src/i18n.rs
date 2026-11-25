@@ -240,6 +240,12 @@ impl Language {
                 "applies when another PC controls this computer; 100% = 1:1" => {
                     "aplica quando outro PC controla este computador; 100% = 1:1"
                 }
+                "Dragging to the edge" => "Arrastando até a borda",
+                "Hold at the edge" => "Segurar na borda",
+                "Cross" => "Atravessar",
+                "hold: a drag stays on this PC until the button is let go; cross: the drag ends at the edge and the cursor goes over" => {
+                    "segurar: o arraste fica neste PC até soltar o botão; atravessar: o arraste termina na borda e o cursor passa"
+                }
                 "Find Lan Mouse instances on the local IPv4 network." => {
                     "Encontre instâncias do Lan Mouse na rede IPv4 local."
                 }

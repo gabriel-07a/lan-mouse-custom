@@ -318,6 +318,11 @@ que o fork está público. Só não trate como suporte oficial.
    `DESKTOP-ABC`) que o sistema não resolve é tentado de novo como
    `DESKTOP-ABC.local` (mDNS), que é como Windows e macOS se anunciam na rede
    local.
+   Arrastar algo (botão do mouse segurado) até a borda mantém o cursor neste
+   PC até soltar o botão; com `drag_across = "cross"` no `config.toml` (ou
+   `lan-mouse cli drag-across cross`, ou o botão nas Configurações) o arraste
+   termina na borda e o cursor atravessa. No sway/wlroots o arraste sempre
+   fica (limitação do Wayland).
 4. Cruze a borda nos dois sentidos, em alturas diferentes (10%, 50%, 90%).
 5. Se algo estranhar, rode com log de debug:
    ```sh

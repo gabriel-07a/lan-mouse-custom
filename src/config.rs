@@ -100,6 +100,9 @@ struct ConfigToml {
     /// keep Num Lock in sync with connected machines (Caps Lock always is);
     /// defaults to true
     sync_num_lock: Option<bool>,
+    /// what a drag (button held) does at the edge to another PC: "hold"
+    /// (default) or "cross"
+    drag_across: Option<lan_mouse_ipc::DragAcross>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     /// known devices with identity and permission policies (config v2)
@@ -1445,6 +1448,20 @@ impl Config {
         } else {
             Some(port)
         };
+    }
+
+    /// What a drag that reaches the edge to another PC does.
+    pub fn drag_across(&self) -> lan_mouse_ipc::DragAcross {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.drag_across)
+            .unwrap_or_default()
+    }
+
+    pub fn set_drag_across(&mut self, policy: lan_mouse_ipc::DragAcross) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .drag_across = (policy != lan_mouse_ipc::DragAcross::default()).then_some(policy);
     }
 
     pub fn set_absolute_pointer_sensitivity(&mut self, percent: u16) {

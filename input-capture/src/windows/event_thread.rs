@@ -372,6 +372,8 @@ thread_local! {
     /// (`None` = no peer is driving us); local barrier detection must stay
     /// quiet except at that edge, where a crossing is the return hand-off
     static REMOTE_PEER: Cell<Option<Position>> = const { Cell::new(None) };
+    /// when this machine's own mouse was last reported while driven
+    static LAST_LOCAL_ACTIVITY: Cell<Option<Instant>> = const { Cell::new(None) };
     /// 1x1 topmost window used to hide the local pointer while capturing.
     /// 0 means "not created" (raw pointer value of the HWND).
     static HIDDEN_POINTER_WINDOW: Cell<isize> = const { Cell::new(0) };
@@ -1034,6 +1036,19 @@ unsafe fn handle_mouse_delta(dx: i32, dy: i32, speed: f64) {
     }
 }
 
+/// Report this machine's own mouse at most this often while a peer drives it.
+const LOCAL_ACTIVITY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A mouse event that a person made on this machine (not injected) and that
+/// means they took the mouse: a move or a button press.
+fn is_local_activity(injected: bool, message: u32) -> bool {
+    !injected
+        && matches!(
+            message,
+            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        )
+}
+
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Required by the hook contract: negative codes must be passed on and the
     // return value of CallNextHookEx propagated.
@@ -1052,6 +1067,20 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
             mouse_low_level.flags & LLMHF_INJECTED != 0,
         ) {
             unpark_cursor();
+        }
+        // A peer drives this machine and somebody moved this machine's own
+        // mouse: the last hand that moved wins.
+        if let Some(entry) = REMOTE_PEER.get() {
+            if is_local_activity(mouse_low_level.flags & LLMHF_INJECTED != 0, wparam.0 as u32)
+                && LAST_LOCAL_ACTIVITY
+                    .get()
+                    .is_none_or(|at| at.elapsed() >= LOCAL_ACTIVITY_INTERVAL)
+            {
+                LAST_LOCAL_ACTIVITY.set(Some(Instant::now()));
+                if let Err(e) = try_send_event(entry, CaptureEvent::LocalActivity) {
+                    log::debug!("dropping local activity: {e}");
+                }
+            }
         }
         // Primary detector: raw input (works with a clamped pointer).
         // Fallback only if raw input could not be registered.
@@ -1472,6 +1501,25 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
 mod tests {
     use super::*;
     use crate::Position;
+
+    /// The person moving or clicking this machine's mouse takes over; the
+    /// peer's injected input, a release or the wheel do not.
+    #[test]
+    fn only_physical_moves_and_presses_take_the_mouse_back() {
+        for message in [
+            WM_MOUSEMOVE,
+            WM_LBUTTONDOWN,
+            WM_RBUTTONDOWN,
+            WM_MBUTTONDOWN,
+            WM_XBUTTONDOWN,
+        ] {
+            assert!(is_local_activity(false, message), "{message:#x}");
+            assert!(!is_local_activity(true, message), "injected {message:#x}");
+        }
+        for message in [WM_LBUTTONUP, WM_RBUTTONUP, WM_MOUSEWHEEL] {
+            assert!(!is_local_activity(false, message), "{message:#x}");
+        }
+    }
 
     #[test]
     fn the_remote_entry_edge_is_the_only_allowed_crossing() {

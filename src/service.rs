@@ -297,8 +297,10 @@ impl Service {
             listener,
             clipboard_from_listener_tx,
             Some(devices.clone()),
+            capture.last_injected(),
         );
         emulation.set_absolute_sensitivity(config.absolute_pointer_sensitivity());
+        capture.set_drag_across(config.drag_across());
         let clipboard_enabled_initial = config.clipboard_enabled();
         let clipboard_enabled = Rc::new(Cell::new(clipboard_enabled_initial));
         let clipboard_limits = Rc::new(Cell::new(config.clipboard_limits()));
@@ -770,6 +772,12 @@ impl Service {
             FrontendRequest::SetAbsoluteSensitivity(percent) => {
                 self.set_absolute_sensitivity(percent);
                 self.save_config();
+            }
+            FrontendRequest::SetDragAcross(policy) => {
+                self.config.set_drag_across(policy);
+                self.capture.set_drag_across(policy);
+                self.save_config();
+                self.notify_frontend(FrontendEvent::DragAcross(policy));
             }
             FrontendRequest::UpdateFingerprint(handle, fingerprint) => {
                 let fingerprint = fingerprint.and_then(|fp| {
@@ -1453,6 +1461,10 @@ impl Service {
                     None => log::info!("switch hotkey {target:?}: no such PC"),
                 }
             }
+            ICaptureEvent::ReleaseLocalButtons(buttons) => {
+                log::info!("a drag reached the edge: letting go of {buttons:?} on this PC");
+                self.emulation.release_buttons_locally(buttons);
+            }
             ICaptureEvent::PushPointer(handle, pos) => {
                 log::debug!("walking the pointer into the {pos} edge for client {handle}");
                 self.emulation.push_pointer(pos);
@@ -1544,6 +1556,7 @@ impl Service {
             .as_ref()
             .is_some_and(PairingWindow::is_open);
         self.notify_frontend(FrontendEvent::PairingActive(pairing_active));
+        self.notify_frontend(FrontendEvent::DragAcross(self.config.drag_across()));
         self.broadcast_devices();
         self.broadcast_pending();
     }

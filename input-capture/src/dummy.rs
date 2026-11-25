@@ -36,6 +36,10 @@ impl Default for DummyInputCapture {
 
 #[async_trait]
 impl Capture for DummyInputCapture {
+    async fn held_buttons(&mut self) -> Option<Vec<u32>> {
+        None
+    }
+
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         if pos == Position::Left {
             self.has_left_client = true;

@@ -14,7 +14,7 @@ import Gio from 'gi://Gio';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const HEARTBEAT_MS = 3_000;
-const EXTENSION_VERSION = '9';
+const EXTENSION_VERSION = '10';
 const POLL_MS = 50;
 // Ignore pointer movement right after a hand-off: the peer may still deliver
 // a few injected motion events while it releases its capture. Requiring two
@@ -31,6 +31,19 @@ const PARK_KIND_RETURN = 'return';
 // moving back, and no peer injects motion that could be mistaken for it.
 const PARK_MOVE_PX_RETURN = 0;
 const MARKERS = ['cursor-hide', 'cursor-park'];
+
+// Which mouse buttons are down right now: the capture portal cannot tell, and
+// Lan Mouse asks when a capture begins so a drag can stay on this screen.
+// Called on the Shell's own bus name (org.gnome.Shell).
+const DBUS_PATH = '/dev/lanmouse/Cursor';
+const DBUS_INTERFACE = `
+<node>
+  <interface name="dev.lanmouse.Cursor">
+    <method name="ButtonsHeld">
+      <arg type="u" direction="out" name="modifier_mask"/>
+    </method>
+  </interface>
+</node>`;
 
 export default class LanMouseCursorExtension extends Extension {
     enable() {
@@ -91,6 +104,16 @@ export default class LanMouseCursorExtension extends Extension {
             this._monitor = null;
         }
 
+        try {
+            this._dbus = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, {
+                // Clutter modifier mask: BUTTON1..5 are bits 8..12
+                ButtonsHeld: () => global.get_pointer()[2] ?? 0,
+            });
+            this._dbus.export(Gio.DBus.session, DBUS_PATH);
+        } catch (_error) {
+            this._dbus = null;
+        }
+
         this._pollId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
             POLL_MS,
@@ -110,6 +133,10 @@ export default class LanMouseCursorExtension extends Extension {
         if (this._monitor) {
             this._monitor.cancel();
             this._monitor = null;
+        }
+        if (this._dbus) {
+            this._dbus.unexport();
+            this._dbus = null;
         }
         if (this._positionId && this._cursorTracker) {
             this._cursorTracker.disconnect(this._positionId);

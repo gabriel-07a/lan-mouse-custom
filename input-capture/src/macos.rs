@@ -822,6 +822,10 @@ impl Drop for MacOSInputCapture {
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
+    async fn held_buttons(&mut self) -> Option<Vec<u32>> {
+        None
+    }
+
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {

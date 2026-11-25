@@ -145,6 +145,10 @@ enum CliSubcommand {
     /// set the sensitivity of input received from peers through the absolute
     /// pointer, in percent (100 = screen-relative 1:1)
     SetAbsoluteSensitivity { percent: u16 },
+    /// what a drag (a mouse button held) does at the edge to another PC:
+    /// `hold` keeps it on this PC until the button is let go, `cross` ends it
+    /// at the edge and lets the cursor go over
+    DragAcross { policy: DragPolicy },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
     /// list known devices with their permissions
@@ -755,6 +759,19 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 .await?;
             settle(&mut rx, Some(id)).await?;
         }
+        CliSubcommand::DragAcross { policy } => {
+            let policy = match policy {
+                DragPolicy::Hold => lan_mouse_ipc::DragAcross::Hold,
+                DragPolicy::Cross => lan_mouse_ipc::DragAcross::Cross,
+            };
+            tx.request(FrontendRequest::SetDragAcross(policy)).await?;
+            loop {
+                if let FrontendEvent::DragAcross(now) = next_event(&mut rx).await? {
+                    println!("drag across the edge: {now:?}");
+                    break;
+                }
+            }
+        }
         CliSubcommand::SetAbsoluteSensitivity { percent } => {
             let percent = validate_sensitivity(percent)?;
             tx.request(FrontendRequest::SetAbsoluteSensitivity(percent))
@@ -1344,4 +1361,11 @@ mod tests {
             Some("rtt p50 2.5ms p99 9.0ms loss 0.4%, recv gap p50 2.0ms p99 16.3ms")
         );
     }
+}
+
+/// `drag-across` choices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum DragPolicy {
+    Hold,
+    Cross,
 }
