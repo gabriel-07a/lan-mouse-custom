@@ -1081,3 +1081,7 @@ garbage line
         assert!(!is_unreachable(&io::Error::from(io::ErrorKind::TimedOut)));
     }
 }
+
+#[cfg(test)]
+#[path = "net_tests/discovery_suite.rs"]
+mod net_suite;

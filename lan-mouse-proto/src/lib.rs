@@ -1426,3 +1426,6 @@ mod extra_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod net_suite;
