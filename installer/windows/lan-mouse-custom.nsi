@@ -327,6 +327,14 @@ Section "Lan Mouse" SEC_MAIN
   RMDir /r "$INSTDIR"
   skip_clean_installdir:
 
+  ; Autostart from a previous install goes first, whatever this one picks:
+  ; with the cleanup inside "Start with Windows", unticking it left the old
+  ; logon task (or shortcut) behind and Lan Mouse still started at logon.
+  Delete "$SMSTARTUP\Lan Mouse.lnk"
+  nsExec::ExecToStack '"$SYSDIR\schtasks.exe" /Delete /TN "${TASKNAME}" /F'
+  Pop $0
+  Pop $1
+
   SetOutPath "$INSTDIR"
   File /r "..\..\lan-mouse-windows\*.*"
   File "..\..\assets\icon.ico"
@@ -391,12 +399,6 @@ SectionEnd
 
 ; Checked by default: a KVM is only useful if it is running.
 Section "Start with Windows" SEC_STARTUP
-  ; Start from a clean state, so switching between the two ways works.
-  Delete "$SMSTARTUP\Lan Mouse.lnk"
-  nsExec::ExecToStack '"$SYSDIR\schtasks.exe" /Delete /TN "${TASKNAME}" /F'
-  Pop $0
-  Pop $1
-
   ${If} ${SectionIsSelected} ${SEC_ELEVATED}
     ; A logon task for every member of Users with their highest rights:
     ; administrators get the elevated token without a UAC prompt, standard
