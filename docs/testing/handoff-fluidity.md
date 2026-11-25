@@ -116,14 +116,14 @@ was not added.
 ## Not done yet
 
 - **Windows pointer acceleration** ("Enhance pointer precision") when Windows
-  drives another PC. The Windows capture forwards raw counts × the pointer
-  speed setting, without the acceleration curve, so a fast flick travels less
-  on the peer than on Windows itself. The exact fix reads the position Windows
-  computed for each move in the low-level hook (the approach of
-  Synergy/Input Leap). That changes the core of the Windows capture: the cursor
-  is pinned away from the edge, the hide overlay moves, and absolute devices
-  keep the raw path. The Windows CI runners only exercise injected input, so it
-  needs a test with a real mouse on the user's PC before it ships.
+  drives another PC: available, opt-in (`windows_pointer_acceleration = true`).
+  The Windows capture then forwards what Windows itself makes of each mouse
+  report. The cursor is held at the centre of its display, every move is
+  blocked in the low-level hook, and its target minus the held point is the
+  motion. Measured on the Windows CI runners: 117 counts became 197 px with
+  the curve on, and the peer got the same within 10 % (`raw counts × speed`
+  sends ~60 % of it). Off by default until it is checked with real mice:
+  absolute devices (tablets, remote desktop) fall back to the raw path.
 - **The driven PC's own mouse on GNOME, sway and X11.** The physical mouse and
   the peer's virtual pointer move one shared cursor and cannot be told apart,
   so the driver keeps control until its own mouse comes back. Nothing gets

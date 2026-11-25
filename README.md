@@ -323,6 +323,10 @@ que o fork está público. Só não trate como suporte oficial.
    `lan-mouse cli drag-across cross`, ou o botão nas Configurações) o arraste
    termina na borda e o cursor atravessa. No sway/wlroots o arraste sempre
    fica (limitação do Wayland).
+   No Windows, `windows_pointer_acceleration = true` faz o movimento enviado ao
+   outro PC seguir a aceleração do próprio Windows ("Aprimorar precisão do
+   ponteiro"): um movimento rápido anda lá o mesmo que andaria aqui.
+   Experimental, desligado por padrão.
 4. Cruze a borda nos dois sentidos, em alturas diferentes (10%, 50%, 90%).
 5. Se algo estranhar, rode com log de debug:
    ```sh
