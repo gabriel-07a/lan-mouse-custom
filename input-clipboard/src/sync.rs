@@ -341,6 +341,9 @@ impl<S: FrameSink> ClipboardSync<S> {
     /// Snapshots that exceed the limits, are empty, or match the content last
     /// applied from a peer (echo) are ignored.
     pub fn on_local_change(&mut self, snapshot: ClipboardSnapshot, now: Instant) {
+        // An empty representation carries nothing, and a receiver waits
+        // forever for the chunks of an offer made only of them.
+        let snapshot = snapshot.without_empty();
         if snapshot.is_empty() {
             return;
         }
@@ -1070,6 +1073,18 @@ mod tests {
     async fn empty_snapshot_is_ignored() {
         let mut h = Harness::new();
         h.a.on_local_change(ClipboardSnapshot::default(), h.now);
+        assert!(h.wire.borrow().is_empty());
+    }
+
+    /// A copy whose only content is empty (an empty selection) is nothing to
+    /// share: offered, it never completed and ended as a transfer error.
+    #[tokio::test]
+    async fn a_copy_of_only_empty_content_is_not_offered() {
+        let mut h = Harness::new();
+        h.a.on_local_change(
+            ClipboardSnapshot::from_items([(Format::Text, Vec::new()), (Format::Html, Vec::new())]),
+            h.now,
+        );
         assert!(h.wire.borrow().is_empty());
     }
 

@@ -615,6 +615,19 @@ mod tests {
         assert_eq!(result, source);
     }
 
+    /// An empty representation next to a real one (an empty text copied with
+    /// an image, a CF_HTML without body) must not keep the transfer from
+    /// completing.
+    #[test]
+    fn an_empty_representation_does_not_stall_the_transfer() {
+        let source = ClipboardSnapshot::from_items([
+            (Format::Text, Vec::new()),
+            (Format::Png, vec![7; 3000]),
+        ]);
+        let result = drive(&source, |_| false).expect("transfer");
+        assert_eq!(result.hash(), source.hash());
+    }
+
     #[test]
     fn transfers_with_heavy_chunk_loss() {
         let source = snapshot();

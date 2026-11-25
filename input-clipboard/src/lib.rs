@@ -215,6 +215,12 @@ impl ClipboardSnapshot {
         self.items.values().map(Vec::len).sum()
     }
 
+    /// The same snapshot without its empty representations.
+    pub fn without_empty(mut self) -> Self {
+        self.items.retain(|_, data| !data.is_empty());
+        self
+    }
+
     /// The same snapshot without one representation.
     pub fn without(&self, format: Format) -> Self {
         let mut items = self.items.clone();
