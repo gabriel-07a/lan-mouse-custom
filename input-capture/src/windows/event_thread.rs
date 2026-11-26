@@ -46,14 +46,6 @@ use input_event::{
 
 use super::{CaptureEvent, Position, display_util};
 
-/// Ignore barrier crossings for a moment after a capture was released, so the
-/// hand-off does not immediately bounce back to the peer we just left.
-///
-/// Kept short: 350 ms made a deliberate quick return to the peer feel like the
-/// cursor had to "push" against the edge. A bounce is a same-edge activation
-/// immediately after release; 120 ms is enough to absorb accidental motion
-/// while keeping intentional crossings responsive.
-const RELEASE_COOLDOWN: Duration = Duration::from_millis(120);
 /// Ignore barrier crossings for this long after lan-mouse injected input: the
 /// remote peer is (just) driving this machine and its motion must not be
 /// mistaken for the local user crossing an edge.
@@ -372,8 +364,9 @@ thread_local! {
         const { RefCell::new((Vec::new(), 0, None)) };
     /// whether raw input (WM_INPUT) was registered successfully
     static RAW_INPUT_OK: Cell<bool> = const { Cell::new(false) };
-    /// time of the last capture release, used for the re-entry cooldown
-    static LAST_RELEASE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// where control came back to this machine, until the cursor moved away
+    /// from it (see [`display_util::rearmed`])
+    static RETURNED_AT: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// edge a remote peer entered through while it drives this machine
     /// (`None` = no peer is driving us); local barrier detection must stay
     /// quiet except at that edge, where a crossing is the return hand-off
@@ -723,10 +716,19 @@ fn release_active_client_at(target: Option<(i32, i32)>) {
     if !release_should_warp(had_active) {
         return;
     }
-    // Cooldown: the pointer is still parked at the edge when control is
-    // handed back, so the next outgoing movement must not immediately
-    // re-enter the peer ("ping-pong" at the shared border).
-    LAST_RELEASE.replace(Some(Instant::now()));
+    // The pointer is still at the edge when control is handed back, so the
+    // next outgoing movement must not immediately re-enter the peer
+    // ("ping-pong" at the shared border): the edge re-arms once the pointer
+    // moved away from where it came back.
+    let returned_at = target
+        .or_else(|| (PIN.get() != ENTRY_POINT.get()).then(|| ENTRY_POINT.get()))
+        .or_else(|| {
+            let mut cursor = POINT::default();
+            unsafe { GetCursorPos(&mut cursor) }
+                .is_ok()
+                .then_some((cursor.x, cursor.y))
+        });
+    RETURNED_AT.set(returned_at);
     PREV_POS.replace(None);
     hide_hidden_pointer();
     // Held at the display centre (system acceleration): without a return
@@ -803,10 +805,13 @@ fn activate(pos: Position, at: (i32, i32)) {
 ///
 /// The remote-active state is handled per edge by [`edge_activation_allowed`]:
 /// the cooldown here only prevents an immediate bounce-back after a release.
-fn may_activate() -> bool {
-    LAST_RELEASE
-        .get()
-        .is_none_or(|released| released.elapsed() >= RELEASE_COOLDOWN)
+fn may_activate(cursor: (i32, i32)) -> bool {
+    if display_util::rearmed(RETURNED_AT.get(), cursor) {
+        RETURNED_AT.set(None);
+        true
+    } else {
+        false
+    }
 }
 
 /// Whether a crossing at `entered` may start a capture while a remote peer is
@@ -826,9 +831,6 @@ fn edge_activation_allowed(remote_peer: Option<Position>, entered: Position) -> 
 /// a coordinate outside the monitor bounds, which is exactly where Windows 10
 /// and 11 (and scaled displays) behave inconsistently.
 unsafe fn try_activate_by_raw(dx: i32, dy: i32) {
-    if !may_activate() {
-        return;
-    }
     let remote_peer = REMOTE_PEER.get();
     // The remote peer's injected motion is visible to raw input as well (and
     // reaches here before the service can flip the remote state); never treat
@@ -839,6 +841,9 @@ unsafe fn try_activate_by_raw(dx: i32, dy: i32) {
     }
     let mut cursor = POINT::default();
     if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+        return;
+    }
+    if !may_activate((cursor.x, cursor.y)) {
         return;
     }
     let entered = DISPLAYS.with_borrow_mut(|(displays, generation, primary)| {
@@ -866,9 +871,6 @@ unsafe fn try_activate_by_raw(dx: i32, dy: i32) {
 /// Fallback detector for machines where raw input could not be registered:
 /// the old "cursor left the monitor bounds" check.
 unsafe fn try_activate_by_legacy(lparam: LPARAM) {
-    if !may_activate() {
-        return;
-    }
     let remote_peer = REMOTE_PEER.get();
     if remote_peer.is_none() && input_event::injection::is_recent(REMOTE_GRACE_MS) {
         return;
@@ -882,6 +884,10 @@ unsafe fn try_activate_by_legacy(lparam: LPARAM) {
         return;
     }
     let curr_pos = (mouse_low_level.pt.x, mouse_low_level.pt.y);
+    if !may_activate(curr_pos) {
+        PREV_POS.replace(Some(curr_pos));
+        return;
+    }
     let prev_pos = PREV_POS.get().unwrap_or(curr_pos);
     PREV_POS.replace(Some(curr_pos));
     let entered = DISPLAYS.with_borrow_mut(|(displays, generation, primary)| {
@@ -1426,12 +1432,12 @@ fn update_clients(request: ClientUpdate) {
                     // visible.
                     unpark_cursor();
                     // A peer taking over must never leave a local capture (and
-                    // a hidden cursor) behind, and the post-release cooldown
+                    // a hidden cursor) behind, and the re-arm after a release
                     // must not swallow the return crossing through `pos`.
                     if ACTIVE_CLIENT.get().is_some() {
                         release_active_client();
                     }
-                    LAST_RELEASE.replace(None);
+                    RETURNED_AT.set(None);
                     log::debug!("remote peer control active from {pos:?}");
                 }
                 None => {

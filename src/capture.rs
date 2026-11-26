@@ -487,7 +487,7 @@ const HANDOFF_RESIDUAL_MAX_PX: f64 = 32.0;
 /// deadline; the position-aware extension below is what decides when the guard
 /// ends early (pointer clearly inward) or must keep running (late residual that
 /// arrives after the fixed window while the pointer is still at the edge).
-const HANDOFF_REVERSE_GUARD: Duration = Duration::from_millis(200);
+const HANDOFF_REVERSE_GUARD: Duration = Duration::from_millis(60);
 /// Logical-px band next to the entry edge where reverse motion is still
 /// activation residual, not a deliberate hand-back.
 ///
@@ -508,12 +508,15 @@ const HANDOFF_ENTRY_BAND_PX: f64 = 16.0;
 ///
 /// The bound is a safety escape, not the decision: it keeps a user who wants to
 /// hand control back immediately from being blocked by a held near-edge reverse
-/// gesture. Trace evidence: the first forwarded motion of a hand-off clusters
-/// at 204.0-205.4 ms (30/95 samples), so the old fixed 200 ms window ended
-/// ~4-5 ms before the hand-off actually settled; 250 ms covers that boundary
-/// with margin while an intentional hand-back still passes at worst 250 ms
-/// after `Begin`.
-const HANDOFF_POSITION_GUARD: Duration = Duration::from_millis(250);
+/// gesture. Trace evidence (2026-11-26, the user's desk and the QA corpus in
+/// `src/qa/handoff_old_receiver.rs`): every activation residual arrived within
+/// 7 ms of `Begin` (single warps of 9-83 px at 0.2 ms; bursts up to 34.9 px by
+/// 7 ms). What the old 250 ms bound dropped after that were deliberate returns
+/// (13-38 deltas, 91-473 px swallowed over 100-250 ms: the cursor "stuck" at
+/// the border). 80 ms (60 ms for the fixed window) covers every residual of
+/// the corpus, including the synthetic old-receiver sequence with reverse
+/// deltas at 40-50 ms, while a deliberate return waits at most 80 ms.
+const HANDOFF_POSITION_GUARD: Duration = Duration::from_millis(80);
 /// How long after a remote peer starts driving this machine an incoming
 /// (`EnterOnly`) capture begin is treated as settling jitter instead of a local
 /// take-back request.
@@ -3793,7 +3796,7 @@ mod capture_handle_tests {
     #[test]
     fn the_reverse_guard_stays_short_and_small() {
         // Runtime checks (not const-eval) keep clippy quiet.
-        assert_eq!(HANDOFF_REVERSE_GUARD.as_millis(), 200);
+        assert_eq!(HANDOFF_REVERSE_GUARD.as_millis(), 60);
         let budget = HANDOFF_RESIDUAL_MAX_PX;
         assert!(
             budget.is_finite() && budget > 0.0 && budget <= 32.0,

@@ -305,6 +305,21 @@ fn scale_normalized_delta(delta: i32, extent: i32) -> i32 {
     if scaled == 0 { delta.signum() } else { scaled }
 }
 
+/// How far the pointer must move from where control came back before the
+/// edge it came back through may start a capture again.
+pub(crate) const REARM_PX: i32 = 8;
+
+/// Whether a new capture may start with the cursor at `cursor`, control
+/// having come back at `returned_at` (`None`: nothing to wait for).
+///
+/// A position rule instead of a timer: right after a return the cursor sits
+/// on the shared edge and must not bounce straight back into the peer, but a
+/// person who moved back in and turns around can cross again at once.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn rearmed(returned_at: Option<(i32, i32)>, cursor: (i32, i32)) -> bool {
+    returned_at.is_none_or(|(x, y)| (cursor.0 - x).abs().max((cursor.1 - y).abs()) >= REARM_PX)
+}
+
 /// Where the cursor is held while capturing with the system pointer
 /// acceleration: the centre of the display under `point` (the whole desktop's
 /// when the layout does not know it). Far from every edge, so the position
@@ -343,6 +358,22 @@ pub(crate) fn accelerated_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_edge_rearms_once_the_cursor_moved_away_from_the_return() {
+        assert!(rearmed(None, (0, 0)), "nothing came back: free to cross");
+        let returned = Some((1919, 540));
+        assert!(!rearmed(returned, (1919, 540)), "still where it came back");
+        assert!(
+            !rearmed(returned, (1919 - REARM_PX + 1, 540)),
+            "not far enough"
+        );
+        assert!(rearmed(returned, (1919 - REARM_PX, 540)));
+        assert!(
+            rearmed(returned, (1919, 540 + REARM_PX)),
+            "along the edge counts too"
+        );
+    }
 
     #[test]
     fn the_cursor_is_held_at_the_centre_of_its_display() {

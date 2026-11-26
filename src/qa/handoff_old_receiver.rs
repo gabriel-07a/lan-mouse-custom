@@ -70,7 +70,7 @@ use crate::coalesce::MotionCoalescer;
 /// `remaining_px`, saturates at 0 and never ends the guard. The fixed
 /// 200 ms window is the only suppression decision.
 const HANDOFF_RESIDUAL_MAX_PX: f64 = 32.0;
-const HANDOFF_REVERSE_GUARD: Duration = Duration::from_millis(200);
+const HANDOFF_REVERSE_GUARD: Duration = Duration::from_millis(60);
 
 /// Source of the production guard, compiled into the test binary for the
 /// model/implementation parity check.
@@ -1241,17 +1241,17 @@ fn a_genuine_return_after_the_guard_window_is_forwarded() {
         "the return must fire on the post-window gesture"
     );
 
-    // Boundary: the guard window is `now < until`; at exactly 200 ms the
+    // Boundary: the guard window is `now < until`; at exactly 60 ms the
     // window is over and the reverse delta is forwarded.
     let mut guard = SourceGuard::after_begin(SourceGuardKind::WindowOnly, Crossing::PeerRight);
     assert!(
-        guard.on_motion(motion(199_999, -5.0, 0.0)).is_drop(),
-        "199_999 us is still inside the 200 ms window"
+        guard.on_motion(motion(59_999, -5.0, 0.0)).is_drop(),
+        "59_999 us is still inside the 60 ms window"
     );
     assert_eq!(
-        guard.on_motion(motion(200_000, -5.0, 0.0)),
+        guard.on_motion(motion(60_000, -5.0, 0.0)),
         GuardDecision::Forward,
-        "at exactly 200_000 us the window is over and a return must pass"
+        "at exactly 60_000 us the window is over and a return must pass"
     );
 }
 
@@ -1295,14 +1295,14 @@ fn window_only_guard_stays_armed_after_forward_deltas_until_the_window_ends() {
         assert_eq!(elapsed_us, 2_000);
         assert_eq!(
             guard_remaining_us,
-            200_000 - 2_000,
+            60_000 - 2_000,
             "dropped deltas must not extend the fixed window"
         );
     }
 
     // Once the window is over the same reverse motion is forwarded.
     assert_eq!(
-        guard.on_motion(motion(200_000, -4.020392417907715, 0.0)),
+        guard.on_motion(motion(60_000, -4.020392417907715, 0.0)),
         GuardDecision::Forward
     );
     assert_eq!(guard.remaining_px(), None);
@@ -1366,7 +1366,7 @@ fn energetic_reverse_pushes_inside_the_window_are_all_suppressed() {
 
     // Delayed, not lost: after the window the reverse motion passes.
     assert_eq!(
-        guard.on_motion(motion(200_000, -20.0, 0.0)),
+        guard.on_motion(motion(60_000, -20.0, 0.0)),
         GuardDecision::Forward
     );
     assert_eq!(guard.remaining_px(), None);
@@ -1647,11 +1647,11 @@ fn observed_delta_grid_matches_the_contract() {
 #[test]
 fn harness_guard_model_matches_the_production_guard() {
     assert_eq!(HANDOFF_RESIDUAL_MAX_PX, 32.0);
-    assert_eq!(HANDOFF_REVERSE_GUARD, Duration::from_millis(200));
+    assert_eq!(HANDOFF_REVERSE_GUARD, Duration::from_millis(60));
 
     for needle in [
         "const HANDOFF_RESIDUAL_MAX_PX: f64 = 32.0;",
-        "const HANDOFF_REVERSE_GUARD: Duration = Duration::from_millis(200);",
+        "const HANDOFF_REVERSE_GUARD: Duration = Duration::from_millis(60);",
         "fn handoff_outward_px(pos: Position, dx: f64, dy: f64) -> f64",
         "reverse_guard_until: Option<Instant>",
         "self.reverse_guard_until = Some(handoff_began + HANDOFF_REVERSE_GUARD);",

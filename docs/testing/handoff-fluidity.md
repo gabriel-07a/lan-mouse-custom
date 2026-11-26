@@ -73,6 +73,20 @@ there is no measurement to calibrate one.
   down** in the app. The release went to the capture being given back. Now it
   is given back to this PC.
 
+- **A dropped connection stayed dropped.** A restart, crash or Wi-Fi drop of
+  the other PC deactivated the outgoing link too, so both PCs waited for a
+  click. Only an explicit Disconnect (`AuthRevoke`) does that now. A session
+  that ends without one reconnects the outgoing link at once
+  (`a_dropped_network_reconnects_by_itself`).
+- **Quick returns were held for up to 250 ms.** The source-side return guard
+  dropped every reverse delta near the edge for 200/250 ms. The user's trace
+  showed real activation residuals within 7 ms; what the window swallowed after
+  that were deliberate returns (91-473 px). It is now 60 ms (fixed) and 80 ms
+  (near the edge).
+- **The Windows re-entry cooldown (120 ms) is now a position rule.** After
+  control comes back, the edge re-arms once the cursor has moved 8 px away
+  from where it returned (`display_util::rearmed`).
+
 Two limits of the test setup, not of the app:
 
 - every service watches its config file, and Linux allows 128 inotify

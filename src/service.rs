@@ -1113,15 +1113,22 @@ impl Service {
                 self.expire_session_grants(addr);
                 let _ = self.clipboard_peer_events.send(addr);
                 if let Some(handle) = self.client_for_incoming(addr) {
-                    // The connection closed on the peer side. Because a
-                    // connection is bidirectional, keep it fully closed: stop
-                    // the outgoing link too instead of letting it redial the
-                    // peer that just hung up.
+                    // The transport went away without an explicit disconnect
+                    // (that one arrives as `AuthRevoke` and deactivates the
+                    // client there): the other PC restarted, crashed or the
+                    // network dropped. Keep the outgoing link active so it
+                    // redials; once the peer is back it accepts and turns its
+                    // own side on again. Deactivating here left both PCs
+                    // waiting for a click after every restart or Wi-Fi drop.
                     if self.client_manager.is_active(handle) {
                         log::info!(
-                            "incoming session from {addr} ended: deactivating the outgoing link of client {handle}"
+                            "incoming session from {addr} ended without a disconnect: reconnecting client {handle}"
                         );
-                        self.deactivate_client(handle);
+                        // The outgoing transport to the same PC is most likely
+                        // dead too (restart, network drop) but its ping
+                        // watchdog needs a few rounds to tell: reconnect now
+                        // instead of sending the next hand-off into it.
+                        self.capture.drop_transport(handle);
                     }
                     if self.client_manager.incoming_addr(handle).is_some() {
                         self.client_manager.set_incoming_addr(handle, None);

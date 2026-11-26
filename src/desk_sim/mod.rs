@@ -293,11 +293,13 @@ impl DeskBuilder {
         // relay that impairs that link
         let mut relays = Vec::new();
         let mut dial_ports = Vec::new();
+        let blackout = relay::Blackout::default();
         for (n, &(of, _, target)) in self.links.iter().enumerate() {
             let port = match self.impairment {
                 Some(impairment) => {
                     let (port, task) =
-                        relay::spawn(port_of(target), impairment, n as u64 + 1).await;
+                        relay::spawn(port_of(target), impairment, n as u64 + 1, blackout.clone())
+                            .await;
                     relays.push(task);
                     port
                 }
@@ -432,6 +434,7 @@ impl DeskBuilder {
             Duration::from_secs(10)
         };
         let desk = Desk {
+            blackout,
             relays,
             pcs,
             links,
@@ -448,6 +451,8 @@ impl DeskBuilder {
 pub(crate) struct Desk {
     /// network impairment relays (aborted with the desk)
     relays: Vec<JoinHandle<()>>,
+    /// takes the network between the PCs down (impaired desks only)
+    blackout: relay::Blackout,
     pcs: Vec<Pc>,
     /// `(of, target port)` for every configured client
     links: Vec<(&'static str, u16)>,
@@ -482,6 +487,16 @@ impl Desk {
 
     fn hand_pc(&self) -> &Pc {
         &self.pcs[0]
+    }
+
+    /// The network between the PCs goes down (`true`) or comes back. Only on
+    /// a desk built with [`DeskBuilder::impaired`].
+    pub(crate) fn network_down(&self, down: bool) {
+        assert!(
+            !self.relays.is_empty(),
+            "network_down needs an impaired desk"
+        );
+        self.blackout.set(down);
     }
 
     /// Move the physical mouse of the hand PC (the first one added).

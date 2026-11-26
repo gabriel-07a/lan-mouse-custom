@@ -40,11 +40,15 @@ impl Rng {
 
 type SharedRng = Rc<RefCell<Rng>>;
 
+/// While set, every relay of the desk drops everything (the network is down).
+pub(crate) type Blackout = Rc<std::cell::Cell<bool>>;
+
 /// Start a relay to `target_port`; returns the port to dial instead.
 pub(crate) async fn spawn(
     target_port: u16,
     impairment: Impairment,
     seed: u64,
+    blackout: Blackout,
 ) -> (u16, JoinHandle<()>) {
     let front = Rc::new(
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -76,9 +80,13 @@ pub(crate) async fn spawn(
                     upstreams.insert(client, upstream.clone());
                     // replies: target -> client, impaired too
                     let (front, back, rng) = (front.clone(), upstream.clone(), rng.clone());
+                    let blackout = blackout.clone();
                     spawn_local(async move {
                         let mut buf = vec![0u8; 65_536];
                         while let Ok(n) = back.recv(&mut buf).await {
+                            if blackout.get() {
+                                continue;
+                            }
                             let datagram = buf[..n].to_vec();
                             let front = front.clone();
                             deliver(&rng, impairment, datagram, move |d| {
@@ -92,6 +100,9 @@ pub(crate) async fn spawn(
                     upstream
                 }
             };
+            if blackout.get() {
+                continue;
+            }
             let datagram = buf[..n].to_vec();
             deliver(&rng, impairment, datagram, move |d| {
                 let upstream = upstream.clone();

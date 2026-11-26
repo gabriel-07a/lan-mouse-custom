@@ -134,3 +134,55 @@ bad_networks! {
     duplicates_gnome_to_windows: "duplicates", gnome -> windows;
     duplicates_windows_to_sway: "duplicates", windows -> sway, ignore = "weekly";
 }
+
+/// The network drops for a few seconds (Wi-Fi gone, the other PC restarting):
+/// nobody pressed Disconnect, so the link must come back by itself and the
+/// hand-off work again, without anyone clicking Connect.
+#[test]
+fn a_dropped_network_reconnects_by_itself() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_env(env_logger::Env::new().filter("LAN_MOUSE_LOG_LEVEL"))
+        .try_init();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(LocalSet::new().run_until(async {
+        let desk = Desk::builder()
+            .pc("A", 1536, 960)
+            .pc("B", 2560, 1440)
+            .place("B", Position::Right, "A")
+            .place("A", Position::Left, "B")
+            .personality("A", Personality::gnome())
+            .personality("B", Personality::windows())
+            .impaired(Impairment {
+                loss: 0.0,
+                jitter: Duration::ZERO,
+                duplicate: 0.0,
+            })
+            .start()
+            .await;
+        desk.network_down(true);
+        // longer than every liveness timeout (incoming 3 s, pings 2 rounds)
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        desk.network_down(false);
+        desk.wait_until(
+            "both links back without a click",
+            Duration::from_secs(20),
+            |d| {
+                ["A", "B"].iter().all(|pc| {
+                    d.pc(pc)
+                        .clients
+                        .get_client_states()
+                        .iter()
+                        .all(|(_, _, state)| state.active && state.active_addr.is_some())
+                })
+            },
+        )
+        .await;
+        desk.approach_edge("A", Position::Right, 0.5).await;
+        desk.move_mouse_on("A", 60.0, 0.0).await;
+        desk.wait_focus("B").await;
+    }));
+}
