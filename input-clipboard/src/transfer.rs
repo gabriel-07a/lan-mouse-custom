@@ -29,7 +29,16 @@ pub const ACK_TIMEOUT: Duration = Duration::from_millis(120);
 pub const MAX_WINDOW_ATTEMPTS: u8 = 6;
 /// Maximum number of chunks emitted in a single [`OutgoingTransfer::poll`]
 /// burst so bulk transfers do not flood the low-latency UDP socket at once.
-pub const MAX_CHUNKS_PER_BURST: usize = 6;
+pub const MAX_CHUNKS_PER_BURST: usize = 32;
+/// Chunks the sender keeps in flight past the acknowledgement base.
+///
+/// Wider than the receiver's 32-chunk acknowledgement bitmap
+/// ([`ACK_WINDOW`]): every receiver keeps chunks at any offset and reports
+/// the first missing one as its base, so with no loss the base moves on as
+/// fast as the chunks arrive. A lost chunk holds the base back until it is
+/// resent. 128 KiB keeps a Wi-Fi link busy without queueing input behind
+/// whole megabytes. No wire change: old receivers behave the same.
+pub const SEND_WINDOW: u32 = 128;
 /// Send an acknowledgement at least this often while chunks keep arriving.
 pub const ACK_EVERY_CHUNKS: u32 = 16;
 pub const ACK_EVERY: Duration = Duration::from_millis(10);
@@ -154,8 +163,8 @@ impl OutgoingTransfer {
             return out;
         }
 
-        let window_end =
-            (self.items[self.current].base + ACK_WINDOW).min(self.items[self.current].total_chunks);
+        let window_end = (self.items[self.current].base + SEND_WINDOW)
+            .min(self.items[self.current].total_chunks);
         let window_sweep_pending = self.items[self.current].cursor < window_end;
         let retransmission_due = self.items[self.current].last_send.is_none_or(|last| {
             now.duration_since(last) >= retransmission_delay(self.items[self.current].attempts)
@@ -303,8 +312,35 @@ struct IncomingItem {
     total: u32,
     data: Vec<u8>,
     received: Vec<bool>,
+    /// chunks marked in `received` (completion without a scan)
+    received_count: usize,
+    /// first chunk not received yet (the acknowledgement base)
+    first_missing: usize,
     chunks_since_ack: u32,
     last_ack: Instant,
+}
+
+impl IncomingItem {
+    fn mark(&mut self, index: usize) {
+        if let Some(received) = self.received.get_mut(index) {
+            if !*received {
+                *received = true;
+                self.received_count += 1;
+            }
+        }
+        while self
+            .received
+            .get(self.first_missing)
+            .copied()
+            .unwrap_or(false)
+        {
+            self.first_missing += 1;
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received_count == self.received.len()
+    }
 }
 
 impl IncomingTransfer {
@@ -342,6 +378,8 @@ impl IncomingTransfer {
                     total: size as u32,
                     data: vec![0; size],
                     received: vec![false; chunk_count(size as u32) as usize],
+                    received_count: 0,
+                    first_missing: 0,
                     chunks_since_ack: 0,
                     last_ack: now,
                 },
@@ -404,14 +442,12 @@ impl IncomingTransfer {
         let first = offset / CHUNK_SIZE as u32;
         let last = (offset + data.len() as u32 - 1) / CHUNK_SIZE as u32;
         for index in first..=last {
-            if let Some(received) = item.received.get_mut(index as usize) {
-                *received = true;
-            }
+            item.mark(index as usize);
         }
         item.chunks_since_ack += 1;
         self.last_update = now;
 
-        let complete = item.received.iter().all(|received| *received);
+        let complete = item.is_complete();
         if complete
             || item.chunks_since_ack >= ACK_EVERY_CHUNKS
             || now.duration_since(item.last_ack) >= ACK_EVERY
@@ -430,9 +466,40 @@ impl IncomingTransfer {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.items
-            .values()
-            .all(|item| item.received.iter().all(|received| *received))
+        self.items.values().all(IncomingItem::is_complete)
+    }
+
+    /// Chunks received so far, over every representation.
+    pub fn received_chunks(&self) -> usize {
+        self.items.values().map(|item| item.received_count).sum()
+    }
+
+    /// Take over what an interrupted transfer of the same content already
+    /// received (same hash, same representations and sizes): the next
+    /// acknowledgements then skip it and the sender only resends the rest.
+    /// Returns whether anything was adopted.
+    pub fn adopt(&mut self, previous: IncomingTransfer) -> bool {
+        if previous.hash != self.hash
+            || previous.items.len() != self.items.len()
+            || previous.items.iter().any(|(format, item)| {
+                self.items
+                    .get(format)
+                    .is_none_or(|own| own.total != item.total)
+            })
+        {
+            return false;
+        }
+        let mut adopted = false;
+        for (format, old) in previous.items {
+            if let Some(item) = self.items.get_mut(&format) {
+                adopted |= old.received_count > 0;
+                item.data = old.data;
+                item.received = old.received;
+                item.received_count = old.received_count;
+                item.first_missing = old.first_missing;
+            }
+        }
+        adopted
     }
 
     /// Current acknowledgements for every representation. Used when a
@@ -471,11 +538,7 @@ impl IncomingTransfer {
 }
 
 fn window(item: &IncomingItem) -> (u32, u32) {
-    let base = item
-        .received
-        .iter()
-        .position(|received| !received)
-        .unwrap_or(item.received.len()) as u32;
+    let base = item.first_missing as u32;
     let mut bitmap = 0u32;
     for bit in 0..ACK_WINDOW {
         let index = base + bit;
@@ -769,9 +832,134 @@ mod tests {
         assert!(matches!(receiver.assemble(), Err(Error::Transfer(_))));
     }
 
+    /// A transfer interrupted half way (the link dropped) and offered again
+    /// with a new serial resumes: only the missing half is sent again.
+    #[test]
+    fn a_re_offered_transfer_resumes_where_it_stopped() {
+        let data: Vec<u8> = (0..CHUNK_SIZE * 40).map(|i| (i * 7 + 3) as u8).collect();
+        let source = ClipboardSnapshot::from_items([(Format::Png, data)]);
+        let t0 = Instant::now();
+        let limits = Limits::default();
+
+        // first attempt: 20 of 40 chunks arrive, then the link drops
+        let first = OutgoingTransfer::new(1, 9, &source);
+        let offer = first.offer_frame();
+        let ClipboardFrame::Offer {
+            serial,
+            origin,
+            hash,
+            items,
+        } = offer.clone()
+        else {
+            unreachable!()
+        };
+        let mut interrupted =
+            IncomingTransfer::from_offer(serial, origin, hash, &items, &limits, t0).expect("offer");
+        let png = source.get(Format::Png).unwrap();
+        for index in 0..20 {
+            let start = index * CHUNK_SIZE;
+            interrupted
+                .on_chunk(
+                    serial,
+                    Format::Png.id(),
+                    start as u32,
+                    png.len() as u32,
+                    &png[start..start + CHUNK_SIZE],
+                    t0,
+                )
+                .expect("chunk");
+        }
+        assert_eq!(interrupted.received_chunks(), 20);
+
+        // second attempt after the reconnect: a new serial, same content
+        let mut sender = OutgoingTransfer::new(2, 9, &source);
+        let ClipboardFrame::Offer {
+            serial,
+            origin,
+            hash,
+            items,
+        } = sender.offer_frame()
+        else {
+            unreachable!()
+        };
+        let mut receiver =
+            IncomingTransfer::from_offer(serial, origin, hash, &items, &limits, t0).expect("offer");
+        assert!(receiver.adopt(interrupted), "same content is adopted");
+        for ack in receiver.acks() {
+            let ClipboardFrame::Ack {
+                serial,
+                mime,
+                base,
+                bitmap,
+            } = ack
+            else {
+                unreachable!()
+            };
+            assert_eq!(base, 20, "the acknowledgement starts after what arrived");
+            sender.on_ack(serial, mime, base, bitmap);
+        }
+        let mut sent = 0;
+        let mut now = t0;
+        while !receiver.is_complete() {
+            now += Duration::from_millis(1);
+            for frame in sender.poll(now) {
+                if let ClipboardFrame::Chunk {
+                    serial,
+                    mime,
+                    offset,
+                    total,
+                    data,
+                } = frame
+                {
+                    sent += 1;
+                    if let Ok(Some(ClipboardFrame::Ack {
+                        serial,
+                        mime,
+                        base,
+                        bitmap,
+                    })) = receiver.on_chunk(serial, mime, offset, total, &data, now)
+                    {
+                        sender.on_ack(serial, mime, base, bitmap);
+                    }
+                }
+            }
+            assert!(now < t0 + Duration::from_secs(5), "never completed");
+        }
+        assert_eq!(sent, 20, "only the missing chunks are sent again");
+        assert_eq!(receiver.assemble().expect("intact"), source);
+    }
+
+    /// Other content is never adopted, even with the same sizes.
+    #[test]
+    fn a_different_copy_is_not_adopted() {
+        let t0 = Instant::now();
+        let limits = Limits::default();
+        let offer_of = |byte: u8, serial: u32| {
+            let snapshot =
+                ClipboardSnapshot::from_items([(Format::Png, vec![byte; CHUNK_SIZE * 4])]);
+            let ClipboardFrame::Offer {
+                serial,
+                origin,
+                hash,
+                items,
+            } = OutgoingTransfer::new(serial, 1, &snapshot).offer_frame()
+            else {
+                unreachable!()
+            };
+            IncomingTransfer::from_offer(serial, origin, hash, &items, &limits, t0).expect("offer")
+        };
+        let old = offer_of(1, 1);
+        let mut new = offer_of(2, 2);
+        assert!(!new.adopt(old));
+        assert_eq!(new.received_chunks(), 0);
+    }
+
     #[test]
     fn large_window_is_paced_across_multiple_polls() {
-        let large = ClipboardSnapshot::from_items([(Format::Png, vec![0x42; CHUNK_SIZE * 20])]);
+        // more than two bursts, inside one send window
+        let chunks = MAX_CHUNKS_PER_BURST * 2 + 5;
+        assert!(chunks <= SEND_WINDOW as usize);
+        let large = ClipboardSnapshot::from_items([(Format::Png, vec![0x42; CHUNK_SIZE * chunks])]);
         let mut sender = OutgoingTransfer::new(7, 1, &large);
         let t0 = Instant::now();
 

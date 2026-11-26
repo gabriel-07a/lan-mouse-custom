@@ -1700,6 +1700,8 @@ impl Service {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
+        // only Linux adds the cursor extension's section below
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut sections = vec![
             ("Service".to_string(), json(&self.diagnostics())),
             ("Links".to_string(), links),

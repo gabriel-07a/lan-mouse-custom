@@ -56,6 +56,9 @@ struct DeferredCommit {
 }
 
 /// One clipboard sync instance.
+/// How long the received part of an interrupted copy is kept for a resume.
+const PARKED_KEEP: Duration = Duration::from_secs(600);
+
 pub struct ClipboardSync<S: FrameSink> {
     sink: S,
     /// Shared with the service so config changes apply without a restart.
@@ -75,6 +78,10 @@ pub struct ClipboardSync<S: FrameSink> {
     accepts_files: HashSet<PeerId>,
     outgoing: HashMap<PeerId, OutgoingTransfer>,
     incoming: HashMap<PeerId, IncomingTransfer>,
+    /// The last incoming transfer that was cut off half way (its peer went
+    /// away, it stalled or another copy replaced it), kept so the same copy
+    /// offered again resumes instead of starting over.
+    parked: Option<(Instant, IncomingTransfer)>,
     /// Hash of the last snapshot written to the local clipboard on behalf of a
     /// peer. Suppresses the backend's owner-change echo of that write.
     last_applied: Option<[u8; 32]>,
@@ -118,6 +125,7 @@ impl<S: FrameSink> ClipboardSync<S> {
             accepts_files: HashSet::new(),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
+            parked: None,
             last_applied: None,
             offered: HashMap::new(),
             deferred: Vec::new(),
@@ -190,8 +198,11 @@ impl<S: FrameSink> ClipboardSync<S> {
         self.outgoing.remove(&peer);
         // Frames queued before the disconnect must not complete an incoming
         // transfer after the peer is gone (a late chunk could otherwise apply
-        // stale content).
-        self.incoming.remove(&peer);
+        // stale content). What arrived is kept for a re-offer after the
+        // reconnect.
+        if let Some(transfer) = self.incoming.remove(&peer) {
+            self.park(transfer, Instant::now());
+        }
         self.offered.remove(&peer);
         self.deferred.retain(|commit| commit.peer != peer);
         if let Some(retry) = &mut self.retry {
@@ -255,10 +266,19 @@ impl<S: FrameSink> ClipboardSync<S> {
         self.last_error.as_deref()
     }
 
+    /// Keep an interrupted transfer for a resume (only one, the latest, and
+    /// only if part of it arrived).
+    fn park(&mut self, transfer: IncomingTransfer, now: Instant) {
+        if transfer.received_chunks() > 0 && !transfer.is_complete() {
+            self.parked = Some((now, transfer));
+        }
+    }
+
     /// Drop every in-flight transfer (used when clipboard sync is disabled).
     pub fn reset(&mut self) {
         self.outgoing.clear();
         self.incoming.clear();
+        self.parked = None;
         self.offered.clear();
         self.deferred.clear();
         self.retry = None;
@@ -455,11 +475,30 @@ impl<S: FrameSink> ClipboardSync<S> {
                     &self.limits.get(),
                     now,
                 ) {
-                    Ok(transfer) => {
+                    Ok(mut transfer) => {
                         log::debug!(
                             "clipboard: accepting snapshot {serial} with {} format(s)",
                             items.len()
                         );
+                        // the copy this peer was sending before, if any
+                        if let Some(previous) = self.incoming.remove(&peer) {
+                            self.park(previous, now);
+                        }
+                        if let Some((_, parked)) = self.parked.take() {
+                            if parked.hash() == transfer.hash() {
+                                let had = parked.received_chunks();
+                                if transfer.adopt(parked) {
+                                    log::info!(
+                                        "clipboard: resuming snapshot {serial} from {had} chunk(s) already received"
+                                    );
+                                    for ack in transfer.acks() {
+                                        self.sink.send(peer, ack);
+                                    }
+                                }
+                            } else {
+                                self.parked = Some((now, parked));
+                            }
+                        }
                         self.incoming.insert(peer, transfer);
                     }
                     Err(e) => {
@@ -680,14 +719,25 @@ impl<S: FrameSink> ClipboardSync<S> {
             }
         }
 
-        self.incoming.retain(|peer, transfer| {
-            if transfer.timed_out(now) {
-                log::warn!("clipboard: incoming transfer from peer {peer} timed out");
-                false
-            } else {
-                true
+        let stalled: Vec<PeerId> = self
+            .incoming
+            .iter()
+            .filter(|(_, transfer)| transfer.timed_out(now))
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in stalled {
+            log::warn!("clipboard: incoming transfer from peer {peer} timed out");
+            if let Some(transfer) = self.incoming.remove(&peer) {
+                self.park(transfer, now);
             }
-        });
+        }
+        if self
+            .parked
+            .as_ref()
+            .is_some_and(|(since, _)| now.duration_since(*since) > PARKED_KEEP)
+        {
+            self.parked = None;
+        }
 
         let completed = self
             .incoming

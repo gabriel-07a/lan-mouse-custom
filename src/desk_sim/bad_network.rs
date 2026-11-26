@@ -186,3 +186,64 @@ fn a_dropped_network_reconnects_by_itself() {
         desk.wait_focus("B").await;
     }));
 }
+
+/// A large copy cut off by a network drop finishes after the reconnect,
+/// intact, resuming from what already arrived.
+#[test]
+fn a_large_copy_survives_a_network_drop() {
+    use input_clipboard::{
+        ClipboardSnapshot, Format,
+        files::{local_item, local_paths},
+    };
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_env(env_logger::Env::new().filter("LAN_MOUSE_LOG_LEVEL"))
+        .try_init();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(LocalSet::new().run_until(async {
+        let desk = Desk::builder()
+            .pc("A", 1536, 960)
+            .pc("B", 2560, 1440)
+            .place("B", Position::Right, "A")
+            .place("A", Position::Left, "B")
+            .impaired(Impairment {
+                loss: 0.0,
+                jitter: Duration::ZERO,
+                duplicate: 0.0,
+            })
+            .start()
+            .await;
+        let src = std::env::temp_dir().join(format!("lan-mouse-drop-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let data: Vec<u8> = (0..8u64 * 1024 * 1024)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        std::fs::write(src.join("big.bin"), &data).unwrap();
+        desk.copy(
+            "A",
+            ClipboardSnapshot::from_items([(Format::Files, local_item(&[src.join("big.bin")]))]),
+        );
+        // part of it gets across, then the network goes away for a while
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        desk.network_down(true);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        desk.network_down(false);
+        desk.wait_until(
+            "B pastes the copy after the drop",
+            Duration::from_secs(90),
+            |d| d.paste("B").get(Format::Files).is_some(),
+        )
+        .await;
+        let paths = local_paths(desk.paste("B").get(Format::Files).expect("files"));
+        assert_eq!(
+            std::fs::read(&paths[0]).unwrap(),
+            data,
+            "the copy arrived intact"
+        );
+        let _ = std::fs::remove_dir_all(&src);
+    }));
+}

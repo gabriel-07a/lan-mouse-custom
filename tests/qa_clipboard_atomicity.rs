@@ -1071,7 +1071,7 @@ fn copy_during_a_long_transport_outage_is_recovered_without_a_second_copy() {
 #[test]
 fn reconnect_after_an_interrupted_transfer_resyncs_the_current_clipboard() {
     let mut net = pair();
-    let copy = bytes_copy(vec![b'x'; 8 * 1024]);
+    let copy = bytes_copy(vec![b'x'; 256 * 1024]);
     net.copy(NODE_A, copy.clone());
     net.deliver(); // offer + the first chunks reach the peer, transfer incomplete
     net.tick();
@@ -1128,7 +1128,7 @@ fn copying_again_after_reconnect_is_offered_again() {
 fn clipboard_survives_a_backend_restart_and_resyncs() {
     let mut net = pair();
     // Multi-chunk payload: the first round delivers an incomplete transfer.
-    let copy = bytes_copy(vec![b'r'; 8 * 1024]);
+    let copy = bytes_copy(vec![b'r'; 256 * 1024]);
     net.copy(NODE_A, copy.clone());
     net.deliver();
     net.tick();
@@ -1145,7 +1145,7 @@ fn clipboard_survives_a_backend_restart_and_resyncs() {
 #[test]
 fn disabling_mid_transfer_clears_stale_state_and_re_enabling_resyncs() {
     let mut net = pair();
-    let copy = bytes_copy(vec![b'z'; 8 * 1024]);
+    let copy = bytes_copy(vec![b'z'; 256 * 1024]);
     net.copy(NODE_A, copy.clone());
     net.deliver();
     net.tick();
@@ -1232,7 +1232,7 @@ fn superseded_transfer_never_overwrites_a_newer_copy() {
 #[test]
 fn incomplete_incoming_transfer_times_out_without_applying() {
     let mut net = pair();
-    let partial = bytes_copy(vec![b'p'; 8 * 1024]);
+    let partial = bytes_copy(vec![b'p'; 256 * 1024]);
     net.copy(NODE_A, partial);
     net.deliver(); // the offer + the first chunks arrive
     net.tick();

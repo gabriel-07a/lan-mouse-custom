@@ -235,3 +235,56 @@ async fn copied_files_and_folders_paste_on_the_other_pc() {
         })
         .await;
 }
+
+/// How fast a large copied file reaches the other PC (MB/s), and that it
+/// arrives intact.
+#[tokio::test(flavor = "current_thread")]
+async fn a_large_copied_file_arrives_quickly() {
+    use input_clipboard::files::{local_item, local_paths};
+    init_log();
+    LocalSet::new()
+        .run_until(async {
+            let desk = a_with_b_on_the_right().await;
+            let src =
+                std::env::temp_dir().join(format!("lan-mouse-desk-bigfile-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&src);
+            std::fs::create_dir_all(&src).unwrap();
+            // incompressible-looking bytes
+            let size: usize = std::env::var("BIG_FILE_KIB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8 * 1024)
+                * 1024;
+            let data: Vec<u8> = (0..size as u64)
+                .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+                .collect();
+            std::fs::write(src.join("video.bin"), &data).unwrap();
+            let started = std::time::Instant::now();
+            desk.copy(
+                "A",
+                ClipboardSnapshot::from_items([(
+                    Format::Files,
+                    local_item(&[src.join("video.bin")]),
+                )]),
+            );
+            desk.wait_until("B pastes the big file", Duration::from_secs(120), |desk| {
+                desk.paste("B").get(Format::Files).is_some()
+            })
+            .await;
+            let took = started.elapsed();
+            let mbps = size as f64 / 1e6 / took.as_secs_f64();
+            eprintln!("{} KiB file: {took:?} ({mbps:.2} MB/s)", size / 1024);
+            // 3.8 MB/s on a developer machine; 0.8 MB/s before the wider send
+            // window. Loose, so a slow CI runner does not flake.
+            assert!(mbps > 1.2, "a large copy crawls at {mbps:.2} MB/s");
+            let pasted = desk.paste("B");
+            let paths = local_paths(pasted.get(Format::Files).expect("files"));
+            assert_eq!(
+                std::fs::read(&paths[0]).unwrap(),
+                data,
+                "the file arrived intact"
+            );
+            let _ = std::fs::remove_dir_all(&src);
+        })
+        .await;
+}
