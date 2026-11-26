@@ -386,3 +386,35 @@ async fn the_windows_acceleration_setting_round_trips() {
         })
         .await;
 }
+
+/// "Create diagnostic report" writes a file with the links and the
+/// configuration, and tells the GUI where it is.
+#[tokio::test(flavor = "current_thread")]
+async fn a_diagnostic_report_is_written_on_request() {
+    init_log();
+    LocalSet::new()
+        .run_until(async {
+            let desk = a_and_b().await;
+            let (mut events, mut requests) = frontend(&desk, "A").await;
+            send(&mut requests, FrontendRequest::CreateDiagnosticReport).await;
+            let path = expect_event(&mut events, "the report path", |event| match event {
+                FrontendEvent::DiagnosticReport(path) => Some(path.clone()),
+                _ => None,
+            })
+            .await;
+            let report = std::fs::read_to_string(&path).expect("the report file");
+            for needle in [
+                "Lan Mouse diagnostic report",
+                "===== Service =====",
+                "===== Links =====",
+                "\"active_addr\"",
+                "===== Configuration =====",
+                "[[clients]]",
+                "===== Audit log (end) =====",
+            ] {
+                assert!(report.contains(needle), "{needle:?} missing from {path}");
+            }
+            assert!(!report.contains("PRIVATE KEY"), "the private key leaked");
+        })
+        .await;
+}

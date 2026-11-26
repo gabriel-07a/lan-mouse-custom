@@ -11,6 +11,7 @@ mod cursor_hide;
 #[cfg(all(test, unix))]
 mod desk_sim;
 mod devices;
+mod diagnostic_report;
 mod discovery;
 mod dns;
 pub mod doctor;

@@ -154,6 +154,10 @@ enum CliSubcommand {
     /// there as here. Experimental; keep it off with a drawing tablet or over
     /// Remote Desktop
     WindowsAcceleration { state: OnOff },
+    /// write a diagnostic report of this PC (versions, links, latency,
+    /// configuration, the end of the hand-off trace) to send when reporting
+    /// a problem; run it on each PC
+    Diagnose,
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
     /// list known devices with their permissions
@@ -763,6 +767,22 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             tx.request(FrontendRequest::UpdateSensitivity(id, percent))
                 .await?;
             settle(&mut rx, Some(id)).await?;
+        }
+        CliSubcommand::Diagnose => {
+            tx.request(FrontendRequest::CreateDiagnosticReport).await?;
+            loop {
+                match next_event(&mut rx).await? {
+                    FrontendEvent::DiagnosticReport(path) => {
+                        println!("diagnostic report: {path}");
+                        break;
+                    }
+                    FrontendEvent::Error(e) => {
+                        eprintln!("{e}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
         }
         CliSubcommand::WindowsAcceleration { state } => {
             let on = state == OnOff::On;

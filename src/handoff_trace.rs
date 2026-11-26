@@ -37,7 +37,7 @@ pub(crate) fn enabled() -> bool {
         .get_or_init(|| std::env::var("LAN_MOUSE_HANDOFF_TRACE").is_ok_and(|value| value == "1"))
 }
 
-fn trace_path() -> Option<PathBuf> {
+pub(crate) fn trace_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("LAN_MOUSE_HANDOFF_TRACE_FILE") {
         return Some(PathBuf::from(path));
     }

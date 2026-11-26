@@ -786,6 +786,8 @@ pub enum FrontendEvent {
     /// Windows: the motion sent to peers follows the system pointer
     /// acceleration
     WindowsPointerAcceleration(bool),
+    /// a diagnostic report was written to this file
+    DiagnosticReport(String),
     /// capture status
     CaptureStatus(Status),
     /// emulation status
@@ -994,6 +996,8 @@ pub enum FrontendRequest {
     /// Windows: make the motion sent to peers follow the system pointer
     /// acceleration ("Enhance pointer precision")
     SetWindowsPointerAcceleration(bool),
+    /// write a diagnostic report of this PC (answered with `DiagnosticReport`)
+    CreateDiagnosticReport,
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// pin (or clear) the expected certificate fingerprint of a client

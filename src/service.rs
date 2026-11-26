@@ -781,6 +781,17 @@ impl Service {
                 self.save_config();
                 self.notify_frontend(FrontendEvent::WindowsPointerAcceleration(on));
             }
+            FrontendRequest::CreateDiagnosticReport => match self.diagnostic_report() {
+                Ok(path) => {
+                    log::info!("diagnostic report written to {}", path.display());
+                    self.notify_frontend(FrontendEvent::DiagnosticReport(
+                        path.display().to_string(),
+                    ));
+                }
+                Err(e) => self.notify_frontend(FrontendEvent::Error(format!(
+                    "could not write the diagnostic report: {e}"
+                ))),
+            },
             FrontendRequest::SetDragAcross(policy) => {
                 self.config.set_drag_across(policy);
                 self.capture.set_drag_across(policy);
@@ -1663,6 +1674,81 @@ impl Service {
         self.capture
             .suppress_lock_keys(now + crate::lock_sync::INJECTED_KEY_SUPPRESS);
         self.emulation.tap_keys(keys);
+    }
+
+    /// Write a diagnostic report of this PC next to the audit log.
+    fn diagnostic_report(&self) -> std::io::Result<std::path::PathBuf> {
+        use crate::diagnostic_report::{ReportInput, build, utc_stamp, write};
+        fn json<T: serde::Serialize>(value: &T) -> String {
+            serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("<{e}>"))
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let (generated_at, file_stamp) = utc_stamp(now);
+        let links = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .map(|(handle, config, state)| {
+                format!(
+                    "client {handle}\nconfig: {}\nstate: {}",
+                    json(&config),
+                    json(&state)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut sections = vec![
+            ("Service".to_string(), json(&self.diagnostics())),
+            ("Links".to_string(), links),
+            ("Devices".to_string(), json(&self.device_snapshot())),
+            (
+                "Address rules".to_string(),
+                json(&self.address_rule_views()),
+            ),
+            (
+                "Configuration".to_string(),
+                std::fs::read_to_string(self.config.config_path())
+                    .unwrap_or_else(|e| format!("could not read the config file: {e}")),
+            ),
+        ];
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let dir = std::path::PathBuf::from(runtime).join("lan-mouse");
+            let read =
+                |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_else(|_| "-".into());
+            sections.push((
+                "GNOME cursor extension".to_string(),
+                format!(
+                    "loaded version: {}\nstatus: {}",
+                    read("cursor-extension-loaded").trim(),
+                    read("cursor-extension-status").trim()
+                ),
+            ));
+        }
+        let input = ReportInput {
+            generated_at,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            commit: String::from_utf8_lossy(&crate::config::local_commit()).into_owned(),
+            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            host: hostname::get()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            sections,
+            tails: vec![
+                ReportInput::trace_tail(crate::handoff_trace::trace_path()),
+                ReportInput::audit_tail(self.audit.path().to_path_buf()),
+            ],
+        };
+        let dir = self
+            .audit
+            .path()
+            .parent()
+            .map(|parent| parent.join("reports"))
+            .unwrap_or_else(|| std::env::temp_dir().join("lan-mouse-reports"));
+        write(&dir, &file_stamp, &build(&input))
     }
 
     pub(crate) fn diagnostics(&self) -> Diagnostics {

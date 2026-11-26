@@ -1298,6 +1298,9 @@ impl Dashboard {
             FrontendEvent::WindowsPointerAcceleration(on) => {
                 self.windows_pointer_acceleration = on;
             }
+            FrontendEvent::DiagnosticReport(path) => {
+                self.status = format!("{} {path}", self.tr("Diagnostic report saved:"));
+            }
             FrontendEvent::CaptureStatus(status) => self.capture_status = status,
             FrontendEvent::EmulationStatus(status) => self.emulation_status = status,
             FrontendEvent::ClipboardStatus(status) => self.clipboard_status = status,
@@ -3879,6 +3882,14 @@ impl Dashboard {
                         0x081018,
                         cx,
                         |this, _, _, _| this.send(FrontendRequest::SaveConfiguration),
+                    ))
+                    .child(self.action_button(
+                        "diagnostic-report",
+                        self.tr("Create diagnostic report"),
+                        0x1d2430,
+                        TEXT,
+                        cx,
+                        |this, _, _, _| this.send(FrontendRequest::CreateDiagnosticReport),
                     ))
                     .child(self.action_button(
                         "refresh-history",

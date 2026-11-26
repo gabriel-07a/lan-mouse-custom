@@ -245,6 +245,8 @@ impl Language {
                     "Aceleração do mouse do Windows no outro PC"
                 }
                 "On" => "Ligada",
+                "Create diagnostic report" => "Gerar diagnóstico",
+                "Diagnostic report saved:" => "Diagnóstico salvo:",
                 "Off" => "Desligada",
                 "When this PC's mouse controls another PC, the cursor there follows Windows' pointer acceleration (\"Enhance pointer precision\"): a fast move goes as far there as it does here. Off: it follows the raw mouse counts and the pointer speed only, so fast moves travel less. Experimental: keep it off with a drawing tablet or over Remote Desktop." => {
                     "Quando o mouse deste PC controla outro PC, o cursor de lá segue a aceleração do Windows (\"Aprimorar precisão do ponteiro\"): um movimento rápido anda lá o mesmo que aqui. Desligada: segue só as contagens do mouse e a velocidade do ponteiro, e movimentos rápidos andam menos. Experimental: deixe desligada se usar mesa digitalizadora ou Área de Trabalho Remota."
